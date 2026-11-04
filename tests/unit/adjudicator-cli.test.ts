@@ -7,10 +7,12 @@ import {
   adjudicatorCommand,
   adjudicatorDoctorChecks,
   adjudicatorLiveChecks,
+  CHOICES,
   type CliDeps,
   detectLocal,
   type Io,
   keyIdFor,
+  looksLikeKey,
   parseChoice,
   remoteNotice,
   setupAdjudicator,
@@ -354,6 +356,83 @@ describe("eminiar adjudicator key", () => {
 
   it("an empty stdin is an error", async () => {
     expect(await run(["key", "set", "typesafe"], fakeIo({ stdin: "" }).io)).toBe(1);
+  });
+
+  describe("never echoes a key pasted on the command line", () => {
+    // The bug report's shape (no dash, matches an env-var name), the suite's sentinel, a long
+    // token with no known prefix, and a short one that only the prefix gives away.
+    const KEYS = [
+      "gsk_SENTINELkeyPastedAsArg0123456789",
+      SENTINEL,
+      "SENTINELnoPrefixButLong42",
+      "sk-SNTNL9q",
+    ];
+    const invocations = (k: string): string[][] => [
+      ["key", "set", k],
+      ["key", k],
+      ["key", "set", "--provider", k],
+      [k],
+      ["key", "set", "typesafe", k],
+      ["key", "clear", k],
+      ["key", "status", k],
+      ["key", "set", "--from-env", k],
+    ];
+
+    for (const k of KEYS)
+      for (const args of invocations(k))
+        it(`${args.join(" ").replace(k, "<key>")} (${k.slice(0, 4)}…)`, async () => {
+          // stdin carries the same key: even reading it must not happen or echo it
+          const t = fakeIo({ stdin: `${k}\n` });
+          expect(await run(args, t.io)).toBe(2);
+          expect(t.text()).not.toContain(k);
+          if (args[0] === "key") expect(t.text()).toContain("never taken from the command line");
+          expect(existsSync(paths().adjudicatorKey)).toBe(false);
+          if (existsSync(paths().configFile))
+            expect(readFileSync(paths().configFile, "utf8")).not.toContain(k);
+        });
+
+    it("other commands hide a key-shaped provider, preset or mode", async () => {
+      const k = KEYS[0] as string;
+      for (const args of [
+        ["enable", "--provider", k],
+        ["enable", "--provider", "openai-compatible", "--preset", k],
+        ["enable", "--mode", k],
+        ["provider", k],
+        ["test", "hello", "--provider", k],
+        ["eval", "--provider", k],
+      ]) {
+        const t = fakeIo();
+        expect(await run(args, t.io)).toBe(2);
+        expect(t.text()).not.toContain(k);
+        expect(t.text()).toContain("argument hidden");
+      }
+      expect(globalRaw().adjudicator).toBeUndefined();
+    });
+
+    it("still names an ordinary unknown provider and accepts --provider as the target", async () => {
+      const t = fakeIo();
+      expect(await run(["key", "set", "bogus"], t.io)).toBe(2);
+      expect(t.text()).toContain('unknown provider "bogus"');
+      const s = fakeIo({ stdin: `${SENTINEL}\n` });
+      expect(await run(["key", "set", "--provider", "groq"], s.io)).toBe(0);
+      expect(JSON.parse(readFileSync(paths().adjudicatorKey, "utf8"))).toEqual({
+        "openai:groq": SENTINEL,
+      });
+      expect(s.text()).not.toContain(SENTINEL);
+    });
+
+    it("looksLikeKey spares every known name and a set --from-env variable", async () => {
+      for (const n of [...CHOICES, "openai-compatible", "openai:cerebras", "OpenAI:Groq"])
+        expect(looksLikeKey(n)).toBe(false);
+      for (const k of KEYS) expect(looksLikeKey(k)).toBe(true);
+      expect(looksLikeKey("bogus")).toBe(false);
+      expect(looksLikeKey(undefined)).toBe(false);
+      const env = { ADJUDICATOR_JEV_KEY_2026xY: "v" };
+      expect(
+        await run(["key", "set", "--from-env", "ADJUDICATOR_JEV_KEY_2026xY"], fakeIo({ env }).io),
+      ).toBe(0);
+      expect(globalRaw().adjudicator).toEqual({ keyEnv: "ADJUDICATOR_JEV_KEY_2026xY" });
+    });
   });
 });
 

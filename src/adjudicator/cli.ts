@@ -276,6 +276,46 @@ export function parseChoice(s: string | undefined): Choice | undefined {
   return undefined;
 }
 
+// --- never echo a pasted key --------------------------------------------------------------
+
+/** Prefixes of common API keys; a short pasted key with one of these is still hidden. */
+const KEY_PREFIX =
+  /^(?:sk|gsk|csk|pk|rk|xai|ghp|gho|ghs|ghu|github_pat|glpat|hf|AIza|nvapi|pplx|tsk)[-_]/i;
+
+/** The fixed answer to a key typed on the command line; it never repeats the argument. */
+export const KEY_NOT_FROM_ARGV =
+  "That looks like a key: keys are never taken from the command line (they would land in shell history and the process list). Run `eminiar adjudicator key set [provider]` and paste it at the hidden prompt, or pipe it on stdin.";
+
+/**
+ * True when a command-line argument is not a known provider/preset name and could be a pasted
+ * key: any unknown token of 16+ chars (every known name is shorter or recognised first) or one
+ * with a common key prefix. Such an argument is never echoed back.
+ */
+export function looksLikeKey(arg: string | undefined): boolean {
+  const v = arg?.trim();
+  if (!v) return false;
+  if (parseChoice(v)) return false;
+  if (/^openai:/i.test(v) && (PRESET_IDS as string[]).includes(v.slice(7).toLowerCase()))
+    return false;
+  return v.length >= 16 || KEY_PREFIX.test(v);
+}
+
+/** `"arg"` for an ordinary unknown value; a fixed placeholder when it could be a key. */
+const shown = (arg: unknown): string =>
+  looksLikeKey(String(arg)) ? "(argument hidden: it may be a key)" : `"${String(arg)}"`;
+
+/**
+ * --from-env takes a variable NAME; refuse one shaped like a key (a key prefix, or mixed case
+ * with digits at key length) unless a variable of that name is actually set.
+ */
+function envNameLooksLikeKey(name: string, env: NodeJS.ProcessEnv): boolean {
+  if (env[name] !== undefined) return false;
+  return (
+    KEY_PREFIX.test(name) ||
+    (name.length >= 20 && /[a-z]/.test(name) && /[A-Z]/.test(name) && /\d/.test(name))
+  );
+}
+
 function choicePatch(c: Choice, current: AdjudicatorConfig): Record<string, unknown> {
   const patch: Record<string, unknown> = { provider: c.provider };
   if (c.preset) {
@@ -407,7 +447,7 @@ export async function setupAdjudicator(io: Io, o: SetupOptions): Promise<SetupRe
   if (o.choice !== undefined) {
     choice = o.choice === true ? { provider: "heuristic" } : parseChoice(o.choice);
     if (!choice) {
-      io.err(`unknown --adjudicator value "${String(o.choice)}"; use ${CHOICES.join("|")}`);
+      io.err(`unknown --adjudicator value ${shown(o.choice)}; use ${CHOICES.join("|")}`);
       return { enabled: false };
     }
   } else {
@@ -1057,13 +1097,13 @@ export async function adjudicatorCommand(
       if (given) {
         const c = parseChoice(given);
         if (!c) {
-          io.err(`unknown provider "${given}"; use ${CHOICES.join("|")}`);
+          io.err(`unknown provider ${shown(given)}; use ${CHOICES.join("|")}`);
           return 2;
         }
         if (str(values.preset) && c.provider === "openai-compatible" && !c.preset) {
           const pc = parseChoice(str(values.preset));
           if (!pc?.preset) {
-            io.err(`unknown preset "${String(values.preset)}"; use ${PRESET_IDS.join("|")}`);
+            io.err(`unknown preset ${shown(values.preset)}; use ${PRESET_IDS.join("|")}`);
             return 2;
           }
           c.preset = pc.preset;
@@ -1073,7 +1113,7 @@ export async function adjudicatorCommand(
       const mode = str(values.mode);
       if (mode) {
         if (!(MODES as readonly string[]).includes(mode)) {
-          io.err(`unknown mode "${mode}"; use ${MODES.join("|")}`);
+          io.err(`unknown mode ${shown(mode)}; use ${MODES.join("|")}`);
           return 2;
         }
         patch.mode = mode;
@@ -1152,7 +1192,7 @@ export async function adjudicatorCommand(
       const c = parseChoice(id);
       if (!c) {
         io.err(
-          `unknown provider "${id}"; use ${PROVIDER_IDS.join("|")} (or a preset: ${PRESET_IDS.join(", ")})`,
+          `unknown provider ${shown(id)}; use ${PROVIDER_IDS.join("|")} (or a preset: ${PRESET_IDS.join(", ")})`,
         );
         return 2;
       }
@@ -1275,7 +1315,9 @@ export async function adjudicatorCommand(
       return 0;
 
     default:
-      io.err(`unknown adjudicator command: ${sub}\n`);
+      io.err(
+        looksLikeKey(sub) ? `${KEY_NOT_FROM_ARGV}\n` : `unknown adjudicator command: ${sub}\n`,
+      );
       io.out(ADJUDICATOR_USAGE);
       return 2;
   }
@@ -1309,19 +1351,30 @@ async function keyCommand(
   io: Io,
   load: () => Config,
 ): Promise<number> {
-  const [action = "status", target, ...extra] = rest;
+  const [action = "status", positional, ...extra] = rest;
+  // `key set --provider groq` names the provider like `key set groq`.
+  const target =
+    positional ?? (values.provider as string[] | undefined)?.find((p) => typeof p === "string");
+  // Every argument is checked for a key shape before any name validation, so a key pasted in
+  // the wrong place is refused with a fixed message and never echoed.
+  if ([action, target, ...extra].some((a) => looksLikeKey(a))) {
+    io.err(KEY_NOT_FROM_ARGV);
+    return 2;
+  }
   const config = load();
   const r = resolveAdjudicator(config, { context: "cli", env: io.env });
   switch (action) {
     case "set": {
       if (extra.length) {
-        io.err(
-          "Keys are never taken from the command line (they would land in shell history and the process list). Run `eminiar adjudicator key set [provider]` and paste it at the hidden prompt, or pipe it on stdin.",
-        );
+        io.err(KEY_NOT_FROM_ARGV);
         return 2;
       }
       const fromEnv = typeof values["from-env"] === "string" ? values["from-env"] : undefined;
       if (fromEnv) {
+        if (envNameLooksLikeKey(fromEnv, io.env)) {
+          io.err(KEY_NOT_FROM_ARGV);
+          return 2;
+        }
         if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(fromEnv)) {
           io.err("--from-env takes the NAME of an environment variable, not a key");
           return 2;
@@ -1336,13 +1389,9 @@ async function keyCommand(
       if (!id) {
         io.err(
           target
-            ? `unknown provider "${target}"; use typesafe (Jev) or a preset: ${PRESET_IDS.join(", ")}`
+            ? `unknown provider ${shown(target)}; use typesafe (Jev) or a preset: ${PRESET_IDS.join(", ")}`
             : "Which provider? `eminiar adjudicator key set typesafe` (Jev) or a preset such as groq.",
         );
-        return 2;
-      }
-      if (/^[A-Za-z0-9_-]{24,}$/.test(target ?? "") && !parseChoice(target)) {
-        io.err("That looks like a key: keys are never taken from the command line.");
         return 2;
       }
       const label = id === "typesafe" ? "TypeSafe (Jev)" : presetLabel(id.slice(7) as PresetId);
@@ -1381,7 +1430,7 @@ async function keyCommand(
       }
       const id = keyIdFor(target, r);
       if (!id) {
-        io.err(`unknown provider "${target}"`);
+        io.err(`unknown provider ${shown(target)}`);
         return 2;
       }
       io.out(clearKey(id) ? `Removed the ${id} key.` : `No stored ${id} key.`);
@@ -1500,7 +1549,7 @@ async function testCommand(
   if (providerArg) {
     const c = parseChoice(providerArg);
     if (!c) {
-      io.err(`unknown provider "${providerArg}"`);
+      io.err(`unknown provider ${shown(providerArg)}`);
       return 2;
     }
     cfg = candidate(cfg, choicePatch(c, cfg));
@@ -1673,7 +1722,7 @@ async function evalCommand(
   for (const raw of o.ids.length ? o.ids : [config.adjudicator.provider]) {
     const c = parseChoice(raw);
     if (!c) {
-      io.err(`unknown provider "${raw}"`);
+      io.err(`unknown provider ${shown(raw)}`);
       return 2;
     }
     ids.push(c.provider);
