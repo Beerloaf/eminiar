@@ -555,7 +555,11 @@ class Reconciler {
         if (r.agentId) this.taken.add(r.agentId);
   }
 
-  /** Commit a patch; on the transition to final, record the row's learning signals. */
+  /**
+   * Commit a patch; on the transition to final, record the row's learning signals and keep
+   * exactly what was taught on the row (scores.taught, empty when nothing was) so a later
+   * relabel or feedback retracts that, not a lesson recomputed from the row's current state.
+   */
   private commit(
     row: AdjudicationRow,
     patch: AdjudicationPatch,
@@ -570,42 +574,41 @@ class Reconciler {
       patch.outcomeTs = this.now;
     const d = diff(row, patch);
     if (!Object.keys(d).length) return;
-    this.db.adjudicator.update(row.id, d);
-    this.result.updated++;
+    let lesson: BiasSignal[] | undefined;
     if (d.final === true && !row.final) {
       this.result.finalized++;
-      const outcome = (d.outcome ?? row.outcome) as AdjudicationOutcome;
-      if (teach && (outcome === "success" || outcome === "failure"))
-        this.teach(row, outcome === "success", teach, d.actualCostUsd ?? row.actualCostUsd);
+      if (teach) {
+        const outcome = (d.outcome ?? row.outcome) as AdjudicationOutcome;
+        lesson =
+          this.learning.enabled && (outcome === "success" || outcome === "failure")
+            ? this.lessonOf(row, outcome === "success", teach, d.actualCostUsd ?? row.actualCostUsd)
+            : [];
+        const scores = withTaught(row.scores, lesson);
+        if (scores !== undefined) d.scores = scores;
+      }
+    }
+    this.db.adjudicator.update(row.id, d);
+    this.result.updated++;
+    for (const sig of lesson ?? []) {
+      recordSignal(this.db, sig, this.learning, this.now);
+      this.result.learned++;
     }
   }
 
-  private teach(
+  /** The signals a finalising swarm row teaches: the tier that ran and the role, if known. */
+  private lessonOf(
     row: AdjudicationRow,
     success: boolean,
     what: { tier?: string | undefined; role?: string | undefined },
     cost: number | null | undefined,
-  ): void {
-    if (!this.learning.enabled) return;
+  ): BiasSignal[] {
     const b = bucketsOf(row);
-    if (what.tier && b.tier !== undefined) {
-      recordSignal(
-        this.db,
-        { dimension: "tier", bucket: b.tier, option: what.tier, success, costUsd: cost },
-        this.learning,
-        this.now,
-      );
-      this.result.learned++;
-    }
-    if (what.role) {
-      recordSignal(
-        this.db,
-        { dimension: "role", bucket: b.role, option: what.role, success, costUsd: cost },
-        this.learning,
-        this.now,
-      );
-      this.result.learned++;
-    }
+    const out: BiasSignal[] = [];
+    if (what.tier && b.tier !== undefined)
+      out.push({ dimension: "tier", bucket: b.tier, option: what.tier, success, costUsd: cost });
+    if (what.role)
+      out.push({ dimension: "role", bucket: b.role, option: what.role, success, costUsd: cost });
+    return out;
   }
 
   /**
@@ -666,10 +669,17 @@ class Reconciler {
       // A later dispatch for the same task means this attempt did not hold: relabel it a
       // failure, unless explicit feedback already labelled it (feedback wins over the guess).
       const relabel = e.outcome !== "failure" && feedbackOf(e) === undefined;
-      const before = relabel ? reconcileLesson(this.db, e) : [];
+      let before: BiasSignal[] = [];
+      let after: BiasSignal[] = [];
       if (relabel) {
         patch.outcome = "failure";
         patch.outcomeSource = "redo";
+        // The lesson follows the label: the success it taught at finalisation becomes a
+        // failure (relabelled, not added), so a final row always holds exactly one lesson.
+        before = taughtLesson(this.db, e);
+        after = reconcileLesson(this.db, { ...e, outcome: "failure", outcomeSource: "redo" });
+        const scores = withTaught(e.scores, this.learning.enabled ? after : before);
+        if (scores !== undefined) patch.scores = scores;
       }
       const d = diff(e, patch);
       if (Object.keys(d).length) {
@@ -677,16 +687,8 @@ class Reconciler {
         Object.assign(e, d);
         this.result.updated++;
       }
-      // The lesson follows the label: the success it taught at finalisation becomes a
-      // failure (relabelled, not added), so a final row always holds exactly one lesson.
       if (relabel)
-        this.result.learned += replaceLesson(
-          this.db,
-          before,
-          reconcileLesson(this.db, e),
-          this.learning,
-          this.now,
-        );
+        this.result.learned += replaceLesson(this.db, before, after, this.learning, this.now);
     }
   }
 
@@ -945,6 +947,82 @@ function ranAsRole(db: StorageAdapter, row: AdjudicationRow): string | undefined
 
 const signalKey = (s: BiasSignal) => `${s.dimension}\u0000${s.bucket}\u0000${s.option}`;
 
+/** One taught signal as kept in scores.taught. */
+interface TaughtEntry {
+  dimension: "tier" | "role";
+  bucket: string;
+  option: string;
+  success: boolean;
+}
+
+function parseScoresObject(scores: string | null | undefined): Record<string, unknown> | null {
+  if (!scores) return {};
+  try {
+    const s = JSON.parse(scores) as unknown;
+    return s && typeof s === "object" && !Array.isArray(s) ? (s as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The signals a row's lesson put in the bias buckets, as recorded in scores.taught when it was
+ * taught (empty: nothing was, e.g. learning was off). Undefined for a row with no record (one
+ * written before the record existed, or never finalised by reconcile / feedback).
+ */
+export function taughtOf(row: Pick<AdjudicationRow, "scores">): BiasSignal[] | undefined {
+  const s = parseScoresObject(row.scores);
+  const raw = s?.taught;
+  if (!Array.isArray(raw)) return undefined;
+  const out: BiasSignal[] = [];
+  for (const t of raw as unknown[]) {
+    if (!t || typeof t !== "object") continue;
+    const e = t as Partial<TaughtEntry>;
+    if (
+      (e.dimension === "tier" || e.dimension === "role") &&
+      typeof e.bucket === "string" &&
+      typeof e.option === "string" &&
+      typeof e.success === "boolean"
+    )
+      out.push({ dimension: e.dimension, bucket: e.bucket, option: e.option, success: e.success });
+  }
+  return out;
+}
+
+/**
+ * The scores JSON with `taught` set to these signals (bucket keys and success only).
+ * Undefined when the existing scores are not a JSON object, so nothing is overwritten.
+ */
+export function withTaught(
+  scores: string | null | undefined,
+  lesson: readonly BiasSignal[],
+): string | undefined {
+  const s = parseScoresObject(scores);
+  if (!s) return undefined;
+  const taught: TaughtEntry[] = lesson.map((l) => ({
+    dimension: l.dimension,
+    bucket: l.bucket,
+    option: l.option,
+    success: l.success,
+  }));
+  return JSON.stringify({ ...s, taught });
+}
+
+/**
+ * What a row's lesson holds in the buckets now: its scores.taught record; for a row without
+ * one, the lesson recomputed from its label (its last feedback, else reconcile's lesson).
+ */
+function taughtLesson(
+  db: StorageAdapter,
+  row: AdjudicationRow,
+  ladder: readonly string[] = TIERS,
+): BiasSignal[] {
+  const taught = taughtOf(row);
+  if (taught) return taught;
+  const prior = feedbackOf(row);
+  return prior ? feedbackLesson(db, row, prior, ladder) : reconcileLesson(db, row);
+}
+
 /**
  * The signals reconcile taught a final swarm row at finalisation (Reconciler.swarmRow): agent
  * rows, and plan rows no agent row tracked by then; success / failure only; the tier that ran
@@ -1060,8 +1138,9 @@ function adjustSignal(
 
 /**
  * Replace a row's lesson `before` with `after`: a signal in both with the same success stays;
- * one whose success flipped is relabelled (n unchanged); one only in `before` is retracted;
- * one only in `after` is recorded. Returns how many bucket options changed.
+ * one whose success flipped is relabelled (n unchanged), or recorded when its option has no
+ * row any more; one only in `before` is retracted; one only in `after` is recorded. Returns
+ * how many bucket options changed.
  */
 export function replaceLesson(
   db: StorageAdapter,
@@ -1081,7 +1160,9 @@ export function replaceLesson(
       recordSignal(db, s, learning, now);
       changed++;
     } else if (p.success !== s.success) {
-      if (adjustSignal(db, s, 0, s.success ? 1 : -1, s.success ? -1 : 1, learning, now)) changed++;
+      if (!adjustSignal(db, s, 0, s.success ? 1 : -1, s.success ? -1 : 1, learning, now))
+        recordSignal(db, s, learning, now);
+      changed++;
     }
   }
   for (const p of prev.values())
@@ -1130,17 +1211,20 @@ export function applyFeedbackResult(
   const now = opts.now ?? Date.now();
   const learning = learningOf(opts.learning, opts.config);
   const ladder = opts.tiers ?? opts.config?.adjudicator?.tiers ?? TIERS;
-  const prior = feedbackOf(row);
-  // What the row taught so far: its last feedback (always final), or reconcile's lesson.
-  const before = prior ? feedbackLesson(db, row, prior, ladder) : reconcileLesson(db, row);
+  const same = feedbackOf(row) === feedback;
+  // What the row's lesson actually put in the buckets (scores.taught), not a lesson recomputed
+  // from the row, config and swarm ledger as they are now.
+  const before = taughtLesson(db, row, ladder);
   const after = feedbackLesson(db, row, feedback, ladder);
-  const same = prior === feedback;
+  // With learning off nothing moves, so the buckets still hold `before`.
+  const scores = withTaught(row.scores, learning.enabled ? after : before);
   db.adjudicator.update(id, {
     outcome: FEEDBACK_OUTCOME[feedback],
     outcomeSource: feedbackSource(feedback),
     // Repeated identical feedback keeps the time it was first given.
     outcomeTs: same && row.outcomeTs != null ? row.outcomeTs : now,
     final: true,
+    ...(scores !== undefined ? { scores } : {}),
   });
   const learned = replaceLesson(db, before, after, learning, now);
   const updated = db.adjudicator.get(id);

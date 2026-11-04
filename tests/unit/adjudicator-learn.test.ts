@@ -21,6 +21,8 @@ import {
   reconcile,
   recordSignal,
   stepMedian,
+  taughtOf,
+  withTaught,
 } from "../../src/adjudicator/learn.js";
 import {
   FALLBACK_MODEL,
@@ -1032,5 +1034,120 @@ describe("feedback is idempotent per decision (task #39)", () => {
     expect(feedbackOf({ outcome: "success", outcomeSource: "feedback:too_big" })).toBe("too_big");
     expect(feedbackOf({ outcome: "success", outcomeSource: "swarm" })).toBeUndefined();
     expect(feedbackOf({ outcome: "success", outcomeSource: "feedback:bogus" })).toBeUndefined();
+  });
+});
+
+describe("feedback retracts exactly what was taught (task #53)", () => {
+  const L = { ...DEFAULT_LEARNING, minSamples: 0 };
+  const OFF = { ...L, enabled: false };
+  const tierRows = () =>
+    db.adjudicator
+      .biasAll()
+      .filter((b) => b.dimension === "tier")
+      .map((b) => ({
+        option: b.option,
+        n: +b.n.toFixed(2),
+        s: +b.s.toFixed(2),
+        f: +b.f.toFixed(2),
+      }))
+      .sort((a, b) => a.option.localeCompare(b.option));
+  const opt = (dim: string, option: string) =>
+    db.adjudicator.biasAll().find((b) => b.dimension === dim && b.option === option);
+  const scores = JSON.stringify({
+    heuristicComplexity: 2.0,
+    features: { intents: { implement: 1 } },
+  });
+
+  it("feedback given with learning off retracts nothing later (probe f1 A)", () => {
+    const R = row({ tier: "sonnet", scores, action: "advised" });
+    applyFeedback(db, R, "too_big", { learning: OFF });
+    expect(taughtOf(db.adjudicator.get(R) as never)).toEqual([]);
+    for (let i = 0; i < 6; i++)
+      applyFeedback(db, row({ tier: "haiku", scores, action: "advised" }), "good", { learning: L });
+    const haiku = opt("tier", "haiku");
+    expect(haiku?.n).toBeCloseTo(5.8, 1);
+
+    applyFeedback(db, R, "too_small", { learning: L });
+    // haiku keeps every real success; R's own lesson (a sonnet failure) is recorded.
+    expect(opt("tier", "haiku")).toMatchObject({ n: haiku?.n, s: haiku?.s, f: haiku?.f });
+    expect(opt("tier", "sonnet")).toMatchObject({ n: 1, s: 0, f: 1 });
+    expect(taughtOf(db.adjudicator.get(R) as never)).toEqual([
+      { dimension: "tier", bucket: "2", option: "sonnet", success: false },
+    ]);
+  });
+
+  it("a long feedback sequence on one row ends holding exactly its last lesson (probe f1 B)", () => {
+    const R = row({ tier: "opus", role: null, scores });
+    for (const fb of [
+      "too_big",
+      "too_small",
+      "good",
+      "too_big",
+      "too_big",
+      "too_small",
+      "too_big",
+      "good",
+      "too_small",
+    ] as const)
+      applyFeedback(db, R, fb, { learning: L });
+    expect(tierRows()).toEqual([
+      { option: "opus", n: 1, s: 0, f: 1 },
+      { option: "sonnet", n: 0, s: 0, f: 0 },
+    ]);
+    expect(db.adjudicator.biasAll().every((b) => b.n >= 0 && b.s >= 0 && b.f >= 0)).toBe(true);
+  });
+
+  it("a changed tier ladder retracts the lower tier too_big actually taught", () => {
+    const R = row({ tier: "sonnet", role: null, scores });
+    applyFeedback(db, R, "too_big", { learning: L, tiers: ["haiku", "sonnet", "opus"] });
+    expect(opt("tier", "haiku")).toMatchObject({ n: 1, s: 1 });
+    // The ladder no longer has a tier below sonnet; the haiku success R taught still goes.
+    applyFeedback(db, R, "good", { learning: L, tiers: ["sonnet", "opus"] });
+    expect(opt("tier", "haiku")).toMatchObject({ n: 0, s: 0 });
+    expect(opt("tier", "sonnet")).toMatchObject({ n: 1, s: 1, f: 0 });
+  });
+
+  it("a row reconcile finalised with learning off does not flip another row's lesson", () => {
+    // Another decision taught a haiku success and a coder success.
+    applyFeedback(db, row({ tier: "haiku" }), "good", { learning: L });
+    const t = swarmTask("done");
+    db.apiCallsUpsert([call({ agent_id: "A1", sidechain: 1, model: "claude-haiku-4-5" })]);
+    const id = row({ runId: "R1", taskId: t, action: "applied" });
+    expect(reconcile(db, { now: NOW, learning: OFF }).learned).toBe(0);
+    expect(db.adjudicator.get(id)).toMatchObject({ outcome: "success", final: true });
+    expect(taughtOf(db.adjudicator.get(id) as never)).toEqual([]);
+
+    applyFeedback(db, id, "too_small", { learning: L });
+    // The other row's success stays; this row's failure is added.
+    expect(opt("tier", "haiku")).toMatchObject({ n: 1 + decayFactor(L.halfLife), f: 1 });
+    expect(opt("role", "coder")).toMatchObject({ n: 1, s: 1 });
+  });
+
+  it("records what reconcile taught on the row and keeps the rest of the scores", () => {
+    const t = swarmTask("done");
+    db.apiCallsUpsert([call({ agent_id: "A1", sidechain: 1, model: "claude-haiku-4-5" })]);
+    const id = row({ runId: "R1", taskId: t, action: "applied", scores });
+    reconcile(db, { now: NOW, learning: L });
+    const r = db.adjudicator.get(id);
+    expect(JSON.parse(r?.scores ?? "{}")).toMatchObject({ heuristicComplexity: 2 });
+    expect(taughtOf(r as never)).toEqual([
+      { dimension: "tier", bucket: "2", option: "haiku", success: true },
+      { dimension: "role", bucket: "implement", option: "coder", success: true },
+    ]);
+  });
+
+  it("a flip whose option row is gone records the new signal instead of dropping it", () => {
+    const R = row({ tier: "opus", role: null, scores });
+    applyFeedback(db, R, "good", { learning: L });
+    db.adjudicator.biasReset();
+    applyFeedback(db, R, "too_small", { learning: L });
+    expect(opt("tier", "opus")).toMatchObject({ n: 1, s: 0, f: 1 });
+  });
+
+  it("withTaught leaves scores that are not a JSON object alone", () => {
+    expect(withTaught("not json", [])).toBeUndefined();
+    expect(withTaught("[1]", [])).toBeUndefined();
+    expect(JSON.parse(withTaught(null, []) as string)).toEqual({ taught: [] });
+    expect(taughtOf({ scores: JSON.stringify({ features: {} }) })).toBeUndefined();
   });
 });
