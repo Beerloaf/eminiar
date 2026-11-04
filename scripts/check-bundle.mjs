@@ -81,15 +81,63 @@ export function findWrappers(text) {
   return out;
 }
 
-/** tsup's ESM shim, known by its init name or its path. */
-const isShim = (w) => ALLOWED_WRAPPERS.has(w.init) || (w.path !== null && SHIM_PATH.test(w.path));
+/**
+ * The init name of tsup's ESM shim under full --minify, where neither its name nor its path
+ * survives, or null. It is recognised by its whole shape, which no internal module can have:
+ * it is the wrapper right after the shim's own `path` / `url` imports, and its body is at most
+ * `"use strict"` (tsconfig strict) plus the shim's setup, the only statements in it:
+ *   import F from"path";import{fileURLToPath as L}from"url";var h=x(()=>{"use strict"});
+ *   import F from"path";import{fileURLToPath as L}from"url";var P,R,i,m=x(()=>{P=()=>L(import.meta.url),R=()=>F.dirname(P()),i=R()});
+ * An internal module's body always calls the shim's init (tsup injects the shim into every
+ * file), so even one that holds nothing but "use strict" does not match. Only the first such
+ * wrapper counts: a bundle has one shim.
+ * @param {string} text
+ * @param {Set<string>} esm the __esm helper names (see wrapperHelpers)
+ * @returns {string | null}
+ */
+export function minifiedShim(text, esm) {
+  const helpers = [...esm].map(esc).join("|");
+  const q = `["'](?:node:)?`;
+  const m = new RegExp(
+    `\\bimport\\s+(${ID})\\s+from\\s*${q}path["']\\s*;?\\s*` +
+      `import\\s*\\{\\s*fileURLToPath(?:\\s+as\\s+(${ID}))?\\s*\\}\\s*from\\s*${q}url["']\\s*;?\\s*` +
+      `var\\s+(?:${ID}\\s*,\\s*)*(${ID})\\s*=\\s*(?:${helpers})\\s*\\(\\s*\\(\\s*\\)\\s*=>\\s*\\{([^{}]*)\\}\\s*\\)`,
+  ).exec(text);
+  if (!m) return null;
+  const [, pathName, urlName = "fileURLToPath", init, body] = m;
+  const p = esc(pathName);
+  const u = esc(urlName);
+  const stmts = body
+    .replace(/^\s*(?:"use strict"|'use strict')\s*;?/, "")
+    .split(/[,;]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const defined = new Set();
+  for (const s of stmts) {
+    const a =
+      new RegExp(`^(${ID})\\s*=\\s*\\(\\s*\\)\\s*=>\\s*${u}\\s*\\(\\s*import\\.meta\\.url\\s*\\)$`).exec(s) ??
+      new RegExp(`^(${ID})\\s*=\\s*\\(\\s*\\)\\s*=>\\s*${p}\\.dirname\\s*\\(\\s*(${ID})\\s*\\(\\s*\\)\\s*\\)$`).exec(s) ??
+      new RegExp(`^(${ID})\\s*=\\s*(${ID})\\s*\\(\\s*\\)$`).exec(s);
+    // The setup only calls getters it defined itself, before the call.
+    if (!a || (a[2] !== undefined && !defined.has(a[2]))) return null;
+    defined.add(a[1]);
+  }
+  return init;
+}
+
+/** tsup's ESM shim: known by its init name or its path, or (minified) by minifiedShim. */
+const isShim = (w, minShim) =>
+  ALLOWED_WRAPPERS.has(w.init) ||
+  (w.path !== null && SHIM_PATH.test(w.path)) ||
+  (w.kind === "esm" && w.path === null && w.init === minShim);
 
 /**
  * A lazy wrapper the server must not have: any __esm module but the shim, or a __commonJS
  * module outside node_modules. Bundled CommonJS packages are always __commonJS-wrapped.
  */
-const isLazyInternal = (w) =>
-  !isShim(w) && (w.kind === "esm" || (w.path !== null && !w.path.includes("node_modules/")));
+const isLazyInternal = (w, minShim) =>
+  !isShim(w, minShim) &&
+  (w.kind === "esm" || (w.path !== null && !w.path.includes("node_modules/")));
 
 /**
  * The problems in one bundle's text; empty when it is fine.
@@ -114,7 +162,8 @@ export function checkBundle(name, text, opts = {}) {
 
   const all = findWrappers(text);
   const wrappers = all.filter((w) => w.kind === "esm");
-  const lazy = all.filter(isLazyInternal);
+  const minShim = minifiedShim(text, wrapperHelpers(text).esm);
+  const lazy = all.filter((w) => isLazyInternal(w, minShim));
 
   const zodInits = new Set(
     wrappers.filter((w) => w.path !== null && ZOD.test(w.path)).map((w) => w.init),
