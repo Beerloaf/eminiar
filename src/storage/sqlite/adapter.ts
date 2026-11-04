@@ -1623,6 +1623,10 @@ export class SqliteAdapter implements StorageAdapter {
       .run(key, value);
   }
 
+  metaDelete(key: string): boolean {
+    return this.db.prepare("DELETE FROM meta WHERE key = ?").run(key).changes > 0;
+  }
+
   purge(scope: PurgeScope): void {
     this.transaction(() => {
       if (scope === "index" || scope === "all") {

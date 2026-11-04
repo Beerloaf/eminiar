@@ -1,24 +1,15 @@
-import { defineConfig } from "tsup";
+import { existsSync, readdirSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { defineConfig, type Options } from "tsup";
 
-// Three entry points, one bundle each. Native and heavy deps stay external so
-// they resolve from node_modules at runtime (better-sqlite3 has a .node binary;
-// transformers/tree-sitter are large and optional).
-export default defineConfig({
-  entry: {
-    server: "src/server.ts",
-    hook: "src/hook.ts",
-    cli: "src/cli.ts",
-  },
+// Native and heavy deps stay external so they resolve from node_modules at runtime
+// (better-sqlite3 has a .node binary; transformers/tree-sitter are large and optional).
+const shared: Options = {
   format: ["esm"],
   target: "node22",
   platform: "node",
   outDir: "dist",
-  // One self-contained file per entry: the server, hook and CLI each read and compile a
-  // single module at start-up instead of a dozen shared chunks (~5 ms less cold start
-  // with the compile cache warm). Costs some duplicated code on disk, never in memory.
-  splitting: false,
   sourcemap: true,
-  clean: true,
   dts: false,
   shims: true,
   // Bundled CommonJS packages (fast-glob) call require() for Node builtins; give the
@@ -39,4 +30,50 @@ export default defineConfig({
     "web-tree-sitter",
     "tsx",
   ],
-});
+};
+
+/** Everything the hook build writes: dist/hook.js(.map) and its dist/hook-*.js(.map) chunks. */
+const HOOK_OUTPUT = ["hook.js", "hook.js.map", "hook-*"];
+
+export default defineConfig([
+  {
+    ...shared,
+    entry: { server: "src/server.ts", cli: "src/cli.ts" },
+    // One self-contained file per entry: the server and CLI each read and compile a
+    // single module at start-up instead of a dozen shared chunks (~5 ms less cold start
+    // with the compile cache warm). Costs some duplicated code on disk, never in memory.
+    splitting: false,
+    // Cleans dist except the hook build's output, which runs in parallel and cleans its own.
+    clean: HOOK_OUTPUT.map((p) => `!${p}`),
+  },
+  {
+    ...shared,
+    entry: { hook: "src/hook.ts" },
+    // The hook runs once per tool call, so it is split: the adjudicator (off by default) is
+    // reached only through dynamic import() and lands in its own chunks, loaded when it is
+    // enabled. Without splitting esbuild inlines those imports and every hook process pays
+    // to parse them (~3 ms p50). Chunks sit next to hook.js, not in a subfolder, so
+    // import.meta.url-relative paths (src/version.ts pluginRoot) resolve the same.
+    splitting: true,
+    clean: false,
+    esbuildOptions(options) {
+      options.chunkNames = "hook-[name]-[hash]";
+    },
+    esbuildPlugins: [
+      {
+        name: "clean-hook-output",
+        setup(build) {
+          // Chunk names carry a content hash, so drop the previous build's before writing.
+          build.onStart(() => {
+            if (!existsSync("dist")) return;
+            for (const f of readdirSync("dist")) {
+              if (f === "hook.js" || f === "hook.js.map" || f.startsWith("hook-")) {
+                rmSync(join("dist", f), { force: true });
+              }
+            }
+          });
+        },
+      },
+    ],
+  },
+]);

@@ -584,6 +584,24 @@ describe("Cursor, SessionStart and SessionEnd", () => {
     expect(db().adjudicator.get(id)!.final).toBe(true);
   });
 
+  it("SessionEnd drops the session's main-advice counter and leaves other sessions' alone", async () => {
+    configure({
+      enabled: true,
+      promptMode: "heuristic",
+      advice: { mainSession: "user", cooldownPrompts: 3 },
+    });
+    await prompt("Where is the function parseConfig defined in src/config.ts?");
+    const key = `adjudicator:main:${sid}`;
+    expect(db().metaGet(key)).toBeDefined();
+    db().metaSet("adjudicator:main:other-session", '{"n":1}');
+
+    await handlers.SessionEnd!(base({ hook_event_name: "SessionEnd", reason: "exit" }));
+    expect(db().metaGet(key)).toBeUndefined();
+    expect(db().metaGet("adjudicator:main:other-session")).toBe('{"n":1}');
+    expect(db().metaDelete("adjudicator:main:other-session")).toBe(true);
+    expect(db().metaDelete("adjudicator:main:other-session")).toBe(false);
+  });
+
   it("SessionStart says one line only when degraded, and warms ollama up asynchronously", async () => {
     const { onSessionStart } = await hooksModule();
     const healthy = configure({ enabled: true });

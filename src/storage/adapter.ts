@@ -252,6 +252,8 @@ export interface StorageAdapter {
 
   metaGet(key: string): string | undefined;
   metaSet(key: string, value: string): void;
+  /** Remove a meta key; returns whether it existed. */
+  metaDelete(key: string): boolean;
   purge(scope: PurgeScope): void;
   transaction<T>(fn: () => T): T;
   close(): void;

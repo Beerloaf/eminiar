@@ -1,4 +1,3 @@
-import { ASYNC_JOB_MAX_MS, runAsyncJob } from "./adjudicator/async.js";
 import { dispatch, gate } from "./hooks/dispatch.js";
 import { hookLog } from "./hooks/log.js";
 
@@ -25,6 +24,9 @@ async function main(): Promise<void> {
     return;
   }
   if (process.argv.includes("--adjudicate")) {
+    // Loaded only here: the engine, providers and their config parsing stay out of every
+    // ordinary hook process (the adjudicator is off by default).
+    const { ASYNC_JOB_MAX_MS, runAsyncJob } = await import("./adjudicator/async.js");
     setTimeout(() => process.exit(0), ASYNC_JOB_MAX_MS).unref();
     await runAsyncJob(raw, { log: (line) => hookLog("info", line) });
     return;

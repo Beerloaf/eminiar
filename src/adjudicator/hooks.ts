@@ -6,7 +6,7 @@
  *   onPrompt        UserPromptSubmit: one advice line, maybe a main-session note (cooldown)
  *   afterRouting    PreToolUse: Agent/Task → onPreAgent + withModel; other raw tools → onPreTool
  *   onSessionStart  one line when enabled but degraded; the ollama keep-alive warm-up
- *   onSessionEnd    reconcile
+ *   onSessionEnd    reconcile; drop the session's main-advice counter
  *
  * Rules that hold everywhere: never deny, never inject `effort` (it is not an Agent input),
  * respect CLAUDE_CODE_SUBAGENT_MODEL_FORCE, an explicit `model` and a frontmatter pin, skip
@@ -589,10 +589,12 @@ function warmUp(
 export function onSessionEnd(
   ctx: ProjectContext,
   db: StorageAdapter,
-  input: Pick<HookInput, "client">,
+  input: Pick<HookInput, "client" | "session_id">,
 ): void {
   try {
     if (!active(ctx.config.adjudicator, input)) return;
+    // The main-session advice counter (mainSessionAdvice) is per session; drop it with the session.
+    if (input.session_id) db.metaDelete(`adjudicator:main:${input.session_id}`);
     reconcile(db, { limit: 200, config: ctx.config });
   } catch (err) {
     log(`adjudicator: reconcile ${(err as Error)?.message ?? String(err)}`);
