@@ -1,0 +1,466 @@
+import type Database from "better-sqlite3";
+import type { AdjudicationRow, Verdict } from "../../adjudicator/types.js";
+import type {
+  AdjudicationInput,
+  AdjudicationListFilter,
+  AdjudicationPatch,
+  AdjudicationSummary,
+  AdjudicatorBiasRow,
+  AdjudicatorCacheEntry,
+  AdjudicatorProviderState,
+  AdjudicatorStore,
+  LatencyStats,
+} from "../types.js";
+
+type Row = Record<string, unknown>;
+
+/** Every `adjudications` column except id, as [camelCase field, snake_case column]. */
+const COLUMNS: ReadonlyArray<readonly [Exclude<keyof AdjudicationRow, "id">, string]> = [
+  ["ts", "ts"],
+  ["surface", "surface"],
+  ["sessionId", "session_id"],
+  ["agentId", "agent_id"],
+  ["toolUseId", "tool_use_id"],
+  ["runId", "run_id"],
+  ["taskId", "task_id"],
+  ["parentId", "parent_id"],
+  ["inputHash", "input_hash"],
+  ["inputHead", "input_head"],
+  ["inputChars", "input_chars"],
+  ["complexity", "complexity"],
+  ["tier", "tier"],
+  ["effort", "effort"],
+  ["tool", "tool"],
+  ["role", "role"],
+  ["confidence", "confidence"],
+  ["scores", "scores"],
+  ["source", "source"],
+  ["provider", "provider"],
+  ["providerModel", "provider_model"],
+  ["providerStatus", "provider_status"],
+  ["latencyMs", "latency_ms"],
+  ["providerLatencyMs", "provider_latency_ms"],
+  ["tokensIn", "tokens_in"],
+  ["tokensOut", "tokens_out"],
+  ["costUsd", "cost_usd"],
+  ["action", "action"],
+  ["modelRequested", "model_requested"],
+  ["modelFinal", "model_final"],
+  ["baselineModel", "baseline_model"],
+  ["actualModel", "actual_model"],
+  ["actualTokens", "actual_tokens"],
+  ["actualCostUsd", "actual_cost_usd"],
+  ["baselineCostUsd", "baseline_cost_usd"],
+  ["savingsUsd", "savings_usd"],
+  ["outcome", "outcome"],
+  ["outcomeSource", "outcome_source"],
+  ["outcomeTs", "outcome_ts"],
+  ["final", "final"],
+  ["version", "version"],
+];
+
+const LATENCY_RING = 50;
+const MAX_LIST = 500;
+
+/** A value as SQLite stores it: booleans become 0/1, undefined becomes NULL. */
+function toDb(v: unknown): unknown {
+  if (v === undefined) return null;
+  if (typeof v === "boolean") return v ? 1 : 0;
+  return v;
+}
+
+function toRow(r: Row): AdjudicationRow {
+  const out: Record<string, unknown> = { id: r.id };
+  for (const [field, col] of COLUMNS) out[field] = field === "final" ? r[col] === 1 : r[col];
+  return out as unknown as AdjudicationRow;
+}
+
+function parseVerdict(raw: unknown): Verdict | null {
+  if (typeof raw !== "string" || !raw) return null;
+  try {
+    const v = JSON.parse(raw) as unknown;
+    return v && typeof v === "object" && !Array.isArray(v) ? (v as Verdict) : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseLatencies(raw: unknown): number[] {
+  if (typeof raw !== "string" || !raw) return [];
+  try {
+    const v = JSON.parse(raw) as unknown;
+    return Array.isArray(v)
+      ? v.filter((n): n is number => typeof n === "number" && Number.isFinite(n))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Nearest-rank percentile of an ascending array. */
+function percentile(sorted: number[], p: number): number | null {
+  if (!sorted.length) return null;
+  const rank = Math.max(1, Math.ceil((p / 100) * sorted.length));
+  return sorted[Math.min(rank, sorted.length) - 1] ?? null;
+}
+
+function latencyStats(values: number[]): LatencyStats {
+  const sorted = [...values].sort((a, b) => a - b);
+  return { n: sorted.length, p50: percentile(sorted, 50), p95: percentile(sorted, 95) };
+}
+
+function ratio(num: number, den: number): number | null {
+  return den > 0 ? num / den : null;
+}
+
+function bump(map: Record<string, number>, key: unknown): void {
+  const k = typeof key === "string" && key ? key : "(none)";
+  map[k] = (map[k] ?? 0) + 1;
+}
+
+/** SQLite implementation of the adjudicator store; shares the adapter's connection. */
+export class SqliteAdjudicatorStore implements AdjudicatorStore {
+  private readonly stmts = new Map<string, Database.Statement<unknown[], unknown>>();
+
+  constructor(private readonly db: Database.Database) {}
+
+  private prep(sql: string): Database.Statement<unknown[], unknown> {
+    let s = this.stmts.get(sql);
+    if (!s) {
+      s = this.db.prepare(sql);
+      this.stmts.set(sql, s);
+    }
+    return s;
+  }
+
+  // --- adjudications ----------------------------------------------------------------
+
+  insert(row: AdjudicationInput): number {
+    const full: Omit<AdjudicationRow, "id"> = {
+      ...row,
+      ts: row.ts ?? Date.now(),
+      outcome: row.outcome ?? "pending",
+      final: row.final ?? false,
+    };
+    const cols = COLUMNS.map(([, c]) => c);
+    const values = COLUMNS.map(([f]) => toDb(full[f]));
+    const info = this.prep(
+      `INSERT INTO adjudications (${cols.join(", ")}) VALUES (${cols.map(() => "?").join(", ")})`,
+    ).run(...values);
+    return Number(info.lastInsertRowid);
+  }
+
+  update(id: number, patch: AdjudicationPatch): boolean {
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    for (const [field, col] of COLUMNS) {
+      if (!(field in patch) || patch[field] === undefined) continue;
+      sets.push(`${col} = ?`);
+      params.push(toDb(patch[field]));
+    }
+    if (!sets.length) return this.get(id) !== undefined;
+    params.push(id);
+    return (
+      this.prep(`UPDATE adjudications SET ${sets.join(", ")} WHERE id = ?`).run(...params).changes >
+      0
+    );
+  }
+
+  get(id: number): AdjudicationRow | undefined {
+    const r = this.prep("SELECT * FROM adjudications WHERE id = ?").get(id) as Row | undefined;
+    return r ? toRow(r) : undefined;
+  }
+
+  list(filter: AdjudicationListFilter = {}): { rows: AdjudicationRow[]; total: number } {
+    const where: string[] = [];
+    const params: unknown[] = [];
+    if (filter.since !== undefined) {
+      where.push("ts >= ?");
+      params.push(filter.since);
+    }
+    if (filter.surface) {
+      where.push("surface = ?");
+      params.push(filter.surface);
+    }
+    if (filter.provider) {
+      where.push("provider = ?");
+      params.push(filter.provider);
+    }
+    if (filter.outcome) {
+      where.push("outcome = ?");
+      params.push(filter.outcome);
+    }
+    const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
+    const total = (
+      this.prep(`SELECT COUNT(*) AS n FROM adjudications ${clause}`).get(...params) as {
+        n: number;
+      }
+    ).n;
+    const limit = Math.max(1, Math.min(filter.limit ?? 50, MAX_LIST));
+    const offset = Math.max(0, filter.offset ?? 0);
+    const rows = this.prep(
+      `SELECT * FROM adjudications ${clause} ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?`,
+    ).all(...params, limit, offset) as Row[];
+    return { rows: rows.map(toRow), total };
+  }
+
+  latestForSession(sessionId: string, surface: string): AdjudicationRow | undefined {
+    const r = this.prep(
+      `SELECT * FROM adjudications WHERE session_id = ? AND surface = ?
+       ORDER BY ts DESC, id DESC LIMIT 1`,
+    ).get(sessionId, surface) as Row | undefined;
+    return r ? toRow(r) : undefined;
+  }
+
+  forTask(runId: string, taskId: number): AdjudicationRow[] {
+    return (
+      this.prep("SELECT * FROM adjudications WHERE run_id = ? AND task_id = ? ORDER BY ts, id").all(
+        runId,
+        taskId,
+      ) as Row[]
+    ).map(toRow);
+  }
+
+  nonFinal(limit: number, olderThan?: number): AdjudicationRow[] {
+    const n = Math.max(1, Math.min(limit, 10_000));
+    const rows =
+      olderThan === undefined
+        ? this.prep("SELECT * FROM adjudications WHERE final = 0 ORDER BY ts, id LIMIT ?").all(n)
+        : this.prep(
+            "SELECT * FROM adjudications WHERE final = 0 AND ts < ? ORDER BY ts, id LIMIT ?",
+          ).all(olderThan, n);
+    return (rows as Row[]).map(toRow);
+  }
+
+  // --- cache ------------------------------------------------------------------------
+
+  cacheGet(key: string, now: number, maxAgeMs?: number): AdjudicatorCacheEntry | undefined {
+    const r = this.prep("SELECT * FROM adjudicator_cache WHERE key = ?").get(key) as
+      | Row
+      | undefined;
+    if (!r) return undefined;
+    const createdAt = Number(r.created_at);
+    if (maxAgeMs !== undefined && createdAt < now - maxAgeMs) return undefined;
+    const verdict = parseVerdict(r.verdict);
+    let hits = Number(r.hits ?? 0);
+    let lastHitAt = r.last_hit_at == null ? null : Number(r.last_hit_at);
+    if (verdict) {
+      this.prep("UPDATE adjudicator_cache SET hits = hits + 1, last_hit_at = ? WHERE key = ?").run(
+        now,
+        key,
+      );
+      hits += 1;
+      lastHitAt = now;
+    }
+    return {
+      key,
+      verdict,
+      provider: (r.provider as string | null) ?? null,
+      createdAt,
+      lastHitAt,
+      hits,
+    };
+  }
+
+  cachePut(key: string, verdict: Verdict | null, provider: string | null, now = Date.now()): void {
+    this.prep(
+      `INSERT INTO adjudicator_cache (key, verdict, provider, created_at, last_hit_at, hits)
+       VALUES (?, ?, ?, ?, NULL, 0)
+       ON CONFLICT(key) DO UPDATE SET verdict = excluded.verdict, provider = excluded.provider,
+         created_at = excluded.created_at, last_hit_at = NULL, hits = 0`,
+    ).run(key, verdict ? JSON.stringify(verdict) : null, provider, now);
+  }
+
+  cachePrune(maxEntries: number, ttlMs: number, now = Date.now()): number {
+    const expired = this.prep("DELETE FROM adjudicator_cache WHERE created_at < ?").run(
+      now - ttlMs,
+    ).changes;
+    const lru = this.prep(
+      `DELETE FROM adjudicator_cache WHERE key NOT IN (
+         SELECT key FROM adjudicator_cache
+         ORDER BY COALESCE(last_hit_at, created_at) DESC, created_at DESC LIMIT ?)`,
+    ).run(Math.max(0, maxEntries)).changes;
+    return expired + lru;
+  }
+
+  // --- provider state ---------------------------------------------------------------
+
+  providerState(provider: string): AdjudicatorProviderState | undefined {
+    const r = this.prep("SELECT * FROM adjudicator_provider_state WHERE provider = ?").get(
+      provider,
+    ) as Row | undefined;
+    if (!r) return undefined;
+    return {
+      provider,
+      state: String(r.state),
+      failures: Number(r.failures ?? 0),
+      retryAt: r.retry_at == null ? null : Number(r.retry_at),
+      lastOkAt: r.last_ok_at == null ? null : Number(r.last_ok_at),
+      lastErrorAt: r.last_error_at == null ? null : Number(r.last_error_at),
+      lastErrorClass: (r.last_error_class as string | null) ?? null,
+      latencies: parseLatencies(r.latencies),
+      spendDay: (r.spend_day as string | null) ?? null,
+      spendUsd: Number(r.spend_usd ?? 0),
+    };
+  }
+
+  saveProviderState(
+    provider: string,
+    patch: Partial<Omit<AdjudicatorProviderState, "provider">>,
+  ): AdjudicatorProviderState {
+    const base: AdjudicatorProviderState = this.providerState(provider) ?? {
+      provider,
+      state: "closed",
+      failures: 0,
+      retryAt: null,
+      lastOkAt: null,
+      lastErrorAt: null,
+      lastErrorClass: null,
+      latencies: [],
+      spendDay: null,
+      spendUsd: 0,
+    };
+    const next: AdjudicatorProviderState = { ...base, provider };
+    for (const [k, v] of Object.entries(patch)) {
+      if (v !== undefined) (next as unknown as Record<string, unknown>)[k] = v;
+    }
+    next.latencies = next.latencies.slice(-LATENCY_RING);
+    this.prep(
+      `INSERT INTO adjudicator_provider_state (provider, state, failures, retry_at, last_ok_at,
+         last_error_at, last_error_class, latencies, spend_day, spend_usd)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(provider) DO UPDATE SET state = excluded.state, failures = excluded.failures,
+         retry_at = excluded.retry_at, last_ok_at = excluded.last_ok_at,
+         last_error_at = excluded.last_error_at, last_error_class = excluded.last_error_class,
+         latencies = excluded.latencies, spend_day = excluded.spend_day,
+         spend_usd = excluded.spend_usd`,
+    ).run(
+      provider,
+      next.state,
+      next.failures,
+      next.retryAt,
+      next.lastOkAt,
+      next.lastErrorAt,
+      next.lastErrorClass,
+      JSON.stringify(next.latencies),
+      next.spendDay,
+      next.spendUsd,
+    );
+    return next;
+  }
+
+  // --- bias -------------------------------------------------------------------------
+
+  biasAll(): AdjudicatorBiasRow[] {
+    return (
+      this.prep("SELECT * FROM adjudicator_bias ORDER BY dimension, bucket, option").all() as Row[]
+    ).map((r) => ({
+      dimension: String(r.dimension),
+      bucket: String(r.bucket),
+      option: String(r.option),
+      n: Number(r.n),
+      s: Number(r.s),
+      f: Number(r.f),
+      costMedian: r.cost_median == null ? null : Number(r.cost_median),
+      bias: Number(r.bias),
+      updatedAt: r.updated_at == null ? null : Number(r.updated_at),
+    }));
+  }
+
+  biasUpsert(row: Omit<AdjudicatorBiasRow, "updatedAt"> & { updatedAt?: number | null }): void {
+    this.prep(
+      `INSERT INTO adjudicator_bias (dimension, bucket, option, n, s, f, cost_median, bias, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(dimension, bucket, option) DO UPDATE SET n = excluded.n, s = excluded.s,
+         f = excluded.f, cost_median = excluded.cost_median, bias = excluded.bias,
+         updated_at = excluded.updated_at`,
+    ).run(
+      row.dimension,
+      row.bucket,
+      row.option,
+      row.n,
+      row.s,
+      row.f,
+      row.costMedian,
+      row.bias,
+      row.updatedAt ?? Date.now(),
+    );
+  }
+
+  biasReset(): number {
+    return this.prep("DELETE FROM adjudicator_bias").run().changes;
+  }
+
+  // --- summary & purge --------------------------------------------------------------
+
+  summary(since?: number): AdjudicationSummary {
+    const rows = (
+      since === undefined
+        ? this.prep(
+            `SELECT surface, source, provider_status, action, outcome, latency_ms,
+               provider_latency_ms, cost_usd, savings_usd, model_final, actual_model
+             FROM adjudications`,
+          ).all()
+        : this.prep(
+            `SELECT surface, source, provider_status, action, outcome, latency_ms,
+               provider_latency_ms, cost_usd, savings_usd, model_final, actual_model
+             FROM adjudications WHERE ts >= ?`,
+          ).all(since)
+    ) as Row[];
+    const bySurface: Record<string, number> = {};
+    const bySource: Record<string, number> = {};
+    const byProviderStatus: Record<string, number> = {};
+    const byAction: Record<string, number> = {};
+    const byOutcome: Record<string, number> = {};
+    const latency: number[] = [];
+    const providerLatency: number[] = [];
+    let costUsd = 0;
+    let savingsUsd = 0;
+    let applyIneffective = 0;
+    let applyChecked = 0;
+    for (const r of rows) {
+      bump(bySurface, r.surface);
+      bump(bySource, r.source);
+      bump(byProviderStatus, r.provider_status);
+      bump(byAction, r.action);
+      bump(byOutcome, r.outcome);
+      if (typeof r.latency_ms === "number") latency.push(r.latency_ms);
+      if (typeof r.provider_latency_ms === "number") providerLatency.push(r.provider_latency_ms);
+      if (typeof r.cost_usd === "number") costUsd += r.cost_usd;
+      if (typeof r.savings_usd === "number") savingsUsd += r.savings_usd;
+      if (r.action === "applied" && typeof r.actual_model === "string" && r.actual_model) {
+        applyChecked += 1;
+        const want = typeof r.model_final === "string" ? r.model_final.toLowerCase() : "";
+        if (!want || !r.actual_model.toLowerCase().includes(want)) applyIneffective += 1;
+      }
+    }
+    const a = (k: string) => byAction[k] ?? 0;
+    return {
+      since: since ?? null,
+      total: rows.length,
+      bySurface,
+      bySource,
+      byProviderStatus,
+      byAction,
+      byOutcome,
+      latency: latencyStats(latency),
+      providerLatency: latencyStats(providerLatency),
+      rates: {
+        follow: ratio(a("followed"), a("advised") + a("followed") + a("ignored")),
+        apply: ratio(a("applied"), a("applied") + a("respected")),
+        respect: ratio(a("respected"), a("applied") + a("respected")),
+      },
+      costUsd,
+      savingsUsd,
+      netUsd: savingsUsd - costUsd,
+      applyIneffective,
+      applyChecked,
+    };
+  }
+
+  purge(): void {
+    this.db.exec(
+      "DELETE FROM adjudications; DELETE FROM adjudicator_cache; DELETE FROM adjudicator_provider_state; DELETE FROM adjudicator_bias;",
+    );
+  }
+}

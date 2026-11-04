@@ -490,6 +490,95 @@ CREATE INDEX IF NOT EXISTS swarm_spawns_tool ON swarm_spawns(tool_use_id);
 CREATE INDEX IF NOT EXISTS swarm_agents_session ON swarm_agents(session_id, status);
 `,
   },
+  {
+    // Adjudicator (src/adjudicator, docs/design/adjudicator.md §12): one row per decision,
+    // the verdict cache, per-provider breaker state and the learned bias buckets. No text
+    // beyond input_head (≤ 80 redacted chars), no keys, no raw provider responses.
+    version: 8,
+    sql: `
+CREATE TABLE IF NOT EXISTS adjudications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  surface TEXT NOT NULL,
+  session_id TEXT,
+  agent_id TEXT,
+  tool_use_id TEXT,
+  run_id TEXT,
+  task_id INTEGER,
+  parent_id INTEGER,
+  input_hash TEXT NOT NULL,
+  input_head TEXT,
+  input_chars INTEGER,
+  complexity REAL,
+  tier TEXT,
+  effort TEXT,
+  tool TEXT,
+  role TEXT,
+  confidence REAL,
+  scores TEXT,
+  source TEXT,
+  provider TEXT,
+  provider_model TEXT,
+  provider_status TEXT,
+  latency_ms INTEGER,
+  provider_latency_ms INTEGER,
+  tokens_in INTEGER,
+  tokens_out INTEGER,
+  cost_usd REAL,
+  action TEXT,
+  model_requested TEXT,
+  model_final TEXT,
+  baseline_model TEXT,
+  actual_model TEXT,
+  actual_tokens INTEGER,
+  actual_cost_usd REAL,
+  baseline_cost_usd REAL,
+  savings_usd REAL,
+  outcome TEXT NOT NULL DEFAULT 'pending',
+  outcome_source TEXT,
+  outcome_ts INTEGER,
+  final INTEGER NOT NULL DEFAULT 0,
+  version TEXT
+);
+CREATE INDEX IF NOT EXISTS adjudications_session ON adjudications(session_id, ts);
+CREATE INDEX IF NOT EXISTS adjudications_task ON adjudications(run_id, task_id);
+CREATE INDEX IF NOT EXISTS adjudications_hash ON adjudications(input_hash);
+CREATE INDEX IF NOT EXISTS adjudications_ts ON adjudications(ts);
+CREATE INDEX IF NOT EXISTS adjudications_final ON adjudications(final, ts);
+CREATE TABLE IF NOT EXISTS adjudicator_cache (
+  key TEXT PRIMARY KEY,
+  verdict TEXT,
+  provider TEXT,
+  created_at INTEGER NOT NULL,
+  last_hit_at INTEGER,
+  hits INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS adjudicator_provider_state (
+  provider TEXT PRIMARY KEY,
+  state TEXT NOT NULL,
+  failures INTEGER NOT NULL DEFAULT 0,
+  retry_at INTEGER,
+  last_ok_at INTEGER,
+  last_error_at INTEGER,
+  last_error_class TEXT,
+  latencies TEXT,
+  spend_day TEXT,
+  spend_usd REAL NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS adjudicator_bias (
+  dimension TEXT NOT NULL,
+  bucket TEXT NOT NULL,
+  option TEXT NOT NULL,
+  n REAL NOT NULL DEFAULT 0,
+  s REAL NOT NULL DEFAULT 0,
+  f REAL NOT NULL DEFAULT 0,
+  cost_median REAL,
+  bias REAL NOT NULL DEFAULT 0,
+  updated_at INTEGER,
+  PRIMARY KEY (dimension, bucket, option)
+);
+`,
+  },
 ];
 
 /** vec0 lives outside the migration list: it needs the extension loaded first and takes the dimension. */

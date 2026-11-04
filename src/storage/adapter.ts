@@ -1,5 +1,6 @@
 import type { SwarmStore } from "../swarm/types.js";
 import type {
+  AdjudicatorStore,
   ApiCallInput,
   ApiCallRow,
   ChunkInput,
@@ -52,6 +53,8 @@ export type SessionPatch = { id: string } & { [K in keyof SessionRow]?: SessionR
 export interface StorageAdapter {
   /** Agent swarm ledger (runs, tasks, workers, events, blackboard); see src/swarm. */
   readonly swarm: SwarmStore;
+  /** Adjudicator decisions, verdict cache, provider breakers and learned bias; see src/adjudicator. */
+  readonly adjudicator: AdjudicatorStore;
 
   // --- documents & chunks -------------------------------------------------
   /** Insert a document with its chunks. Same uri+hash → returns the existing id with created=false. */

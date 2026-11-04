@@ -1,3 +1,5 @@
+import type { AdjudicationRow, Verdict } from "../adjudicator/types.js";
+
 export type ContentType = "prose" | "code" | "json";
 
 /** Well-known sources; any string is accepted so callers can namespace freely. */
@@ -108,7 +110,14 @@ export interface VocabTerm {
   df: number;
 }
 
-export type PurgeScope = "index" | "sessions" | "graph" | "memories" | "usage" | "all";
+export type PurgeScope =
+  | "index"
+  | "sessions"
+  | "graph"
+  | "memories"
+  | "usage"
+  | "adjudicator"
+  | "all";
 
 export interface SessionRow {
   id: string;
@@ -443,4 +452,145 @@ export interface UsageFilter {
   /** true = only sidechain rows, false = only main-thread rows, undefined = both. */
   sidechain?: boolean | undefined;
   limit?: number | undefined;
+}
+
+// --- adjudicator (docs/design/adjudicator.md §12) ------------------------------------
+
+/** A new `adjudications` row: `id` is assigned, `ts` defaults to now, outcome to pending. */
+export type AdjudicationInput = Omit<AdjudicationRow, "id" | "ts" | "outcome" | "final"> & {
+  ts?: number | undefined;
+  outcome?: AdjudicationRow["outcome"] | undefined;
+  final?: boolean | undefined;
+};
+
+/** Columns to change; undefined leaves a column alone, null clears it. */
+export type AdjudicationPatch = {
+  [K in Exclude<keyof AdjudicationRow, "id">]?: AdjudicationRow[K] | undefined;
+};
+
+export interface AdjudicationListFilter {
+  /** Epoch ms, inclusive. */
+  since?: number | undefined;
+  surface?: string | undefined;
+  provider?: string | undefined;
+  outcome?: string | undefined;
+  /** Default 50, at most 500. */
+  limit?: number | undefined;
+  offset?: number | undefined;
+}
+
+export interface AdjudicatorCacheEntry {
+  key: string;
+  /** null is the `pending` marker an async job leaves while it runs. */
+  verdict: Verdict | null;
+  provider: string | null;
+  createdAt: number;
+  lastHitAt: number | null;
+  hits: number;
+}
+
+/** Breaker, latency ring and daily spend of one provider (§9). */
+export interface AdjudicatorProviderState {
+  provider: string;
+  /** closed | open | half_open | slow */
+  state: string;
+  failures: number;
+  retryAt: number | null;
+  lastOkAt: number | null;
+  lastErrorAt: number | null;
+  lastErrorClass: string | null;
+  /** The last ≤ 50 provider latencies in ms, oldest first. */
+  latencies: number[];
+  /** UTC day (YYYY-MM-DD) that `spendUsd` belongs to. */
+  spendDay: string | null;
+  spendUsd: number;
+}
+
+/** One learned bucket (§7.7): decayed counts n/s/f and the bias they yield. */
+export interface AdjudicatorBiasRow {
+  dimension: string;
+  bucket: string;
+  option: string;
+  n: number;
+  s: number;
+  f: number;
+  costMedian: number | null;
+  bias: number;
+  updatedAt: number | null;
+}
+
+export interface LatencyStats {
+  /** Rows with a value. */
+  n: number;
+  p50: number | null;
+  p95: number | null;
+}
+
+export interface AdjudicationSummary {
+  since: number | null;
+  total: number;
+  bySurface: Record<string, number>;
+  bySource: Record<string, number>;
+  byProviderStatus: Record<string, number>;
+  byAction: Record<string, number>;
+  byOutcome: Record<string, number>;
+  latency: LatencyStats;
+  providerLatency: LatencyStats;
+  /**
+   * follow = followed / (advised + followed + ignored): advice-mode dispatches whose advice
+   * was taken. apply = applied / (applied + respected) and respect = respected /
+   * (applied + respected): apply-mode dispatches. null when the denominator is 0.
+   */
+  rates: { follow: number | null; apply: number | null; respect: number | null };
+  /** Σ cost_usd: the adjudicator's own provider spend. */
+  costUsd: number;
+  /** Σ savings_usd as reconcile credited it. */
+  savingsUsd: number;
+  /** savingsUsd − costUsd. */
+  netUsd: number;
+  /** Applied rows whose actual_model does not name model_final. */
+  applyIneffective: number;
+  /** Applied rows with an actual_model to compare against (the m of "n of m"). */
+  applyChecked: number;
+}
+
+/** Persistence of the adjudicator; synchronous, every hook write is one statement. */
+export interface AdjudicatorStore {
+  insert(row: AdjudicationInput): number;
+  /** Returns false when no row has that id. */
+  update(id: number, patch: AdjudicationPatch): boolean;
+  get(id: number): AdjudicationRow | undefined;
+  /** Newest first; `total` counts every row matching the filter. */
+  list(filter?: AdjudicationListFilter): { rows: AdjudicationRow[]; total: number };
+  latestForSession(sessionId: string, surface: string): AdjudicationRow | undefined;
+  /** Oldest first. */
+  forTask(runId: string, taskId: number): AdjudicationRow[];
+  /** Rows with final = 0, oldest first; `olderThan` (epoch ms) keeps only rows with ts < it. */
+  nonFinal(limit: number, olderThan?: number): AdjudicationRow[];
+
+  /**
+   * The cache entry for `key`. A hit with a verdict bumps hits and last_hit_at to `now`.
+   * With `maxAgeMs`, an entry created before now − maxAgeMs is a miss (and is not bumped).
+   */
+  cacheGet(key: string, now: number, maxAgeMs?: number): AdjudicatorCacheEntry | undefined;
+  /** Insert or replace; `null` writes the pending marker. */
+  cachePut(key: string, verdict: Verdict | null, provider: string | null, now?: number): void;
+  /** Drop entries older than ttlMs, then all but the maxEntries most recently used. Returns rows deleted. */
+  cachePrune(maxEntries: number, ttlMs: number, now?: number): number;
+
+  providerState(provider: string): AdjudicatorProviderState | undefined;
+  /** Merge `patch` into the stored state (or a closed default) and save it; returns the result. */
+  saveProviderState(
+    provider: string,
+    patch: Partial<Omit<AdjudicatorProviderState, "provider">>,
+  ): AdjudicatorProviderState;
+
+  biasAll(): AdjudicatorBiasRow[];
+  biasUpsert(row: Omit<AdjudicatorBiasRow, "updatedAt"> & { updatedAt?: number | null }): void;
+  /** Clears the bias table only; returns rows deleted. */
+  biasReset(): number;
+
+  summary(since?: number): AdjudicationSummary;
+  /** Clears all four adjudicator tables. */
+  purge(): void;
 }
