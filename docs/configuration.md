@@ -154,8 +154,12 @@ only:
 - It must not hold a key. A field named like `apiKey`, `token`, `secret` or `password` makes the
   config invalid. Keys go in `~/.eminiar/adjudicator.key` (`eminiar adjudicator key set`) or an
   environment variable named by `keyEnv`.
-- `remoteConsent` is read from `~/.eminiar/config.json` and the environment only. It is ignored
-  in the committed `eminiar.config.json`.
+- Only `enabled`, `mode`, `surfaces`, `promptMode`, `minPromptChars`, `tiers`, `weights`,
+  `apply`, `advice`, `embedding`, `learning` and `cache` may be set in the committed
+  `eminiar.config.json`. Everything that decides where text and keys go or how much is spent
+  (`provider`, `typesafe`, `openai`, `keyEnv`, `remoteConsent`, `remoteConsentOrigins`,
+  `privacy`, `budget`, `timeouts`, `breaker`) comes from `~/.eminiar/config.json` only, and from
+  there only while that file is outside the project (see `EMINIAR_HOME` below).
 
 | Key | Default | Description |
 |---|---|---|
@@ -185,13 +189,13 @@ only:
 | `timeouts.localMs` | `600` | Provider deadline on prompts and dispatches for local providers |
 | `timeouts.connectMs` | `150` | Port probe timeout for `provider --detect` |
 | `minPromptChars` | `12` | Shorter prompts are not scored |
-| `tiers` | `["haiku", "sonnet", "opus"]` | The model ladder, smallest first. Add `"fable"` to allow it |
+| `tiers` | `["haiku", "sonnet", "opus"]` | The model ladder, smallest first. Add `"fable"` to allow it. Each tier at most once (at most 4 entries), since every provider request carries the whole ladder |
 | `weights.providerMax` | `0.7` | Largest weight a Jev or OpenAI-compatible answer gets in the blend |
 | `weights.embeddingMax` | `0.4` | Largest weight an embedding answer gets |
 | `weights.selfReportScale` | `0.6` | Multiplier on a model's self-reported confidence (Jev's calibrated confidence is used as is) |
 | `weights.lowConfidence` | `0.55` | A tier choice below this confidence moves one tier up |
-| `weights.tierCenters` | `{"haiku": 0.6, "sonnet": 2.0, "opus": 3.4}` | The complexity each tier fits best |
-| `weights.features` | `{}` | Per-feature weight overrides, for example `{"design": 2.0}`. `asymmetry` (default 2) sets how strongly the tier leans up; `toolProvider` above 0 lets a provider vote on the tool |
+| `weights.tierCenters` | `{"haiku": 0.6, "sonnet": 2.0, "opus": 3.4}` | The complexity each tier fits best (at most 16 entries) |
+| `weights.features` | `{}` | Per-feature weight overrides, for example `{"design": 2.0}`. `asymmetry` (default 2) sets how strongly the tier leans up; `toolProvider` above 0 lets a provider vote on the tool. At most 64 entries |
 | `apply.scope` | `"swarm"` | In apply mode, set the model on swarm worker dispatches only (`swarm`) or on every dispatch (`all`) |
 | `apply.minConfidence` | `0.7` | Apply only at or above this tier confidence |
 | `apply.floor` | `"haiku"` | Smallest tier apply mode sets |
@@ -219,7 +223,7 @@ only:
 |---|---|
 | `EMINIAR_ROUTING_MODE` | Overrides `routing.mode` |
 | `EMINIAR_EMBEDDINGS=0` | Turns off embeddings |
-| `EMINIAR_HOME` | Moves the data directory (default `~/.eminiar`) |
+| `EMINIAR_HOME` | Moves the data directory (default `~/.eminiar`). A `config.json` there that lies inside the project (or any git work tree of it) cannot set the adjudicator's provider, consent, endpoints, `keyEnv`, privacy, budget or timeouts, since a repo's `.claude/settings.json` could set this variable. The same applies when `HOME` is moved into the project |
 | `CURSOR_CONFIG_DIR` | Where `install --cursor` writes Cursor's `hooks.json`, `mcp.json` and `skills/` (default `~/.cursor`) |
 | `EMINIAR_PROJECT_ROOT` | Sets the project root. Otherwise `CLAUDE_PROJECT_DIR`, then the current directory |
 | `EMINIAR_DEBUG` | Prints stack traces from the CLI |

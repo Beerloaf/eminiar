@@ -411,6 +411,71 @@ describe("consent is bound to the origin the notice named (#33)", () => {
     expect(await run(["provider", "cerebras"], t.io)).toBe(1);
   });
 
+  it("a legacy migration records only the origin the notice named, never an env-swapped one (#55)", async () => {
+    const legacy = {
+      adjudicator: {
+        provider: "openai-compatible",
+        openai: { preset: "groq" },
+        remoteConsent: true,
+      },
+    };
+    // The env (e.g. a project's .claude/settings.json) swaps the provider to typesafe.
+    writeFileSync(paths().configFile, JSON.stringify(legacy));
+    process.env.EMINIAR_ADJUDICATOR_PROVIDER = "typesafe";
+    let t = fakeIo({ env: { EMINIAR_ADJUDICATOR_PROVIDER: "typesafe" } });
+    expect(await run(["provider", "cerebras", "--accept-remote"], t.io)).toBe(0);
+    expect(t.text()).toContain("is sent to https://api.cerebras.ai");
+    // The only notice shown names cerebras (the env-picked typesafe stays unconsented).
+    expect(t.lines.filter((l) => l.includes("is sent to"))).toEqual([
+      expect.stringContaining("is sent to https://api.cerebras.ai"),
+    ]);
+    expect(globalRaw().adjudicator.remoteConsentOrigins).toEqual(["https://api.cerebras.ai"]);
+    delete process.env.EMINIAR_ADJUDICATOR_PROVIDER;
+
+    // Without the env: moving off the legacy provider records the new origin alone; the old one
+    // (never named by this notice) asks again later.
+    writeFileSync(paths().configFile, JSON.stringify(legacy));
+    t = fakeIo();
+    expect(await run(["provider", "cerebras", "--accept-remote"], t.io)).toBe(0);
+    expect(globalRaw().adjudicator.remoteConsentOrigins).toEqual(["https://api.cerebras.ai"]);
+    t = fakeIo();
+    expect(await run(["provider", "groq"], t.io)).toBe(1);
+
+    // Re-confirming the legacy provider itself records exactly the origin the printed notice
+    // names; while the env picks a provider, a legacy consent covers nothing, so it asks.
+    writeFileSync(paths().configFile, JSON.stringify(legacy));
+    process.env.EMINIAR_ADJUDICATOR_PROVIDER = "typesafe";
+    t = fakeIo({ env: { EMINIAR_ADJUDICATOR_PROVIDER: "typesafe" } });
+    expect(await run(["provider", "groq"], t.io)).toBe(1);
+    expect(globalRaw().adjudicator.remoteConsentOrigins).toBeUndefined();
+    delete process.env.EMINIAR_ADJUDICATOR_PROVIDER;
+    t = fakeIo();
+    expect(await run(["provider", "groq"], t.io)).toBe(0);
+    expect(t.text()).toContain("is sent to https://api.groq.com");
+    expect(globalRaw().adjudicator.remoteConsentOrigins).toEqual(["https://api.groq.com"]);
+  });
+
+  it("refuses to write provider, consent or keys into a personal config inside the project (#54)", async () => {
+    process.env.EMINIAR_HOME = join(root, ".em");
+    let t = fakeIo();
+    expect(await run(["provider", "groq", "--accept-remote"], t.io)).toBe(1);
+    expect(t.text()).toContain("inside this project");
+    expect(existsSync(paths().configFile)).toBe(false);
+    t = fakeIo();
+    expect(await run(["enable", "--provider", "groq", "--accept-remote"], t.io)).toBe(1);
+    t = fakeIo({ env: { GITHUB_TOKEN: "x" } });
+    expect(await run(["key", "set", "--from-env", "GITHUB_TOKEN"], t.io)).toBe(1);
+    t = fakeIo({ stdin: `${SENTINEL}\n` });
+    expect(await run(["key", "set", "groq"], t.io)).toBe(1);
+    expect(existsSync(paths().adjudicatorKey)).toBe(false);
+    expect(existsSync(paths().configFile)).toBe(false);
+    expect(t.text()).not.toContain(SENTINEL);
+    // `enable --project` writes only the project file, which is fine.
+    t = fakeIo();
+    expect(await run(["enable", "--project"], t.io)).toBe(0);
+    expect(existsSync(paths().configFile)).toBe(false);
+  });
+
   it("status and doctor name the origin and whether consent covers it", async () => {
     writeAdjudicatorPatch(paths().configFile, {
       enabled: true,
@@ -675,6 +740,36 @@ describe("doctor", () => {
     expect(JSON.stringify(checks)).not.toContain(SENTINEL);
   });
 
+  it("reads CLAUDE_CODE_SUBAGENT_MODEL_FORCE with Claude Code's on/off rule, like the hook (#59)", async () => {
+    writeAdjudicatorPatch(paths().configFile, { enabled: true, mode: "apply" });
+    const config = loadConfig(root);
+    for (const [value, on] of [
+      ["yes", true],
+      ["ON", true],
+      ["True", true],
+      ["1", true],
+      ["no", false],
+      ["off", false],
+      ["0", false],
+      ["false", false],
+      ["", false],
+      ["maybe", false],
+    ] as const) {
+      const env = { CLAUDE_CODE_SUBAGENT_MODEL_FORCE: value };
+      const checks = adjudicatorDoctorChecks(config, { root, db, env });
+      expect(
+        checks.some((c) => c.name === "adjudicator apply"),
+        value,
+      ).toBe(on);
+      const t = fakeIo({ env });
+      expect(await run(["status"], t.io)).toBe(0);
+      expect(t.text().includes("CLAUDE_CODE_SUBAGENT_MODEL_FORCE is on"), value).toBe(on);
+      const j = fakeIo({ env });
+      expect(await run(["status", "--json"], j.io)).toBe(0);
+      expect(JSON.parse(j.text()).modelForced, value).toBe(on);
+    }
+  });
+
   it("status, doctor and the dashboard name project keys that were ignored, even while off (#46)", async () => {
     writeFileSync(
       join(root, "eminiar.config.json"),
@@ -854,5 +949,108 @@ describe("eminiar adjudicator test / eval / stats", () => {
     const t = fakeIo();
     expect(await run(["frobnicate"], t.io)).toBe(2);
     expect(t.text()).toContain("eminiar adjudicator <command>");
+  });
+});
+
+describe("flag values never echo or store a key (#57)", () => {
+  const K = "gsk_SENTINELKEY0123456789abcdef";
+  const RAW = "SENTINELKEY0123456789abcdef0123"; // no known prefix, still key-shaped
+  const cases: string[][] = [
+    ["provider", "groq", "--model", K, "--accept-remote"],
+    ["provider", "groq", "--model", RAW, "--accept-remote"],
+    [
+      "provider",
+      "custom",
+      "--base-url",
+      `https://h.example/v1?api_key=${K}`,
+      "--model",
+      "m",
+      "--accept-remote",
+    ],
+    [
+      "provider",
+      "custom",
+      "--base-url",
+      "https://h.example/v1?api_key=short",
+      "--model",
+      "m",
+      "--accept-remote",
+    ],
+    [
+      "provider",
+      "custom",
+      "--base-url",
+      `https://h.example/v1?x=${RAW}`,
+      "--model",
+      "m",
+      "--accept-remote",
+    ],
+    [
+      "provider",
+      "custom",
+      "--base-url",
+      `https://u:${K}@h.example/v1`,
+      "--model",
+      "m",
+      "--accept-remote",
+    ],
+    [
+      "provider",
+      "custom",
+      "--base-url",
+      `https://h.example/${RAW}/v1`,
+      "--model",
+      "m",
+      "--accept-remote",
+    ],
+    [
+      "provider",
+      "custom",
+      "--base-url",
+      `https://h.example/v1#${K}`,
+      "--model",
+      "m",
+      "--accept-remote",
+    ],
+    ["stats", "--since", K],
+    ["stats", "--since", "nonsense-value"],
+    ["eval", "--fixture", `${RAW}.json`],
+    ["eval", "--repeat", K],
+  ];
+  it.each(cases)("refuses %s %s … without echoing or writing it", async (...args) => {
+    const t = fakeIo();
+    expect(await run(args, t.io)).toBe(2);
+    for (const secret of [K, RAW, "short", "nonsense-value"])
+      expect(t.text()).not.toContain(secret);
+    if (existsSync(paths().configFile))
+      expect(readFileSync(paths().configFile, "utf8")).not.toMatch(/SENTINEL|short/);
+  });
+
+  it("ordinary model ids, URLs and dates still pass", async () => {
+    let t = fakeIo();
+    expect(
+      await run(
+        [
+          "provider",
+          "custom",
+          "--base-url",
+          "https://h.example/openai/v1?api-version=2024-10-21",
+          "--model",
+          "meta-llama/Llama-3.1-8B-Instruct-Turbo",
+          "--accept-remote",
+        ],
+        t.io,
+      ),
+    ).toBe(0);
+    expect(globalRaw().adjudicator.openai).toMatchObject({
+      baseUrl: "https://h.example/openai/v1?api-version=2024-10-21",
+      model: "meta-llama/Llama-3.1-8B-Instruct-Turbo",
+    });
+    t = fakeIo();
+    expect(await run(["provider", "ollama", "--model", "qwen2.5:1.5b-instruct"], t.io)).toBe(0);
+    t = fakeIo();
+    expect(await run(["stats", "--since", "2026-10-01T00:00:00Z"], t.io)).toBe(0);
+    t = fakeIo();
+    expect(await run(["stats", "--since", "7d"], t.io)).toBe(0);
   });
 });

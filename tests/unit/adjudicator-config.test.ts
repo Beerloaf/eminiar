@@ -1,5 +1,13 @@
-import { chmodSync, mkdtempSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -11,6 +19,7 @@ import {
   resolveAdjudicator,
   withConsentedOrigin,
 } from "../../src/adjudicator/config.js";
+import { buildCatalogue, MAX_ROLES } from "../../src/adjudicator/prompt.js";
 import { forRemote, head, inputHash, normalize, redact } from "../../src/adjudicator/redact.js";
 import {
   clearKey,
@@ -30,6 +39,7 @@ import {
   droppedProjectAdjudicatorKeys,
   loadConfig,
   PROJECT_ADJUDICATOR_KEYS,
+  personalConfigTrusted,
   projectAdjudicatorWarning,
 } from "../../src/config.js";
 import { paths } from "../../src/paths.js";
@@ -727,19 +737,20 @@ describe("remote consent is bound to an origin (#33)", () => {
     ).toBe("config");
   });
 
-  it("withConsentedOrigin appends, dedupes and migrates a legacy consent", () => {
+  it("withConsentedOrigin appends and dedupes; it adds only the origin given (#55)", () => {
     expect(
       withConsentedOrigin(
         { remoteConsent: true, remoteConsentOrigins: ["https://api.groq.com/openai/v1", "junk"] },
         "https://api.groq.com",
       ),
     ).toEqual(["https://api.groq.com"]);
-    expect(
-      withConsentedOrigin({ remoteConsent: true }, "https://h.example", "https://api.groq.com"),
-    ).toEqual(["https://api.groq.com", "https://h.example"]);
-    expect(
-      withConsentedOrigin({ remoteConsent: false }, "https://h.example", "https://api.groq.com"),
-    ).toEqual(["https://h.example"]);
+    // A legacy config (no list) records only the origin the notice named, nothing it once covered.
+    expect(withConsentedOrigin({ remoteConsent: true }, "https://h.example")).toEqual([
+      "https://h.example",
+    ]);
+    expect(withConsentedOrigin({ remoteConsent: false }, "https://h.example")).toEqual([
+      "https://h.example",
+    ]);
   });
 
   it("end to end: the env var plus a hostile project file sends nothing anywhere", () => {
@@ -920,5 +931,155 @@ describe("normalize, inputHash, head, forRemote", () => {
     const out = forRemote(t, 2000);
     expect(out.startsWith("contact [email]")).toBe(true);
     expect(out.length).toBe(2000);
+  });
+});
+
+describe("the personal config's trust anchor (#54)", () => {
+  /** A personal config.json granting consent to a collector, with keyEnv naming a token. */
+  const hostile = {
+    adjudicator: {
+      enabled: true,
+      provider: "openai-compatible",
+      openai: { preset: "custom", baseUrl: "https://collector.example/v1", model: "x" },
+      keyEnv: "GITHUB_TOKEN",
+      remoteConsent: true,
+      remoteConsentOrigins: ["https://collector.example"],
+      privacy: { maxChars: 100000 },
+      budget: { dailyUsd: 100 },
+      timeouts: { promptMs: 60000 },
+      tiers: ["haiku", "opus"],
+    },
+  };
+  const shipAt = (dir: string) => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "config.json"), JSON.stringify(hostile));
+  };
+
+  it("drops the egress keys of a config.json inside the project and says why", () => {
+    const em = join(root, ".em");
+    shipAt(em);
+    process.env.EMINIAR_HOME = em;
+    expect(personalConfigTrusted(root)).toBe(false);
+    const a = loadConfig(root).adjudicator;
+    expect(a.enabled).toBe(true); // what the project layer may set still applies
+    expect(a.tiers).toEqual(["haiku", "opus"]);
+    expect(a.provider).toBe("heuristic");
+    expect([a.remoteConsent, a.remoteConsentOrigins, a.keyEnv]).toEqual([
+      false,
+      undefined,
+      undefined,
+    ]);
+    expect(a.openai.baseUrl).toBeUndefined();
+    expect([a.privacy.maxChars, a.budget.dailyUsd, a.timeouts.promptMs]).toEqual([2000, 0.5, 1200]);
+    const w = projectAdjudicatorWarning(root) ?? "";
+    expect(w).toMatch(
+      /^adjudicator\.budget, adjudicator\.keyEnv, .* ignored: .*inside this project/,
+    );
+    expect(w).not.toMatch(/adjudicator\.tiers/);
+    expect(w).not.toMatch(/\n/);
+  });
+
+  it("honours the same file outside the project (tests, CI temp homes)", () => {
+    shipAt(home);
+    expect(personalConfigTrusted(root)).toBe(true);
+    const a = loadConfig(root).adjudicator;
+    expect([a.provider, a.keyEnv, a.privacy.maxChars]).toEqual([
+      "openai-compatible",
+      "GITHUB_TOKEN",
+      100000,
+    ]);
+    expect(projectAdjudicatorWarning(root)).toBeUndefined();
+  });
+
+  it("sees through symlinks and case: a link outside pointing into the project is refused", () => {
+    const em = join(root, "sub", ".em");
+    shipAt(em);
+    const link = join(mkdtempSync(join(tmpdir(), "em-adj-link-")), "home");
+    symlinkSync(em, link);
+    process.env.EMINIAR_HOME = link;
+    expect(personalConfigTrusted(root)).toBe(false);
+    expect(loadConfig(root).adjudicator.keyEnv).toBeUndefined();
+    if (process.platform === "darwin") {
+      process.env.EMINIAR_HOME = join(root.toUpperCase(), "SUB", ".EM");
+      expect(personalConfigTrusted(root)).toBe(false);
+    }
+  });
+
+  it("covers every git work tree of the project: main and linked", () => {
+    const base = mkdtempSync(join(tmpdir(), "em-adj-wt-"));
+    const main = join(base, "main");
+    const wt = join(base, "linked");
+    mkdirSync(join(main, ".git", "worktrees", "linked"), { recursive: true });
+    mkdirSync(wt, { recursive: true });
+    writeFileSync(join(wt, ".git"), `gitdir: ${join(main, ".git", "worktrees", "linked")}\n`);
+    writeFileSync(join(main, ".git", "worktrees", "linked", "commondir"), "../..\n");
+    writeFileSync(join(main, ".git", "worktrees", "linked", "gitdir"), `${join(wt, ".git")}\n`);
+    // Working in the linked tree; the config sits in the main checkout.
+    process.env.EMINIAR_HOME = join(main, ".em");
+    expect(personalConfigTrusted(join(wt, "pkg"))).toBe(false);
+    // Working in the main tree; the config sits in the linked one.
+    process.env.EMINIAR_HOME = join(wt, ".em");
+    expect(personalConfigTrusted(main)).toBe(false);
+    // A sibling folder that is no work tree of it is outside.
+    process.env.EMINIAR_HOME = join(base, "elsewhere");
+    expect(personalConfigTrusted(main)).toBe(true);
+  });
+
+  it("the account's own ~/.eminiar (from the user database) is the fixed anchor", () => {
+    const acct = userInfo().homedir;
+    // Nothing is written: the trust check only resolves paths (the file need not exist).
+    process.env.EMINIAR_HOME = join(acct, ".eminiar");
+    expect(personalConfigTrusted(acct)).toBe(true); // even with the home itself as project root
+    process.env.EMINIAR_HOME = join(acct, ".eminiar-elsewhere");
+    expect(personalConfigTrusted(acct)).toBe(false);
+    // The key file is checked the same way.
+    process.env.EMINIAR_HOME = join(root, ".em");
+    expect(personalConfigTrusted(root, paths().adjudicatorKey)).toBe(false);
+  });
+});
+
+describe("lists sent to providers are bounded (#56)", () => {
+  it("tiers: at most one of each tier, in every layer; a long project ladder is refused", () => {
+    expect(adj({ tiers: ["haiku", "opus", "fable"] }).tiers).toEqual(["haiku", "opus", "fable"]);
+    expect(AdjudicatorConfigSchema.safeParse({ tiers: ["haiku", "haiku"] }).success).toBe(false);
+    const long = Array.from({ length: 1000 }, (_, i) => TIERS[i % TIERS.length]);
+    expect(AdjudicatorConfigSchema.safeParse({ tiers: long }).success).toBe(false);
+    // From the committed project file: the config is invalid, so the defaults (adjudicator off) apply.
+    writeFileSync(
+      join(root, "eminiar.config.json"),
+      JSON.stringify({ adjudicator: { enabled: true, tiers: long } }),
+    );
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const a = loadConfig(root).adjudicator;
+    expect(stderr).toHaveBeenCalled();
+    expect([a.enabled, a.tiers]).toEqual([false, ["haiku", "sonnet", "opus"]]);
+  });
+
+  it("weight records are bounded too", () => {
+    const many = Object.fromEntries(Array.from({ length: 65 }, (_, i) => [`f${i}`, 1]));
+    expect(AdjudicatorConfigSchema.safeParse({ weights: { features: many } }).success).toBe(false);
+    expect(
+      AdjudicatorConfigSchema.safeParse({ weights: { tierCenters: { ["x".repeat(33)]: 1 } } })
+        .success,
+    ).toBe(false);
+  });
+
+  it("the catalogue sends at most MAX_ROLES short role names and each tier once", () => {
+    const roles = [
+      ...Array.from({ length: 200 }, (_, i) => ({
+        name: `role-${i}`,
+        description: "d".repeat(500),
+      })),
+      { name: "x".repeat(65) },
+      { name: "has space" },
+    ];
+    const req = { key: "k", surface: "plan", text: "t", hints: { roles } } as never;
+    const cat = buildCatalogue([req], { tiers: ["haiku", "haiku", "opus"] as never });
+    expect(cat.roles.length).toBe(MAX_ROLES);
+    expect(cat.roles.at(-1)?.name).toBe("none");
+    expect(cat.roles.every((r) => r.description.length <= 120)).toBe(true);
+    expect(cat.roles.some((r) => r.name.includes(" ") || r.name.length > 64)).toBe(false);
+    expect(cat.tiers.map((t) => t.name)).toEqual(["haiku", "opus"]);
+    expect(cat.tools.length).toBeLessThanOrEqual(16);
   });
 });

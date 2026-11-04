@@ -136,23 +136,15 @@ export function consentedOrigins(a: Pick<AdjudicatorConfig, "remoteConsentOrigin
 }
 
 /**
- * The remoteConsentOrigins list the CLI writes after the user accepted `origin`: the current list
- * plus `origin`. A legacy config (remoteConsent true, no list) is migrated by also keeping
- * `previous`, the origin of the provider configured before the change, which that consent covered.
+ * The remoteConsentOrigins list the CLI writes after the notice naming `origin` was accepted: the
+ * current list plus `origin`, and nothing else (task #55). A legacy config (remoteConsent true, no
+ * list) is migrated to just that origin; another host it once covered asks again when chosen.
  */
 export function withConsentedOrigin(
   a: Pick<AdjudicatorConfig, "remoteConsent" | "remoteConsentOrigins">,
   origin: string,
-  previous?: string,
 ): string[] {
   const list = consentedOrigins(a);
-  if (
-    a.remoteConsentOrigins === undefined &&
-    a.remoteConsent &&
-    previous &&
-    !list.includes(previous)
-  )
-    list.push(previous);
   if (!list.includes(origin)) list.push(origin);
   return list;
 }

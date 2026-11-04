@@ -17,6 +17,7 @@ import {
   type Config,
   ConfigSchema,
   loadConfig,
+  personalConfigTrusted,
   projectAdjudicatorWarning,
 } from "../config.js";
 import type { ProjectContext } from "../context.js";
@@ -33,7 +34,9 @@ import {
   withAuthLockout,
   withConsentedOrigin,
 } from "./config.js";
+import { subagentModelForced } from "./env.js";
 import type { ProviderDeps } from "./providers/http.js";
+import { isSecretName } from "./redact.js";
 import { clearKey, type KeyId, keyFileStatus, mask, setKey, storedKeyIds } from "./secrets.js";
 import {
   type AdjudicationRequest,
@@ -294,6 +297,63 @@ export function looksLikeKey(arg: string | undefined): boolean {
   return v.length >= 16 || KEY_PREFIX.test(v);
 }
 
+/**
+ * True when a flag value (a model id, a date, a path, a URL part) could carry a key (task #57):
+ * a common key prefix, or a segment of 20+ characters between separators that holds a digit.
+ * Model ids, dates and paths are made of short segments ("openai/gpt-oss-20b",
+ * "2026-11-04T12:00:00Z"), so they pass; looksLikeKey's 16-char rule would refuse them.
+ */
+export function valueLooksLikeKey(value: string | undefined): boolean {
+  const v = value?.trim();
+  if (!v) return false;
+  if (KEY_PREFIX.test(v)) return true;
+  return v.split(/[\s\-_/.:@+=,;&?#%~]+/).some((seg) => seg.length >= 20 && /\d/.test(seg));
+}
+
+/**
+ * Why a --base-url is refused, or undefined when it may be stored (task #57). It must be a plain
+ * http(s) URL: no user name or password, no fragment, no query parameter named like a secret or
+ * holding a key-shaped value, no key-shaped path segment. The message never repeats the URL.
+ */
+export function baseUrlProblem(raw: string): string | undefined {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return "--base-url takes an http(s) URL such as https://host/v1";
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:")
+    return "--base-url takes an http(s) URL such as https://host/v1";
+  const why =
+    u.username || u.password
+      ? "a user name or password"
+      : [...u.searchParams].some(
+            ([k, v]) => isSecretName(k) || valueLooksLikeKey(k) || valueLooksLikeKey(v),
+          )
+        ? "a key in its query string"
+        : u.hash
+          ? "a #fragment"
+          : valueLooksLikeKey(decodeURIComponent(u.pathname))
+            ? "a key-shaped path segment"
+            : undefined;
+  if (!why) return undefined;
+  return `--base-url must not carry ${why}; keys are never taken from the command line. Use the endpoint's plain URL and \`eminiar adjudicator key set\` for the key.`;
+}
+
+/**
+ * The first string flag that could carry a key, checked before any config is loaded (task
+ * #57); its value is never echoed. Provider, preset and mode names go through shown().
+ */
+function argvKeyProblem(values: Record<string, unknown>): string | undefined {
+  for (const flag of ["model", "since", "fixture", "repeat", "providers"]) {
+    const v = values[flag];
+    if (typeof v === "string" && valueLooksLikeKey(v)) return KEY_NOT_FROM_ARGV;
+  }
+  const url = values["base-url"];
+  if (typeof url === "string" && url) return baseUrlProblem(url);
+  return undefined;
+}
+
 /** `"arg"` for an ordinary unknown value; a fixed placeholder when it could be a key. */
 const shown = (arg: unknown): string =>
   looksLikeKey(String(arg)) ? "(argument hidden: it may be a key)" : `"${String(arg)}"`;
@@ -371,6 +431,19 @@ export function remoteNotice(
   return `The text of your prompts and subagent tasks (redacted, at most ${cfg.privacy.maxChars} chars) is sent to ${r.origin ?? hostOf(r.baseUrl)} to score them.`;
 }
 
+/**
+ * Task #54: true (after saying why) when `file`, the personal config by default, lies inside this
+ * project because EMINIAR_HOME or HOME points into it. The adjudicator ignores provider, consent
+ * and key settings there, and a key stored there could be committed, so the caller writes nothing.
+ */
+function personalFileUntrusted(io: Io, root: string, file = paths().configFile): boolean {
+  if (personalConfigTrusted(root, file)) return false;
+  io.err(
+    `${file} is inside this project (EMINIAR_HOME or HOME points into it): the adjudicator ignores provider, consent and key settings there, and a key stored there could be committed. Nothing was changed; run this from a shell where EMINIAR_HOME and HOME point outside the project.`,
+  );
+  return true;
+}
+
 /** The consent fields of ~/.eminiar/config.json alone: never the env var or the project file. */
 function personalConsent(): Pick<AdjudicatorConfig, "remoteConsent" | "remoteConsentOrigins"> {
   try {
@@ -391,7 +464,8 @@ function personalConsent(): Pick<AdjudicatorConfig, "remoteConsent" | "remoteCon
 /**
  * Whether the CLI must show the notice and ask before writing `r` (task #33): consent is bound to
  * an origin, so a new host asks again. A legacy consent (remoteConsent true, no origin list) still
- * covers, without asking, the provider it was given for (`previous`), and is then recorded.
+ * covers, without asking, the provider it was given for (`previous`, from personalOrigin()), and
+ * is then recorded.
  */
 function mustAsk(r: Resolved, previous: string | undefined): boolean {
   if (!r.configuredRemote) return false;
@@ -401,25 +475,34 @@ function mustAsk(r: Resolved, previous: string | undefined): boolean {
 
 /**
  * The consent fields to write once `r` is agreed to: remoteConsent true and its origin added to
- * remoteConsentOrigins (a legacy config also keeps `previous`). Nothing when no origin is known
- * or the user was not asked and holds no legacy consent.
+ * remoteConsentOrigins. Only the origin the notice just named is added (task #55): migrating a
+ * legacy config records nothing else, so another host it once covered asks again. Nothing when no
+ * origin is known or the user was not asked and holds no legacy consent.
  */
-function consentPatch(
-  r: Resolved,
-  previous: string | undefined,
-  asked: boolean,
-): Record<string, unknown> {
+function consentPatch(r: Resolved, asked: boolean): Record<string, unknown> {
   if (!r.configuredRemote || !r.origin) return {};
   if (!asked && r.consentVia !== "legacy") return {};
-  const personal = personalConsent();
-  const list = withConsentedOrigin(personal, r.origin, previous);
+  const list = withConsentedOrigin(personalConsent(), r.origin);
   return { remoteConsent: true, remoteConsentOrigins: list };
 }
 
-/** The origin of the currently configured remote target, or undefined (local or unparsable). */
-function currentOrigin(config: Config | AdjudicatorConfig, env: NodeJS.ProcessEnv) {
-  const r = resolveAdjudicator(config, { context: "cli", env });
-  return r.configuredRemote ? r.origin : undefined;
+/**
+ * The remote origin ~/.eminiar/config.json itself configures (task #55): parsed from that file's
+ * own values, with no project layer and no env var, so EMINIAR_ADJUDICATOR_PROVIDER cannot make
+ * a host the user never picked look like the one a legacy consent was given for. Undefined for a
+ * local target, an unreadable file or an untrusted one (personalConfigTrusted).
+ */
+function personalOrigin(root: string): string | undefined {
+  try {
+    if (!personalConfigTrusted(root)) return undefined;
+    const a = readRaw(paths().configFile).adjudicator;
+    const parsed = AdjudicatorConfigSchema.safeParse(isObj(a) ? a : {});
+    if (!parsed.success) return undefined;
+    const r = resolveAdjudicator(parsed.data, { context: "cli", env: {} });
+    return r.configuredRemote ? r.origin : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -519,11 +602,12 @@ export async function setupAdjudicator(io: Io, o: SetupOptions): Promise<SetupRe
     choice = await pickProvider(io);
   }
 
+  if (personalFileUntrusted(io, process.cwd())) return { enabled: false };
   let patch: Record<string, unknown> = { enabled: true, ...choicePatch(choice, base) };
   let r = resolveAdjudicator(candidate(base, patch), { context: "cli", env: io.env });
   if (r.configuredRemote) {
     if (await ensureConsent(io, r, base, { acceptRemote: !!o.acceptRemote })) {
-      patch = { ...patch, ...consentPatch(r, undefined, true) };
+      patch = { ...patch, ...consentPatch(r, true) };
     } else {
       io.out(
         `Kept everything on this machine: using the heuristic. Switch later with \`eminiar adjudicator enable --provider ${choice.preset ?? choice.provider}\`.`,
@@ -716,10 +800,8 @@ async function storage(ctx: ProjectContext, deps: CliDeps): Promise<StorageAdapt
   return getStorage(ctx, { vectors: false });
 }
 
-const forced = (env: NodeJS.ProcessEnv) => {
-  const v = env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE?.trim().toLowerCase();
-  return !!v && v !== "0" && v !== "false";
-};
+/** CLAUDE_CODE_SUBAGENT_MODEL_FORCE with Claude Code's on/off rule, as the hook reads it. */
+const forced = (env: NodeJS.ProcessEnv) => subagentModelForced(env);
 
 export async function statusReport(
   ctx: ProjectContext,
@@ -876,7 +958,7 @@ export function formatStatus(s: StatusReport): string {
     );
   if (s.mode === "apply" && s.modelForced)
     lines.push(
-      "warning: CLAUDE_CODE_SUBAGENT_MODEL_FORCE is set, so Claude Code ignores the applied `model`",
+      "warning: CLAUDE_CODE_SUBAGENT_MODEL_FORCE is on, so Claude Code ignores the applied `model`",
     );
   if (!s.enabled) lines.push("turn it on with `eminiar adjudicator enable`");
   return lines.join("\n");
@@ -1014,7 +1096,7 @@ export function adjudicatorDoctorChecks(
       name: "adjudicator apply",
       ok: false,
       detail:
-        "CLAUDE_CODE_SUBAGENT_MODEL_FORCE is set, so Claude Code ignores the `model` apply mode sets; unset it or use mode advise",
+        "CLAUDE_CODE_SUBAGENT_MODEL_FORCE is on, so Claude Code ignores the `model` apply mode sets; unset it or use mode advise",
     });
   if (r0.configured === "embedding") {
     let cached = false;
@@ -1150,6 +1232,11 @@ export async function adjudicatorCommand(
     strict: false,
   });
   const [sub = "status", ...rest] = positionals;
+  const argProblem = argvKeyProblem(values);
+  if (argProblem) {
+    io.err(argProblem);
+    return 2;
+  }
   const str = (v: unknown) => (typeof v === "string" && v ? v : undefined);
   const providerFlag = (values.provider as string[] | undefined)?.filter(Boolean) ?? [];
   const load = () => loadConfig(ctx.root);
@@ -1165,6 +1252,8 @@ export async function adjudicatorCommand(
       const current = load().adjudicator;
       const patch: Record<string, unknown> = { enabled: true };
       const given = providerFlag[0] ?? str(values.preset);
+      if ((!values.project || given || str(values.mode)) && personalFileUntrusted(io, ctx.root))
+        return 1;
       if (given) {
         const c = parseChoice(given);
         if (!c) {
@@ -1191,7 +1280,7 @@ export async function adjudicatorCommand(
       }
       const next = candidate(current, patch);
       const r = resolveAdjudicator(next, { context: "cli", env: io.env });
-      const previous = currentOrigin(current, io.env);
+      const previous = personalOrigin(ctx.root);
       const ask = mustAsk(r, previous);
       if (ask) {
         if (!(await ensureConsent(io, r, next, { acceptRemote: !!values["accept-remote"] }))) {
@@ -1199,7 +1288,7 @@ export async function adjudicatorCommand(
           return 1;
         }
       } else if (r.configuredRemote) io.out(remoteNotice(r, next));
-      Object.assign(patch, consentPatch(r, previous, ask));
+      Object.assign(patch, consentPatch(r, ask));
       if (values.project) {
         writeAdjudicatorPatch(projectFile(ctx.root), { enabled: true });
         io.out(`Wrote adjudicator.enabled: true to ${projectFile(ctx.root)} (commit it to share).`);
@@ -1215,7 +1304,11 @@ export async function adjudicatorCommand(
       );
       if (!after.adjudicator.enabled) io.out(`(${enabledSource(ctx.root, io.env)} keeps it off)`);
       const need = keyNeed(ra);
-      if (need && ra.keySource === "none") {
+      if (
+        need &&
+        ra.keySource === "none" &&
+        personalConfigTrusted(ctx.root, paths().adjudicatorKey)
+      ) {
         if (io.isTTY) {
           const key = await readKey(io, need.label, true);
           if (key) storeKey(io, need.id, key);
@@ -1278,6 +1371,7 @@ export async function adjudicatorCommand(
         }
         c.preset = pc.preset;
       }
+      if (personalFileUntrusted(io, ctx.root)) return 1;
       const patch = choicePatch(c, config.adjudicator);
       const baseUrl = str(values["base-url"]);
       const model = str(values.model);
@@ -1294,7 +1388,7 @@ export async function adjudicatorCommand(
       const next = candidate(config.adjudicator, patch);
       const r = resolveAdjudicator(next, { context: "cli", env: io.env });
       // Consent is bound to the origin: a new host (another preset, --base-url) asks again.
-      const previous = currentOrigin(config, io.env);
+      const previous = personalOrigin(ctx.root);
       const ask = mustAsk(r, previous);
       if (ask) {
         if (!(await ensureConsent(io, r, next, { acceptRemote: !!values["accept-remote"] }))) {
@@ -1302,7 +1396,7 @@ export async function adjudicatorCommand(
           return 1;
         }
       } else if (r.configuredRemote) io.out(remoteNotice(r, next));
-      Object.assign(patch, consentPatch(r, previous, ask));
+      Object.assign(patch, consentPatch(r, ask));
       writeAdjudicatorPatch(paths().configFile, patch);
       const ra = resolveAdjudicator(load(), { context: "cli", env: io.env });
       io.out(
@@ -1316,7 +1410,7 @@ export async function adjudicatorCommand(
     }
 
     case "key":
-      return keyCommand(rest, values, io, load);
+      return keyCommand(rest, values, io, load, ctx.root);
 
     case "test":
       return testCommand(rest.join(" "), providerFlag[0], !!values.json, load(), io, deps);
@@ -1351,8 +1445,11 @@ export async function adjudicatorCommand(
       let since: number | undefined;
       try {
         since = parseSince(str(values.since), io.now());
-      } catch (err) {
-        io.err((err as Error).message);
+      } catch {
+        // A fixed message: the value is never echoed (task #57).
+        io.err(
+          "invalid --since: use an ISO date (2026-10-01) or a relative value like 30d, 12h, 2w",
+        );
         return 2;
       }
       const db = await storage(ctx, deps);
@@ -1443,6 +1540,7 @@ async function keyCommand(
   values: Record<string, unknown>,
   io: Io,
   load: () => Config,
+  root: string,
 ): Promise<number> {
   const [action = "status", positional, ...extra] = rest;
   // `key set --provider groq` names the provider like `key set groq`.
@@ -1472,6 +1570,7 @@ async function keyCommand(
           io.err("--from-env takes the NAME of an environment variable, not a key");
           return 2;
         }
+        if (personalFileUntrusted(io, root)) return 1;
         writeAdjudicatorPatch(paths().configFile, { keyEnv: fromEnv });
         io.out(
           `The adjudicator now reads its key from $${fromEnv}${io.env[fromEnv] ? ` (set: ${mask(io.env[fromEnv])})` : " (not set in this shell)"}; no key was stored.`,
@@ -1487,6 +1586,7 @@ async function keyCommand(
         );
         return 2;
       }
+      if (personalFileUntrusted(io, root, paths().adjudicatorKey)) return 1;
       const label = id === "typesafe" ? "TypeSafe (Jev)" : presetLabel(id.slice(7) as PresetId);
       let key: string;
       try {

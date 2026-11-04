@@ -658,12 +658,19 @@ Apply happens only when ALL of these hold:
 1. `mode` is `"apply"`.
 2. `apply.scope` allows it: `"swarm"` means swarm workers only; `"all"` means any
    `subagent_type`.
-3. `process.env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE` is unset or `"0"`.
+3. `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` is off, by Claude Code's on/off rule
+   (src/adjudicator/env.ts `subagentModelForced`): `1`/`true`/`yes`/`on` in any casing are on,
+   everything else is off. The hook, the plan advice and the CLI's status/doctor all read it there.
 4. `tool_input.model` is absent. An explicit choice always wins, and the row's action becomes
    `"respected"`.
 5. With `respectFrontmatter`: the agent's frontmatter model is absent or `"inherit"`. For swarm
-   agents it comes from `RoleSpec.model`; for others from `.claude/agents/<type>.md` under the
-   project root, read in at most 1 ms. Unknown counts as "not pinned".
+   agents it comes from `RoleSpec.model`; for others src/adjudicator/agent-pin.ts
+   `resolveAgentPin` finds the definition in Claude Code's order: managed > project
+   `.claude/agents` (cwd up to the repo root, closest first) > user `~/.claude/agents` > plugin
+   agents (`installed_plugins.json` + `CLAUDE_CODE_PLUGIN_DIRS`, scoped name) > built-ins.
+   Folders are scanned recursively and matched on the frontmatter `name`. An unknown pin
+   (nothing found, unreadable, conflicting copies, scan limits, a session-only `--agents` agent)
+   is never overridden: the action is `advised` and the row's `scores.pin` says why.
 6. tier confidence ≥ `apply.minConfidence`.
 7. The tier, clamped to [floor, ceiling], is one of sonnet/opus/haiku/fable.
 
@@ -821,7 +828,7 @@ Every savings figure is shown with its assumptions:
 | key file permissions too open | not read; doctor fails with a `chmod 600` hint |
 | breaker open, slow p95, or over the daily budget | provider skipped; status recorded |
 | DB busy or locked, or v8 not migrated | the verdict is still returned but not persisted. `hooks.ts` wraps each surface in try/catch and never throws into the dispatcher |
-| `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` | no apply; action respected; doctor warns when mode is apply |
+| `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` on (`1`/`true`/`yes`/`on`) | no apply; action respected; status and doctor warn when mode is apply |
 | explicit Agent model, or pinned frontmatter | no apply; action respected |
 | model outside the org's `availableModels` | Claude Code substitutes another; reconcile records `actual_model` and the mismatch |
 | Claude Code ignores a hook-set model | detected as `apply_ineffective`; status and doctor recommend advise |

@@ -70,10 +70,17 @@ export function itemId(i: number): string {
   return `i${i}`;
 }
 
+/** Roles sent per request, "none" included (task #56): swarm.yaml comes with the repo. */
+export const MAX_ROLES = 16;
+/** A role name sent to a provider: a short identifier. Others are left out. */
+const ROLE_NAME = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/;
+
 /**
  * The catalogue for a batch: the configured tier ladder, the roles named in the requests'
  * hints (a swarm's own roles) or DEFAULT_ROLES, and the tool ids (narrowed by `tools` to the
- * registered ones).
+ * registered ones). Every list is bounded, since each provider call carries all of it (task
+ * #56): tiers are unique TIERS (deduped here too), at most MAX_ROLES roles with short identifier
+ * names and one-line descriptions, and tools are the fixed TOOL_IDS.
  */
 export function buildCatalogue(
   reqs: readonly AdjudicationRequest[],
@@ -81,15 +88,19 @@ export function buildCatalogue(
 ): Catalogue {
   const roles = new Map<string, string>();
   for (const r of reqs)
-    for (const role of r.hints?.roles ?? [])
-      if (role.name && !roles.has(role.name)) roles.set(role.name, role.description ?? "");
+    for (const role of r.hints?.roles ?? []) {
+      if (roles.size >= MAX_ROLES - 1) break;
+      if (typeof role.name === "string" && ROLE_NAME.test(role.name) && !roles.has(role.name))
+        roles.set(role.name, typeof role.description === "string" ? role.description : "");
+    }
   if (roles.size === 0) for (const r of DEFAULT_ROLES) roles.set(r, ROLE_DESCRIPTIONS[r]);
   else if (!roles.has("none")) roles.set("none", ROLE_DESCRIPTIONS.none);
 
   const allowed = o.tools ? new Set(o.tools) : undefined;
   const tools = TOOL_IDS.filter((t) => !allowed || allowed.has(t) || t === "none");
+  const tiers = [...new Set(o.tiers)].filter((t) => t in TIER_CRITERIA);
   return {
-    tiers: o.tiers.map((t) => ({ name: t, description: TIER_CRITERIA[t] })),
+    tiers: tiers.map((t) => ({ name: t, description: TIER_CRITERIA[t] })),
     roles: [...roles].map(([name, description]) => ({ name, description: oneLine(description) })),
     tools: tools.map((t) => ({ name: t, description: TOOL_DESCRIPTIONS[t] })),
   };

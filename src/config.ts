@@ -1,5 +1,6 @@
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { userInfo } from "node:os";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { z } from "zod";
 import { MODES, PROVIDER_IDS, TIERS } from "./adjudicator/types.js";
 import { paths } from "./paths.js";
@@ -98,8 +99,18 @@ const buildAdjudicatorObject = () =>
       })
       .prefault({}),
     minPromptChars: z.number().int().min(0).default(12),
-    /** Ordered ladder, smallest first; "fable" may be inserted by the user. */
-    tiers: z.array(z.enum(TIERS)).min(1).default(["haiku", "sonnet", "opus"]),
+    /**
+     * Ordered ladder, smallest first; "fable" may be inserted by the user. Every provider request
+     * carries the whole ladder and a committed project file may set it, so it is bounded: each
+     * tier at most once (task #56).
+     */
+    tiers: z
+      .array(z.enum(TIERS))
+      .min(1)
+      .max(TIERS.length)
+      .refine((t) => new Set(t).size === t.length, "adjudicator.tiers must not repeat a tier")
+      .meta({ uniqueItems: true })
+      .default(["haiku", "sonnet", "opus"]),
     weights: z
       .object({
         providerMax: z.number().min(0).max(1).default(0.7),
@@ -107,10 +118,16 @@ const buildAdjudicatorObject = () =>
         selfReportScale: z.number().min(0).max(1).default(0.6),
         lowConfidence: z.number().min(0).max(1).default(0.55),
         tierCenters: z
-          .record(z.string(), z.number())
+          .record(z.string().max(32), z.number())
+          .refine((o) => Object.keys(o).length <= 16, "at most 16 tier centers")
+          .meta({ maxProperties: 16 })
           .default({ haiku: 0.6, sonnet: 2.0, opus: 3.4 }),
         /** Per-feature weight overrides (§7.2), e.g. {"design": 2.0, "toolProvider": 0.2}. */
-        features: z.record(z.string(), z.number()).default({}),
+        features: z
+          .record(z.string().max(64), z.number())
+          .refine((o) => Object.keys(o).length <= 64, "at most 64 feature weights")
+          .meta({ maxProperties: 64 })
+          .default({}),
       })
       .prefault({}),
     apply: z
@@ -562,22 +579,173 @@ export function droppedProjectAdjudicatorKeys(raw: Record<string, unknown>): str
 }
 
 /**
- * One line for doctor/status when <root>/eminiar.config.json sets adjudicator keys that only the
- * personal config may set; undefined when it sets none.
+ * One line for doctor/status/dashboard when adjudicator keys that only the personal config may
+ * set are ignored: set by <root>/eminiar.config.json, or by a "personal" config.json that lives
+ * inside the project (personalConfigTrusted). Undefined when nothing is ignored.
  */
 export function projectAdjudicatorWarning(projectRoot: string): string | undefined {
-  const file = join(projectRoot, "eminiar.config.json");
+  const lines: string[] = [];
+  const personal = personalAdjudicatorWarning(projectRoot);
+  if (personal) lines.push(personal);
+  const raw = readJsonQuiet(join(projectRoot, "eminiar.config.json"));
+  const dropped = raw ? droppedProjectAdjudicatorKeys(raw) : [];
+  if (dropped.length)
+    lines.push(
+      `eminiar.config.json sets adjudicator.${dropped.join(", adjudicator.")}: ignored, only ~/.eminiar/config.json may set ${dropped.length === 1 ? "it" : "them"}`,
+    );
+  return lines.length ? lines.join(" · ") : undefined;
+}
+
+/**
+ * The warning for an untrusted personal config (task #54); the keys come first, before any
+ * ":", so the dashboard can read them out of the line.
+ */
+function personalAdjudicatorWarning(projectRoot: string): string | undefined {
+  const file = paths().configFile;
+  const raw = readJsonQuiet(file);
+  const dropped = raw ? droppedProjectAdjudicatorKeys(raw) : [];
+  if (!dropped.length || personalConfigTrusted(projectRoot, file)) return undefined;
+  return `adjudicator.${dropped.join(", adjudicator.")} ignored: ${file} is inside this project (EMINIAR_HOME or HOME points into it), and only a config outside the project may set ${dropped.length === 1 ? "it" : "them"}`;
+}
+
+/** A JSON object file, or undefined when it is missing, malformed or not an object. */
+function readJsonQuiet(file: string): Record<string, unknown> | undefined {
   if (!existsSync(file)) return undefined;
-  let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(file, "utf8"));
+    const raw: unknown = JSON.parse(readFileSync(file, "utf8"));
+    return isPlainObject(raw) ? raw : undefined;
   } catch {
     return undefined; // loadConfig already reports a malformed file
   }
-  if (!isPlainObject(raw)) return undefined;
-  const dropped = droppedProjectAdjudicatorKeys(raw);
-  if (!dropped.length) return undefined;
-  return `eminiar.config.json sets adjudicator.${dropped.join(", adjudicator.")}: ignored, only ~/.eminiar/config.json may set ${dropped.length === 1 ? "it" : "them"}`;
+}
+
+// --- trust anchor for the personal config (task #54) ---------------------------------------
+
+const CASE_INSENSITIVE_FS = process.platform === "darwin" || process.platform === "win32";
+
+/**
+ * realpath (canonical case where the OS gives it); for a path that does not exist yet, the real
+ * path of its nearest existing ancestor plus the rest, so a file about to be written is placed too.
+ */
+function realPath(p: string): string {
+  const abs = resolve(p);
+  try {
+    return realpathSync.native(abs);
+  } catch {
+    const parent = dirname(abs);
+    return parent === abs ? abs : join(realPath(parent), basename(abs));
+  }
+}
+
+function samePath(a: string, b: string): boolean {
+  return CASE_INSENSITIVE_FS ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+/** `child` is `parent` or below it (both real paths). */
+function isInside(child: string, parent: string): boolean {
+  const rel = relative(
+    CASE_INSENSITIVE_FS ? parent.toLowerCase() : parent,
+    CASE_INSENSITIVE_FS ? child.toLowerCase() : child,
+  );
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
+/**
+ * The OS account's home directory from the user database (os.userInfo(), i.e. getpwuid on
+ * POSIX), never $HOME: an env block cannot move it. Undefined when the lookup fails.
+ */
+function accountHome(): string | undefined {
+  try {
+    return userInfo().homedir || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The work tree enclosing `start` (the nearest ancestor holding `.git`) and every work tree of
+ * that repository: the main one and each linked `git worktree`. Read from the files git keeps
+ * (`.git` file → gitdir → commondir → worktrees/<name>/gitdir), so no git process is spawned.
+ */
+function gitWorktrees(start: string): string[] {
+  const out: string[] = [];
+  let dir = start;
+  for (;;) {
+    const dotGit = join(dir, ".git");
+    let isFile: boolean | undefined;
+    try {
+      isFile = statSync(dotGit).isFile();
+    } catch {
+      isFile = undefined;
+    }
+    if (isFile !== undefined) {
+      out.push(dir);
+      try {
+        let gitDir = dotGit;
+        if (isFile) {
+          const m = /^gitdir:\s*(.+)$/m.exec(readFileSync(dotGit, "utf8"));
+          if (!m?.[1]) return out;
+          gitDir = resolve(dir, m[1].trim());
+        }
+        let common = gitDir;
+        try {
+          common = resolve(gitDir, readFileSync(join(gitDir, "commondir"), "utf8").trim());
+        } catch {
+          // a main work tree's .git directory is its own common dir
+        }
+        if (basename(common) === ".git") out.push(dirname(common));
+        const wt = join(common, "worktrees");
+        let names: string[] = [];
+        try {
+          names = readdirSync(wt).slice(0, 256);
+        } catch {
+          // no linked work trees
+        }
+        for (const name of names) {
+          try {
+            const g = readFileSync(join(wt, name, "gitdir"), "utf8").trim();
+            if (g) out.push(dirname(resolve(wt, name, g)));
+          } catch {
+            // a pruned or half-written entry
+          }
+        }
+      } catch {
+        // an unreadable .git: the enclosing work tree alone is still an anchor
+      }
+      return out;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) return out;
+    dir = parent;
+  }
+}
+
+/**
+ * Whether `file` (default: paths().configFile; also the key file) is the user's own and may set
+ * the adjudicator keys that decide where text and keys go (task #54). A trusted project's
+ * .claude/settings.json `env` block reaches the hooks, so it could point EMINIAR_HOME (or HOME,
+ * which os.homedir() reads) at a config.json the repo ships. The anchor the repo cannot move is
+ * the account's own home from the user database: a file directly in <account home>/.eminiar is
+ * always trusted. Any other location is trusted only when its real path is outside the project
+ * root, the current directory and every git work tree of either (a cloned repo cannot write
+ * outside its own checkout without running code). The file need not exist yet.
+ */
+export function personalConfigTrusted(
+  projectRoot: string,
+  file: string = paths().configFile,
+): boolean {
+  const real = realPath(file);
+  const home = accountHome();
+  if (home && samePath(dirname(real), realPath(join(home, ".eminiar")))) return true;
+  const anchors = new Set<string>();
+  for (const start of [projectRoot, process.cwd()]) {
+    if (!start) continue;
+    const r = realPath(start);
+    anchors.add(r);
+    for (const w of gitWorktrees(r)) anchors.add(realPath(w));
+  }
+  for (const a of anchors) if (isInside(real, a)) return false;
+  return true;
 }
 
 /**
@@ -595,13 +763,25 @@ function projectLayer(raw: Record<string, unknown>): Record<string, unknown> {
 }
 
 /**
+ * The personal layer: paths().configFile as it is, unless it sets adjudicator keys outside
+ * PROJECT_ADJUDICATOR_KEYS from a location the project could have put there
+ * (personalConfigTrusted, task #54); then it gets the project layer's cut.
+ */
+function personalLayer(projectRoot: string): Record<string, unknown> {
+  const file = paths().configFile;
+  const raw = readJson(file);
+  if (!droppedProjectAdjudicatorKeys(raw).length) return raw;
+  return personalConfigTrusted(projectRoot, file) ? raw : projectLayer(raw);
+}
+
+/**
  * Precedence: defaults < ~/.eminiar/config.json < <root>/eminiar.config.json < EMINIAR_* env.
  * The project file is the one teams commit.
  */
 export function loadConfig(projectRoot: string): Config {
   const merged = deepMerge(
     deepMerge(
-      readJson(paths().configFile),
+      personalLayer(projectRoot),
       projectLayer(readJson(join(projectRoot, "eminiar.config.json"))),
     ),
     envOverrides(),

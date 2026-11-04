@@ -696,6 +696,7 @@
             "opus"
           ],
           "minItems": 1,
+          "maxItems": 4,
           "type": "array",
           "items": {
             "type": "string",
@@ -705,7 +706,8 @@
               "opus",
               "fable"
             ]
-          }
+          },
+          "uniqueItems": true
         },
         "weights": {
           "default": {},
@@ -743,21 +745,25 @@
               },
               "type": "object",
               "propertyNames": {
-                "type": "string"
+                "type": "string",
+                "maxLength": 32
               },
               "additionalProperties": {
                 "type": "number"
-              }
+              },
+              "maxProperties": 16
             },
             "features": {
               "default": {},
               "type": "object",
               "propertyNames": {
-                "type": "string"
+                "type": "string",
+                "maxLength": 64
               },
               "additionalProperties": {
                 "type": "number"
-              }
+              },
+              "maxProperties": 64
             }
           }
         },

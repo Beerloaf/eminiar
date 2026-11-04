@@ -4,7 +4,7 @@ kind: decision
 tags: []
 related: [file:src/adjudicator/agent-pin.ts, file:src/adjudicator/env.ts, file:src/adjudicator/hooks.ts, file:src/adjudicator/swarm.ts]
 created: 2026-11-04T12:47:47.413Z
-updated: 2026-11-04T12:47:47.413Z
+updated: 2026-11-04T13:00:31.575Z
 ---
 
 Adjudicator apply mode: agent model pins and the FORCE flag (tasks #42/#43, swarm run 20261104-483f39, 2026-11-04, branch feature/adjudicator).
@@ -18,4 +18,4 @@ Plugin agents (`plugin:agent`, `plugin:sub:agent`): install paths come from <CLA
 The result is pinned, unpinned or unknown. It is unknown when no file is found, the name is malformed, copies or same-name files disagree, a scan hits its limits, or a bare name isn't found (a --agents session agent cannot be seen from a hook).
 Rule: with apply.respectFrontmatter on, an UNKNOWN pin is never overridden. The action is `advised`, no inline provider call is made, the note says "not applied: the agent's model pin is unknown", and the lookup is stored in the row's scores JSON under `pin`.
 CLAUDE_CODE_SUBAGENT_MODEL_FORCE is read only through src/adjudicator/env.ts subagentModelForced (envFlagOn). It follows Claude Code's on/off rule: 1/true/yes/on in any casing are on; everything else (0/false/no/off, empty, unknown values) is off.
-swarm.ts modelForced delegates to it. cli.ts still has its own copy; follow-up task #59.
+swarm.ts modelForced delegates to it. cli.ts status/doctor delegate to it too (task #59).

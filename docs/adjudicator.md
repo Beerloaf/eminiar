@@ -103,6 +103,17 @@ cannot send your text or keys anywhere. In `eminiar.config.json` the adjudicator
 while the adjudicator is off. A repo that turns the adjudicator on for someone with no personal
 setup gets the heuristic, which never leaves the machine.
 
+The same `.claude/settings.json` `env` block could also move `EMINIAR_HOME` (or `HOME`) into the
+repo, so that a `config.json` the repo ships is read as your personal one. eminiar anchors the
+personal config to your account: `~/.eminiar/config.json` in the home directory from the
+system's user database (not `$HOME`) is always yours. A `config.json` anywhere else is honoured
+only when its real path, after symlinks, is outside the project root, the current directory and
+every git work tree of that repository. A personal config inside the project gets the same
+treatment as `eminiar.config.json`: only the keys listed above apply, and doctor, status and the
+dashboard name the ones it ignored. `enable`, `provider` and `key set` refuse to write there (a
+key stored inside a repo could be committed). Keep a custom `EMINIAR_HOME` outside your projects;
+temporary directories, as tests and CI use, are fine.
+
 ## Providers and privacy
 
 | Provider | Choose with | Runs where | What leaves this machine | Needs |
@@ -165,7 +176,10 @@ adjudicator off.
 A config written before consent named origins (`remoteConsent: true` with no list) still covers
 the built-in hosts (`https://api.groq.com`, `https://api.cerebras.ai`, `https://api.typesafe.ai`)
 for the provider your config names, but not for one `EMINIAR_ADJUDICATOR_PROVIDER` swaps in. The
-next `enable` or `provider` records the origin it was given for.
+next `enable` or `provider` writes `remoteConsentOrigins` with only the origin its notice named.
+The provider your config named is worked out from `~/.eminiar/config.json` alone, never from an
+environment override. If you move to another host, the old one asks again the next time you pick
+it.
 
 eminiar never follows an HTTP redirect from a provider: a 3xx answer is an error, so a server
 cannot forward your text or key to another host. Set the base URL to the final endpoint.
@@ -215,7 +229,10 @@ dashboard payload. A config section that contains a field named like `apiKey`, `
 there is no terminal (`pbpaste | eminiar adjudicator key set typesafe`). It stores the key in
 **`~/.eminiar/adjudicator.key`**, a JSON file with mode **0600** written through a temporary file
 and a rename. A key file that group or others can read is ignored, and `doctor` tells you to run
-`chmod 600`. A key given as an argument is refused.
+`chmod 600`. A key given as an argument is refused, and so is any flag value shaped like one:
+`--model`, `--since`, `--fixture` or `--repeat` with a key prefix or a long run of characters
+with digits, and a `--base-url` with a user name or password, a fragment, or a query parameter or
+path segment that holds a key. The error never repeats the value and nothing is written.
 
 eminiar looks for a key in this order:
 
@@ -269,8 +286,11 @@ These are Claude Code's rules for a subagent's model, and the adjudicator follow
 
 1. `model` on the Agent call wins, then the subagent's frontmatter `model` (`inherit` means the
    main model), then `CLAUDE_CODE_SUBAGENT_MODEL`, then the main session's model.
-2. `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` overrides all of them. When it is set (and not `0`), the
-   adjudicator never changes a model, and the plan advice says the model line is informational.
+2. `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` overrides all of them. It follows Claude Code's on/off
+   rule: `1`, `true`, `yes` or `on`, in any casing, turn it on; anything else (`0`, `false`,
+   `no`, `off`, empty, unknown values) leaves it off. While it is on, the adjudicator never
+   changes a model, the plan advice says the model line is informational, and `status` and
+   `doctor` warn in apply mode.
 3. The Agent `model` parameter accepts only `haiku`, `sonnet`, `opus` and `fable`.
 4. **Effort cannot be set per call.** `effort` is not an Agent input; it is set only in the
    agent file's frontmatter. The adjudicator therefore suggests an effort level but never
@@ -280,13 +300,24 @@ Apply mode changes the model only when all of these hold:
 
 - `apply.scope` is `all`, or the dispatch is a swarm worker (`swarm`, the default)
 - the call has no explicit `model`
-- the agent file has no `model` pin, or `apply.respectFrontmatter` is `false`
-- `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` is unset or `0`
+- the agent's definition has no `model` pin (or `inherit`), or `apply.respectFrontmatter` is
+  `false`
+- `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` is off
 - the tier confidence is at least `apply.minConfidence`
 
 The tier is clamped to `apply.floor` … `apply.ceiling`. The hook keeps every other field of the
 call, never turns a deny or ask into an allow, and never adds `effort`. Each dispatch is recorded
 as `advised`, `applied` or `respected` (left alone because of an explicit model, a pin or FORCE).
+
+The pin is looked up the way Claude Code finds the agent: managed agents first, then the
+project's `.claude/agents` folders from the current directory up to the repo root (closest
+first), then `~/.claude/agents`, then plugin agents (`plugin:agent`, from
+`installed_plugins.json` and `CLAUDE_CODE_PLUGIN_DIRS`), then the built-in agents. Folders are
+searched recursively and matched on the frontmatter `name`, not the file name. When the pin
+cannot be known (no definition found, an unreadable or malformed file, copies that disagree, or
+an agent defined only for the session with `--agents`), apply mode leaves the model alone and
+only advises: the note says "not applied: the agent's model pin is unknown" and the decision's
+`scores.pin` records why.
 
 ## Swarm plans
 
