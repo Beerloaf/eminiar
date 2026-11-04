@@ -10,8 +10,9 @@
  *   onSessionEnd    reconcile; drop the session's main-advice counter
  *
  * Rules that hold everywhere: never deny, never inject `effort` (it is not an Agent input),
- * respect CLAUDE_CODE_SUBAGENT_MODEL_FORCE, an explicit `model` and a frontmatter pin, skip
- * the Cursor client, and never throw (advice must not break a hook).
+ * respect CLAUDE_CODE_SUBAGENT_MODEL_FORCE, an explicit `model` and a frontmatter pin (managed,
+ * project, user or plugin agent; one that cannot be read is not overridden), skip the Cursor
+ * client, and never throw (advice must not break a hook).
  */
 
 import { readdirSync, readFileSync } from "node:fs";
@@ -25,9 +26,11 @@ import { getStorage } from "../storage/index.js";
 import type { AdjudicationInput, AdjudicationPatch } from "../storage/types.js";
 import { coordinationRoot, type SwarmSpawnCheck } from "../swarm/hooks.js";
 import type { TaskRow } from "../swarm/types.js";
+import { type AgentPin, resolveAgentPin } from "./agent-pin.js";
 import { type AsyncJob, spawnAsyncJob } from "./async.js";
 import { resolveAdjudicator } from "./config.js";
 import { adjudicateOne, cacheKeyFor, type EngineOptions } from "./engine.js";
+import { subagentModelForced } from "./env.js";
 import { extractFeatures } from "./features.js";
 import { topIntent } from "./heuristic.js";
 import { biasFor, reconcile } from "./learn.js";
@@ -285,18 +288,6 @@ export interface AgentAdvice {
   rowId?: number;
 }
 
-/** The `model:` of `.claude/agents/<type>.md`, when the file exists and says one. */
-export function frontmatterModel(root: string, agentType: string): string | undefined {
-  if (!/^[A-Za-z0-9_.-]+$/.test(agentType)) return undefined; // plugin agents: unknown
-  try {
-    const text = readFileSync(join(root, ".claude", "agents", `${agentType}.md`), "utf8");
-    const fm = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text)?.[1];
-    return fm ? /^model:\s*["']?([^"'\s#]+)/m.exec(fm)?.[1] : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 /** The tier within [floor, ceiling] on the haiku < sonnet < opus < fable ladder. */
 export function clampTier(tier: string, floor: Tier, ceiling: Tier): Tier | undefined {
   const r = tierRank(tier);
@@ -304,6 +295,21 @@ export function clampTier(tier: string, floor: Tier, ceiling: Tier): Tier | unde
   const lo = tierRank(floor);
   const hi = Math.max(lo, tierRank(ceiling));
   return TIERS[Math.min(hi, Math.max(lo, r))];
+}
+
+/**
+ * The row's scores JSON with the agent-pin lookup added under `pin`, so a decision shows why a
+ * model was or was not applied. Empty when the row or its scores cannot be read.
+ */
+function withPin(db: StorageAdapter, rowId: number, pin: AgentPin): { scores?: string } {
+  try {
+    const raw = db.adjudicator.get(rowId)?.scores;
+    const parsed: unknown = raw ? JSON.parse(raw) : {};
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return { scores: JSON.stringify({ ...parsed, pin }) };
+  } catch {
+    return {};
+  }
 }
 
 /** The swarm task of a worker dispatch: this project's ledger, else the coordination root's. */
@@ -320,11 +326,6 @@ function findTask(
   const mdb = getStorage(getContext(main), { vectors: false });
   const m = mdb.swarm.taskGet(taskId);
   return m && m.run_id === runId ? { db: mdb, task: m } : undefined;
-}
-
-function forced(env: NodeJS.ProcessEnv): boolean {
-  const v = env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE;
-  return v !== undefined && v !== "" && v !== "0";
 }
 
 /**
@@ -375,12 +376,17 @@ export async function onPreAgent(
   }
 
   const explicit = str(ti.model);
-  const pinned = frontmatterModel(ctx.root, agentType);
+  // The agent's definition in Claude Code's lookup order. A pin that cannot be read (a plugin
+  // agent without a readable file, a --agents session agent) is never overridden: advice only.
+  const pin = resolveAgentPin(agentType, { root: ctx.root, cwd: input.cwd, env });
+  const pinned = pin.status === "pinned" ? pin.model : undefined;
   const pinnedRespected = cfg.apply.respectFrontmatter && isPinned(pinned);
-  const isForced = forced(env);
+  const pinUnknown = cfg.apply.respectFrontmatter && pin.status === "unknown";
+  const isForced = subagentModelForced(env);
   const applyMode = cfg.mode === "apply";
   const inScope = cfg.apply.scope === "all" || !!worker;
-  const mayApply = applyMode && inScope && !isForced && !explicit && !pinnedRespected;
+  const mayApply =
+    applyMode && inScope && !isForced && !explicit && !pinnedRespected && !pinUnknown;
   const sessionId =
     input.session_id && input.session_id !== "unknown" ? input.session_id : undefined;
   const baseline = resolveBaseline(db, { pinned, sessionId, ts: now });
@@ -431,7 +437,7 @@ export async function onPreAgent(
       explicit ??
       (isForced ? (str(env.CLAUDE_CODE_SUBAGENT_MODEL) ?? null) : null) ??
       (isPinned(pinned) ? pinned : null);
-  } else if (clamped && conf >= cfg.apply.minConfidence) {
+  } else if (clamped && conf >= cfg.apply.minConfidence && !pinUnknown) {
     action = "applied";
     model = clamped;
     modelFinal = clamped;
@@ -441,7 +447,7 @@ export async function onPreAgent(
   }
   if (a.rowId !== undefined) {
     try {
-      db.adjudicator.update(a.rowId, { action, modelFinal });
+      db.adjudicator.update(a.rowId, { action, modelFinal, ...withPin(db, a.rowId, pin) });
     } catch {
       // the row keeps its verdict without the action
     }
@@ -450,6 +456,8 @@ export async function onPreAgent(
   const why = `complexity ${c}, conf ${conf.toFixed(2)}`;
   const extras = [`suggested effort ${effort}`];
   if (role && role !== "none") extras.push(`role ${role}`);
+  if (applyMode && inScope && pinUnknown && !isForced && !explicit)
+    extras.push("not applied: the agent's model pin is unknown");
   let note: string;
   if (action === "applied") {
     note = `adjudicator: model ${model} applied (${why}); ${extras.join(", ")}`;

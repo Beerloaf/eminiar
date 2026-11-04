@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { envFlagOn, subagentModelForced } from "../../src/adjudicator/env.js";
 import {
   hasProvider,
   registerProvider,
@@ -196,6 +197,27 @@ describe("plan advice helpers", () => {
     );
     expect(modelForced({ CLAUDE_CODE_SUBAGENT_MODEL_FORCE: "0" })).toBe(false);
     expect(modelForced({})).toBe(false);
+  });
+
+  it("reads CLAUDE_CODE_SUBAGENT_MODEL_FORCE with Claude Code's on/off rule, like the hook (#43)", () => {
+    const on = ["1", "true", "TRUE", "yes", "Yes", "on", "ON", " 1 "];
+    const off = ["0", "false", "False", "no", "off", "OFF", "", " ", "2", "enabled"];
+    for (const v of on) {
+      expect(envFlagOn(v), v).toBe(true);
+      expect(subagentModelForced({ CLAUDE_CODE_SUBAGENT_MODEL_FORCE: v }), v).toBe(true);
+      expect(modelForced({ CLAUDE_CODE_SUBAGENT_MODEL_FORCE: v }), v).toBe(true);
+    }
+    for (const v of off) {
+      expect(envFlagOn(v), v).toBe(false);
+      expect(modelForced({ CLAUDE_CODE_SUBAGENT_MODEL_FORCE: v }), v).toBe(false);
+    }
+    expect(envFlagOn(undefined)).toBe(false);
+    const one: PlanAdvice[] = [
+      { taskId: 1, agentType: "a", model: "haiku", effort: "low", complexity: 1, confidence: 0.9 },
+    ];
+    expect(planAdviceBlock(one, { CLAUDE_CODE_SUBAGENT_MODEL_FORCE: "no" })).toMatch(
+      /^Adjudicator suggestions: pass the model/,
+    );
   });
 });
 

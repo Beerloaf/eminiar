@@ -4,6 +4,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { resolveAgentPin } from "../../src/adjudicator/agent-pin.js";
 import type { AsyncJob } from "../../src/adjudicator/async.js";
 import { resolveAdjudicator } from "../../src/adjudicator/config.js";
 import { clearKey, resetSecrets, setKey } from "../../src/adjudicator/secrets.js";
@@ -52,12 +53,17 @@ const ENV_KEYS = [
   "EMINIAR_ADJUDICATOR_REMOTE",
   "CLAUDE_PROJECT_DIR",
   "CLAUDE_CODE_SUBAGENT_MODEL_FORCE",
+  "HOME",
+  "CLAUDE_CODE_PLUGIN_CACHE_DIR",
+  "CLAUDE_CODE_PLUGIN_DIRS",
 ];
 
 beforeAll(() => {
   for (const k of ENV_KEYS) saved[k] = process.env[k];
   for (const k of ENV_KEYS) delete process.env[k];
   process.env.EMINIAR_HOME = mkdtempSync(join(tmpdir(), "em-adj-hooks-home-"));
+  // User-level and plugin agents are read from HOME: keep the real ~/.claude out of the tests.
+  process.env.HOME = mkdtempSync(join(tmpdir(), "em-adj-hooks-user-"));
   root = mkdtempSync(join(tmpdir(), "em-adj-hooks-root-"));
   writeFileSync(join(root, "package.json"), "{}");
   // Swarm enforcement and roots follow the session's project dir: keep them on this project.
@@ -420,6 +426,127 @@ describe("PreToolUse Agent, apply mode", () => {
       expect(o?.hookSpecificOutput?.permissionDecision).not.toBe("deny");
   });
 
+  it("respects a user-level pin in ~/.claude/agents (#42 repro) and records the pin", async () => {
+    apply({}, "off");
+    const dir = join(process.env.HOME as string, ".claude", "agents", "review");
+    mkdirSync(dir, { recursive: true });
+    // Identity is the frontmatter name, not the file name, and subfolders are scanned.
+    writeFileSync(
+      join(dir, "reviewer-file.md"),
+      "---\nname: deep-reviewer\ndescription: thorough reviewer\nmodel: opus\n---\nReview.\n",
+    );
+    const input = {
+      ...AGENT_INPUT,
+      subagent_type: "deep-reviewer",
+      prompt: "Rename the variable foo to bar in src/a.ts",
+    };
+    const out = await preTool("Agent", input);
+    expect(out?.hookSpecificOutput?.updatedInput).toBeUndefined();
+    const r = rowsOf(sid, "agent")[0]!;
+    expect(r.action).toBe("respected");
+    expect(r.baselineModel).toBe("opus");
+    expect(r.modelFinal).toBe("opus");
+    const pin = JSON.parse(r.scores!).pin;
+    expect(pin).toMatchObject({ status: "pinned", source: "user", model: "opus" });
+    expect(pin.file).toBe(join("~", ".claude", "agents", "review", "reviewer-file.md"));
+  });
+
+  it("a project definition shadows the user one of the same name", async () => {
+    apply({}, "off");
+    const user = join(process.env.HOME as string, ".claude", "agents");
+    mkdirSync(user, { recursive: true });
+    writeFileSync(join(user, "shadowed.md"), "---\nname: shadowed\nmodel: opus\n---\nb\n");
+    mkdirSync(join(root, ".claude", "agents"), { recursive: true });
+    writeFileSync(
+      join(root, ".claude", "agents", "shadowed.md"),
+      "---\nname: shadowed\nmodel: inherit\n---\nb\n",
+    );
+    const out = await preTool("Agent", { ...AGENT_INPUT, subagent_type: "shadowed" });
+    expect(out?.hookSpecificOutput?.updatedInput?.model).toBeDefined();
+    expect(rowsOf(sid, "agent")[0]!.action).toBe("applied");
+  });
+
+  it("never applies over a plugin agent whose definition cannot be read; says why", async () => {
+    apply({}, "off");
+    const out = await preTool("Agent", { ...AGENT_INPUT, subagent_type: "ghost-plugin:helper" });
+    expect(out?.hookSpecificOutput?.updatedInput).toBeUndefined();
+    expect(out?.hookSpecificOutput?.additionalContext).toMatch(/model pin is unknown/);
+    const r = rowsOf(sid, "agent")[0]!;
+    expect(r.action).toBe("advised");
+    expect(r.modelFinal).toBeNull();
+    expect(JSON.parse(r.scores!).pin).toMatchObject({ status: "unknown", source: "plugin" });
+
+    // An unknown bare name (a --agents session agent?) is advice only too.
+    const bare = await preTool("Agent", { ...AGENT_INPUT, subagent_type: "nowhere-agent" });
+    expect(bare?.hookSpecificOutput?.updatedInput).toBeUndefined();
+    expect(rowsOf(sid, "agent").map((x) => x.action)).toEqual(["advised", "advised"]);
+  });
+
+  it("finds installed plugin agents: applies to an unpinned one, respects a pinned one", async () => {
+    apply({}, "off");
+    const install = mkdtempSync(join(tmpdir(), "em-adj-plugin-"));
+    mkdirSync(join(install, "agents", "review"), { recursive: true });
+    writeFileSync(join(install, "agents", "plain.md"), "---\nname: plain\n---\nb\n");
+    writeFileSync(
+      join(install, "agents", "review", "security.md"),
+      "---\nname: security\nmodel: 'opus' # pinned\n---\nb\n",
+    );
+    const plugins = join(process.env.HOME as string, ".claude", "plugins");
+    mkdirSync(plugins, { recursive: true });
+    writeFileSync(
+      join(plugins, "installed_plugins.json"),
+      JSON.stringify({
+        version: 2,
+        plugins: { "my-plugin@market": [{ scope: "user", installPath: install }] },
+      }),
+    );
+    const plain = await preTool("Agent", { ...AGENT_INPUT, subagent_type: "my-plugin:plain" });
+    expect(plain?.hookSpecificOutput?.updatedInput?.model).toBeDefined();
+    const sec = await preTool("Agent", {
+      ...AGENT_INPUT,
+      description: "security",
+      subagent_type: "my-plugin:review:security",
+    });
+    expect(sec?.hookSpecificOutput?.updatedInput).toBeUndefined();
+    const missing = await preTool("Agent", {
+      ...AGENT_INPUT,
+      description: "missing",
+      subagent_type: "my-plugin:absent",
+    });
+    expect(missing?.hookSpecificOutput?.updatedInput).toBeUndefined();
+    const rs = rowsOf(sid, "agent").sort((a, b) => a.id - b.id);
+    expect(rs.map((r) => r.action)).toEqual(["applied", "respected", "advised"]);
+    expect(rs[1]!.modelFinal).toBe("opus");
+  });
+
+  it("respectFrontmatter false applies even over a pin it cannot read", async () => {
+    apply({ apply: { scope: "all", minConfidence: 0, respectFrontmatter: false } }, "off");
+    const out = await preTool("Agent", { ...AGENT_INPUT, subagent_type: "ghost-plugin:helper" });
+    expect(out?.hookSpecificOutput?.updatedInput?.model).toBeDefined();
+  });
+
+  it("reads CLAUDE_CODE_SUBAGENT_MODEL_FORCE with Claude Code's on/off rule (#43)", async () => {
+    apply({}, "off");
+    const cases: Array<[string, boolean]> = [
+      ["1", true],
+      ["TRUE", true],
+      ["yes", true],
+      ["On", true],
+      ["0", false],
+      ["false", false],
+      ["no", false],
+      ["off", false],
+      ["", false],
+    ];
+    for (const [i, [v, isForced]] of cases.entries()) {
+      process.env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE = v;
+      const out = await preTool("Agent", { ...AGENT_INPUT, description: `force ${i}` });
+      expect(out?.hookSpecificOutput?.updatedInput?.model === undefined, `FORCE=${v}`).toBe(
+        isForced,
+      );
+    }
+  });
+
   it("scope swarm leaves a non-worker dispatch to advice", async () => {
     apply({ apply: { scope: "swarm", minConfidence: 0 } }, "off");
     const out = await preTool("Agent", { ...AGENT_INPUT });
@@ -523,6 +650,12 @@ describe("onPreAgent", () => {
       effort: "low",
       role: "coder",
     });
+    // `eminiar swarm sync` writes the worker's agent file; this one pins no model.
+    mkdirSync(join(root, ".claude", "agents"), { recursive: true });
+    writeFileSync(
+      join(root, ".claude", "agents", "swarm-feature-coder.md"),
+      "---\nname: swarm-feature-coder\ndescription: coder\n---\nbody\n",
+    );
     const a = await onPreAgent(
       ctx,
       base({
@@ -866,6 +999,136 @@ describe("Cursor, SessionStart and SessionEnd", () => {
     expect(jobs).toHaveLength(1);
     expect(jobs[0]!.request.surface).toBe("test");
     expect(jobs[0]!.projectRoot).toBe(ollama.root);
+  });
+});
+
+describe("resolveAgentPin: Claude Code's agent lookup order", () => {
+  const md = (name: string, model?: string) =>
+    `---\nname: ${name}\ndescription: d\n${model ? `model: ${model}\n` : ""}---\nbody\n`;
+  function world() {
+    const home = mkdtempSync(join(tmpdir(), "em-pin-home-"));
+    const proj = mkdtempSync(join(tmpdir(), "em-pin-proj-"));
+    mkdirSync(join(proj, ".git"));
+    const put = (dir: string, file: string, text: string) => {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, file), text);
+    };
+    const look = (type: string, over: Record<string, unknown> = {}) =>
+      resolveAgentPin(type, { root: proj, env: { HOME: home }, managedDir: null, ...over });
+    return { home, proj, put, look };
+  }
+
+  it("project (closest to the cwd first), then user, then built-ins", () => {
+    const { home, proj, put, look } = world();
+    put(join(home, ".claude", "agents"), "a.md", md("a", "opus"));
+    expect(look("a")).toMatchObject({ status: "pinned", source: "user", model: "opus" });
+    put(join(proj, ".claude", "agents", "deep"), "whatever.md", md("a", "inherit"));
+    expect(look("a")).toMatchObject({ status: "unpinned", source: "project" });
+    const sub = join(proj, "pkg", "app");
+    put(join(proj, "pkg", ".claude", "agents"), "a.md", md("a", "haiku"));
+    mkdirSync(sub, { recursive: true });
+    expect(look("a", { cwd: sub })).toMatchObject({ status: "pinned", model: "haiku" });
+    // The file name does not identify an agent; only `name` does.
+    put(join(proj, ".claude", "agents"), "b.md", md("not-b", "opus"));
+    expect(look("b").status).toBe("unknown");
+  });
+
+  it("a managed definition wins over project and user", () => {
+    const { home, proj, put, look } = world();
+    const managed = mkdtempSync(join(tmpdir(), "em-pin-managed-"));
+    put(join(managed, ".claude", "agents"), "m.md", md("m", "sonnet"));
+    put(join(proj, ".claude", "agents"), "m.md", md("m"));
+    put(join(home, ".claude", "agents"), "m.md", md("m"));
+    expect(look("m", { managedDir: managed })).toMatchObject({
+      status: "pinned",
+      source: "managed",
+      model: "sonnet",
+    });
+  });
+
+  it("built-ins: no pin for general-purpose/Explore/Plan, fixed models for the others", () => {
+    const { home, put, look } = world();
+    for (const t of ["general-purpose", "Explore", "Plan"])
+      expect(look(t)).toMatchObject({ status: "unpinned", source: "builtin" });
+    expect(look("claude-code-guide")).toMatchObject({ status: "pinned", model: "haiku" });
+    expect(look("statusline-setup")).toMatchObject({ status: "pinned", model: "sonnet" });
+    // A user agent named Explore overrides the built-in and keeps its own model.
+    put(join(home, ".claude", "agents"), "explore.md", md("Explore", "haiku"));
+    expect(look("Explore")).toMatchObject({ status: "pinned", source: "user", model: "haiku" });
+    expect(look("unheard-of").status).toBe("unknown");
+  });
+
+  it("two same-name definitions that disagree are unknown; agreeing ones decide", () => {
+    const { proj, put, look } = world();
+    const dir = join(proj, ".claude", "agents");
+    put(dir, "x1.md", md("dup", "opus"));
+    put(join(dir, "more"), "x2.md", md("dup"));
+    expect(look("dup").status).toBe("unknown");
+    put(dir, "y1.md", md("same", "opus"));
+    put(join(dir, "more"), "y2.md", md("same", '"opus"'));
+    expect(look("same")).toMatchObject({ status: "pinned", model: "opus" });
+  });
+
+  it("plugin agents: installed_plugins.json, scoped subfolders, the manifest agents key", () => {
+    const { home, put, look } = world();
+    const v1 = mkdtempSync(join(tmpdir(), "em-pin-plugin-"));
+    put(join(v1, "agents"), "plain.md", md("plain"));
+    put(join(v1, "agents", "review"), "security.md", md("security", "opus"));
+    const custom = mkdtempSync(join(tmpdir(), "em-pin-plugin-custom-"));
+    put(join(custom, ".claude-plugin"), "plugin.json", JSON.stringify({ agents: ["./extra/"] }));
+    put(join(custom, "agents"), "ignored.md", md("ignored", "opus"));
+    put(join(custom, "extra"), "worker.md", md("worker", "haiku"));
+    put(
+      join(home, ".claude", "plugins"),
+      "installed_plugins.json",
+      JSON.stringify({
+        version: 2,
+        plugins: {
+          "pa@m": [{ scope: "user", installPath: v1 }],
+          "pc@m": [{ scope: "project", installPath: custom, projectPath: "/x" }],
+        },
+      }),
+    );
+    expect(look("pa:plain")).toMatchObject({ status: "unpinned", source: "plugin" });
+    expect(look("pa:review:security")).toMatchObject({ status: "pinned", model: "opus" });
+    expect(look("pa:security").status).toBe("unknown");
+    expect(look("pc:worker")).toMatchObject({ status: "pinned", model: "haiku" });
+    // The manifest key replaces agents/, so that directory is not an agent source.
+    expect(look("pc:ignored").status).toBe("unknown");
+    expect(look("nope:agent")).toMatchObject({ status: "unknown", source: "plugin" });
+    expect(look("pa:../secret").status).toBe("unknown");
+    expect(look("pa:").status).toBe("unknown");
+
+    // A second installed copy that disagrees makes the pin unknown.
+    const v2 = mkdtempSync(join(tmpdir(), "em-pin-plugin-v2-"));
+    put(join(v2, "agents"), "plain.md", md("plain", "sonnet"));
+    put(
+      join(home, ".claude", "plugins"),
+      "installed_plugins.json",
+      JSON.stringify({ plugins: { "pa@m": [{ installPath: v1 }, { installPath: v2 }] } }),
+    );
+    expect(look("pa:plain").status).toBe("unknown");
+  });
+
+  it("plugin roots follow CLAUDE_CODE_PLUGIN_CACHE_DIR and CLAUDE_CODE_PLUGIN_DIRS", () => {
+    const { put, look } = world();
+    const cache = mkdtempSync(join(tmpdir(), "em-pin-cache-"));
+    const inst = mkdtempSync(join(tmpdir(), "em-pin-inst-"));
+    put(join(inst, "agents"), "a.md", md("a", "opus"));
+    put(
+      cache,
+      "installed_plugins.json",
+      JSON.stringify({ plugins: { "pz@m": [{ installPath: inst }] } }),
+    );
+    expect(
+      look("pz:a", { env: { HOME: "/nonexistent", CLAUDE_CODE_PLUGIN_CACHE_DIR: cache } }),
+    ).toMatchObject({ status: "pinned", model: "opus" });
+    const dev = mkdtempSync(join(tmpdir(), "em-pin-dev-"));
+    put(join(dev, ".claude-plugin"), "plugin.json", JSON.stringify({ name: "devp" }));
+    put(join(dev, "agents"), "b.md", md("b"));
+    expect(
+      look("devp:b", { env: { HOME: "/nonexistent", CLAUDE_CODE_PLUGIN_DIRS: `/rel:${dev}` } }),
+    ).toMatchObject({ status: "unpinned", source: "plugin" });
   });
 });
 

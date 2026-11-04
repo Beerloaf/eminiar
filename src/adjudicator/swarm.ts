@@ -15,6 +15,7 @@ import type { ProjectContext } from "../context.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import type { RunRow, SwarmSpec, TaskRow } from "../swarm/types.js";
 import { type Adjudication, adjudicate, type EngineOptions } from "./engine.js";
+import { subagentModelForced } from "./env.js";
 import { complexityBucket, topIntent } from "./heuristic.js";
 import { biasFromRows, type LearningConfig } from "./learn.js";
 import { type AdjudicationRequest, type AdjudicatorProvider, TIERS, type Tier } from "./types.js";
@@ -28,10 +29,9 @@ export function planAdviceEnabled(config: Pick<Config, "adjudicator">): boolean 
   return !!a?.enabled && a.surfaces.plan !== false;
 }
 
-/** The env flag that makes Claude Code ignore `model` on the Agent call. */
+/** The env flag that makes Claude Code ignore `model` on the Agent call (Claude Code's on/off rule). */
 export function modelForced(env: NodeJS.ProcessEnv = process.env): boolean {
-  const v = env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE?.trim().toLowerCase();
-  return !!v && v !== "0" && v !== "false";
+  return subagentModelForced(env);
 }
 
 export interface PlanAdvice {
