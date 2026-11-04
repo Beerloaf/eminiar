@@ -1130,11 +1130,7 @@ function LogRow({
 
 // --- cards -------------------------------------------------------------------------------
 
-/**
- * Overview fields the server sends that the shared AdjOverview type does not list yet: the origin
- * remote consent must cover, and projectAdjudicatorWarning()'s line (task #48).
- */
-type HealthOverview = AdjOverview & { origin?: string | null; projectIgnored?: string | null };
+type HealthOverview = AdjOverview;
 
 /** The adjudicator keys a projectIgnored line names, e.g. ["keyEnv", "provider"]. */
 function ignoredKeysOf(line: string | null | undefined): string[] {

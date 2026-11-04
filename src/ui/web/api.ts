@@ -923,6 +923,10 @@ export interface AdjOverview {
   keySource: "env" | "file" | "none";
   keyFileRefused: boolean;
   consent: boolean;
+  /** The remote origin consent applies to (scheme://host:port), null for local providers. */
+  origin?: string | null;
+  /** The warning line naming project-config adjudicator keys that were ignored, if any. */
+  projectIgnored?: string | null;
   health: AdjHealth[];
   apply: { checked: number; ineffective: number; effective: number };
   summary: AdjSummary;
