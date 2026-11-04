@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { getContext, type ProjectContext, resetContextCache } from "../../src/context.js";
@@ -791,6 +792,49 @@ describe("eminiar swarm CLI", () => {
     expect(fin.code).toBe(0);
     expect(JSON.parse(fin.out)).toMatchObject({ type: "swarm.finished", status: "cancelled" });
     expect(runSnapshot(db, db.swarm.runGet(active.id)!).run.status).toBe("cancelled");
+  });
+
+  it("watch stops quietly with 0 when the reader of its output goes away (EPIPE)", async () => {
+    await tool({ action: "start", swarm: "feat", goal: "watch | head -1" });
+    const db = getStorage(ctx, { vectors: false });
+    const active = db.swarm.runActive("feat")!;
+    const output = new PassThrough();
+    const lines: string[] = [];
+    const started = Date.now();
+    // A long interval and no maxTicks: only the reader going away can end this watch.
+    const code = await swarmCommand(
+      ["watch", "--run", active.id, "--interval", "60"],
+      ctx,
+      {
+        out: (s) => {
+          lines.push(s);
+          // what a closed pipe does to process.stdout after the write
+          setImmediate(() =>
+            output.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" })),
+          );
+        },
+        err: (s) => lines.push(`err: ${s}`),
+      },
+      { output },
+    );
+    expect(code).toBe(0);
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0]!)).toMatchObject({ type: "swarm.snapshot", run: active.id });
+    expect(Date.now() - started).toBeLessThan(5_000);
+
+    // an output that is already closed ends the watch without waiting for a second tick
+    const t1 = Date.now();
+    const closed = new PassThrough();
+    closed.destroy();
+    const again = await swarmCommand(
+      ["watch", "--run", active.id, "--interval", "60"],
+      ctx,
+      { out: () => {}, err: () => {} },
+      { output: closed },
+    );
+    expect(again).toBe(0);
+    expect(Date.now() - t1).toBeLessThan(5_000);
+    await tool({ action: "finish", run: active.id, status: "cancelled" });
   });
 
   it("status in the terminal prints every task, where the tool caps the text", async () => {
