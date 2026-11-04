@@ -181,7 +181,7 @@ export function planAdviceBlock(
 ): string {
   if (!advice.length) return "";
   const head = modelForced(env)
-    ? "Adjudicator suggestions (CLAUDE_CODE_SUBAGENT_MODEL_FORCE is set, so Claude Code ignores `model` on the Agent call; informational only):"
+    ? "Adjudicator suggestions (CLAUDE_CODE_SUBAGENT_MODEL_FORCE is on, so Claude Code ignores `model` on the Agent call; informational only):"
     : "Adjudicator suggestions: pass the model as `model` on each Agent call (effort is advice; it is set only in the agent file):";
   return [head, ...planLines(advice)].join("\n");
 }
