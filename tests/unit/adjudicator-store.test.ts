@@ -546,7 +546,9 @@ describe("SqliteAdjudicatorStore", () => {
     expect(sum.byOutcome).toEqual({ "n/a": 20, pending: 8 });
     expect(sum.latency).toEqual({ n: 20, p50: 10, p95: 19 });
     expect(sum.providerLatency).toEqual({ n: 10, p50: 500, p95: 1000 });
-    expect(sum.rates.follow).toBeCloseTo(3 / 24);
+    // followed / advise-mode dispatches: 3 / (3 followed + 1 ignored). The 20 advised prompt rows
+    // are main-session advice, not dispatches, so they stay out (the old 3 / 24 counted them; #81).
+    expect(sum.rates.follow).toBeCloseTo(3 / 4);
     expect(sum.rates.apply).toBeCloseTo(3 / 4);
     expect(sum.rates.respect).toBeCloseTo(1 / 4);
     expect(sum.costUsd).toBeCloseTo(0.01);
@@ -566,21 +568,66 @@ describe("SqliteAdjudicatorStore", () => {
   it("summary: advised rows whose advice named no model leave the follow rate (#78)", () => {
     const s = a.adjudicator;
     const scores = (o: unknown) => JSON.stringify(o);
+    const ran = "claude-sonnet-5-5";
     s.insert(row({ ts: 1, action: "followed" }));
     s.insert(row({ ts: 2, action: "advised" }));
-    s.insert(row({ ts: 3, action: "advised", scores: scores({ pinDeferred: true, pin: {} }) }));
-    s.insert(row({ ts: 4, action: "advised", scores: scores({ pinDeferred: true }) }));
-    s.insert(row({ ts: 5, action: "advised", scores: scores({ forced: true }) }));
+    // Flagged rows that ran: counted in keptModel like the savings report (#81).
+    s.insert(
+      row({ ts: 3, action: "advised", actualModel: ran, scores: scores({ pinDeferred: true }) }),
+    );
+    s.insert(
+      row({
+        ts: 4,
+        action: "advised",
+        actualModel: ran,
+        scores: scores({ pinDeferred: true, pin: { model: "sonnet" } }),
+      }),
+    );
+    s.insert(row({ ts: 5, action: "advised", actualModel: ran, scores: scores({ forced: true }) }));
+    // A fork not priced yet: nothing to follow, but not in keptModel until it has run.
     s.insert(row({ ts: 6, action: "advised", scores: scores({ fork: true }) }));
-    // malformed scores, a false flag and an apply-mode row are not counted
-    s.insert(row({ ts: 7, action: "advised", scores: "{not json" }));
-    s.insert(row({ ts: 8, action: "advised", scores: scores({ forced: false }) }));
-    s.insert(row({ ts: 9, action: "respected", scores: scores({ forced: true }) }));
+    // A kept pin that ran on another model is no kept pin (keptPin), yet still has nothing to follow.
+    s.insert(
+      row({
+        ts: 7,
+        action: "advised",
+        actualModel: "claude-haiku-4-5",
+        scores: scores({ pinDeferred: true, pin: { model: "opus" } }),
+      }),
+    );
+    // malformed scores and a false flag are ordinary advised rows
+    s.insert(row({ ts: 8, action: "advised", scores: "{not json" }));
+    s.insert(row({ ts: 9, action: "advised", scores: scores({ forced: false }) }));
+    // An apply-mode row under FORCE that ran counts as kept, as in the savings report.
+    s.insert(
+      row({ ts: 10, action: "respected", actualModel: ran, scores: scores({ forced: true }) }),
+    );
     const sum = s.summary();
-    expect(sum.keptModel).toEqual({ pin: 2, force: 1, fork: 1 });
-    expect(sum.byAction).toMatchObject({ advised: 7, followed: 1, respected: 1 });
-    // followed / (advised 7 − kept 4 + followed 1)
+    expect(sum.keptModel).toEqual({ pin: 2, force: 2, fork: 0 });
+    expect(sum.byAction).toMatchObject({ advised: 8, followed: 1, respected: 1 });
+    // followed / unflagged advise-mode dispatches (ts 1, 2, 8, 9)
     expect(sum.rates.follow).toBeCloseTo(1 / 4);
+  });
+
+  it("summary: counts each dispatch once, so a fully followed swarm run follows 100% (#81)", () => {
+    const s = a.adjudicator;
+    // Three swarm tasks, each a plan row (advised) and an agent row the coordinator followed.
+    for (const t of [1, 2, 3]) {
+      s.insert(row({ ts: t, surface: "plan", runId: "R1", taskId: t, action: "advised" }));
+      s.insert(row({ ts: 10 + t, runId: "R1", taskId: t, action: "followed" }));
+    }
+    // Main-session prompt advice is no dispatch.
+    s.insert(row({ ts: 20, surface: "prompt", action: "advised" }));
+    let sum = s.summary();
+    expect(sum.byAction).toMatchObject({ advised: 4, followed: 3 });
+    expect(sum.rates.follow).toBe(1);
+    // A task only planned (no agent row) counts by its plan row; a non-swarm agent row by itself.
+    s.insert(row({ ts: 30, surface: "plan", runId: "R1", taskId: 4, action: "advised" }));
+    s.insert(row({ ts: 31, action: "ignored" }));
+    sum = s.summary();
+    expect(sum.rates.follow).toBeCloseTo(3 / 5);
+    // Inside a window that starts after the plan rows, the agent rows still count once each.
+    expect(s.summary(11).rates.follow).toBeCloseTo(3 / 5);
   });
 
   it("an empty table summarises to zeros and null rates", () => {

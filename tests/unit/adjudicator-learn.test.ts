@@ -810,10 +810,13 @@ describe("savingsReport", () => {
     expect(rep.keptModel).toEqual({ pin: 1, force: 1, fork: 1 });
 
     const s = db.adjudicator.summary();
-    // advised rows: 3 plan rows + P1, P2, F1, K1 = 7; U1 followed. Out: P1, P2 (pinDeferred), F1, K1.
     expect(s.byAction).toMatchObject({ advised: 7, followed: 1 });
-    expect(s.keptModel).toEqual({ pin: 2, force: 1, fork: 1 });
-    expect(s.rates.follow).toBeCloseTo(1 / (7 - 4 + 1), 10);
+    // The summary counts dispatches like the report (#81): P2 passed a model over its kept pin,
+    // so it is no kept pin (it sits in the matrix).
+    expect(s.keptModel).toEqual(rep.keptModel);
+    // Dispatches: the agent rows P1, P2, F1, K1, U1 (each plan row has one). P1, P2, F1 and K1
+    // carry a KeptModel flag (nothing to follow), so U1 followed of U1 = 1.
+    expect(s.rates.follow).toBe(1);
 
     expect(
       keptPin({ scores: pinScores, modelRequested: null, actualModel: "claude-opus-5-5" }),
@@ -830,6 +833,54 @@ describe("savingsReport", () => {
       }),
     ).toBe(true);
   });
+
+  for (const c of [
+    {
+      name: "kept pins",
+      // coder pinned (opus), architect unpinned, reviewer pin unknown (ran on haiku)
+      tasks: [
+        { scores: { pin: { status: "pinned", model: "opus" }, pinDeferred: true }, ran: "opus" },
+        { scores: {}, ran: "sonnet", requested: "haiku" },
+        { scores: { pin: { status: "unknown" }, pinDeferred: true }, ran: "haiku" },
+      ],
+      kept: { pin: 2, force: 0, fork: 0 },
+    },
+    {
+      name: "FORCE",
+      tasks: [1, 2, 3].map(() => ({ scores: { forced: true }, ran: "sonnet" as const })),
+      kept: { pin: 0, force: 3, fork: 0 },
+    },
+  ] as const)
+    it(`summary.keptModel equals savingsReport.keptModel (${c.name}, #81)`, () => {
+      const ID = {
+        haiku: "claude-haiku-4-5",
+        sonnet: "claude-sonnet-5-5",
+        opus: "claude-opus-5-5",
+      };
+      c.tasks.forEach((t, i) => {
+        const agent = `W${i + 1}`;
+        const task = swarmTask("done", agent);
+        db.apiCallsUpsert([call({ agent_id: agent, sidechain: 1, model: ID[t.ran] })]);
+        // Plan and agent rows both carry the flag, as plan advice and onPreAgent store it.
+        const scores = JSON.stringify(t.scores);
+        const plan = row({ surface: "plan", runId: "R1", taskId: task, action: "advised", scores });
+        row({
+          runId: "R1",
+          taskId: task,
+          parentId: plan,
+          action: "advised",
+          scores,
+          modelRequested: "requested" in t ? t.requested : null,
+        });
+      });
+      // A fork outside the swarm that has not run yet: neither report counts it.
+      row({ action: "advised", scores: '{"fork":true}' });
+      reconcile(db, { now: NOW });
+      const rep = savingsReport(db);
+      const s = db.adjudicator.summary();
+      expect(rep.keptModel).toEqual(c.kept);
+      expect(s.keptModel).toEqual(rep.keptModel);
+    });
 
   it("says so when no usage is recorded", () => {
     row({ surface: "mcp" });

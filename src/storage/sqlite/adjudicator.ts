@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
-import type { AdjudicationRow, Verdict } from "../../adjudicator/types.js";
+import type { AdjudicationRow, Surface, Verdict } from "../../adjudicator/types.js";
+import { dispatchFilter, keptDispatch, keptModel } from "../dispatch.js";
 import type {
   AdjudicationInput,
   AdjudicationListFilter,
@@ -15,14 +16,13 @@ import { healAdjudicatorColumns } from "./schema.js";
 
 type Row = Record<string, unknown>;
 
-/**
- * The row's KeptModel flag ('pin' | 'force' | 'fork' | NULL) from its scores JSON, with the keys
- * src/adjudicator/savings.ts KEPT_MODEL_FLAG names; NULL for scores that are not valid JSON.
- */
-const KEPT_MODEL_SQL = `CASE WHEN scores IS NOT NULL AND json_valid(scores) THEN
-    CASE WHEN json_extract(scores, '$.pinDeferred') = 1 THEN 'pin'
-         WHEN json_extract(scores, '$.forced') = 1 THEN 'force'
-         WHEN json_extract(scores, '$.fork') = 1 THEN 'fork' END END`;
+/** The columns summary() reads. */
+const SUMMARY_COLUMNS = `surface, source, provider_status, action, outcome, latency_ms,
+  provider_latency_ms, cost_usd, savings_usd, model_final, actual_model, run_id, task_id,
+  model_requested, scores`;
+
+/** Advise-mode actions: the follow rate's denominator. */
+const ADVISE_ACTIONS = new Set(["advised", "followed", "ignored"]);
 
 /** Every `adjudications` column except id, as [camelCase field, snake_case column]. */
 const COLUMNS: ReadonlyArray<readonly [Exclude<keyof AdjudicationRow, "id">, string]> = [
@@ -479,19 +479,21 @@ export class SqliteAdjudicatorStore implements AdjudicatorStore {
   summary(since?: number): AdjudicationSummary {
     const rows = (
       since === undefined
-        ? this.prep(
-            `SELECT surface, source, provider_status, action, outcome, latency_ms,
-               provider_latency_ms, cost_usd, savings_usd, model_final, actual_model,
-               ${KEPT_MODEL_SQL} AS kept_model
-             FROM adjudications`,
-          ).all()
-        : this.prep(
-            `SELECT surface, source, provider_status, action, outcome, latency_ms,
-               provider_latency_ms, cost_usd, savings_usd, model_final, actual_model,
-               ${KEPT_MODEL_SQL} AS kept_model
-             FROM adjudications WHERE ts >= ?`,
-          ).all(since)
+        ? this.prep(`SELECT ${SUMMARY_COLUMNS} FROM adjudications`).all()
+        : this.prep(`SELECT ${SUMMARY_COLUMNS} FROM adjudications WHERE ts >= ?`).all(since)
     ) as Row[];
+    // Each dispatch counted once, by the savings report's rule (src/storage/dispatch.ts): a swarm
+    // task by its agent row, by its plan row only when no agent row tracks it. Prompt, mcp and
+    // tool rows are no dispatches, so they stay out of the follow rate and keptModel (#81).
+    const fields = rows.map((r) => ({
+      surface: r.surface as Surface,
+      runId: (r.run_id as string | null) ?? null,
+      taskId: (r.task_id as number | null) ?? null,
+      scores: (r.scores as string | null) ?? null,
+      modelRequested: (r.model_requested as string | null) ?? null,
+      actualModel: (r.actual_model as string | null) ?? null,
+    }));
+    const isDispatch = dispatchFilter(fields);
     const bySurface: Record<string, number> = {};
     const bySource: Record<string, number> = {};
     const byProviderStatus: Record<string, number> = {};
@@ -503,14 +505,22 @@ export class SqliteAdjudicatorStore implements AdjudicatorStore {
     let savingsUsd = 0;
     let applyIneffective = 0;
     let applyChecked = 0;
-    const keptModel = { pin: 0, force: 0, fork: 0 };
-    for (const r of rows) {
-      // Advised rows whose model the advice did not name (savings.ts keptModel): counted apart.
-      if (
-        r.action === "advised" &&
-        (r.kept_model === "pin" || r.kept_model === "force" || r.kept_model === "fork")
-      )
-        keptModel[r.kept_model] += 1;
+    const kept = { pin: 0, force: 0, fork: 0 };
+    let followed = 0;
+    let adviseDispatches = 0;
+    rows.forEach((r, i) => {
+      const f = fields[i] as (typeof fields)[number];
+      if (isDispatch(f)) {
+        // Dispatches that ran on a model Claude Code chose: the savings report's keptModel.
+        const k = keptDispatch(f);
+        if (k) kept[k] += 1;
+        // A dispatch whose advice named no model has nothing to follow (reconcile never marks
+        // it followed), whether or not it has run yet: out of the follow rate.
+        if (typeof r.action === "string" && ADVISE_ACTIONS.has(r.action) && !keptModel(f)) {
+          adviseDispatches += 1;
+          if (r.action === "followed") followed += 1;
+        }
+      }
       bump(bySurface, r.surface);
       bump(bySource, r.source);
       bump(byProviderStatus, r.provider_status);
@@ -525,7 +535,7 @@ export class SqliteAdjudicatorStore implements AdjudicatorStore {
         const want = typeof r.model_final === "string" ? r.model_final.toLowerCase() : "";
         if (!want || !r.actual_model.toLowerCase().includes(want)) applyIneffective += 1;
       }
-    }
+    });
     const a = (k: string) => byAction[k] ?? 0;
     return {
       since: since ?? null,
@@ -538,19 +548,11 @@ export class SqliteAdjudicatorStore implements AdjudicatorStore {
       latency: latencyStats(latency),
       providerLatency: latencyStats(providerLatency),
       rates: {
-        follow: ratio(
-          a("followed"),
-          a("advised") -
-            keptModel.pin -
-            keptModel.force -
-            keptModel.fork +
-            a("followed") +
-            a("ignored"),
-        ),
+        follow: ratio(followed, adviseDispatches),
         apply: ratio(a("applied"), a("applied") + a("respected")),
         respect: ratio(a("respected"), a("applied") + a("respected")),
       },
-      keptModel,
+      keptModel: kept,
       costUsd,
       savingsUsd,
       netUsd: savingsUsd - costUsd,

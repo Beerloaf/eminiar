@@ -550,16 +550,20 @@ export interface AdjudicationSummary {
   latency: LatencyStats;
   providerLatency: LatencyStats;
   /**
-   * follow = followed / (advised + followed + ignored − keptModel): advice-mode dispatches whose
-   * advice was taken, leaving out the advised rows that named no model. apply = applied /
-   * (applied + respected) and respect = respected / (applied + respected): apply-mode
-   * dispatches. null when the denominator is 0.
+   * follow = followed / advice-mode dispatches (advised, followed or ignored), each dispatch
+   * counted once (src/storage/dispatch.ts dispatchFilter: a swarm task by its agent row, by its
+   * plan row only when it has none; prompt rows are no dispatches) and leaving out those whose
+   * advice named no model (a KeptModel flag: nothing to follow). apply = applied / (applied +
+   * respected) and respect = respected / (applied + respected): apply-mode dispatches. null when
+   * the denominator is 0.
    */
   rates: { follow: number | null; apply: number | null; respect: number | null };
   /**
-   * Advised rows whose advice named no model (src/adjudicator/savings.ts keptModel): the agent's
-   * pin was kept, CLAUDE_CODE_SUBAGENT_MODEL_FORCE set the model, or a fork ran on the main
-   * session's model. Out of the follow rate's denominator.
+   * Dispatches that ran on a model the advice did not name, counted exactly like the savings
+   * report's keptModel (src/storage/dispatch.ts keptDispatch): the agent's pin was kept and it
+   * ran on it, CLAUDE_CODE_SUBAGENT_MODEL_FORCE set the model, or a fork ran on the main
+   * session's model. Only rows reconcile has priced (an actual model) count here; flagged rows
+   * leave the follow rate even before that.
    */
   keptModel: { pin: number; force: number; fork: number };
   /** Σ cost_usd: the adjudicator's own provider spend. */

@@ -9,6 +9,15 @@
  */
 
 import type { StorageAdapter } from "../storage/adapter.js";
+import {
+  dispatchFilter,
+  KEPT_MODEL_FLAG,
+  type KeptModel,
+  keptDispatch,
+  keptModel,
+  keptPin,
+  tierOf,
+} from "../storage/dispatch.js";
 import type { AdjudicationListFilter, ApiCallRow } from "../storage/types.js";
 import {
   costOfCall,
@@ -19,7 +28,18 @@ import {
 import { FALLBACK_MODEL } from "../usage/savings.js";
 import { type AdjudicationRow, TIERS, type Tier } from "./types.js";
 
-export { FALLBACK_MODEL };
+// The dispatch-counting helpers (tierOf .. keptDispatch) live in src/storage/dispatch.ts so the
+// store's summary counts dispatches exactly as this report does (#81).
+export {
+  dispatchFilter,
+  FALLBACK_MODEL,
+  KEPT_MODEL_FLAG,
+  type KeptModel,
+  keptDispatch,
+  keptModel,
+  keptPin,
+  tierOf,
+};
 
 export const SAVINGS_ASSUMPTIONS: readonly string[] = Object.freeze([
   "Token counts would have been the same on the baseline model. Smaller models can need more turns, so compare tokens per successful task by tier.",
@@ -37,17 +57,6 @@ const SESSION_LOOKBACK_MS = 12 * 60 * 60 * 1000;
 
 // --- tiers ---------------------------------------------------------------------------
 
-/** The tier a model id belongs to ("claude-opus-5-5[1m]" → "opus"); undefined when none. */
-export function tierOf(model: string | null | undefined): Tier | undefined {
-  const id = String(model ?? "").toLowerCase();
-  if (!id) return undefined;
-  if (id.includes("haiku")) return "haiku";
-  if (id.includes("sonnet")) return "sonnet";
-  if (id.includes("opus")) return "opus";
-  if (id.includes("fable") || id.includes("mythos")) return "fable";
-  return undefined;
-}
-
 /** Position on the haiku < sonnet < opus < fable ladder; −1 when unknown. */
 export function tierRank(tier: string | null | undefined): number {
   return TIERS.indexOf(tier as Tier);
@@ -59,40 +68,6 @@ export function tierRank(tier: string | null | undefined): number {
 export function isPinned(model: string | null | undefined): model is string {
   const m = String(model ?? "").trim();
   return m !== "" && m.toLowerCase() !== "inherit";
-}
-
-/**
- * Why the advice named no model for a dispatch (docs/adjudicator.md "What the advice tells you to
- * pass"), from the flag onPreAgent and plan advice store in the row's scores JSON:
- *   pin    `pinDeferred`: the agent's model pin was kept (pinned, or unknown) under
- *          apply.respectFrontmatter
- *   force  `forced`: CLAUDE_CODE_SUBAGENT_MODEL_FORCE is on, so Claude Code sets the model
- *   fork   `fork`: a fork runs on the main session's model
- * Reconcile neither detects a follow nor credits savings for such a row, and the follow rate and
- * the suggested-tier matrix leave it out.
- */
-export type KeptModel = "pin" | "force" | "fork";
-
-/** The scores JSON key of each KeptModel. */
-export const KEPT_MODEL_FLAG: Readonly<Record<KeptModel, string>> = Object.freeze({
-  pin: "pinDeferred",
-  force: "forced",
-  fork: "fork",
-});
-
-/** The KeptModel flag stored in the row's scores JSON, if any. */
-export function keptModel(row: Pick<AdjudicationRow, "scores">): KeptModel | undefined {
-  if (!row.scores) return undefined;
-  try {
-    const s: unknown = JSON.parse(row.scores);
-    if (!s || typeof s !== "object" || Array.isArray(s)) return undefined;
-    const o = s as Record<string, unknown>;
-    for (const k of Object.keys(KEPT_MODEL_FLAG) as KeptModel[])
-      if (o[KEPT_MODEL_FLAG[k]] === true) return k;
-    return undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 /** The advice kept the agent's model pin (see KeptModel): no follow, no credit. */
@@ -119,25 +94,6 @@ export function withKeptModel(
   } catch {
     return undefined;
   }
-}
-
-/**
- * A row whose advice kept the agent's pin and that ran on it: no model was passed, and the model
- * that ran is the pinned one (or cannot be compared: an unknown pin, no usage yet).
- */
-export function keptPin(
-  row: Pick<AdjudicationRow, "scores" | "modelRequested" | "actualModel">,
-): boolean {
-  if (keptModel(row) !== "pin" || row.modelRequested) return false;
-  let pinModel: unknown;
-  try {
-    pinModel = (JSON.parse(row.scores as string) as { pin?: { model?: unknown } })?.pin?.model;
-  } catch {
-    return false;
-  }
-  const want = typeof pinModel === "string" ? (tierOf(pinModel) ?? pinModel) : undefined;
-  const ran = row.actualModel ? (tierOf(row.actualModel) ?? row.actualModel) : undefined;
-  return !want || !ran || want === ran;
 }
 
 export interface BaselineQuery {
@@ -354,8 +310,6 @@ export interface SavingsReportOptions {
 
 const CREDITED = new Set(["applied", "followed"]);
 
-const taskKey = (r: Pick<AdjudicationRow, "runId" | "taskId">) => `${r.runId}#${r.taskId}`;
-
 /**
  * Realised, potential, spend and net for rows since `since`. Run reconcile first so the
  * per-row figures are current; potential savings are repriced here from the prompt windows.
@@ -372,17 +326,9 @@ export function savingsReport(db: StorageAdapter, opts: SavingsReportOptions = {
   const byTier: Partial<Record<Tier, TierTokens>> = {};
   const matrix = new Map<string, { suggested: string; actual: string; n: number }>();
   const kept: Record<KeptModel, number> = { pin: 0, force: 0, fork: 0 };
-  // A swarm task has a plan row and, once dispatched, an agent row; reconcile gives both the
-  // worker's calls. Count the task once: by its agent row(s), by the plan row only when no
-  // agent row tracks the task (the rule reconcile teaches by). Agent rows follow their plan
-  // row, so a plan row inside `since` has its agent rows inside it too.
-  const dispatched = new Set(
-    rows
-      .filter((r) => r.surface === "agent" && r.runId && typeof r.taskId === "number")
-      .map(taskKey),
-  );
-  const counts = (r: AdjudicationRow) =>
-    r.surface === "agent" || (r.surface === "plan" && !dispatched.has(taskKey(r)));
+  // Each dispatch counted once: a swarm task by its agent row(s), by its plan row only when no
+  // agent row tracks it (the rule reconcile teaches by; src/storage/dispatch.ts).
+  const counts = dispatchFilter(rows);
 
   for (const r of rows) {
     if (typeof r.costUsd === "number") spendUsd += r.costUsd;
@@ -393,8 +339,8 @@ export function savingsReport(db: StorageAdapter, opts: SavingsReportOptions = {
     }
     // A row whose model Claude Code chose (FORCE, a fork, a kept pin) is no agreement or
     // disagreement with the advice: it is counted on its own.
-    const outside = counts(r) && r.actualModel ? keptModel(r) : undefined;
-    if (outside && (outside !== "pin" || keptPin(r))) kept[outside]++;
+    const outside = counts(r) ? keptDispatch(r) : undefined;
+    if (outside) kept[outside]++;
     else if (counts(r) && r.tier && r.actualModel) {
       const actual = tierOf(r.actualModel) ?? r.actualModel;
       const k = `${r.tier}\u0000${actual}`;
