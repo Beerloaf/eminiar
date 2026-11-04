@@ -168,6 +168,42 @@ const LEAKS: Array<[string, string, string]> = [
   ["BOM and soft hyphen in name", "DB_PAS­S=Hunt3rPw9 ﻿API_KEY=Hunt3rPw8", "Hunt3rPw"],
   ["fullwidth =", "DB_PASSWORD＝Hunt3rPw9", "Hunt3rPw9"],
   ["fullwidth name", "ＤＢ_ＰＡＳＳ=Hunt3rPw9", "Hunt3rPw9"],
+  // every Default_Ignorable_Code_Point, not just the zero-width ones (task #64)
+  ["CGJ U+034F in name", "DB_PASS\u034FWORD=Hunt3rPw9xyz", "Hunt3rPw9xyz"],
+  ["variation selector U+FE0F in name", "DB_PASS\uFE0FWORD=Hunt3rPw9xyz", "Hunt3rPw9xyz"],
+  ["variation selector U+E0100 in name", "DB_PASS\u{E0100}WORD=Hunt3rPw9xyz", "Hunt3rPw9xyz"],
+  ["tag char U+E0041 in name", "DB_PASS\u{E0041}WORD=Hunt3rPw9xyz", "Hunt3rPw9xyz"],
+  ["Hangul filler U+3164 in name", "DB_PASS\u3164WORD=Hunt3rPw9xyz", "Hunt3rPw9xyz"],
+  ["Hangul fillers U+115F U+1160", "DB_PASS\u115F\u1160WORD=Hunt3rPw9xyz", "Hunt3rPw9xyz"],
+  ["halfwidth Hangul filler U+FFA0", "DB_PASS\uFFA0WORD=Hunt3rPw9xyz", "Hunt3rPw9xyz"],
+  ["ALM U+061C in name", "DB_PASS\u061CWORD=Hunt3rPw9xyz", "Hunt3rPw9xyz"],
+  ["Khmer vowel U+17B4 in name", "DB_PASS\u17B4WORD=Hunt3rPw9xyz", "Hunt3rPw9xyz"],
+  ["Mongolian FVS U+180B in name", "DB_PASS\u180BWORD=Hunt3rPw9xyz", "Hunt3rPw9xyz"],
+  ["invisible times U+2062 in name", "DB_PASS\u2062WORD=Hunt3rPw9xyz", "Hunt3rPw9xyz"],
+  ["musical U+1D173 in name", "DB_PASS\u{1D173}WORD=Hunt3rPw9xyz", "Hunt3rPw9xyz"],
+  ["NFKC ligature in name", "ﬁle_token=Hunt3rPw9xyz", "Hunt3rPw9xyz"],
+  // nested YAML block scalars whose key hides a character (cleaned before the indentation pass)
+  ["nested YAML block", "creds:\n  db_password: |\n    Hunt3rPw9xyz\n  user: x", "Hunt3rPw9xyz"],
+  [
+    "nested YAML block, ZWSP in key",
+    "creds:\n  db_pass\u200Bword: |\n    Hunt3rPw9xyz\n  user: x",
+    "Hunt3rPw9xyz",
+  ],
+  [
+    "nested YAML block, fullwidth colon",
+    "creds:\n  db_password\uFF1A |\n    Hunt3rPw9xyz\n  user: x",
+    "Hunt3rPw9xyz",
+  ],
+  [
+    "nested YAML block, tag char in key",
+    "a:\n  b:\n    api\u{E0020}_key: >-\n      Hunt3rPw9xyz\n      more\n    c: 1",
+    "Hunt3rPw9xyz",
+  ],
+  [
+    "nested YAML block, ZWSP before the block line's indent",
+    "creds:\n  db_password: |\n\u200B    Hunt3rPw9xyz\n  user: x",
+    "Hunt3rPw9xyz",
+  ],
 ];
 
 /** Must come back exactly as given. */
@@ -280,6 +316,57 @@ describe("redact: secrets are masked", () => {
   it("strips invisible characters and applies NFKC before matching", () => {
     expect(redact("PASS​WORD=Hunt3rPw9")).toBe("PASSWORD=***");
     expect(redact("DB_PASSWORD＝Hunt3rPw9")).toBe("DB_PASSWORD=***");
+    expect(redact("DB_PASS͏WORD=Hunt3rPw9")).toBe("DB_PASSWORD=***");
+    expect(redact("DB_PASS\u{E0041}WORD=Hunt3rPw9")).toBe("DB_PASSWORD=***");
+    expect(redact("DB_PASSㅤWORD=Hunt3rPw9")).toBe("DB_PASSWORD=***");
+  });
+
+  it("leaves no default-ignorable character in what it returns", () => {
+    const hidden = "a­͏؜ᅟᅠ឴឵᠋᠎​‍‏";
+    const more = "‪‮⁠⁤⁯ㅤ︀️﻿ﾠ\u{1D173}\u{E0001}\u{E0FFF}b";
+    const ignorable = /\p{Default_Ignorable_Code_Point}/u;
+    expect(redact(hidden + more)).toBe("ab");
+    expect(ignorable.test(forRemote(hidden + more, 2000))).toBe(false);
+    expect(ignorable.test(head(hidden + more, 200))).toBe(false);
+  });
+
+  it("masks nested YAML blocks through head() and forRemote() with the key cleaned first", () => {
+    const zw = "creds:\n  db_pass​word: |\n    Hunt3rPw9xyz\n  user: x";
+    expect(redact(zw)).toBe("creds:\n  db_password: |\n    ***\n  user: x");
+    expect(forRemote(zw, 2000)).toBe("creds:\n db_password: |\n ***\n user: x");
+    expect(head(zw, 200)).toBe("creds: db_password: | *** user: x");
+    const fw = "creds:\n  db_password： |\n    Hunt3rPw9xyz\n  user: x";
+    expect(forRemote(fw, 2000)).toBe("creds:\n db_password: |\n ***\n user: x");
+  });
+
+  it("does not turn a non-secret into a secret by stripping or normalising", () => {
+    // the joined name is still not a secret name
+    for (const text of [
+      "token​count=12345abc",
+      "max‌_tokens=4096",
+      "pass­through=enabled1",
+      "key⁠board=qwerty123",
+      "api͏KeyName=primary1",
+      "token_count： 12345abc",
+      "Ｋｅｙｂｏａｒｄ＝ｑｗｅｒｔｙ123",
+      "settings:\n  max​_tokens: |\n    4096 per call\n  user: x",
+      "notes： |\n  the token is rotated\n  weekly",
+    ]) {
+      expect(redact(text), text).not.toContain("***");
+      expect(forRemote(text, 2000), text).not.toContain("***");
+      expect(head(text, 200), text).not.toContain("***");
+    }
+    // visible text around stripped characters is kept as it is
+    expect(redact("ship it \u{1F44D}️, the ​build is green")).toBe(
+      "ship it \u{1F44D}, the build is green",
+    );
+    expect(redact("﻿fix the cache key in src/a.ts")).toBe("fix the cache key in src/a.ts");
+    expect(redact("한국어 텍스트는 그대로")).toBe("한국어 텍스트는 그대로");
+  });
+
+  it("still masks a plain secret next to stripped characters", () => {
+    expect(redact("​DB_PASS=Hunt3rPw9 and⁠ API_KEY=Hunt3rPw8")).toBe("DB_PASS=*** and API_KEY=***");
+    expect(forRemote("x­: DB_PASS=Hunt3rPw9", 2000)).toBe("x: DB_PASS=***");
   });
 
   it("masks a YAML block scalar only as deep as it is indented", () => {
@@ -406,7 +493,26 @@ describe("redact: performance", () => {
       "secret is 1".repeat(n / 11),
       "​".repeat(n),
       "a​=".repeat(n / 3),
+      "\u{E0041}".repeat(n / 2),
+      "ㅤa".repeat(n / 2),
+      "a͏_".repeat(n / 3),
+      "pass​word： |\n".concat(" x\n".repeat(n / 3)),
+      "a： |\n".repeat(n / 5),
     ];
-    for (const s of inputs) expect(time(s), s.slice(0, 20)).toBeLessThan(100);
+    // A quadratic rule on 100 KB is ~5e9 steps (seconds); a linear pass is a few ms. Under
+    // parallel load (vitest workers, CI neighbours) an absolute 100 ms flakes, so the bound scales
+    // with a linear baseline measured here, on the same machine under the same load, and a slow
+    // input is re-timed before it fails. The bound stays an order of magnitude below a real
+    // blow-up, so only a real blow-up fails.
+    const plain = "the quick brown fox jumps over the lazy dog 0123456789\n".repeat(n / 55);
+    const baseline = Math.min(time(plain), time(plain), time(plain));
+    const bound = Math.max(100, 25 * baseline);
+    for (const s of inputs) {
+      let t = time(s);
+      for (let retry = 0; retry < 2 && t >= bound; retry++) t = Math.min(t, time(s));
+      expect(t, `${JSON.stringify(s.slice(0, 20))} (bound ${bound.toFixed(0)} ms)`).toBeLessThan(
+        bound,
+      );
+    }
   });
 });

@@ -186,10 +186,21 @@ function maskCookiePairs(pairs: string): string {
 }
 
 /**
- * Characters that are invisible or change direction: a zero-width space inside `PASS​WORD=` would
- * otherwise split the name so the rules miss it. Stripped before any rule runs.
+ * Default-ignorable code points (Unicode Default_Ignorable_Code_Point): zero-width and joiner
+ * characters, soft hyphen, bidi controls, the combining grapheme joiner, variation selectors,
+ * Hangul fillers, tag characters and the BOM. They render as nothing, so `PASS\u200BWORD=` or
+ * `DB_PASS\u{E0041}WORD=` would otherwise split the name and the rules would miss it.
  */
-const INVISIBLE = /[­᠎​-‏‪-‮⁠-⁤⁦-⁩﻿]/g;
+const IGNORABLE = /\p{Default_Ignorable_Code_Point}/gu;
+
+/**
+ * Strip the default-ignorable characters and apply NFKC (fullwidth `＝` / `：` become `=` / `:`,
+ * ligatures unfold). Stripped again after NFKC, which maps U+3164 / U+FFA0 to the ignorable
+ * U+1160. Leaves spaces, tabs and newlines alone, so YAML indentation survives. Idempotent.
+ */
+function clean(text: string): string {
+  return text.replace(IGNORABLE, "").normalize("NFKC").replace(IGNORABLE, "");
+}
 
 type Rule =
   | [RegExp, string | ((...m: string[]) => string)]
@@ -309,11 +320,11 @@ const RULES: Rule[] = [
 
 /**
  * Mask secrets, emails and long hex/base64 runs. Idempotent; linear in the input. The text is
- * NFKC-normalised (fullwidth `＝` becomes `=`) and stripped of invisible characters first, so
- * neither can hide a secret's name from the rules.
+ * cleaned first (default-ignorable characters stripped, NFKC applied), so neither an invisible
+ * character nor a fullwidth form can hide a secret's name from the rules.
  */
 export function redact(text: string): string {
-  let out = maskYamlBlocks(text.normalize("NFKC").replace(INVISIBLE, ""));
+  let out = maskYamlBlocks(clean(text));
   for (const rule of RULES) {
     if (rule[0] === "assignments") out = rule[1](out);
     else if (typeof rule[1] === "string") out = out.replace(rule[0], rule[1]);
@@ -324,15 +335,17 @@ export function redact(text: string): string {
 
 /** The redacted head kept in the DB: at most n chars (code points), with "…" when cut. */
 export function head(text: string, n = 80): string {
-  const chars = Array.from(redact(normalize(maskYamlBlocks(text))).replace(/\s+/g, " "));
+  // clean() before the YAML pass so a block's key is found while its indentation is intact.
+  const chars = Array.from(redact(normalize(maskYamlBlocks(clean(text)))).replace(/\s+/g, " "));
   if (chars.length <= n) return chars.join("");
   return `${chars.slice(0, Math.max(0, n - 1)).join("")}…`;
 }
 
 /** The only text a remote provider receives: normalised, redacted, cut to maxChars. */
 export function forRemote(text: string, maxChars: number): string {
-  // YAML blocks first: normalize() collapses the indentation that delimits them.
-  return Array.from(redact(normalize(maskYamlBlocks(text))))
+  // YAML blocks first: normalize() collapses the indentation that delimits them. clean() goes
+  // before them, so a key hiding a zero-width char or a fullwidth colon is still recognised.
+  return Array.from(redact(normalize(maskYamlBlocks(clean(text)))))
     .slice(0, maxChars)
     .join("");
 }
