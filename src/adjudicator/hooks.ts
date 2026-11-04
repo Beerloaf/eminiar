@@ -9,10 +9,12 @@
  *   onSessionStart  one line when enabled but degraded; the ollama keep-alive warm-up
  *   onSessionEnd    reconcile; drop the session's main-advice counter
  *
- * Rules that hold everywhere: never deny, never inject `effort` (it is not an Agent input),
- * respect CLAUDE_CODE_SUBAGENT_MODEL_FORCE, an explicit `model` and a frontmatter pin (managed,
- * project, user or plugin agent; one that cannot be read is not overridden), skip the Cursor
- * client, and never throw (advice must not break a hook).
+ * Rules that hold everywhere: never deny, never inject `effort` (the Agent call takes one since
+ * Claude Code 2.1.292, but it stays advice for the coordinator to pass), respect
+ * CLAUDE_CODE_SUBAGENT_MODEL_FORCE, an explicit `model` and a frontmatter pin (managed, project,
+ * user or plugin agent; one that cannot be read is not overridden) in advise mode as in apply
+ * mode (the advice then names the pin, never a model to pass), skip the Cursor client, and never
+ * throw (advice must not break a hook).
  */
 
 import { readdirSync, readFileSync } from "node:fs";
@@ -36,11 +38,13 @@ import { topIntent } from "./heuristic.js";
 import { biasFor, reconcile } from "./learn.js";
 import type { FetchLike } from "./providers/http.js";
 import { isPinned, resolveBaseline, tierOf, tierRank } from "./savings.js";
+import { effortForced, pinnedPart } from "./swarm.js";
 import {
   type AdjudicationAction,
   type AdjudicationRequest,
   type AdjudicationRow,
   type AdjudicatorProvider,
+  AGENT_EFFORT_SINCE,
   type Features,
   TIERS,
   type Tier,
@@ -301,12 +305,20 @@ export function clampTier(tier: string, floor: Tier, ceiling: Tier): Tier | unde
  * The row's scores JSON with the agent-pin lookup added under `pin`, so a decision shows why a
  * model was or was not applied. Empty when the row or its scores cannot be read.
  */
-function withPin(db: StorageAdapter, rowId: number, pin: AgentPin): { scores?: string } {
+function withPin(
+  db: StorageAdapter,
+  rowId: number,
+  pin: AgentPin,
+  deferred = false,
+): { scores?: string } {
   try {
     const raw = db.adjudicator.get(rowId)?.scores;
     const parsed: unknown = raw ? JSON.parse(raw) : {};
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-    return { scores: JSON.stringify({ ...parsed, pin }) };
+    // `pinDeferred`: the advice kept the agent's pin, so reconcile credits no savings (savings.ts).
+    return {
+      scores: JSON.stringify({ ...parsed, pin, ...(deferred ? { pinDeferred: true } : {}) }),
+    };
   } catch {
     return {};
   }
@@ -445,22 +457,44 @@ export async function onPreAgent(
     action = "advised";
     modelFinal = null;
   }
+  // Advise mode respects a pin like apply mode: no model to pass, and no savings credit later
+  // (also when the coordinator passes a model anyway: it was not advised).
+  const pinDeferred = (pinnedRespected || pinUnknown) && !isForced && !model;
   if (a.rowId !== undefined) {
     try {
-      db.adjudicator.update(a.rowId, { action, modelFinal, ...withPin(db, a.rowId, pin) });
+      db.adjudicator.update(a.rowId, {
+        action,
+        modelFinal,
+        ...withPin(db, a.rowId, pin, pinDeferred),
+      });
     } catch {
       // the row keeps its verdict without the action
     }
   }
 
   const why = `complexity ${c}, conf ${conf.toFixed(2)}`;
-  const extras = [`suggested effort ${effort}`];
+  // The Agent call takes `effort` (Claude Code 2.1.292+) unless CLAUDE_CODE_EFFORT_LEVEL outranks
+  // it or the call already passes one; the hook never sets it.
+  const effortHint =
+    str(ti.effort) || effortForced(env)
+      ? `suggested effort ${effort}`
+      : `pass effort:'${effort}' (Claude Code ${AGENT_EFFORT_SINCE}+)`;
+  const extras = [effortHint];
   if (role && role !== "none") extras.push(`role ${role}`);
   if (applyMode && inScope && pinUnknown && !isForced && !explicit)
     extras.push("not applied: the agent's model pin is unknown");
   let note: string;
   if (action === "applied") {
     note = `adjudicator: model ${model} applied (${why}); ${extras.join(", ")}`;
+  } else if (pinDeferred && !explicit) {
+    const part = pinnedPart(
+      { status: pinUnknown ? "unknown" : "pinned", model: pinned, source: pin.source },
+      clamped,
+      worker && pin.source === "project"
+        ? undefined
+        : `remove the model pin in ${pin.file ?? "the agent's definition"}`,
+    );
+    note = `adjudicator: ${part}; ${extras.filter((e) => !e.startsWith("not applied")).join(", ")}`;
   } else if (
     action === "advised" &&
     !explicit &&

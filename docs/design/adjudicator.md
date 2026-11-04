@@ -11,8 +11,8 @@ PreToolUse/UserPromptSubmit, model-config). The design depends on them.
 |---|---|
 | Subagent model precedence: the Agent call's `model` param, then the subagent frontmatter `model` (`inherit` means the main model), then `CLAUDE_CODE_SUBAGENT_MODEL`, then the main model. `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` overrides all of them. Claude Code substitutes a model when the requested one is outside the org's `availableModels`. | When FORCE is set, the adjudicator never tries to change the model. |
 | The Agent call's `model` accepts only `sonnet`, `opus`, `haiku` or `fable`: no `inherit` and no full ids. Frontmatter accepts aliases, full ids and `inherit`. | Tiers are limited to those four aliases. |
-| `effort` is not an Agent tool input. Only agent-file frontmatter can set it. | Effort per dispatch is advice only. Never inject an `effort` key into the Agent input. |
-| PreToolUse `updatedInput` replaces the whole input, so every unchanged field must be included. Rules are re-evaluated, and in auto mode a changed call without `permissionDecision` may be denied. The docs don't say whether a model set by a hook takes effect. | Rewriting through the hook is best-effort. Advice to the coordinator is the main, reliable path: `em_swarm plan` shows a suggested model per task and the coordinator passes `model` on the Agent call. The optional `apply` mode is opt-in, and a test must check that the merge keeps every field. |
+| From Claude Code 2.1.292 the Agent call takes an `effort` parameter for a non-fork subagent; it overrides the agent file's `effort` and lasts across resumes, and `CLAUDE_CODE_EFFORT_LEVEL` outranks both (sub-agents "Choose an effort level"). Levels are `low`, `medium`, `high`, `xhigh`, `max`; a level the model lacks falls back to the highest one below it (model-config "Adjust effort level"). | Effort per dispatch is advice for the coordinator to pass as `effort` on the Agent call (informational while `CLAUDE_CODE_EFFORT_LEVEL` is set). The hook never injects an `effort` key, in apply mode too. |
+| PreToolUse `updatedInput` replaces the whole input, so every unchanged field must be included. Rules are re-evaluated, and in auto mode a changed call without `permissionDecision` may be denied. The docs don't say whether a model set by a hook takes effect. | Rewriting through the hook is best-effort. Advice to the coordinator is the main, reliable path: `em_swarm plan` shows a suggested model and effort per task and the coordinator passes `model` and `effort` on the Agent call. A model pin in the agent's definition is respected in advise mode as in apply mode: the advice names the pin, never a different `model` to pass. The optional `apply` mode is opt-in, and a test must check that the merge keeps every field. |
 | UserPromptSubmit cannot change the main session's model. It can only add context or block. | Main-session model choice is advice text only. |
 
 **Product decision** (coordinator, from the user's request): choosing model size for dispatched
@@ -58,8 +58,12 @@ It can be blended with one provider:
 
 - Hooks test `ctx.config.adjudicator.enabled` (config is already loaded) before calling any
   adjudicator code.
-- Adjudicator modules have no top-level side effects. They are bundled into `dist/hook.js`
-  because tsup uses `splitting: false`, but they stay inert until called.
+- Adjudicator modules have no top-level side effects. The hook build is split (since 3001537):
+  the hooks reach the adjudicator only through dynamic `import()`, so it lands in `hook-*`
+  chunks next to `dist/hook.js` that are loaded only when it is enabled. The server and CLI stay
+  single files (`splitting: false`); there the adjudicator is bundled in but inert until called,
+  and `scripts/check-bundle.mjs` fails the build on a dynamic `import()` of an internal module
+  that the server reaches.
 - When off: the `em_adjudicate` tool is not registered, and nothing is written to the DB or the
   network.
 - Kill switch: `EMINIAR_ADJUDICATOR=0`.
@@ -155,7 +159,7 @@ Hot files get thin call-outs only, never logic: `routing.ts` (risk 0.56), `captu
 export const SCORER_VERSION = "1";
 export type Surface = "prompt" | "agent" | "plan" | "tool" | "mcp" | "test";
 export type Tier = "haiku" | "sonnet" | "opus" | "fable";          // the only Agent `model` values
-export type Effort = "low" | "medium" | "high" | "xhigh";            // advice only
+export type Effort = "low" | "medium" | "high" | "xhigh" | "max";    // advice: the coordinator passes it as `effort` (CC ≥ 2.1.292)
 export type ProviderId = "heuristic" | "typesafe" | "openai-compatible" | "embedding";
 export type Source = "heuristic" | "blend" | "cache" | "fallback";
 export type ProviderStatus = "ok" | "timeout" | "http_error" | "rate_limited" | "invalid"
@@ -463,8 +467,9 @@ For each tier t in `config.tiers`:
 - risk adds +0.4·risk to tiers ≥ sonnet; chat adds +1 to the lowest tier
 - softmax with τ = 0.5, so the scores sum to 1. Reasons cite c and the adjustments.
 
-Effort from c: < 1.5 low, < 2.5 medium, < 3.5 high, otherwise xhigh. This is advice only: the
-Agent input has no effort field.
+Effort from c: < 1.5 low, < 2.5 medium, < 3.5 high, < 3.75 xhigh, otherwise max (`max` only at
+the very top of the scale, so defaults stay conservative). It is advice: the coordinator passes it
+as `effort` on the Agent call (Claude Code ≥ 2.1.292); the hook never injects it.
 
 ### 7.4 Tool table
 
@@ -723,10 +728,16 @@ Then:
 - Implementation: one helper `withModel(output, input, model)` in `src/adjudicator/hooks.ts`,
   applied at routing's return points. `routing.ts` gets only call-outs.
 - Never inject `effort`. Effort and role are advice: one `additionalContext` line, e.g.
-  "adjudicator: suggested effort high, role reviewer".
+  "adjudicator: pass effort:'high' (Claude Code 2.1.292+), role reviewer" ("suggested effort
+  high" when the call already passes `effort` or `CLAUDE_CODE_EFFORT_LEVEL` is set).
 - In advise mode, `onPreAgent` never calls the network. It records the row and, when the
   coordinator passed no model and the advice differs from the baseline, adds one note:
   "adjudicator: model haiku would do (complexity 1, conf 0.8): pass model:'haiku'".
+- Advise mode respects pins like apply mode (with `apply.respectFrontmatter`): for a pinned
+  agent, or one whose pin is unknown, the note names the pin instead, e.g. "adjudicator: pinned
+  opus (adjudicator would pick haiku; remove the model pin in <file> to let it choose)", and the
+  row's scores JSON gets `pinDeferred: true`, so reconcile detects no follow and credits no
+  savings for it.
 
 Effectiveness check: `reconcile` compares `model_final` with the model that `api_calls` show for
 the agent. Each mismatch counts as `apply_ineffective`. `status` and doctor report "apply did not
@@ -848,7 +859,8 @@ Every savings figure is shown with its assumptions:
 1. The token counts would have been the same on the baseline model. Smaller models can need more
    turns, so the dashboard shows tokens per successful task by tier next to it.
 2. List prices, with cache pricing unchanged.
-3. Credit only for dispatches that were followed or applied.
+3. Credit only for dispatches that were followed or applied, and none for a dispatch whose advice
+   kept the agent's model pin (`pinDeferred` in the row's scores: pinned or unknown).
 4. The adjudicator's own spend is subtracted.
 5. No credit for tool advice: eminiar's `em_stats` already counts context kept out by `em_*`
    tools, so crediting it here would double-count. We report only the tool-advice follow rate.
@@ -928,14 +940,22 @@ is embedding.
   - One batched provider call within `planMs`; the heuristic on any failure.
   - Insert plan rows (run_id, task_id).
   - For each task, append e.g.
-    "#5 → swarm-feature-coder · model haiku · effort low (complexity 1, conf 0.82)".
+    "#5 → swarm-feature-coder · model haiku · effort low (complexity 1, conf 0.82)", or, when
+    the role's agent pins a model (resolveAgentPin; respected unless
+    `apply.respectFrontmatter` is off), "#5 → swarm-feature-coder · pinned opus (adjudicator
+    would pick haiku; remove the pin in swarm.yaml to let it choose) · effort low (…)"; an
+    unreadable definition shows "model pin is unknown (…)".
   - Add "role suggested: tester (planned: coder)" when the role differs.
-- The "Next:" text tells the coordinator to pass `model` on each Agent call.
+  - The advice step fails open: the tasks are already stored, so an error there logs to
+    stderr and the plan returns its normal text plus "Adjudicator advice unavailable for this
+    plan (the tasks are planned)." (a reported failure would make the coordinator plan twice).
+- The "Next:" text tells the coordinator to pass `model` and `effort` on each Agent call.
 - No `PlanTask` schema change, no `swarm.yaml` key, no new `TaskRow` columns, no new
   `EVENT_KINDS`. The swarm ledger stays stable, and the suggestions live in `adjudications`.
 - `coordinatorBrief` (`src/swarm/brief.ts`, steps block L371-378) gets one line when enabled:
-  "Adjudicator on: em_swarm plan shows a suggested model per task; pass it as `model` on the
-  Agent call (effort is advice)."
+  "Adjudicator on: em_swarm plan shows a suggested model and effort per task; pass them as
+  `model` and `effort` on the Agent call (`effort` needs Claude Code 2.1.292+; a pinned agent
+  keeps its model)."
 - In apply mode, `onPreAgent` finds the plan row by (run, task) through
   `spawn.kind === "worker"`, so it needs no extra provider call.
 
@@ -1088,7 +1108,8 @@ its own container.
   - setup for each preset (Jev key, Groq, Cerebras, Ollama with
     `ollama pull qwen2.5:1.5b-instruct`, LM Studio, llama.cpp)
   - advise vs apply, with the Claude Code precedence facts (Agent model > frontmatter >
-    `CLAUDE_CODE_SUBAGENT_MODEL`; FORCE overrides everything; effort is frontmatter-only)
+    `CLAUDE_CODE_SUBAGENT_MODEL`; FORCE overrides everything; `effort` on the Agent call from
+    Claude Code 2.1.292, outranked by `CLAUDE_CODE_EFFORT_LEVEL`)
   - latency budgets, breaker and budgets
   - learning, the savings method, eval, troubleshooting
 - `docs/configuration.md`: an `adjudicator` table covering every key.

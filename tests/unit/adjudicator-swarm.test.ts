@@ -1,8 +1,23 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+
+/** #66: lets a test make adjudicatePlan throw; every other call reaches the real module. */
+const planFault = vi.hoisted(() => ({ error: undefined as Error | undefined }));
+vi.mock("../../src/adjudicator/swarm.js", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../../src/adjudicator/swarm.js")>();
+  return {
+    ...real,
+    adjudicatePlan: async (...args: Parameters<typeof real.adjudicatePlan>) => {
+      if (planFault.error) throw planFault.error;
+      return real.adjudicatePlan(...args);
+    },
+  };
+});
+
 import { envFlagOn, subagentModelForced } from "../../src/adjudicator/env.js";
+import { effortFor, MAX_EFFORT_AT } from "../../src/adjudicator/heuristic.js";
 import {
   hasProvider,
   registerProvider,
@@ -10,16 +25,20 @@ import {
 } from "../../src/adjudicator/providers/index.js";
 import {
   adjudicatePlan,
+  effortForced,
   modelForced,
   type PlanAdvice,
   planAdviceBlock,
   planAdviceEnabled,
+  planAdviceHead,
   planLines,
   taskRequest,
 } from "../../src/adjudicator/swarm.js";
 import {
   type AdjudicationRequest,
   type AdjudicatorProvider,
+  AGENT_EFFORT_SINCE,
+  EFFORTS,
   TIERS,
 } from "../../src/adjudicator/types.js";
 import { type Config, ConfigSchema } from "../../src/config.js";
@@ -56,6 +75,15 @@ swarms:
         description: writes and runs tests
 `;
 const SESSION = "sess-adj-swarm";
+
+// The plan advice head reads CLAUDE_CODE_EFFORT_LEVEL from process.env: keep the caller's out.
+const savedEffortLevel = process.env.CLAUDE_CODE_EFFORT_LEVEL;
+beforeAll(() => {
+  delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
+});
+afterAll(() => {
+  if (savedEffortLevel !== undefined) process.env.CLAUDE_CODE_EFFORT_LEVEL = savedEffortLevel;
+});
 
 const configWith = (adjudicator: Record<string, unknown>): Config =>
   ConfigSchema.parse({ adjudicator });
@@ -221,6 +249,147 @@ describe("plan advice helpers", () => {
   });
 });
 
+describe("plan advice: model pins and the Agent call's effort (#68)", () => {
+  const base: PlanAdvice = {
+    taskId: 3,
+    role: "coder",
+    agentType: "swarm-feat-coder",
+    model: "haiku",
+    effort: "low",
+    complexity: 1,
+    confidence: 0.9,
+  };
+
+  it("names a respected pin and the pick instead of a model to pass", () => {
+    expect(
+      planLines([
+        { ...base, pin: { status: "pinned", model: "opus", source: "project" } },
+        {
+          ...base,
+          taskId: 4,
+          pin: { status: "pinned", model: "claude-haiku-4-5", source: "project" },
+        },
+        { ...base, taskId: 5, pin: { status: "unknown" } },
+        { ...base, taskId: 6, pin: { status: "pinned", model: "sonnet", source: "user" } },
+        { ...base, taskId: 7 },
+      ]),
+    ).toEqual([
+      "#3 → swarm-feat-coder · pinned opus (adjudicator would pick haiku; remove the pin in swarm.yaml to let it choose) · effort low (complexity 1, conf 0.90)",
+      "#4 → swarm-feat-coder · pinned claude-haiku-4-5 (matches the adjudicator's pick) · effort low (complexity 1, conf 0.90)",
+      "#5 → swarm-feat-coder · model pin is unknown (adjudicator would pick haiku; not overridden while the agent's definition cannot be read) · effort low (complexity 1, conf 0.90)",
+      "#6 → swarm-feat-coder · pinned sonnet (adjudicator would pick haiku; remove the user agent's model pin to let it choose) · effort low (complexity 1, conf 0.90)",
+      "#7 → swarm-feat-coder · model haiku · effort low (complexity 1, conf 0.90)",
+    ]);
+  });
+
+  it("tells the coordinator to pass effort, unless CLAUDE_CODE_EFFORT_LEVEL outranks it", () => {
+    expect(AGENT_EFFORT_SINCE).toBe("2.1.292");
+    expect(planAdviceHead([base], {})).toBe(
+      "Adjudicator suggestions: pass the model as `model` and the effort as `effort` on each Agent call (`effort` needs Claude Code 2.1.292 or later):",
+    );
+    expect(planAdviceHead([{ ...base, pin: { status: "pinned", model: "opus" } }], {})).toMatch(
+      /; a pinned agent keeps its model: pass no `model`:$/,
+    );
+    expect(effortForced({ CLAUDE_CODE_EFFORT_LEVEL: "high" })).toBe(true);
+    expect(effortForced({ CLAUDE_CODE_EFFORT_LEVEL: " " })).toBe(false);
+    expect(planAdviceHead([base], { CLAUDE_CODE_EFFORT_LEVEL: "high" })).toBe(
+      "Adjudicator suggestions: pass the model as `model` on each Agent call (effort is informational: CLAUDE_CODE_EFFORT_LEVEL is set and outranks `effort`):",
+    );
+    const forced = planAdviceHead([base], { CLAUDE_CODE_SUBAGENT_MODEL_FORCE: "1" });
+    expect(forced).toMatch(/CLAUDE_CODE_SUBAGENT_MODEL_FORCE is on/);
+    expect(forced).toMatch(/pass the effort as `effort` \(Claude Code 2\.1\.292 or later\)/);
+    expect(planAdviceBlock([base], {})).not.toMatch(/set only in the agent file/);
+  });
+
+  it("the effort ladder reaches max only at the top of the scale", () => {
+    expect(EFFORTS).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect([3.5, 3.6, MAX_EFFORT_AT - 0.01, MAX_EFFORT_AT, 4].map(effortFor)).toEqual([
+      "xhigh",
+      "xhigh",
+      "xhigh",
+      "max",
+      "max",
+    ]);
+  });
+
+  describe("adjudicatePlan resolves each agent's pin", () => {
+    let root: string;
+    let db: StorageAdapter;
+    const savedHome = process.env.HOME;
+    beforeAll(() => {
+      process.env.EMINIAR_HOME = mkdtempSync(join(tmpdir(), "em-home-adj-pin-"));
+      process.env.HOME = mkdtempSync(join(tmpdir(), "em-user-adj-pin-"));
+      root = mkdtempSync(join(tmpdir(), "em-adj-pin-"));
+      writeFileSync(join(root, "package.json"), "{}");
+      mkdirSync(join(root, ".claude", "agents"), { recursive: true });
+      writeFileSync(
+        join(root, ".claude", "agents", "pinned.md"),
+        "---\nname: pin-coder\nmodel: opus\n---\nb\n",
+      );
+      writeFileSync(
+        join(root, ".claude", "agents", "free.md"),
+        "---\nname: free-coder\nmodel: inherit\n---\nb\n",
+      );
+      resetContextCache();
+      db = getStorage(getContext(root), { vectors: false });
+    });
+    afterAll(() => {
+      closeAllStorage();
+      delete process.env.EMINIAR_HOME;
+      if (savedHome === undefined) delete process.env.HOME;
+      else process.env.HOME = savedHome;
+    });
+
+    const spec = {
+      name: "pins",
+      roles: [
+        { role: "pinned", agentType: "pin-coder", description: "pinned coder" },
+        { role: "free", agentType: "free-coder", description: "free coder" },
+        { role: "ghost", agentType: "ghost-coder", description: "no file" },
+      ],
+    } as unknown as SwarmSpec;
+
+    const plan = async (adjudicator: Record<string, unknown>) => {
+      const ctx = { root, config: configWith({ enabled: true, ...adjudicator }) };
+      const run = db.swarm.runCreate({
+        id: `pins-${Math.random().toString(36).slice(2, 8)}`,
+        swarm: "pins",
+        goal: "g",
+        topology: "hierarchical",
+      });
+      const tasks = ["pinned", "free", "ghost"].map((role) =>
+        db.swarm.taskAdd({
+          run_id: run.id,
+          title: `Rename a variable in the ${role} module`,
+          role,
+        }),
+      );
+      return adjudicatePlan(ctx, db, run, spec, tasks, { provider: null, env: {} });
+    };
+
+    it("pinned and unknown pins are kept; an unpinned agent gets a model", async () => {
+      const a = await plan({});
+      expect(a.map((x) => x.pin)).toEqual([
+        { status: "pinned", model: "opus", source: "project" },
+        undefined,
+        { status: "unknown", source: undefined },
+      ]);
+      const lines = planLines(a);
+      expect(lines[0]).toMatch(/^#\d+ → pin-coder · pinned opus \(/);
+      expect(lines[1]).toMatch(/^#\d+ → free-coder · model (haiku|sonnet|opus|fable) · effort /);
+      expect(lines[2]).toMatch(/^#\d+ → ghost-coder · model pin is unknown \(/);
+      for (const l of [lines[0], lines[2]])
+        expect(l).not.toMatch(/ · model (haiku|sonnet|opus|fable) /);
+    });
+
+    it("apply.respectFrontmatter false advises over every pin", async () => {
+      const a = await plan({ apply: { respectFrontmatter: false } });
+      expect(a.every((x) => x.pin === undefined)).toBe(true);
+      expect(planLines(a).every((l) => / · model \w+ · effort /.test(l))).toBe(true);
+    });
+  });
+});
+
 describe("em_swarm plan advice and em_adjudicate", () => {
   let root: string;
   let ctx: ProjectContext;
@@ -288,7 +457,9 @@ describe("em_swarm plan advice and em_adjudicate", () => {
     enable();
     const start = await call({ action: "start", swarm: "feat", goal: "on goal" });
     expect(start.match(/Adjudicator on:/g)).toHaveLength(1);
-    expect(start).toContain("pass it as `model` on the Agent call (effort is advice)");
+    expect(start).toContain(
+      "pass them as `model` and `effort` on the Agent call (`effort` needs Claude Code 2.1.292+; a pinned agent keeps its model)",
+    );
   });
 
   it("scores a plan in ONE batched provider call, prints a line per task and stores rows by (run, task)", async () => {
@@ -311,13 +482,17 @@ describe("em_swarm plan advice and em_adjudicate", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]).toHaveLength(3);
     expect(calls[0]?.every((r) => r.surface === "plan")).toBe(true);
-    expect(out).toContain("passing each task's suggested model below as `model`");
-    expect(out).toContain("Adjudicator suggestions: pass the model as `model` on each Agent call");
+    expect(out).toContain(
+      "passing each task's suggested model and effort below as `model` and `effort`",
+    );
+    expect(out).toContain(
+      "Adjudicator suggestions: pass the model as `model` and the effort as `effort` on each Agent call",
+    );
     const lines = out.split("\n").filter((l) => /^#\d+ → /.test(l));
     expect(lines).toHaveLength(3);
     for (const l of lines)
       expect(l).toMatch(
-        /^#\d+ → swarm-feat-(coder|tester) · model (haiku|sonnet|opus|fable) · effort (low|medium|high|xhigh) \(complexity \d, conf \d\.\d\d\)/,
+        /^#\d+ → swarm-feat-(coder|tester) · model (haiku|sonnet|opus|fable) · effort (low|medium|high|xhigh|max) \(complexity \d, conf \d\.\d\d\)/,
       );
 
     const run = db.swarm.runs({ status: "active", limit: 1 })[0]!;
@@ -367,6 +542,41 @@ describe("em_swarm plan advice and em_adjudicate", () => {
     });
     expect(n).toBe(1);
     expect(out.split("\n").filter((l) => /^#\d+ → /.test(l))).toHaveLength(2);
+  });
+
+  it("fails open when the advice step throws: the plan reports its tasks once (#66)", async () => {
+    enable();
+    const { p } = fakeProvider();
+    registerProvider("embedding", () => p);
+    await call({ action: "start", swarm: "feat", goal: "advice throws" });
+    const run = db.swarm.runs({ status: "active", limit: 1 })[0]!;
+    const writes: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      writes.push(String(chunk));
+      return true;
+    });
+    planFault.error = new Error("Cannot find module app-swarm-X.js");
+    let out: string;
+    try {
+      out = await call({
+        action: "plan",
+        tasks: [{ title: "Implement exponential backoff in the downloader", role: "coder" }],
+      });
+    } finally {
+      planFault.error = undefined;
+      spy.mockRestore();
+    }
+    expect(out).not.toMatch(/failed|Cannot find module/);
+    expect(out).toMatch(/^Planned 1 task\(s\) in run /);
+    expect(out).toContain("Implement exponential backoff in the downloader (coder)");
+    expect(out).not.toContain("Adjudicator suggestions");
+    expect(out).not.toContain("passing each task's suggested model");
+    expect(out.split("\n").at(-1)).toBe(
+      "Adjudicator advice unavailable for this plan (the tasks are planned).",
+    );
+    expect(writes.join("")).toContain("adjudicator plan advice skipped: Cannot find module");
+    const tasks = db.swarm.tasks(run.id);
+    expect(tasks).toHaveLength(1);
   });
 
   it("skips plan advice when surfaces.plan is off, and adjudicatePlan is a no-op when disabled", async () => {

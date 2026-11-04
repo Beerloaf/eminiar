@@ -297,7 +297,9 @@ function planned(
     ? `Next: spawn one worker per claimable task with the Agent tool: subagent_type ${types}${
         rows.some((t) => !t.role) ? " (a task without a role fits any)" : ""
       }, and a prompt that names "task #N" (the worker claims it)${
-        advice ? ", passing each task's suggested model below as `model`" : ""
+        advice
+          ? ", passing each task's suggested model and effort below as `model` and `effort`"
+          : ""
       }; run_in_background: true runs them in parallel. Watch with em_swarm {action:"status"}.`
     : "Next: the coordinator spawns workers for these; name the new task ids in your final message.";
   return capOutput(
@@ -452,11 +454,22 @@ async function dispatch(args: Args, callerCtx: ProjectContext): Promise<string> 
       // an isolated worker), so they match the main checkout's paths.
       const rows = addTasks(db, callerCtx, run, swarm, caller, args.tasks);
       // Adjudicator advice (opt-in): one batched scoring of the new tasks; nothing when off.
+      // The tasks are already stored, so the advice fails open: an error here must not make
+      // the plan look failed (a retry would plan every task twice).
       let advice = "";
+      let adviceNote = "";
       if (ctx.config.adjudicator?.enabled && ctx.config.adjudicator.surfaces.plan) {
-        advice = planAdviceBlock(await adjudicatePlan(ctx, db, run, swarm, rows, { sessionId }));
+        try {
+          advice = planAdviceBlock(await adjudicatePlan(ctx, db, run, swarm, rows, { sessionId }));
+        } catch (err) {
+          process.stderr.write(
+            `eminiar: adjudicator plan advice skipped: ${(err as Error)?.message ?? String(err)}\n`,
+          );
+          adviceNote = "Adjudicator advice unavailable for this plan (the tasks are planned).";
+        }
       }
-      return planned(db, rows, swarm, run, caller, advice);
+      const out = planned(db, rows, swarm, run, caller, advice);
+      return adviceNote ? `${out}\n${adviceNote}` : out;
     }
 
     case "claim": {

@@ -17,9 +17,15 @@ export type Surface = (typeof SURFACES)[number];
 export const TIERS = ["haiku", "sonnet", "opus", "fable"] as const;
 export type Tier = (typeof TIERS)[number];
 
-/** Advice only: the Agent input has no effort field. */
-export const EFFORTS = ["low", "medium", "high", "xhigh"] as const;
+/**
+ * Claude Code's effort levels (sub-agents "Choose an effort level"). Advice: the coordinator
+ * passes it as `effort` on the Agent call (Claude Code AGENT_EFFORT_SINCE or later, non-fork
+ * subagents; CLAUDE_CODE_EFFORT_LEVEL outranks it). The hook never injects it.
+ */
+export const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 export type Effort = (typeof EFFORTS)[number];
+/** The first Claude Code version whose Agent tool takes a per-call `effort`. */
+export const AGENT_EFFORT_SINCE = "2.1.292";
 
 export const PROVIDER_IDS = ["heuristic", "typesafe", "openai-compatible", "embedding"] as const;
 export type ProviderId = (typeof PROVIDER_IDS)[number];

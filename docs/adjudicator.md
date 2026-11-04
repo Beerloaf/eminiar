@@ -264,7 +264,7 @@ reports the key that would actually be sent, so a local target shows only its ke
 |---|---|---|---|
 | Prompt | UserPromptSubmit | One line for Claude, for example `eminiar adjudicator: complexity 1/4 (lookup) · start with em_symbols → em_search · if you delegate: haiku, role explorer` | `surfaces.prompt` |
 | Main session | UserPromptSubmit | A note when the session model is at least two tiers above the advice, at most once every `advice.cooldownPrompts` prompts: `… /model haiku would be cheaper than opus` | `advice.mainSession`: `user` (shown to you), `context` (to Claude) or `off` |
-| Subagent dispatch | PreToolUse on `Agent` | A note on the call: `adjudicator: model haiku would do (complexity 1, conf 0.82): pass model:'haiku'; suggested effort low, role explorer`. In apply mode it may set the model | `surfaces.agent` |
+| Subagent dispatch | PreToolUse on `Agent` | A note on the call: `adjudicator: model haiku would do (complexity 1, conf 0.82): pass model:'haiku'; pass effort:'low' (Claude Code 2.1.292+), role explorer`. For an agent whose definition pins a model it names the pin instead: `adjudicator: pinned opus (adjudicator would pick haiku; remove the model pin in .claude/agents/x.md to let it choose); …`. In apply mode it may set the model | `surfaces.agent` |
 | Swarm plan | `em_swarm plan` | One line per task, see [Swarm plans](#swarm-plans) | `surfaces.plan` |
 | Raw tool | PreToolUse on `Bash`, `Read`, `Grep`, … | A hint when the call contradicts the prompt's advised `em_*` tool, once per prompt, only when routing said nothing | `surfaces.tools` (off by default) |
 
@@ -298,9 +298,13 @@ These are Claude Code's rules for a subagent's model, and the adjudicator follow
    changes a model, the plan advice says the model line is informational, and `status` and
    `doctor` warn in apply mode.
 3. The Agent `model` parameter accepts only `haiku`, `sonnet`, `opus` and `fable`.
-4. **Effort cannot be set per call.** `effort` is not an Agent input; it is set only in the
-   agent file's frontmatter. The adjudicator therefore suggests an effort level but never
-   injects one.
+4. **Effort can be passed per call** from Claude Code 2.1.292: the Agent call takes an `effort`
+   parameter (`low`, `medium`, `high`, `xhigh` or `max`; levels a model lacks fall back to the
+   highest one below) that overrides the agent file's `effort`, for non-fork subagents.
+   `CLAUDE_CODE_EFFORT_LEVEL` outranks both. The adjudicator suggests a level for the
+   coordinator to pass (`max` only at the very top of the complexity scale, c ≥ 3.75), and says
+   the level is informational while `CLAUDE_CODE_EFFORT_LEVEL` is set. The hook never injects
+   `effort`, in apply mode too.
 
 Apply mode changes the model only when all of these hold:
 
@@ -322,8 +326,14 @@ first), then `~/.claude/agents`, then plugin agents (`plugin:agent`, from
 searched recursively and matched on the frontmatter `name`, not the file name. When the pin
 cannot be known (no definition found, an unreadable or malformed file, copies that disagree, or
 an agent defined only for the session with `--agents`), apply mode leaves the model alone and
-only advises: the note says "not applied: the agent's model pin is unknown" and the decision's
-`scores.pin` records why.
+only advises: the note says "model pin is unknown (… not overridden while the agent's definition
+cannot be read)" and the decision's `scores.pin` records why.
+
+Advise mode respects pins the same way (with `apply.respectFrontmatter` on, the default). For a
+pinned agent, or one whose pin is unknown, the dispatch note and the plan line name the pin and
+what the adjudicator would pick, and never tell the coordinator to pass a different `model`.
+Remove the pin (for swarm workers, the role's `model` in `swarm.yaml`) to let the adjudicator
+choose. These dispatches get no savings credit, even if a `model` is passed anyway.
 
 ## Swarm plans
 
@@ -331,15 +341,23 @@ With `surfaces.plan` on, `em_swarm plan` scores all new tasks in one batched cal
 `timeouts.planMs`; the heuristic answers if the provider fails) and appends one line per task:
 
 ```text
-Adjudicator suggestions: pass the model as `model` on each Agent call (effort is advice; it is set only in the agent file):
+Adjudicator suggestions: pass the model as `model` and the effort as `effort` on each Agent call (`effort` needs Claude Code 2.1.292 or later); a pinned agent keeps its model: pass no `model`:
 #5 → swarm-feature-coder · model haiku · effort low (complexity 1, conf 0.82)
 #6 → swarm-feature-architect · model opus · effort high (complexity 3, conf 0.77); role suggested: architect (planned: coder)
+#7 → swarm-feature-reviewer · pinned opus (adjudicator would pick haiku; remove the pin in swarm.yaml to let it choose) · effort low (complexity 1, conf 0.80)
 ```
+
+A role whose agent pins a model (its `model` in `swarm.yaml`, or any agent definition Claude Code
+would find first) keeps it; a definition that cannot be read shows `model pin is unknown`. With
+`CLAUDE_CODE_SUBAGENT_MODEL_FORCE` on the model is informational, and with
+`CLAUDE_CODE_EFFORT_LEVEL` set the effort is. If scoring fails outright, the plan still succeeds
+and ends with "Adjudicator advice unavailable for this plan (the tasks are planned)."
 
 The planned role gets a head start in scoring, so "role suggested" appears only on strong
 evidence. When the worker is dispatched, the hook reuses the plan's verdict for that task rather
 than scoring again, and records whether the coordinator followed it. This is the reliable path:
-the coordinator passes `model`, which Claude Code always honours.
+the coordinator passes `model` (and `effort`), which Claude Code honours unless
+`CLAUDE_CODE_SUBAGENT_MODEL_FORCE` (or `CLAUDE_CODE_EFFORT_LEVEL`) is set.
 
 ## em_adjudicate
 
@@ -383,7 +401,8 @@ The savings figure is an estimate. This is how it is computed.
   [usage](usage.md) data), else `claude-sonnet-5-5`.
 - **Realised savings.** The tokens the dispatch actually used, repriced at the baseline model,
   minus their actual cost. Only dispatches where the advice was **followed** or **applied** get
-  credit. A failed attempt that was redone is charged its full cost.
+  credit. A failed attempt that was redone is charged its full cost. A dispatch to an agent
+  whose model pin the advice kept (pinned or unknown) gets none.
 - **Net** = realised savings − the adjudicator's own provider spend.
 - **Potential savings.** Prompts whose advised tier was below the model that ran, repriced at
   the advised tier. Shown separately and never added to net.
@@ -396,6 +415,8 @@ Assumptions, shown next to every figure:
 - List prices, with cache pricing unchanged (`usage.pricing` overrides apply).
 - Credit only for dispatches that were followed or applied; a failed attempt that was redone is
   charged its full cost.
+- No credit for a dispatch to an agent whose model pin the advice kept (pinned, or a pin that
+  could not be read): the adjudicator chose nothing there.
 - The adjudicator's own provider spend is subtracted.
 - No credit for tool advice: `em_stats` already counts the context kept out by `em_*` tools.
   Only the tool-advice follow rate is reported.

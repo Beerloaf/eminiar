@@ -25,6 +25,7 @@ export const SAVINGS_ASSUMPTIONS: readonly string[] = Object.freeze([
   "Token counts would have been the same on the baseline model. Smaller models can need more turns, so compare tokens per successful task by tier.",
   "List prices, with cache pricing unchanged.",
   "Credit only for dispatches that were followed or applied; a failed attempt that was redone is charged its full cost.",
+  "No credit for a dispatch to an agent whose model pin the advice kept (pinned, or a pin that could not be read): the adjudicator chose nothing there.",
   "The adjudicator's own provider spend is subtracted.",
   "No credit for tool advice: em_stats already counts context kept out by em_* tools. Only the tool-advice follow rate is reported.",
   "Main-session advice yields potential savings only and is never added to net: the counterfactual cannot be observed.",
@@ -57,6 +58,21 @@ export function tierRank(tier: string | null | undefined): number {
 export function isPinned(model: string | null | undefined): model is string {
   const m = String(model ?? "").trim();
   return m !== "" && m.toLowerCase() !== "inherit";
+}
+
+/**
+ * The dispatch's advice kept the agent's model pin (onPreAgent stores `pinDeferred` in the row's
+ * scores JSON when the pin is pinned or unknown and apply.respectFrontmatter is on): no model was
+ * advised, so reconcile neither detects a follow nor credits savings for it.
+ */
+export function pinDeferred(row: Pick<AdjudicationRow, "scores">): boolean {
+  if (!row.scores) return false;
+  try {
+    const s: unknown = JSON.parse(row.scores);
+    return !!s && typeof s === "object" && (s as { pinDeferred?: unknown }).pinDeferred === true;
+  } catch {
+    return false;
+  }
 }
 
 export interface BaselineQuery {

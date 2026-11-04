@@ -31,6 +31,7 @@ import {
   actualCost,
   allRows,
   dominantModel,
+  pinDeferred,
   repriceAt,
   resolveBaseline,
   tierOf,
@@ -633,8 +634,10 @@ class Reconciler {
     if (!row.baselineModel) patch.baselineModel = baseline;
 
     // Follow detection: the coordinator passed a model; compare it with the advice it saw.
+    // A dispatch whose advice kept the agent's pin advised no model: no follow, no credit.
+    const deferred = pinDeferred(row);
     let action = row.action ?? null;
-    if (action === "advised" && row.modelRequested) {
+    if (action === "advised" && row.modelRequested && !deferred) {
       const parent = row.parentId ? this.db.adjudicator.get(row.parentId) : undefined;
       const advice = parent?.tier ?? row.tier ?? undefined;
       const requested = tierOf(row.modelRequested) ?? row.modelRequested;
@@ -652,7 +655,7 @@ class Reconciler {
     patch.actualCostUsd = actual;
     patch.baselineCostUsd = base;
     let savings: number | null = null;
-    if (CREDITED.has(action ?? "")) {
+    if (CREDITED.has(action ?? "") && !deferred) {
       if (redone && outcome === "failure") savings = actual === null ? null : -actual;
       else if (actual !== null && base !== null) savings = base - actual;
     }

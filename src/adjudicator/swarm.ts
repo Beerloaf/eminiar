@@ -1,9 +1,10 @@
 /**
  * Swarm plan advice (docs/design/adjudicator.md §16): after `em_swarm plan` adds its tasks, ONE
  * batched adjudication scores them all, stores a `plan` row per task keyed by (run, task), and
- * returns one suggestion line per task for the coordinator: the agent to spawn, the `model` to
- * pass on the Agent call and the effort (advice only), plus a note when the scorer would pick a
- * different role than the plan did.
+ * returns one suggestion line per task for the coordinator: the agent to spawn, the `model` and
+ * `effort` to pass on the Agent call, plus a note when the scorer would pick a different role than
+ * the plan did. An agent whose definition pins a model (or whose pin cannot be read) keeps it, like
+ * apply mode: the line names the pin and what the adjudicator would pick, never a model to pass.
  *
  * Everything here is a no-op while the adjudicator is off or `surfaces.plan` is false, and it
  * never throws: the plan is already committed when this runs, so a scoring failure costs the
@@ -14,11 +15,19 @@ import type { Config } from "../config.js";
 import type { ProjectContext } from "../context.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import type { RunRow, SwarmSpec, TaskRow } from "../swarm/types.js";
+import { type AgentPin, resolveAgentPin } from "./agent-pin.js";
 import { type Adjudication, adjudicate, type EngineOptions } from "./engine.js";
 import { subagentModelForced } from "./env.js";
 import { complexityBucket, topIntent } from "./heuristic.js";
 import { biasFromRows, type LearningConfig } from "./learn.js";
-import { type AdjudicationRequest, type AdjudicatorProvider, TIERS, type Tier } from "./types.js";
+import { isPinned, tierOf } from "./savings.js";
+import {
+  type AdjudicationRequest,
+  type AdjudicatorProvider,
+  AGENT_EFFORT_SINCE,
+  TIERS,
+  type Tier,
+} from "./types.js";
 
 /** Text of one task sent to the scorer (title + detail), before redaction and the provider cap. */
 const TASK_TEXT_MAX = 4000;
@@ -32,6 +41,17 @@ export function planAdviceEnabled(config: Pick<Config, "adjudicator">): boolean 
 /** The env flag that makes Claude Code ignore `model` on the Agent call (Claude Code's on/off rule). */
 export function modelForced(env: NodeJS.ProcessEnv = process.env): boolean {
   return subagentModelForced(env);
+}
+
+/**
+ * The agent's model pin as plan advice respects it: `pinned` (with the model) or `unknown` (the
+ * definition cannot be read with certainty). Absent when the agent is unpinned or
+ * apply.respectFrontmatter is off; then the model is advised as usual.
+ */
+export interface PlanPin {
+  status: "pinned" | "unknown";
+  model?: string | undefined;
+  source?: AgentPin["source"];
 }
 
 export interface PlanAdvice {
@@ -48,6 +68,8 @@ export interface PlanAdvice {
   complexity: number;
   confidence: number;
   rowId?: number | undefined;
+  /** Set when the agent's model pin is respected: the line then names it instead of `model`. */
+  pin?: PlanPin | undefined;
 }
 
 export interface PlanOptions {
@@ -91,6 +113,20 @@ export function learnedBias(db: StorageAdapter, cfg: Config["adjudicator"]): Eng
 
 const asTier = (s: string | undefined): Tier | undefined =>
   (TIERS as readonly string[]).includes(s ?? "") ? (s as Tier) : undefined;
+
+/** The pin plan advice respects for `agentType`, or undefined (unpinned / not respected). */
+export function respectedPin(
+  agentType: string | undefined,
+  respectFrontmatter: boolean,
+  lookup: (type: string) => AgentPin,
+): PlanPin | undefined {
+  if (!agentType || !respectFrontmatter) return undefined;
+  const pin = lookup(agentType);
+  if (pin.status === "pinned" && isPinned(pin.model))
+    return { status: "pinned", model: pin.model, source: pin.source };
+  if (pin.status === "unknown") return { status: "unknown", source: pin.source };
+  return undefined;
+}
 
 function adviceOf(a: Adjudication, task: TaskRow, swarm: SwarmSpec): PlanAdvice {
   const v = a.verdict;
@@ -149,7 +185,23 @@ export async function adjudicatePlan(
     if (opts.now) engine.now = opts.now;
     if (opts.log) engine.log = opts.log;
     const out = await adjudicate(reqs, engine);
-    return out.map((a, i) => adviceOf(a, tasks[i] as TaskRow, swarm));
+    // One pin lookup per agent type (the swarm's generated agents, usually a handful).
+    const env = opts.env ?? process.env;
+    const pins = new Map<string, AgentPin>();
+    const lookup = (type: string): AgentPin => {
+      let p = pins.get(type);
+      if (!p) {
+        p = resolveAgentPin(type, { root: ctx.root, cwd: ctx.root, env });
+        pins.set(type, p);
+      }
+      return p;
+    };
+    return out.map((a, i) => {
+      const advice = adviceOf(a, tasks[i] as TaskRow, swarm);
+      const pin = respectedPin(advice.agentType, cfg.apply.respectFrontmatter, lookup);
+      if (pin) advice.pin = pin;
+      return advice;
+    });
   } catch (err) {
     opts.log?.(`adjudicator: plan advice skipped: ${(err as Error)?.message ?? String(err)}`);
     return [];
@@ -158,12 +210,33 @@ export async function adjudicatePlan(
 
 const r2 = (n: number) => (Math.round(n * 100) / 100).toFixed(2);
 
-/** One line per task, e.g. "#5 → swarm-feature-coder · model haiku · effort low (complexity 1, conf 0.82)". */
+/** Where to remove a respected pin: swarm.yaml for the project agents eminiar generates. */
+function pinHome(pin: PlanPin): string {
+  return pin.source === "project" || pin.source === undefined
+    ? "remove the pin in swarm.yaml"
+    : `remove the ${pin.source} agent's model pin`;
+}
+
+/** "pinned opus (adjudicator would pick haiku; remove the pin in swarm.yaml to let it choose)". */
+export function pinnedPart(pin: PlanPin, model: Tier | undefined, fix = pinHome(pin)): string {
+  if (pin.status === "unknown")
+    return `model pin is unknown (${model ? `adjudicator would pick ${model}; ` : ""}not overridden while the agent's definition cannot be read)`;
+  const pinned = pin.model ?? "?";
+  if (!model || (tierOf(pinned) ?? pinned) === model)
+    return `pinned ${pinned} (matches the adjudicator's pick)`;
+  return `pinned ${pinned} (adjudicator would pick ${model}; ${fix} to let it choose)`;
+}
+
+/**
+ * One line per task, e.g. "#5 → swarm-feature-coder · model haiku · effort low (complexity 1,
+ * conf 0.82)", or "#5 → swarm-feature-coder · pinned opus (adjudicator would pick haiku; …) ·
+ * effort low (…)" for an agent whose pin is respected.
+ */
 export function planLines(advice: readonly PlanAdvice[]): string[] {
   return advice.map((a) => {
     const parts = [
       a.agentType ?? "any role",
-      ...(a.model ? [`model ${a.model}`] : []),
+      ...(a.pin ? [pinnedPart(a.pin, a.model)] : a.model ? [`model ${a.model}`] : []),
       `effort ${a.effort}`,
     ];
     let line = `#${a.taskId} → ${parts.join(" · ")} (complexity ${complexityBucket(a.complexity)}, conf ${r2(a.confidence)})`;
@@ -180,8 +253,31 @@ export function planAdviceBlock(
   env: NodeJS.ProcessEnv = process.env,
 ): string {
   if (!advice.length) return "";
-  const head = modelForced(env)
-    ? "Adjudicator suggestions (CLAUDE_CODE_SUBAGENT_MODEL_FORCE is on, so Claude Code ignores `model` on the Agent call; informational only):"
-    : "Adjudicator suggestions: pass the model as `model` on each Agent call (effort is advice; it is set only in the agent file):";
-  return [head, ...planLines(advice)].join("\n");
+  return [planAdviceHead(advice, env), ...planLines(advice)].join("\n");
+}
+
+/** CLAUDE_CODE_EFFORT_LEVEL outranks the Agent call's `effort` (and the agent file's). */
+export function effortForced(env: NodeJS.ProcessEnv = process.env): boolean {
+  const v = env.CLAUDE_CODE_EFFORT_LEVEL?.trim();
+  return !!v;
+}
+
+/** The block's first line: what to pass on the Agent call, given FORCE, the effort env and pins. */
+export function planAdviceHead(
+  advice: readonly PlanAdvice[],
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const effortSet = effortForced(env);
+  const effortNote = "CLAUDE_CODE_EFFORT_LEVEL is set and outranks `effort`";
+  const pins = advice.some((a) => a.pin) ? "; a pinned agent keeps its model: pass no `model`" : "";
+  if (modelForced(env))
+    return `Adjudicator suggestions (CLAUDE_CODE_SUBAGENT_MODEL_FORCE is on, so Claude Code ignores \`model\` on the Agent call; the model is informational; ${
+      effortSet
+        ? `${effortNote}, so effort is too`
+        : `pass the effort as \`effort\` (Claude Code ${AGENT_EFFORT_SINCE} or later)`
+    }):`;
+  const pass = effortSet
+    ? `pass the model as \`model\` on each Agent call (effort is informational: ${effortNote})`
+    : `pass the model as \`model\` and the effort as \`effort\` on each Agent call (\`effort\` needs Claude Code ${AGENT_EFFORT_SINCE} or later)`;
+  return `Adjudicator suggestions: ${pass}${pins}:`;
 }

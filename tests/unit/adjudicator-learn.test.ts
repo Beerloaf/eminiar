@@ -27,6 +27,7 @@ import {
 import {
   FALLBACK_MODEL,
   isPinned,
+  pinDeferred,
   promptWindows,
   repriceAt,
   resolveBaseline,
@@ -534,6 +535,33 @@ describe("reconcile: savings credit", () => {
     expect(i?.savingsUsd ?? null).toBeNull();
     // The plan row is advice only.
     expect(db.adjudicator.get(plan)?.savingsUsd ?? null).toBeNull();
+  });
+
+  it("credits nothing for a dispatch whose advice kept the agent's model pin (#68)", () => {
+    db.apiCallsUpsert([call({ ts: NOW - 40 * MIN })]);
+    const t = swarmTask("done", "P1");
+    db.apiCallsUpsert([call({ agent_id: "P1", sidechain: 1, model: "claude-haiku-4-5" })]);
+    const plan = row({ surface: "plan", runId: "R1", taskId: t, tier: "haiku", action: "advised" });
+    // The coordinator passed the plan's tier anyway, over a pin the advice kept.
+    const pinned = row({
+      runId: "R1",
+      taskId: t,
+      parentId: plan,
+      action: "advised",
+      modelRequested: "haiku",
+      scores: JSON.stringify({ pin: { status: "pinned", model: "opus" }, pinDeferred: true }),
+    });
+    reconcile(db, { now: NOW });
+    const r = db.adjudicator.get(pinned);
+    expect(r?.action).toBe("advised");
+    expect(r?.actualCostUsd).toBeCloseTo(HAIKU, 10);
+    expect(r?.savingsUsd ?? null).toBeNull();
+    expect(savingsReport(db).creditedRows).toBe(0);
+
+    expect(pinDeferred({ scores: JSON.stringify({ pinDeferred: true }) })).toBe(true);
+    expect(pinDeferred({ scores: JSON.stringify({ pin: { status: "pinned" } }) })).toBe(false);
+    expect(pinDeferred({ scores: "not json" })).toBe(false);
+    expect(pinDeferred({ scores: null })).toBe(false);
   });
 
   it("charges a redone failed attempt its full cost", () => {

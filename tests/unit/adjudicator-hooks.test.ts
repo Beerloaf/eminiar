@@ -53,6 +53,7 @@ const ENV_KEYS = [
   "EMINIAR_ADJUDICATOR_REMOTE",
   "CLAUDE_PROJECT_DIR",
   "CLAUDE_CODE_SUBAGENT_MODEL_FORCE",
+  "CLAUDE_CODE_EFFORT_LEVEL",
   "HOME",
   "CLAUDE_CODE_PLUGIN_CACHE_DIR",
   "CLAUDE_CODE_PLUGIN_DIRS",
@@ -671,7 +672,111 @@ describe("onPreAgent", () => {
     expect(r.taskId).toBe(task.id);
     expect(r.tier).toBe("haiku");
     expect(r.action).toBe("applied");
-    expect(a?.note).toMatch(/suggested effort low, role coder/);
+    expect(a?.note).toMatch(/pass effort:'low' \(Claude Code 2\.1\.292\+\), role coder/);
+  });
+
+  describe("advise mode respects model pins like apply mode (#68)", () => {
+    const LIST = { description: "x", prompt: "list the files in src" };
+    const advise = async (input: Record<string, unknown>) => {
+      const ctx = configure({ enabled: true, mode: "advise" });
+      const { onPreAgent } = await hooksModule();
+      // The session runs on opus, so an unpinned agent gets "pass model" advice.
+      db().apiCallsUpsert([call({ model: "claude-opus-5-5" })]);
+      const a = await onPreAgent(ctx, base({ tool_name: "Agent", tool_input: input }), undefined);
+      return { a, r: rowsOf(sid, "agent")[0]! };
+    };
+
+    it("pinned: names the pin and the pick, never a model to pass; no savings credit", async () => {
+      mkdirSync(join(root, ".claude", "agents"), { recursive: true });
+      writeFileSync(
+        join(root, ".claude", "agents", "adv-pinned.md"),
+        "---\nname: adv-pinned\nmodel: opus\n---\nbody\n",
+      );
+      const { a, r } = await advise({ ...LIST, subagent_type: "adv-pinned" });
+      expect(r.tier).not.toBe("opus");
+      expect(a?.action).toBe("advised");
+      expect(a?.model).toBeUndefined();
+      expect(a?.note).toMatch(
+        new RegExp(
+          `^adjudicator: pinned opus \\(adjudicator would pick ${r.tier}; remove the model pin in .*adv-pinned\\.md to let it choose\\)`,
+        ),
+      );
+      expect(a?.note).not.toMatch(/pass model/);
+      expect(r.modelFinal).toBeNull();
+      expect(JSON.parse(r.scores!)).toMatchObject({
+        pin: { status: "pinned", model: "opus" },
+        pinDeferred: true,
+      });
+    });
+
+    it("unknown pin: no model to pass either", async () => {
+      const { a, r } = await advise({ ...LIST, subagent_type: "ghost-plugin:helper" });
+      expect(a?.note).toMatch(
+        /^adjudicator: model pin is unknown \(adjudicator would pick \w+; not overridden/,
+      );
+      expect(a?.note).not.toMatch(/pass model/);
+      expect(JSON.parse(r.scores!)).toMatchObject({
+        pin: { status: "unknown" },
+        pinDeferred: true,
+      });
+    });
+
+    it("unpinned: keeps the pass-model advice and is creditable", async () => {
+      mkdirSync(join(root, ".claude", "agents"), { recursive: true });
+      writeFileSync(
+        join(root, ".claude", "agents", "adv-free.md"),
+        "---\nname: adv-free\nmodel: inherit\n---\nbody\n",
+      );
+      const { a, r } = await advise({ ...LIST, subagent_type: "adv-free" });
+      expect(a?.note).toMatch(
+        /^adjudicator: model \w+ would do \(complexity \d, conf [\d.]+\): pass model:'\w+'/,
+      );
+      expect(JSON.parse(r.scores!).pinDeferred).toBeUndefined();
+    });
+
+    it("respectFrontmatter false advises over the pin", async () => {
+      const ctx = configure({
+        enabled: true,
+        mode: "advise",
+        apply: { respectFrontmatter: false },
+      });
+      const { onPreAgent } = await hooksModule();
+      db().apiCallsUpsert([call({ model: "claude-opus-5-5" })]);
+      const a = await onPreAgent(
+        ctx,
+        base({ tool_name: "Agent", tool_input: { ...LIST, subagent_type: "ghost-plugin:helper" } }),
+        undefined,
+      );
+      expect(a?.note).toMatch(/pass model:'\w+'/);
+    });
+
+    it("says to pass effort unless the call has one or CLAUDE_CODE_EFFORT_LEVEL outranks it", async () => {
+      const first = await advise({ ...LIST, subagent_type: "general-purpose" });
+      expect(first.a?.note).toMatch(
+        /pass effort:'(low|medium|high|xhigh|max)' \(Claude Code 2\.1\.292\+\)/,
+      );
+      const ctx = configure({ enabled: true, mode: "advise" });
+      const { onPreAgent } = await hooksModule();
+      const own = await onPreAgent(
+        ctx,
+        base({ tool_name: "Agent", tool_input: { ...LIST, description: "own", effort: "high" } }),
+        undefined,
+      );
+      expect(own?.note).toMatch(/suggested effort \w+/);
+      expect(own?.note).not.toMatch(/pass effort/);
+      process.env.CLAUDE_CODE_EFFORT_LEVEL = "low";
+      try {
+        const env = await onPreAgent(
+          ctx,
+          base({ tool_name: "Agent", tool_input: { ...LIST, description: "env" } }),
+          undefined,
+        );
+        expect(env?.note).toMatch(/suggested effort \w+/);
+        expect(env?.note).not.toMatch(/pass effort/);
+      } finally {
+        delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
+      }
+    });
   });
 });
 

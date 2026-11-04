@@ -142,11 +142,15 @@ export function complexityBucket(c: number): number {
   return clamp(Math.round(c), 0, 4);
 }
 
+/** Effort ladder from complexity; `max` only at the very top (c ≥ MAX_EFFORT_AT). */
+export const MAX_EFFORT_AT = 3.75;
+
 export function effortFor(c: number): Effort {
   if (c < 1.5) return "low";
   if (c < 2.5) return "medium";
   if (c < 3.5) return "high";
-  return "xhigh";
+  if (c < MAX_EFFORT_AT) return "xhigh";
+  return "max";
 }
 
 /** The strongest intent, or undefined when none fired. */
