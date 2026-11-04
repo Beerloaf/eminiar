@@ -34,6 +34,11 @@
  * | taskFiles      | +0.4   | plan task touching more than 3 files                           |
  * | taskDeps       | +0.2   | plan task with more than one dependency                        |
  * | taskFloor      |  2     | a swarm task title ("T7: ...") is a planned unit: c ≥ this     |
+ * | investigateFloor | 2    | an investigation (why, figure out, look into, explain ...) of a |
+ * |                |        | system-level subject or emergent symptom follows behaviour     |
+ * |                |        | across modules: c ≥ this (one named symbol stays a lookup)     |
+ * | crossCuttingFloor | 2   | threading a value through layers, or judging a change's impact |
+ * |                |        | on its callers, touches every hop: c ≥ this                    |
  * | toolProvider   |  0     | blend weight of a provider's tool answer (§7.4); 0 = heuristic owns tools |
  * | asymmetry      |  2     | tier cost ratio: under-tiering costs a redo, so being c units   |
  * |                |        | above a tier's centre costs `asymmetry`× being c units below it |
@@ -96,6 +101,8 @@ export const DEFAULT_FEATURE_WEIGHTS: Readonly<Record<string, number>> = Object.
   taskFiles: 0.4,
   taskDeps: 0.2,
   taskFloor: 2,
+  investigateFloor: 2,
+  crossCuttingFloor: 2,
   toolProvider: 0,
   asymmetry: 2,
 });
@@ -272,6 +279,13 @@ export function scoreComplexity(
   if (f.task && f.task.files > 3)
     term("taskFiles", w.taskFiles ?? 0, `task touches ${f.task.files} files`);
   if (f.task && f.task.deps > 1) term("taskDeps", w.taskDeps ?? 0, `${f.task.deps} deps`);
+  // Investigations and cross-cutting changes are sized by what they touch, not by their wording.
+  const invFloor = w.investigateFloor ?? 0;
+  if (f.investigate && c < invFloor)
+    term("investigate", invFloor - c, `investigates system behaviour: floor ${invFloor}`);
+  const ccFloor = w.crossCuttingFloor ?? 0;
+  if (f.crossCutting && c < ccFloor)
+    term("crossCutting", ccFloor - c, `cross-cutting change: floor ${ccFloor}`);
   const floor = w.taskFloor ?? 0;
   if (f.taskTitle && c < floor) term("taskFloor", floor - c, `swarm task title: floor ${floor}`);
   return { complexity: clamp(c, 0, 4), reasons };

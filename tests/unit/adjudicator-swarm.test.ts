@@ -30,8 +30,10 @@ import { type CallerStamp, resetSwarmSecret, signCaller } from "../../src/swarm/
 import type { SwarmSpec, TaskRow } from "../../src/swarm/types.js";
 import {
   emAdjudicate,
+  NOTE_MAX,
   registerServerProviders,
   runAdjudicate,
+  type ServerProviderOptions,
   scoreLine,
   topReasons,
 } from "../../src/tools/em_adjudicate.js";
@@ -463,6 +465,40 @@ describe("em_swarm plan advice and em_adjudicate", () => {
     );
   });
 
+  it("stores the feedback note redacted and capped, and shows it in explain", async () => {
+    enable({ provider: "heuristic" });
+    const r = await runAdjudicate({ action: "score", text: "Rename the flag in the CLI" }, ctx, {
+      db,
+    });
+    const id = Number(/^\[(\d+)\]/.exec(r.content[0]!.text)![1]);
+    await runAdjudicate(
+      {
+        action: "feedback",
+        id,
+        outcome: "too_big",
+        note: "haiku was enough; token sk-abcdefghijklmnopqrstuvwx leaked in the log",
+      },
+      ctx,
+      { db },
+    );
+    const note = db.adjudicator.get(id)?.feedbackNote;
+    expect(note).toBe("haiku was enough; token sk-*** leaked in the log");
+    const ex = (await runAdjudicate({ action: "explain", id }, ctx, { db })).content[0]!.text;
+    expect(ex).toContain(`feedback note: "${note}"`);
+
+    await runAdjudicate(
+      { action: "feedback", id, outcome: "good", note: `${"long note ".repeat(100)}end` },
+      ctx,
+      { db },
+    );
+    const long = db.adjudicator.get(id)?.feedbackNote ?? "";
+    expect(Array.from(long)).toHaveLength(NOTE_MAX);
+    expect(long.endsWith("…")).toBe(true);
+    // Feedback without a note keeps the earlier one.
+    await runAdjudicate({ action: "feedback", id, outcome: "good" }, ctx, { db });
+    expect(db.adjudicator.get(id)?.feedbackNote).toBe(long);
+  });
+
   it("score and feedback refuse while off; explain and stats still read", async () => {
     expect(
       (await runAdjudicate({ action: "score", text: "x y z" }, ctx, { db })).content[0]!.text,
@@ -490,6 +526,64 @@ describe("registerServerProviders", () => {
       await registerServerProviders(configWith({ enabled: true, provider: "embedding" })),
     ).toBe(true);
     expect(hasProvider("embedding")).toBe(true);
+  });
+
+  it("warms the exemplars and then the model in the background, never before returning", async () => {
+    const order: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((res) => {
+      release = res;
+    });
+    const factory = (() => ({
+      id: "embedding",
+      remote: false,
+      dims: ["tier", "complexity"],
+      async adjudicate() {
+        throw new Error("not called");
+      },
+      async warm() {
+        order.push("exemplars");
+        await gate;
+      },
+    })) as unknown as NonNullable<ServerProviderOptions["factory"]>;
+    const embedder = async () => ({ warm: () => void order.push("model") });
+    const cfg = configWith({ enabled: true, provider: "embedding" });
+
+    expect(await registerServerProviders(cfg, { warm: true, factory, embedder })).toBe(true);
+    expect(hasProvider("embedding")).toBe(true);
+    expect(order).toEqual(["exemplars"]); // registered while the exemplar load is still running
+    release();
+    await new Promise((res) => setTimeout(res, 0));
+    expect(order).toEqual(["exemplars", "model"]);
+
+    // A failing warm-up is swallowed; without warm nothing is loaded.
+    order.length = 0;
+    const failing = (() => ({
+      async warm() {
+        order.push("fail");
+        throw new Error("no model");
+      },
+    })) as unknown as NonNullable<ServerProviderOptions["factory"]>;
+    expect(await registerServerProviders(cfg, { warm: true, factory: failing, embedder })).toBe(
+      true,
+    );
+    await new Promise((res) => setTimeout(res, 0));
+    expect(order).toEqual(["fail"]);
+    order.length = 0;
+    expect(await registerServerProviders(cfg, { factory, embedder })).toBe(true);
+    await new Promise((res) => setTimeout(res, 0));
+    expect(order).toEqual([]);
+    // Disabled: no registration and no warm-up.
+    resetProviders();
+    expect(
+      await registerServerProviders(configWith({ provider: "embedding" }), {
+        warm: true,
+        factory,
+        embedder,
+      }),
+    ).toBe(false);
+    expect(hasProvider("embedding")).toBe(false);
+    expect(order).toEqual([]);
   });
 });
 

@@ -10,6 +10,8 @@ import { resolveAdjudicator } from "../adjudicator/config.js";
 import { adjudicate } from "../adjudicator/engine.js";
 import { complexityBucket } from "../adjudicator/heuristic.js";
 import { applyFeedback, type Feedback, reconcile } from "../adjudicator/learn.js";
+import type { EmbeddingFactory } from "../adjudicator/providers/embedding.js";
+import { head } from "../adjudicator/redact.js";
 import { type SavingsReportOptions, savingsReport } from "../adjudicator/savings.js";
 import { learnedBias } from "../adjudicator/swarm.js";
 import type {
@@ -34,6 +36,8 @@ export const FEEDBACK_VALUES = ["good", "too_small", "too_big"] as const;
 /** The compact actions stay under this; explain may run longer. */
 export const COMPACT_MAX = 1000;
 const EXPLAIN_MAX = 6000;
+/** A feedback note is stored redact()ed and cut to this many chars. */
+export const NOTE_MAX = 500;
 
 const OFF =
   "The adjudicator is off for this project: run `eminiar adjudicator enable`, then /mcp reconnect.";
@@ -155,6 +159,7 @@ export function formatExplain(
     `outcome ${row.outcome}${row.outcomeSource ? ` (${row.outcomeSource})` : ""}${row.final ? ", final" : ""} · actual ${row.actualModel ?? "–"}${
       row.actualTokens != null ? `, ${row.actualTokens} tokens` : ""
     }${row.actualCostUsd != null ? `, ${usd(row.actualCostUsd)}` : ""} · baseline cost ${usd(row.baselineCostUsd)} · savings ${usd(row.savingsUsd)}`,
+    ...(row.feedbackNote ? [`feedback note: "${row.feedbackNote}"`] : []),
   ];
   return capOutput(
     [
@@ -217,15 +222,24 @@ export function formatStats(
 
 // --- server start --------------------------------------------------------------------
 
+export interface ServerProviderOptions {
+  /** Load the exemplar vectors and the model in the background once registered. */
+  warm?: boolean;
+  /** Test seams: the factory to register and the shared embedder the warm-up loads. */
+  factory?: EmbeddingFactory;
+  embedder?: () => Promise<{ warm?(): void } | undefined>;
+}
+
 /**
  * Register the runtime-only providers the MCP server can run (the embedding provider) when
  * the adjudicator is enabled and embedding is the effective provider. Returns whether it
  * registered one. The embedding module is imported only then, so a disabled server never
- * loads it.
+ * loads it. `warm` never delays the return: the warm-up runs detached and its failure only
+ * means the first plan or score call loads the model instead.
  */
 export async function registerServerProviders(
   config: Config,
-  opts: { warm?: boolean } = {},
+  opts: ServerProviderOptions = {},
 ): Promise<boolean> {
   if (!config.adjudicator?.enabled) return false;
   const r = resolveAdjudicator(config, { context: "server" });
@@ -234,16 +248,18 @@ export async function registerServerProviders(
     import("../adjudicator/providers/index.js"),
     import("../adjudicator/providers/embedding.js"),
   ]);
-  const factory = defaultEmbeddingFactory(config);
+  const factory = opts.factory ?? defaultEmbeddingFactory(config);
   registerProvider("embedding", factory);
   if (opts.warm) {
-    try {
-      void factory(r, config.adjudicator, {})
-        .warm()
-        .catch(() => undefined);
-    } catch {
-      // the first plan or score call loads it instead
-    }
+    const embedder =
+      opts.embedder ??
+      (async () => (await import("../embeddings/provider.js")).getProvider(config));
+    // Exemplar vectors first (usually from the disk cache), then the model itself: a cached
+    // load never runs the model, which would leave it for the first query.
+    void (async () => {
+      await factory(r, config.adjudicator, {}).warm();
+      (await embedder())?.warm?.();
+    })().catch(() => undefined);
   }
   return true;
 }
@@ -263,7 +279,11 @@ const SCHEMA = {
   tasks: z.array(Task).max(20).optional().describe("score: tasks to score in one batch"),
   id: z.number().int().positive().optional().describe("explain/feedback: decision id"),
   outcome: z.enum(FEEDBACK_VALUES).optional().describe("feedback: how the advice turned out"),
-  note: z.string().max(200).optional().describe("feedback: a short note"),
+  note: z
+    .string()
+    .max(4000)
+    .optional()
+    .describe(`feedback: a short note, kept redacted and cut to ${NOTE_MAX} chars`),
   since: z.string().optional().describe("stats: ISO date or relative like 7d, 12h"),
 };
 
@@ -358,10 +378,12 @@ export async function runAdjudicate(
         ...(deps.now ? { now: deps.now() } : {}),
       });
       if (!row) return errorResult(`no adjudicator decision ${args.id}`);
+      const note = args.note?.trim() ? head(args.note, NOTE_MAX) : undefined;
+      if (note) db().adjudicator.update(row.id, { feedbackNote: note });
       const learned = cfg.learning.enabled ? "; the learned bias was updated" : "";
       return text(
         `Feedback ${args.outcome} on decision ${row.id} (${row.tier ?? "–"}${row.role ? `, ${row.role}` : ""}): outcome ${row.outcome}, final${learned}.${
-          args.note ? ` Note: ${clip(args.note, 200)}` : ""
+          note ? ` Note: ${clip(note, 200)}` : ""
         }`,
       );
     }

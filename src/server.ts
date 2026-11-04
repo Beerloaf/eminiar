@@ -28,7 +28,9 @@ const SANDBOX_TOOLS = new Set(["em_execute", "em_execute_file", "em_batch_execut
 
 // Opt-in tools (em_adjudicate) are listed only when their feature is on for the config loaded
 // at start; enabling one later needs /mcp reconnect. The adjudicator's embedding provider is
-// registered here (never in a hook) when it is the effective provider.
+// registered here (never in a hook) when it is the effective provider, and its model warmed,
+// both in the background: start-up and tool listing never wait. Only the tools that score
+// (ADJUDICATOR_TOOLS) wait for the registration, not for the warm-up. Disabled: nothing loads.
 let startConfig: ReturnType<typeof getContext>["config"] | undefined;
 try {
   startConfig = getContext().config;
@@ -36,10 +38,12 @@ try {
   process.stderr.write(`eminiar: config not loaded at start: ${(err as Error).message}\n`);
 }
 const listed = startConfig ? availableTools(tools, startConfig) : tools.filter((t) => !t.available);
-if (startConfig)
-  await registerServerProviders(startConfig).catch((err: unknown) =>
-    process.stderr.write(`eminiar: adjudicator provider skipped: ${(err as Error).message}\n`),
-  );
+const ADJUDICATOR_TOOLS = new Set(["em_adjudicate", "em_swarm"]);
+const providersReady: Promise<unknown> = startConfig
+  ? registerServerProviders(startConfig, { warm: true }).catch((err: unknown) =>
+      process.stderr.write(`eminiar: adjudicator provider skipped: ${(err as Error).message}\n`),
+    )
+  : Promise.resolve();
 
 for (const tool of listed) {
   server.registerTool(
@@ -59,6 +63,7 @@ for (const tool of listed) {
           const drain = drainReindexQueue(ctx, getStorage(ctx)).catch(() => undefined);
           if (!SANDBOX_TOOLS.has(tool.name)) await drain;
         }
+        if (ADJUDICATOR_TOOLS.has(tool.name)) await providersReady;
         return await tool.handler(rest, ctx);
       } catch (err) {
         return errorResult(`${tool.name} failed: ${(err as Error).stack ?? String(err)}`);

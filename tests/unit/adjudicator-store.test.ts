@@ -6,7 +6,11 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import type { Verdict } from "../../src/adjudicator/types.js";
 import { SqliteAdapter } from "../../src/storage/sqlite/adapter.js";
-import { migrations } from "../../src/storage/sqlite/schema.js";
+import {
+  ADJUDICATOR_LATE_COLUMNS,
+  healAdjudicatorColumns,
+  migrations,
+} from "../../src/storage/sqlite/schema.js";
 import type { AdjudicationInput } from "../../src/storage/types.js";
 import { emPurge } from "../../src/tools/em_purge.js";
 
@@ -91,6 +95,109 @@ describe("schema migration v8: adjudicator tables", () => {
       expect(count(again, "adjudications")).toBe(1);
     } finally {
       again.close();
+    }
+  });
+});
+
+describe("pre-release v8 databases (task #26)", () => {
+  const colsOf = (db: Database.Database, table: string) =>
+    (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((c) => c.name);
+
+  /** The v8 DDL as it first ran on development machines: without the late columns. */
+  function oldV8Sql(): string {
+    let sql = migrations.find((m) => m.version === 8)!.sql!;
+    for (const [, col, ddl] of ADJUDICATOR_LATE_COLUMNS) {
+      sql = sql.replace(`  ${col} ${ddl},\n`, "").replace(`,\n  ${col} ${ddl}\n)`, "\n)");
+    }
+    return sql;
+  }
+
+  function oldV8Db(): string {
+    const path = tmpDb("em-v8-old-");
+    const raw = new Database(path);
+    for (const m of migrations) {
+      if (m.version > 7) break;
+      if (m.sql) raw.exec(m.sql);
+      m.up?.(raw);
+    }
+    raw.exec(oldV8Sql());
+    raw.prepare("INSERT INTO meta (key, value) VALUES ('schema_version', '8')").run();
+    for (const [table, col] of ADJUDICATOR_LATE_COLUMNS)
+      expect(colsOf(raw, table)).not.toContain(col);
+    raw
+      .prepare(
+        "INSERT INTO adjudicator_provider_state (provider, state, failures, spend_usd) VALUES ('openai', 'open', 2, 0.5)",
+      )
+      .run();
+    raw
+      .prepare("INSERT INTO adjudications (ts, surface, input_hash) VALUES (1, 'agent', 'old')")
+      .run();
+    raw.close();
+    return path;
+  }
+
+  it("adds the missing v8 columns on first use, keeps the rows, and saves state again", () => {
+    const path = oldV8Db();
+    const a = new SqliteAdapter(path, { vectors: false });
+    try {
+      expect(a.metaGet("schema_version")).toBe("8");
+      // Opening alone leaves the tables alone (a disabled adjudicator never touches them).
+      expect(colsOf(a.db, "adjudications")).not.toContain("feedback_note");
+      expect(a.adjudicator.providerState("openai")).toMatchObject({
+        state: "open",
+        failures: 2,
+        calls: 0,
+        authFingerprint: null,
+      });
+      for (const [table, col] of ADJUDICATOR_LATE_COLUMNS)
+        expect(colsOf(a.db, table)).toContain(col);
+      const saved = a.adjudicator.saveProviderState("openai", { calls: 3, authFingerprint: "fp1" });
+      expect(saved).toMatchObject({ calls: 3, authFingerprint: "fp1", failures: 2 });
+      expect(a.adjudicator.providerState("openai")).toMatchObject({
+        calls: 3,
+        authFingerprint: "fp1",
+      });
+      const id = a.adjudicator.insert(row({ feedbackNote: "kept" }));
+      expect(a.adjudicator.get(id)?.feedbackNote).toBe("kept");
+      expect(a.adjudicator.list().total).toBe(2);
+    } finally {
+      a.close();
+    }
+    const again = new SqliteAdapter(path, { vectors: false });
+    try {
+      expect(healAdjudicatorColumns(again.db)).toEqual([]);
+      expect(again.adjudicator.providerState("openai")?.calls).toBe(3);
+    } finally {
+      again.close();
+    }
+  });
+
+  it("heals idempotently and skips tables that do not exist yet", () => {
+    const empty = new Database(":memory:");
+    expect(healAdjudicatorColumns(empty)).toEqual([]);
+    empty.close();
+    const raw = new Database(oldV8Db());
+    expect(healAdjudicatorColumns(raw)).toEqual([
+      "adjudicator_provider_state.calls",
+      "adjudicator_provider_state.auth_fingerprint",
+      "adjudications.feedback_note",
+    ]);
+    expect(healAdjudicatorColumns(raw)).toEqual([]);
+    raw.close();
+  });
+
+  it("stores, clears and lists the feedback note on a fresh database", () => {
+    const a = new SqliteAdapter(tmpDb("em-note-"), { vectors: false });
+    try {
+      const id = a.adjudicator.insert(row());
+      expect(a.adjudicator.get(id)?.feedbackNote ?? null).toBeNull();
+      expect(a.adjudicator.update(id, { feedbackNote: "needed opus" })).toBe(true);
+      expect(a.adjudicator.get(id)?.feedbackNote).toBe("needed opus");
+      expect(a.adjudicator.list().rows[0]?.feedbackNote).toBe("needed opus");
+      a.adjudicator.update(id, { feedbackNote: null });
+      expect(a.adjudicator.get(id)?.feedbackNote).toBeNull();
+    } finally {
+      a.close();
     }
   });
 });

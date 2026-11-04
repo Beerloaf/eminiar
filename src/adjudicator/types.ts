@@ -262,4 +262,6 @@ export interface AdjudicationRow {
   outcomeTs?: number | null;
   final: boolean;
   version?: string | null;
+  /** em_adjudicate feedback note: redact()ed, at most 500 chars. */
+  feedbackNote?: string | null;
 }

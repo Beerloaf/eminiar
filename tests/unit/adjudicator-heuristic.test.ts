@@ -406,6 +406,79 @@ describe("under-escalation rules (task #23)", () => {
   });
 });
 
+describe("investigation and cross-cutting floors (task #26)", () => {
+  const has = (s: ScoreSet, feature: string) =>
+    s.complexityReasons.some((r) => r.feature === feature);
+
+  it("floors an investigation of system behaviour at complexity 2", () => {
+    for (const t of [
+      "figure out why the nightly export job sends some emails twice",
+      "look into why the search page feels sluggish on large projects",
+      "investigate why the build got so much slower this week",
+      "explain how session expiry and token refresh work together",
+      "what's the root cause of the intermittent timeout in the sync worker",
+      "explain the retry queue",
+    ]) {
+      const f = extractFeatures(t);
+      expect(f.investigate, t).toBe(true);
+      const s = scoreHeuristic(f);
+      expect(s.complexity, t).toBeGreaterThanOrEqual(2);
+      expect(s.tier.choice, t).toBe("sonnet");
+    }
+    expect(has(score("explain the retry queue"), "investigate")).toBe(true);
+  });
+
+  it("floors threading a value through layers and judging a change's impact at 2", () => {
+    for (const t of [
+      "thread the trace id through every log call in the request path",
+      "pass the tenant id through the job runner to the storage layer",
+      "what is the impact of changing the return type of loadConfig",
+      "what will happen if we rename the session table",
+    ]) {
+      const f = extractFeatures(t);
+      expect(f.crossCutting, t).toBe(true);
+      const s = scoreHeuristic(f);
+      expect(s.complexity, t).toBeGreaterThanOrEqual(2);
+      expect(s.tier.choice, t).toBe("sonnet");
+      expect(has(s, "crossCutting"), t).toBe(true);
+    }
+  });
+
+  it("keeps explaining one named thing, and lookups about a system, on haiku", () => {
+    for (const t of [
+      "explain what this regex does",
+      "explain the parseArgs function in cli.ts",
+      "explain how `cacheKey` works",
+      "where is the cache configured",
+      "how does em_search rank results",
+      "what is a build step",
+      "list the jobs in the queue config",
+      "who calls the session store",
+    ]) {
+      const f = extractFeatures(t);
+      expect(f.investigate, t).toBe(false);
+      expect(f.crossCutting, t).toBe(false);
+      expect(score(t).tier.choice, t).toBe("haiku");
+    }
+    // "through" without a value being carried is not cross-cutting.
+    expect(extractFeatures("read through the README").crossCutting).toBe(false);
+  });
+
+  it("only raises: a bigger request keeps its own complexity, and the floors are configurable", () => {
+    const big = score(
+      "investigate why the sync worker deadlocks under load and redesign its locking",
+    );
+    expect(has(big, "investigate")).toBe(false);
+    expect(big.complexity).toBeGreaterThan(2);
+    const t = "figure out why the nightly job runs twice";
+    const off = scoreHeuristic(extractFeatures(t), { features: { investigateFloor: 0 } });
+    expect(off.complexity).toBeLessThan(2);
+    expect(has(off, "investigate")).toBe(false);
+    expect(DEFAULT_FEATURE_WEIGHTS.investigateFloor).toBe(2);
+    expect(DEFAULT_FEATURE_WEIGHTS.crossCuttingFloor).toBe(2);
+  });
+});
+
 describe("eval set acceptance (§7.8)", () => {
   // Majority baselines from research-local-3: tier haiku 0.475, complexity "0" 0.30.
   const rows = EVAL_SET.map((it) => {

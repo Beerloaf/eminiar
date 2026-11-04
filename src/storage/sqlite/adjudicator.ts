@@ -11,6 +11,7 @@ import type {
   AdjudicatorStore,
   LatencyStats,
 } from "../types.js";
+import { healAdjudicatorColumns } from "./schema.js";
 
 type Row = Record<string, unknown>;
 
@@ -57,6 +58,7 @@ const COLUMNS: ReadonlyArray<readonly [Exclude<keyof AdjudicationRow, "id">, str
   ["outcomeTs", "outcome_ts"],
   ["final", "final"],
   ["version", "version"],
+  ["feedbackNote", "feedback_note"],
 ];
 
 const LATENCY_RING = 50;
@@ -122,11 +124,30 @@ function bump(map: Record<string, number>, key: unknown): void {
 export class SqliteAdjudicatorStore implements AdjudicatorStore {
   private readonly stmts = new Map<string, Database.Statement<unknown[], unknown>>();
 
+  private healed = false;
+
   constructor(private readonly db: Database.Database) {}
+
+  /**
+   * Before the first statement, add the v8 columns a pre-release v8 database lacks (schema.ts
+   * ADJUDICATOR_LATE_COLUMNS). Done here rather than at open so a disabled adjudicator never
+   * touches its tables; the adapter has migrated by the time any store method runs.
+   */
+  private heal(): void {
+    if (this.healed) return;
+    try {
+      healAdjudicatorColumns(this.db);
+      this.healed = true;
+    } catch {
+      // a read-only or busy database: retried on the next new statement; meanwhile the
+      // statement that needs the column reports the error
+    }
+  }
 
   private prep(sql: string): Database.Statement<unknown[], unknown> {
     let s = this.stmts.get(sql);
     if (!s) {
+      this.heal();
       s = this.db.prepare(sql);
       this.stmts.set(sql, s);
     }

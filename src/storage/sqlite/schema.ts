@@ -538,7 +538,8 @@ CREATE TABLE IF NOT EXISTS adjudications (
   outcome_source TEXT,
   outcome_ts INTEGER,
   final INTEGER NOT NULL DEFAULT 0,
-  version TEXT
+  version TEXT,
+  feedback_note TEXT
 );
 CREATE INDEX IF NOT EXISTS adjudications_session ON adjudications(session_id, ts);
 CREATE INDEX IF NOT EXISTS adjudications_task ON adjudications(run_id, task_id);
@@ -582,6 +583,42 @@ CREATE TABLE IF NOT EXISTS adjudicator_bias (
 `,
   },
 ];
+
+/**
+ * Columns added to the v8 tables after v8 first ran on development databases (v8 was not yet
+ * released, so the migration was edited in place). Those databases are already at version 8
+ * and never rerun it; healAdjudicatorColumns adds what they lack. A released change to these
+ * tables gets a new migration instead.
+ */
+export const ADJUDICATOR_LATE_COLUMNS: ReadonlyArray<
+  readonly [table: string, column: string, ddl: string]
+> = [
+  ["adjudicator_provider_state", "calls", "INTEGER NOT NULL DEFAULT 0"],
+  ["adjudicator_provider_state", "auth_fingerprint", "TEXT"],
+  ["adjudications", "feedback_note", "TEXT"],
+];
+
+/**
+ * Adds any ADJUDICATOR_LATE_COLUMNS a database lacks. Idempotent and cheap (one table_info per
+ * table); tables that do not exist yet are left to the migration. Returns the columns added.
+ */
+export function healAdjudicatorColumns(db: Database.Database): string[] {
+  const added: string[] = [];
+  const present = new Map<string, Set<string> | null>();
+  for (const [table, column, ddl] of ADJUDICATOR_LATE_COLUMNS) {
+    let cols = present.get(table);
+    if (cols === undefined) {
+      const info = db.pragma(`table_info(${table})`) as Array<{ name: string }>;
+      cols = info.length ? new Set(info.map((c) => c.name)) : null;
+      present.set(table, cols);
+    }
+    if (!cols || cols.has(column)) continue;
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+    cols.add(column);
+    added.push(`${table}.${column}`);
+  }
+  return added;
+}
 
 /** vec0 lives outside the migration list: it needs the extension loaded first and takes the dimension. */
 export function vecTableSql(dims: number): string {

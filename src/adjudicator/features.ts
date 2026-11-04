@@ -33,6 +33,14 @@ export interface FeatureExtras {
   taskTitle: boolean;
   /** 0..1: performance work backed by a measured number ("800ms", "40kb", "50k docs"). */
   perf: number;
+  /**
+   * An open investigation of system behaviour: an investigation verb (why, figure out, look
+   * into, investigate, root cause, explain ...) whose subject is a system (a cache, a job, the
+   * build) or an emergent symptom (twice, intermittent, doubled), not one named symbol.
+   */
+  investigate: boolean;
+  /** A cross-cutting change: a value threaded through several layers, or the impact of a change. */
+  crossCutting: boolean;
 }
 
 interface Lexeme {
@@ -221,6 +229,27 @@ const PERF =
 const MEASURE =
   /\b\d[\d,.]*\s?(?:ms|µs|us|s|secs?|seconds?|minutes?|mins?|kb|mb|gb|tb|x|%|rps|qps)\b|\b(?:\d{4,}|\d[\d,.]*\s?[km]|\d{1,3}(?:,\d{3})+|a (?:million|billion|thousand))\s?[a-z]*\b/;
 
+/**
+ * Investigation verbs. How big the work is depends on the subject: "why is the port 3000" is a
+ * lookup, "figure out why the job runs twice" means following behaviour across modules.
+ * "explain" counts only without a named symbol or path (explaining one function is a read).
+ */
+const INVESTIGATE =
+  /\b(?:why|figure out|look into|investigat\w*|root[- ]?caus\w*|track down|get to the bottom of|diagnos\w*|dig into)\b/;
+const EXPLAIN = /\b(?:explain|walk (?:me )?through)\b/;
+/** System-level subjects: behaviour that emerges from several modules working together. */
+const SYSTEM_SUBJECT =
+  /\b(?:cach(?:e|es|ing)|invalidat\w*|builds?|pipelines?|jobs?|queues?|workers?|schedul\w*|cron|checkout|requests?|sessions?|startup|boot\w*|sync(?:ing|hroni[sz]\w*)?|replicat\w*|retr(?:y|ies)|lifecycle|concurren\w*|locking|index(?:ing|er)|ingest\w*|render(?:ing)?|deploy\w*|memory|latency|throughput|services?|server|database|transactions?|event loop|events|consistency|ordering|timeouts?|expiry|routing|middleware|webhooks?|connection pool|rate limit\w*|garbage collect\w*|token refresh)\b/;
+/** Symptoms of emergent behaviour: they say "follow it across the system", whatever the noun. */
+const EMERGENT =
+  /\b(?:twice|duplicat\w*|intermittent\w*|sometimes|randomly|occasionally|doubl(?:e|ed|es|ing)|tripl\w*|spik\w*|keeps? growing|over time|under load|feels? (?:slow|sluggish|laggy))\b/;
+/** A value threaded through layers ("plumb the signal through ...") touches every hop. */
+const THREAD =
+  /\b(?:thread|plumb|propagat|pass|carry|forward)(?:s|es|ed|e|ing)? (?:[\w.'-]+ ){1,6}(?:all the way )?through\b/;
+/** Judging the effect of a change (not listing dependents) reasons over every caller. */
+const IMPACT_OF_CHANGE =
+  /\b(?:impact|effect|consequences?|blast radius) of (?:changing|renaming|removing|dropping|moving|splitting|deleting|replacing|reordering|making)\b|\bwhat (?:would|will) happen if (?:we |i )?(?:change|rename|remove|drop|move|split|delete|replace|make)\b/;
+
 const PATH_RE = /[\w./-]+\.(?:ts|tsx|js|py|go|rs|md|json|ya?ml|sql|php)\b/g;
 const SYMBOL_RE =
   /`[^`\n]+`|\b[a-z][a-z0-9]*[A-Z]\w*\b|\b[A-Z][a-z0-9]+[A-Z]\w*\b|\b[a-z0-9]+_[a-z0-9_]+\b/g;
@@ -308,6 +337,11 @@ export function extractFeatures(
   );
   const risk = Math.min(1, 0.5 * count(RISK, lower));
   const perf = PERF.test(lower) && MEASURE.test(lower) ? 1 : 0;
+  const prosePaths = count(PATH_RE, body);
+  const named = prosePaths > 0 || count(SYMBOL_RE, body.replace(PATH_RE, " ")) > 0;
+  const systemic = SYSTEM_SUBJECT.test(lower) || EMERGENT.test(lower);
+  const investigate = systemic && (INVESTIGATE.test(lower) || (!named && EXPLAIN.test(lower)));
+  const crossCutting = THREAD.test(lower) || IMPACT_OF_CHANGE.test(lower);
   const classify = classifyPrompt(trimmed.slice(0, SCAN_CHARS)).find(
     (d) => d.category !== "user_prompt" && d.category !== "intent",
   )?.category;
@@ -326,10 +360,12 @@ export function extractFeatures(
     chat,
     slash: trimmed.startsWith("/"),
     proseWords: Math.min(words, wordCount(prose)),
-    prosePaths: count(PATH_RE, body),
+    prosePaths,
     pasted,
     taskTitle: TASK_TITLE.test(trimmed),
     perf,
+    investigate,
+    crossCutting,
   };
   if (classify) f.classify = classify;
   if (hints && (hints.role || hints.files !== undefined || hints.deps !== undefined)) {
