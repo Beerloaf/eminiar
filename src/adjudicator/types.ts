@@ -1,0 +1,263 @@
+/**
+ * Shared types and constants of the adjudicator (docs/design/adjudicator.md §4). Pure
+ * declarations: no imports with side effects, so the hook bundle pays nothing while the
+ * adjudicator is off.
+ */
+
+/** Bump when scoring changes so cached verdicts and stored rows from older scorers are told apart. */
+export const SCORER_VERSION = "1";
+
+export const SURFACES = ["prompt", "agent", "plan", "tool", "mcp", "test"] as const;
+export type Surface = (typeof SURFACES)[number];
+
+/** The only values Claude Code's Agent `model` parameter accepts. */
+export const TIERS = ["haiku", "sonnet", "opus", "fable"] as const;
+export type Tier = (typeof TIERS)[number];
+
+/** Advice only: the Agent input has no effort field. */
+export const EFFORTS = ["low", "medium", "high", "xhigh"] as const;
+export type Effort = (typeof EFFORTS)[number];
+
+export const PROVIDER_IDS = ["heuristic", "typesafe", "openai-compatible", "embedding"] as const;
+export type ProviderId = (typeof PROVIDER_IDS)[number];
+
+export const MODES = ["advise", "apply"] as const;
+export type Mode = (typeof MODES)[number];
+
+export type Source = "heuristic" | "blend" | "cache" | "fallback";
+
+export type ProviderStatus =
+  | "ok"
+  | "timeout"
+  | "http_error"
+  | "rate_limited"
+  | "invalid"
+  | "breaker_open"
+  | "slow_guard"
+  | "over_budget"
+  | "no_key"
+  | "no_consent"
+  | "skipped"
+  | "n/a";
+
+export const INTENTS = [
+  "lookup",
+  "impact",
+  "history",
+  "run",
+  "bigfile",
+  "docs",
+  "recall",
+  "plan",
+  "edit_small",
+  "implement",
+  "refactor",
+  "design",
+  "review",
+  "debug",
+  "research",
+  "test",
+  "git",
+  "ui",
+  "chat",
+] as const;
+export type Intent = (typeof INTENTS)[number];
+
+/** Options of the tool table (§7.4); intersected with the registered tools at runtime. */
+export const TOOL_IDS = [
+  "em_symbols",
+  "em_search",
+  "em_graph_impact",
+  "em_history",
+  "em_execute",
+  "em_execute_file",
+  "em_docs",
+  "em_fetch_and_index",
+  "em_recall",
+  "em_swarm",
+  "Edit",
+  "Bash",
+  "Agent",
+  "none",
+] as const;
+export type ToolId = (typeof TOOL_IDS)[number];
+
+/** Options of the role table (§7.5) when no swarm run narrows them to its own roles. */
+export const DEFAULT_ROLES = [
+  "explorer",
+  "researcher",
+  "coder",
+  "tester",
+  "reviewer",
+  "architect",
+  "ui",
+  "none",
+] as const;
+
+export interface Reason {
+  feature: string;
+  weight: number;
+  note: string;
+}
+
+export interface ScoreEntry {
+  option: string;
+  /** 0..1; the entries of one table sum to 1. */
+  score: number;
+  reasons: Reason[];
+}
+
+export interface ScoreTable {
+  dimension: "tool" | "tier" | "role";
+  /** Sorted by score, descending. */
+  entries: ScoreEntry[];
+  choice: string;
+  confidence: number;
+}
+
+export interface Features {
+  words: number;
+  chars: number;
+  lines: number;
+  paths: number;
+  symbols: number;
+  codeBlock: boolean;
+  stackTrace: boolean;
+  intents: Partial<Record<Intent, number>>;
+  /** 0..1 */
+  scope: number;
+  /** 0..1 */
+  risk: number;
+  chat: boolean;
+  slash: boolean;
+  classify?: string;
+  task?: { role?: string; files: number; deps: number };
+}
+
+export interface ScoreSet {
+  /** 0..4, continuous. */
+  complexity: number;
+  complexityReasons: Reason[];
+  tool: ScoreTable;
+  tier: ScoreTable;
+  role: ScoreTable;
+  effort: Effort;
+}
+
+export interface AdjudicationRequest {
+  key: string;
+  surface: Surface;
+  text: string;
+  hints?: {
+    role?: string;
+    roles?: Array<{ name: string; description?: string }>;
+    files?: number;
+    deps?: number;
+  };
+}
+
+export interface Dist {
+  probs: Record<string, number>;
+  confidence: number;
+  calibrated: boolean;
+}
+
+export interface ProviderAnswer {
+  key: string;
+  complexity?: { value: number; confidence: number };
+  tier?: Dist;
+  role?: Dist;
+  tool?: Dist;
+  risky?: number;
+  needsPlan?: number;
+}
+
+export interface ProviderResult {
+  answers: ProviderAnswer[];
+  usage: { inTok: number; outTok: number; costUsd: number };
+  latencyMs: number;
+  model: string;
+}
+
+export interface AdjudicatorProvider {
+  id: ProviderId;
+  remote: boolean;
+  dims: Array<"complexity" | "tier" | "role" | "tool">;
+  adjudicate(
+    reqs: AdjudicationRequest[],
+    o: { signal: AbortSignal; deadlineMs: number },
+  ): Promise<ProviderResult>;
+  probe(o: { signal: AbortSignal }): Promise<{ ok: boolean; latencyMs: number; detail: string }>;
+}
+
+export interface Verdict extends ScoreSet {
+  id?: number;
+  key: string;
+  source: Source;
+  provider: ProviderId;
+  providerStatus: ProviderStatus;
+  alpha: Partial<Record<"complexity" | "tier" | "role" | "tool", number>>;
+  bias: Record<string, number>;
+  latencyMs: number;
+  providerLatencyMs?: number;
+  usage?: ProviderResult["usage"];
+  version: string;
+}
+
+export type AdjudicationAction =
+  | "advised"
+  | "applied"
+  | "followed"
+  | "respected"
+  | "ignored"
+  | "none";
+
+export type AdjudicationOutcome = "pending" | "success" | "failure" | "abandoned" | "n/a";
+
+/** One row of the `adjudications` table (§12), camelCase. Nullable columns are optional. */
+export interface AdjudicationRow {
+  id: number;
+  ts: number;
+  surface: Surface;
+  sessionId?: string | null;
+  agentId?: string | null;
+  toolUseId?: string | null;
+  runId?: string | null;
+  taskId?: number | null;
+  parentId?: number | null;
+  inputHash: string;
+  /** At most 80 chars of redact()ed text (privacy.storeHead). */
+  inputHead?: string | null;
+  inputChars?: number | null;
+  complexity?: number | null;
+  tier?: string | null;
+  effort?: string | null;
+  tool?: string | null;
+  role?: string | null;
+  confidence?: number | null;
+  /** JSON: ScoreSet + features + alpha + bias. */
+  scores?: string | null;
+  source?: Source | null;
+  provider?: ProviderId | null;
+  providerModel?: string | null;
+  providerStatus?: ProviderStatus | null;
+  latencyMs?: number | null;
+  providerLatencyMs?: number | null;
+  tokensIn?: number | null;
+  tokensOut?: number | null;
+  costUsd?: number | null;
+  action?: AdjudicationAction | null;
+  modelRequested?: string | null;
+  modelFinal?: string | null;
+  baselineModel?: string | null;
+  actualModel?: string | null;
+  actualTokens?: number | null;
+  actualCostUsd?: number | null;
+  baselineCostUsd?: number | null;
+  savingsUsd?: number | null;
+  outcome: AdjudicationOutcome;
+  outcomeSource?: string | null;
+  outcomeTs?: number | null;
+  final: boolean;
+  version?: string | null;
+}

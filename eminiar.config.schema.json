@@ -489,6 +489,430 @@
           "type": "boolean"
         }
       }
+    },
+    "adjudicator": {
+      "default": {},
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "type": "boolean"
+        },
+        "provider": {
+          "default": "heuristic",
+          "type": "string",
+          "enum": [
+            "heuristic",
+            "typesafe",
+            "openai-compatible",
+            "embedding"
+          ]
+        },
+        "mode": {
+          "default": "advise",
+          "type": "string",
+          "enum": [
+            "advise",
+            "apply"
+          ]
+        },
+        "surfaces": {
+          "default": {},
+          "type": "object",
+          "properties": {
+            "prompt": {
+              "default": true,
+              "type": "boolean"
+            },
+            "agent": {
+              "default": true,
+              "type": "boolean"
+            },
+            "plan": {
+              "default": true,
+              "type": "boolean"
+            },
+            "tools": {
+              "default": false,
+              "type": "boolean"
+            }
+          }
+        },
+        "promptMode": {
+          "default": "async",
+          "type": "string",
+          "enum": [
+            "heuristic",
+            "async",
+            "blocking"
+          ]
+        },
+        "typesafe": {
+          "default": {},
+          "type": "object",
+          "properties": {
+            "model": {
+              "default": "jev-1.14.0",
+              "type": "string"
+            },
+            "baseUrl": {
+              "default": "https://api.typesafe.ai/v1",
+              "type": "string",
+              "format": "uri"
+            }
+          }
+        },
+        "openai": {
+          "default": {},
+          "type": "object",
+          "properties": {
+            "preset": {
+              "default": "groq",
+              "type": "string",
+              "enum": [
+                "groq",
+                "cerebras",
+                "ollama",
+                "lmstudio",
+                "llamacpp",
+                "custom"
+              ]
+            },
+            "baseUrl": {
+              "type": "string",
+              "format": "uri"
+            },
+            "model": {
+              "type": "string"
+            },
+            "json": {
+              "default": "auto",
+              "type": "string",
+              "enum": [
+                "schema",
+                "object",
+                "auto"
+              ]
+            },
+            "price": {
+              "type": "object",
+              "properties": {
+                "inPerM": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "outPerM": {
+                  "type": "number",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "inPerM",
+                "outPerM"
+              ]
+            }
+          }
+        },
+        "embedding": {
+          "default": {},
+          "type": "object",
+          "properties": {
+            "k": {
+              "default": 5,
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "minSimilarity": {
+              "default": 0.55,
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
+          }
+        },
+        "keyEnv": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+        },
+        "remoteConsent": {
+          "default": false,
+          "type": "boolean"
+        },
+        "timeouts": {
+          "default": {},
+          "type": "object",
+          "properties": {
+            "promptMs": {
+              "default": 1200,
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "agentMs": {
+              "default": 800,
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "planMs": {
+              "default": 3000,
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "localMs": {
+              "default": 600,
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "connectMs": {
+              "default": 150,
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            }
+          }
+        },
+        "minPromptChars": {
+          "default": 12,
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "tiers": {
+          "default": [
+            "haiku",
+            "sonnet",
+            "opus"
+          ],
+          "minItems": 1,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "haiku",
+              "sonnet",
+              "opus",
+              "fable"
+            ]
+          }
+        },
+        "weights": {
+          "default": {},
+          "type": "object",
+          "properties": {
+            "providerMax": {
+              "default": 0.7,
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "embeddingMax": {
+              "default": 0.4,
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "selfReportScale": {
+              "default": 0.6,
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "lowConfidence": {
+              "default": 0.55,
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "tierCenters": {
+              "default": {
+                "haiku": 0.6,
+                "sonnet": 2,
+                "opus": 3.4
+              },
+              "type": "object",
+              "propertyNames": {
+                "type": "string"
+              },
+              "additionalProperties": {
+                "type": "number"
+              }
+            },
+            "features": {
+              "default": {},
+              "type": "object",
+              "propertyNames": {
+                "type": "string"
+              },
+              "additionalProperties": {
+                "type": "number"
+              }
+            }
+          }
+        },
+        "apply": {
+          "default": {},
+          "type": "object",
+          "properties": {
+            "scope": {
+              "default": "swarm",
+              "type": "string",
+              "enum": [
+                "swarm",
+                "all"
+              ]
+            },
+            "minConfidence": {
+              "default": 0.7,
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "floor": {
+              "default": "haiku",
+              "type": "string",
+              "enum": [
+                "haiku",
+                "sonnet",
+                "opus",
+                "fable"
+              ]
+            },
+            "ceiling": {
+              "default": "opus",
+              "type": "string",
+              "enum": [
+                "haiku",
+                "sonnet",
+                "opus",
+                "fable"
+              ]
+            },
+            "respectFrontmatter": {
+              "default": true,
+              "type": "boolean"
+            }
+          }
+        },
+        "advice": {
+          "default": {},
+          "type": "object",
+          "properties": {
+            "mainSession": {
+              "default": "user",
+              "type": "string",
+              "enum": [
+                "off",
+                "user",
+                "context"
+              ]
+            },
+            "cooldownPrompts": {
+              "default": 8,
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          }
+        },
+        "learning": {
+          "default": {},
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "default": true,
+              "type": "boolean"
+            },
+            "maxBias": {
+              "default": 0.3,
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "minSamples": {
+              "default": 5,
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "halfLife": {
+              "default": 50,
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "costWeight": {
+              "default": 0.05,
+              "type": "number",
+              "minimum": 0
+            }
+          }
+        },
+        "cache": {
+          "default": {},
+          "type": "object",
+          "properties": {
+            "ttlHours": {
+              "default": 24,
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "maxEntries": {
+              "default": 2000,
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            }
+          }
+        },
+        "breaker": {
+          "default": {},
+          "type": "object",
+          "properties": {
+            "failures": {
+              "default": 2,
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "cooldownSec": {
+              "default": 120,
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            }
+          }
+        },
+        "budget": {
+          "default": {},
+          "type": "object",
+          "properties": {
+            "dailyUsd": {
+              "default": 0.5,
+              "type": "number",
+              "minimum": 0
+            }
+          }
+        },
+        "privacy": {
+          "default": {},
+          "type": "object",
+          "properties": {
+            "maxChars": {
+              "default": 2000,
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "storeHead": {
+              "default": true,
+              "type": "boolean"
+            }
+          }
+        }
+      }
     }
   },
   "title": "eminiar.config.json",
