@@ -346,8 +346,8 @@ describe("POST /api/adjudicator/test", () => {
     const d = deps({ config: remoteCfg(), env: sentinelEnv(), provider: fakeProvider() });
     const on = await call("/api/adjudicator/test", {}, d, "POST", { text, useProvider: true });
     expect(on.body).toMatchObject({ usedProvider: true, reason: "used" });
-    // gate + recordSuccess, each in one BEGIN IMMEDIATE
-    expect(tx.mock.calls.length).toBeGreaterThanOrEqual(2);
+    // recordSuccess in one BEGIN IMMEDIATE; a closed breaker's gate only reads (task #51)
+    expect(tx.mock.calls.length).toBeGreaterThanOrEqual(1);
     expect(db.adjudicator.providerState("openai-compatible")?.calls).toBe(1);
     tx.mockRestore();
   });

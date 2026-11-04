@@ -24,10 +24,23 @@
  * hex, never the key) of the key that was rejected. The provider is skipped (status
  * "auth_failed") without any network call until the key changes or AUTH_LOCKOUT_MS passes.
  *
+ * Timeouts: a call cut off at its deadline goes into the latency ring as a sample ABOVE its
+ * budget (budget + 1 ms, or what it really took if more), so the p95 ratio counts it as slow.
+ * The engine measures the call from its own start while the budget also covers the pre-call
+ * work, so the raw wall time of an aborted call is always a little under the budget and would
+ * never trip the guard. A provider that times out on more than 1 call in 20 trips the slow guard
+ * once SLOW_MIN_SAMPLES samples are in, even though its successes keep resetting the breaker's
+ * consecutive-failure streak.
+ *
  * Every function is synchronous (better-sqlite3) and swallows nothing: the engine wraps them.
- * gate, recordSuccess and recordFailure each read and write the state inside one
- * store.atomically() (BEGIN IMMEDIATE), so parallel hook processes cannot all claim the
- * half-open slot or lose a spend/call increment.
+ * gate reads the state WITHOUT a lock (WAL readers never wait) and decides from it; only when it
+ * must write (claim the half-open slot, reset an expired slow or auth state) does it re-read and
+ * write inside one store.atomically() (BEGIN IMMEDIATE), so parallel hook processes cannot all
+ * claim the half-open slot. recordSuccess and recordFailure read-modify-write inside one
+ * atomically() too, so no spend/call increment is lost. Each takes `lockWaitMs` to bound how long
+ * it waits for another process's write lock; the caller treats a throw as "provider not allowed".
+ * A record that could not be written keeps its call and spend in memory (per store) and they are
+ * added to the next record that succeeds; the gate counts them meanwhile.
  */
 
 import { createHash } from "node:crypto";
@@ -125,24 +138,137 @@ export function authLockout(
   };
 }
 
+// --- accounting a record could not write ------------------------------------------------
+
+/** Calls and spend of today that a record failed to write (database busy). */
+export interface Unrecorded {
+  day: string;
+  calls: number;
+  spendUsd: number;
+}
+
+const unrecordedByStore = new WeakMap<AdjudicatorStore, Map<string, Unrecorded>>();
+
+/**
+ * What failed records of this store left unwritten for `provider` today (zeros when nothing).
+ * A long-lived process (the MCP server) adds it to the next record that succeeds; a hook process
+ * exits first, so the engine also logs it.
+ */
+export function unrecorded(store: AdjudicatorStore, provider: string, now: number): Unrecorded {
+  const day = utcDay(now);
+  const u = unrecordedByStore.get(store)?.get(provider);
+  return u && u.day === day ? { ...u } : { day, calls: 0, spendUsd: 0 };
+}
+
+function carry(
+  store: AdjudicatorStore,
+  provider: string,
+  now: number,
+  calls: number,
+  spendUsd: number,
+): void {
+  if (!calls && !spendUsd) return;
+  const u = unrecorded(store, provider, now);
+  let m = unrecordedByStore.get(store);
+  if (!m) {
+    m = new Map();
+    unrecordedByStore.set(store, m);
+  }
+  m.set(provider, { day: u.day, calls: u.calls + calls, spendUsd: u.spendUsd + spendUsd });
+}
+
+function settle(store: AdjudicatorStore, provider: string): void {
+  unrecordedByStore.get(store)?.delete(provider);
+}
+
+/** The stored state with today's unwritten calls and spend added (for the budget check). */
+function withUnrecorded(
+  s: AdjudicatorProviderState | undefined,
+  u: Unrecorded,
+  now: number,
+): AdjudicatorProviderState | undefined {
+  if (!u.calls && !u.spendUsd) return s;
+  const base: AdjudicatorProviderState = s ?? {
+    provider: "",
+    state: "closed",
+    failures: 0,
+    retryAt: null,
+    lastOkAt: null,
+    lastErrorAt: null,
+    lastErrorClass: null,
+    latencies: [],
+    spendDay: null,
+    spendUsd: 0,
+    calls: 0,
+    authFingerprint: null,
+  };
+  return {
+    ...base,
+    spendDay: u.day,
+    spendUsd: spendToday(s, now) + u.spendUsd,
+    calls: callsToday(s, now) + u.calls,
+  };
+}
+
+// --- gate -------------------------------------------------------------------------------
+
+type GateOptions = {
+  now: number;
+  remote: boolean;
+  keyFingerprint?: string | null | undefined;
+  /** Bound on the wait for another process's write lock (default: the connection's). */
+  lockWaitMs?: number | undefined;
+};
+
 /**
  * May this provider be called now? Claims the half-open slot when an open breaker has cooled
- * down, and resets an expired slow state (with an empty latency ring).
+ * down, and resets an expired slow state (with an empty latency ring). Denials and the plain
+ * closed case only read; the write lock is taken only to claim or reset. Throws when that write
+ * cannot get the lock within `lockWaitMs`: the caller must then NOT call the provider.
  */
 export function gate(
   store: AdjudicatorStore,
   provider: string,
   cfg: Pick<AdjudicatorConfig, "breaker" | "budget">,
-  o: { now: number; remote: boolean; keyFingerprint?: string | null | undefined },
+  o: GateOptions,
 ): GateDecision {
-  return atomically(store, () => gateTx(store, provider, cfg, o));
+  const u = unrecorded(store, provider, o.now);
+  const s = store.providerState(provider);
+  const read = planGate(withUnrecorded(s, u, o.now), cfg, o);
+  if (read !== "write") return read.allow ? { ...read, state: s } : read;
+  return atomically(store, () => gateTx(store, provider, cfg, o, u), o.lockWaitMs);
+}
+
+/** The gate's decision from a state read without a lock, or "write" when it must claim/reset. */
+function planGate(
+  s: AdjudicatorProviderState | undefined,
+  cfg: Pick<AdjudicatorConfig, "budget">,
+  o: GateOptions,
+): GateDecision | "write" {
+  const over = o.remote && overBudget(s, cfg, o.now);
+  const future = s?.retryAt !== null && s?.retryAt !== undefined && o.now < s.retryAt;
+  if (s?.state === "auth_failed") {
+    if (authLockout(s, o.now, o.keyFingerprint)?.locked)
+      return { allow: false, status: "auth_failed" };
+  } else if (s?.state === "open" || s?.state === "half_open") {
+    if (future) return { allow: false, status: "breaker_open" };
+  } else if (s?.state === "slow") {
+    if (future) return { allow: false, status: "slow_guard" };
+  } else {
+    return over
+      ? { allow: false, status: "over_budget" }
+      : { allow: true, halfOpen: false, state: s };
+  }
+  // A claim or reset is due, but an exhausted budget denies without touching the state.
+  return over ? { allow: false, status: "over_budget" } : "write";
 }
 
 function gateTx(
   store: AdjudicatorStore,
   provider: string,
   cfg: Pick<AdjudicatorConfig, "breaker" | "budget">,
-  o: { now: number; remote: boolean; keyFingerprint?: string | null | undefined },
+  o: GateOptions,
+  u: Unrecorded,
 ): GateDecision {
   let s = store.providerState(provider);
   const cooldownMs = cfg.breaker.cooldownSec * 1000;
@@ -174,7 +300,7 @@ function gateTx(
     });
   }
 
-  if (o.remote && overBudget(s, cfg, o.now)) {
+  if (o.remote && overBudget(withUnrecorded(s, u, o.now), cfg, o.now)) {
     // Hand the half-open slot back: the breaker did not get its trial call.
     if (halfOpen) store.saveProviderState(provider, { state: "open", retryAt: o.now });
     return { allow: false, status: "over_budget" };
@@ -205,26 +331,58 @@ export function recordSuccess(
     budgetMs: number;
     /** false: a warm-up or test call; its latency stays out of the slow guard (default true). */
     sample?: boolean | undefined;
+    /** Bound on the wait for another process's write lock (default: the connection's). */
+    lockWaitMs?: number | undefined;
   },
 ): AdjudicatorProviderState {
-  return atomically(store, () => {
-    const s = store.providerState(provider);
-    const day = utcDay(o.now);
-    const spent = spendToday(s, o.now) + (o.costUsd ?? 0);
-    const ring = o.sample === false ? ringOf(s) : addSample(s, o.latencyMs, o.budgetMs);
-    const slow = isSlow(ring);
-    return store.saveProviderState(provider, {
-      state: slow ? "slow" : "closed",
-      failures: 0,
-      retryAt: slow ? o.now + cfg.breaker.cooldownSec * 1000 : null,
-      lastOkAt: o.now,
-      ...ring,
-      spendDay: day,
-      spendUsd: spent,
-      calls: callsToday(s, o.now) + 1,
-      authFingerprint: null,
-    });
-  });
+  const u = unrecorded(store, provider, o.now);
+  return recorded(store, provider, o.now, 1, o.costUsd ?? 0, () =>
+    atomically(
+      store,
+      () => {
+        const s = store.providerState(provider);
+        const day = utcDay(o.now);
+        const spent = spendToday(s, o.now) + u.spendUsd + (o.costUsd ?? 0);
+        const ring = o.sample === false ? ringOf(s) : addSample(s, o.latencyMs, o.budgetMs);
+        const slow = isSlow(ring);
+        return store.saveProviderState(provider, {
+          state: slow ? "slow" : "closed",
+          failures: 0,
+          retryAt: slow ? o.now + cfg.breaker.cooldownSec * 1000 : null,
+          lastOkAt: o.now,
+          ...ring,
+          spendDay: day,
+          spendUsd: spent,
+          calls: callsToday(s, o.now) + u.calls + 1,
+          authFingerprint: null,
+        });
+      },
+      o.lockWaitMs,
+    ),
+  );
+}
+
+/**
+ * Run a record; on success the carried calls and spend are now in the stored state, on a throw
+ * (database busy) this record's own call and spend are carried instead, and the error rethrown.
+ */
+function recorded<T>(
+  store: AdjudicatorStore,
+  provider: string,
+  now: number,
+  calls: number,
+  spendUsd: number,
+  fn: () => T,
+): T {
+  let out: T;
+  try {
+    out = fn();
+  } catch (err) {
+    carry(store, provider, now, calls, spendUsd);
+    throw err;
+  }
+  settle(store, provider);
+  return out;
 }
 
 /** Does this error class count towards opening the breaker? (§9: timeouts, 5xx, 429/529, refused.) */
@@ -250,9 +408,15 @@ export function recordFailure(
     sample?: boolean | undefined;
     /** Fingerprint of the key the call used (keyFingerprint); stored on a 401/403. */
     keyFingerprint?: string | null | undefined;
+    /** Bound on the wait for another process's write lock (default: the connection's). */
+    lockWaitMs?: number | undefined;
   },
 ): AdjudicatorProviderState {
-  return atomically(store, () => recordFailureTx(store, provider, cfg, o));
+  const u = unrecorded(store, provider, o.now);
+  const calls = o.kind === "no_key" ? 0 : 1;
+  return recorded(store, provider, o.now, calls, 0, () =>
+    atomically(store, () => recordFailureTx(store, provider, cfg, o, u), o.lockWaitMs),
+  );
 }
 
 function recordFailureTx(
@@ -260,13 +424,14 @@ function recordFailureTx(
   provider: string,
   cfg: Pick<AdjudicatorConfig, "breaker">,
   o: Parameters<typeof recordFailure>[3],
+  u: Unrecorded,
 ): AdjudicatorProviderState {
   const s = store.providerState(provider);
   const cooldownMs = cfg.breaker.cooldownSec * 1000;
   const errorClass = o.status !== undefined ? `${o.kind}:${o.status}` : o.kind;
   // Every call that reached the provider counts towards budget.dailyCalls (no_key never sent one).
-  const day = { spendDay: utcDay(o.now), spendUsd: spendToday(s, o.now) };
-  const calls = callsToday(s, o.now) + (o.kind === "no_key" ? 0 : 1);
+  const day = { spendDay: utcDay(o.now), spendUsd: spendToday(s, o.now) + u.spendUsd };
+  const calls = callsToday(s, o.now) + u.calls + (o.kind === "no_key" ? 0 : 1);
   if (isAuthFailure(o.kind, o.status)) {
     // Not a breaker failure: retrying will not help until the key changes.
     return store.saveProviderState(provider, {
@@ -281,9 +446,10 @@ function recordFailureTx(
   }
   const counts = countsAsFailure(o.kind, o.status);
   const failures = counts ? (s?.failures ?? 0) + 1 : (s?.failures ?? 0);
+  // A timeout is a sample above its budget (see the header): the call took at least that long.
   const ring =
-    o.kind === "timeout" && o.latencyMs !== undefined && o.sample !== false
-      ? addSample(s, o.latencyMs, o.budgetMs)
+    o.kind === "timeout" && o.sample !== false
+      ? addSample(s, timeoutLatency(o.latencyMs, o.budgetMs), o.budgetMs)
       : ringOf(s);
   let state: string;
   let retryAt: number | null;
@@ -313,9 +479,15 @@ function recordFailureTx(
   });
 }
 
+/** The latency sample of a call cut off at its deadline: never below budget + 1 ms. */
+export function timeoutLatency(latencyMs: number | undefined, budgetMs: number): number {
+  return Math.max(Math.round(latencyMs ?? 0), Math.round(budgetMs) + 1);
+}
+
 /** The store's write transaction when it has one (SQLite: BEGIN IMMEDIATE), else `fn` as is. */
-function atomically<T>(store: AdjudicatorStore, fn: () => T): T {
-  return store.atomically ? store.atomically(fn) : fn();
+function atomically<T>(store: AdjudicatorStore, fn: () => T, lockWaitMs?: number): T {
+  if (store.atomically) return store.atomically(fn, { lockWaitMs });
+  return lockWaitMs !== undefined && store.withLockWait ? store.withLockWait(lockWaitMs, fn) : fn();
 }
 
 /** The latency ring and its per-sample budgets, kept the same length (0 = budget unknown). */

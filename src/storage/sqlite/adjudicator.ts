@@ -280,12 +280,16 @@ export class SqliteAdjudicatorStore implements AdjudicatorStore {
     let hits = Number(r.hits ?? 0);
     let lastHitAt = r.last_hit_at == null ? null : Number(r.last_hit_at);
     if (verdict) {
-      this.prep("UPDATE adjudicator_cache SET hits = hits + 1, last_hit_at = ? WHERE key = ?").run(
-        now,
-        key,
-      );
-      hits += 1;
-      lastHitAt = now;
+      try {
+        this.prep(
+          "UPDATE adjudicator_cache SET hits = hits + 1, last_hit_at = ? WHERE key = ?",
+        ).run(now, key);
+        hits += 1;
+        lastHitAt = now;
+      } catch {
+        // The hit counter is a statistic: a locked database (SQLITE_BUSY) must not turn a hit
+        // the reader can see into a miss, so the bump is skipped instead.
+      }
     }
     return {
       key,
@@ -399,11 +403,24 @@ export class SqliteAdjudicatorStore implements AdjudicatorStore {
     return next;
   }
 
-  atomically<T>(fn: () => T): T {
+  atomically<T>(fn: () => T, o: { lockWaitMs?: number | undefined } = {}): T {
     // Heal before BEGIN so the DDL never runs inside the caller's transaction.
     this.heal();
     if (this.db.inTransaction) return fn();
-    return this.db.transaction(fn).immediate();
+    const tx = () => this.db.transaction(fn).immediate();
+    return o.lockWaitMs === undefined ? tx() : this.withLockWait(o.lockWaitMs, tx);
+  }
+
+  withLockWait<T>(ms: number, fn: () => T): T {
+    const prev = Number(this.db.pragma("busy_timeout", { simple: true }));
+    const next = Math.max(0, Math.min(Number.isFinite(prev) ? prev : 0, Math.floor(ms)));
+    if (next === prev) return fn();
+    this.db.pragma(`busy_timeout = ${next}`);
+    try {
+      return fn();
+    } finally {
+      this.db.pragma(`busy_timeout = ${prev}`);
+    }
   }
 
   // --- bias -------------------------------------------------------------------------

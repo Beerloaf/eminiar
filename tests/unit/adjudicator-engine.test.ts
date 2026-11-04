@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   type AsyncJob,
@@ -23,6 +24,8 @@ import {
   recordFailure,
   recordSuccess,
   SLOW_MIN_SAMPLES,
+  timeoutLatency,
+  unrecorded,
   utcDay,
 } from "../../src/adjudicator/breaker.js";
 import {
@@ -436,22 +439,27 @@ describe("never throws, never waits past the budget", () => {
     expect(a?.verdict.source).toBe("fallback");
   });
 
-  it("a store that throws on every call: verdict still returned, just not persisted", async () => {
+  it("a store that throws on every call: heuristic verdict returned, not persisted, provider NOT called (fails closed, task #51)", async () => {
     const broken = new Proxy({} as AdjudicatorStore, {
       get: () => () => {
         throw new Error("SQLITE_BUSY");
       },
     });
     const lines: string[] = [];
+    const p = ok();
     const [a] = await adjudicate([req("k1")], {
       ...base(adj()),
       store: broken,
-      provider: ok(),
+      provider: p,
       log: (l) => lines.push(l),
     });
-    expect(a?.verdict.source).toBe("blend");
+    // An unreadable breaker state could hide an open breaker, a spent budget or a rejected key.
+    expect(a?.verdict.source).toBe("fallback");
+    expect(a?.verdict.providerStatus).toBe("skipped");
+    expect(p.calls).toHaveLength(0);
     expect(a?.rowId).toBeUndefined();
     expect(lines.some((l) => l.includes("SQLITE_BUSY"))).toBe(true);
+    expect(lines.some((l) => l.includes("gate unavailable"))).toBe(true);
   });
 
   it("returns [] for no requests and survives a broken config object", async () => {
@@ -541,40 +549,93 @@ describe("breaker (persisted across processes)", () => {
 });
 
 describe("slow guard and daily cap", () => {
-  it("p95 over the surface budget turns the provider slow for cooldownSec, then it starts over", async () => {
-    const cfg = adj({ breaker: { failures: 2, cooldownSec: 30 } });
-    let now = T0;
-    const clock = () => now;
-    const slow = ok({ latencyMs: 5000 });
-    for (let i = 0; i < SLOW_MIN_SAMPLES; i++) {
-      const r = await adjudicateOne(req(`k${i}`, `prompt number ${i} about refactoring`), {
+  it("timeouts are samples above budget: 1 call in 3 timing out trips the slow guard, then it starts over (task #52)", async () => {
+    // 3 consecutive failures would open the breaker, but every third call times out, so the
+    // successes in between keep resetting that streak: only the slow guard can catch it.
+    const cfg = adj({ breaker: { failures: 3, cooldownSec: 30 } });
+    let skew = 0;
+    const clock = () => Date.now() + skew;
+    let n = 0;
+    const flaky = fake(async (reqs, signal) => {
+      if (++n % 3 === 0)
+        await new Promise((_, reject) =>
+          signal.addEventListener("abort", () =>
+            reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+          ),
+        );
+      return {
+        answers: reqs.map((r) => opusAnswer(r.key)),
+        usage: { inTok: 10, outTok: 5, costUsd: 0 },
+        latencyMs: 1,
+        model: "jev-1.14.0",
+      };
+    });
+    const BUDGET = 40;
+    let firstSlow = -1;
+    for (let k = 0; k < 2 * SLOW_MIN_SAMPLES && firstSlow < 0; k++) {
+      await adjudicateOne(req(`k${k}`, `prompt number ${k} about refactoring`), {
         ...base(cfg),
-        provider: slow,
+        provider: flaky,
         now: clock,
+        budgetMs: BUDGET,
       });
-      expect(r.verdict.source).toBe("blend");
+      if (openStore().providerState("typesafe")?.state === "slow") firstSlow = k;
     }
-    expect(openStore().providerState("typesafe")?.state).toBe("slow");
+    // It trips as soon as the ring holds SLOW_MIN_SAMPLES samples.
+    expect(firstSlow).toBe(SLOW_MIN_SAMPLES - 1);
+    let st = openStore().providerState("typesafe");
+    expect(st?.failures).toBeLessThan(cfg.breaker.failures);
+    const timeouts = (st?.latencies ?? []).filter((l, i) => l > (st?.latencyBudgets?.[i] ?? 0));
+    expect(timeouts.length).toBe(Math.floor(SLOW_MIN_SAMPLES / 3));
+    expect(Math.min(...timeouts)).toBe(BUDGET + 1);
+
+    const calls = flaky.calls.length;
     const r = await adjudicateOne(req("kx", "another distinct prompt"), {
       ...base(cfg),
-      provider: slow,
+      provider: flaky,
       now: clock,
+      budgetMs: BUDGET,
     });
     expect(r.verdict.providerStatus).toBe("slow_guard");
-    expect(slow.calls).toHaveLength(SLOW_MIN_SAMPLES);
+    expect(flaky.calls).toHaveLength(calls);
 
-    now = T0 + 31_000;
-    const fast = ok({ latencyMs: 40 });
+    skew = 31_000;
+    const fast = ok();
     const after = await adjudicateOne(req("ky", "yet another distinct prompt"), {
       ...base(cfg),
       provider: fast,
       now: clock,
     });
     expect(after.verdict.source).toBe("blend");
-    const st = openStore().providerState("typesafe");
+    st = openStore().providerState("typesafe");
     expect(st?.state).toBe("closed");
-    expect(st?.latencies).toEqual([40]);
+    expect(st?.latencies).toHaveLength(1);
     expect(st?.latencyBudgets).toHaveLength(1);
+  });
+
+  it("a timeout is recorded above its budget even when the call measured less (pre-call time)", () => {
+    const store = openStore();
+    const cfg = adj();
+    const st = recordFailure(store, "typesafe", cfg, {
+      now: T0,
+      kind: "timeout",
+      latencyMs: 780,
+      budgetMs: 800,
+      halfOpen: false,
+    });
+    expect(st.latencies).toEqual([801]);
+    expect(st.latencyBudgets).toEqual([800]);
+    expect(timeoutLatency(undefined, 800)).toBe(801);
+    expect(timeoutLatency(950, 800)).toBe(950);
+    // A test/warm-up timeout stays out of the ring.
+    const t = recordFailure(store, "typesafe", cfg, {
+      now: T0,
+      kind: "timeout",
+      budgetMs: 800,
+      halfOpen: false,
+      sample: false,
+    });
+    expect(t.latencies).toHaveLength(1);
   });
 
   it("each sample is judged against its own budget: a slow plan batch never makes fast agent calls slow (task #36)", () => {
@@ -665,9 +726,19 @@ describe("slow guard and daily cap", () => {
     let st = openStore().providerState("typesafe");
     expect(st?.latencies).toEqual([]);
     expect(st?.calls).toBe(1);
+    // The sample is the time the engine measured (150 ms on this clock), not a reported one.
+    const answers150 = fake(async (reqs) => {
+      now += 150;
+      return {
+        answers: reqs.map((r) => opusAnswer(r.key)),
+        usage: { inTok: 10, outTok: 5, costUsd: 0 },
+        latencyMs: 9999,
+        model: "jev-1.14.0",
+      };
+    });
     await adjudicateOne(req("p1", "explain the session cache flow"), {
       ...base(cfg),
-      provider: ok({ latencyMs: 150 }),
+      provider: answers150,
       now: clock,
     });
     st = openStore().providerState("typesafe");
@@ -1045,6 +1116,172 @@ process.stdout.write(JSON.stringify({ allow: g.allow, halfOpen: g.allow ? g.half
     real.saveProviderState("typesafe", { state: "open", retryAt: T0 - 1 });
     const g = gate(plain, "typesafe", adj(), { now: T0, remote: true });
     expect(g.allow && g.halfOpen).toBe(true);
+  });
+});
+
+describe("a held write lock never bypasses the gate (task #51)", () => {
+  /** Another connection holding the write lock (MCP server reindex, usage ingest, a hook). */
+  function holdLock(): () => void {
+    const holder = new Database(dbPath);
+    holder.exec("BEGIN IMMEDIATE");
+    holder.exec("INSERT INTO meta (key, value) VALUES ('lock-probe', '1')");
+    return () => {
+      holder.exec("ROLLBACK");
+      holder.close();
+    };
+  }
+  const SLACK = 150;
+  /** A clock that runs from T0 (lock waits are bounded by the budget left on it). */
+  let started = Date.now();
+  const running = () => T0 + (Date.now() - started);
+  beforeEach(() => {
+    started = Date.now();
+  });
+
+  it("open breaker: denied from a read (no claim, no provider call) within the budget", async () => {
+    const cfg = adj();
+    openStore().saveProviderState("typesafe", { state: "open", failures: 3, retryAt: T0 + 60_000 });
+    const release = holdLock();
+    try {
+      const p = ok();
+      const t0 = Date.now();
+      const a = await adjudicateOne(req("k1", "refactor the storage adapter", "agent"), {
+        ...base(cfg),
+        provider: p,
+        now: running,
+      });
+      expect(a.verdict.providerStatus).toBe("breaker_open");
+      expect(p.calls).toHaveLength(0);
+      expect(Date.now() - t0).toBeLessThan(surfaceBudget(cfg, "agent") + SLACK);
+    } finally {
+      release();
+    }
+  });
+
+  it("over the daily budget or call cap, or locked out: denied from a read", async () => {
+    const cfg = adj({ budget: { dailyUsd: 0.5, dailyCalls: 50 } });
+    const store = openStore();
+    const fp = keyFingerprint(SENTINEL);
+    const cases: Array<[Parameters<AdjudicatorStore["saveProviderState"]>[1], string]> = [
+      [{ state: "closed", spendDay: utcDay(T0), spendUsd: 0.75, calls: 40 }, "over_budget"],
+      [{ state: "closed", spendDay: utcDay(T0), spendUsd: 0, calls: 50 }, "over_budget"],
+      // A cooled-down breaker that would need a half-open claim, but the budget is spent.
+      [{ state: "open", retryAt: T0 - 1, spendDay: utcDay(T0), spendUsd: 0.9 }, "over_budget"],
+      [{ state: "auth_failed", retryAt: T0 + 60_000, authFingerprint: fp }, "auth_failed"],
+    ];
+    for (const [state, status] of cases) {
+      store.purge();
+      store.saveProviderState("typesafe", state);
+      const release = holdLock();
+      try {
+        const p = ok();
+        const t0 = Date.now();
+        const a = await adjudicateOne(req("k1", "split the session store", "plan"), {
+          ...base(cfg),
+          provider: p,
+          now: running,
+        });
+        expect(a.verdict.providerStatus, status).toBe(status);
+        expect(p.calls).toHaveLength(0);
+        expect(Date.now() - t0).toBeLessThan(500);
+      } finally {
+        release();
+      }
+    }
+  });
+
+  it("a half-open claim that cannot get the lock fails CLOSED within the budget", async () => {
+    const cfg = adj();
+    openStore().saveProviderState("typesafe", { state: "open", failures: 3, retryAt: T0 - 1 });
+    const release = holdLock();
+    try {
+      const p = ok();
+      const lines: string[] = [];
+      const t0 = Date.now();
+      const a = await adjudicateOne(req("k1", "refactor the storage adapter", "agent"), {
+        ...base(cfg),
+        provider: p,
+        now: running,
+        log: (l) => lines.push(l),
+      });
+      expect(a.verdict.source).toBe("fallback");
+      expect(a.verdict.providerStatus).toBe("skipped");
+      expect(p.calls).toHaveLength(0);
+      expect(lines.some((l) => l.includes("gate unavailable"))).toBe(true);
+      expect(Date.now() - t0).toBeLessThan(surfaceBudget(cfg, "agent") + SLACK);
+    } finally {
+      release();
+    }
+    // Nothing was claimed: the next process gets the trial call.
+    expect(openStore().providerState("typesafe")?.state).toBe("open");
+  });
+
+  it("closed: the provider is called, a record that cannot be written is carried and logged, never lost", async () => {
+    const cfg = adj({ budget: { dailyUsd: 10, dailyCalls: 3 } });
+    const store = openStore();
+    store.saveProviderState("typesafe", { state: "closed", spendDay: utcDay(T0), calls: 1 });
+    const lines: string[] = [];
+    const release = holdLock();
+    const t0 = Date.now();
+    try {
+      const a = await adjudicateOne(req("k1", "refactor the storage adapter", "agent"), {
+        ...base(cfg, { store }),
+        provider: ok({ costUsd: 0.25 }),
+        now: running,
+        log: (l) => lines.push(l),
+      });
+      expect(a.verdict.source).toBe("blend");
+      expect(Date.now() - t0).toBeLessThan(surfaceBudget(cfg, "agent") + SLACK);
+      expect(lines.some((l) => l.includes("breaker state not written"))).toBe(true);
+      expect(unrecorded(store, "typesafe", T0)).toMatchObject({ calls: 1, spendUsd: 0.25 });
+      // The gate counts the carried call: 1 stored + 1 carried + this one reaches the cap of 3.
+      const b = await adjudicateOne(req("k2", "rename a helper", "agent"), {
+        ...base(cfg, { store }),
+        provider: ok({ costUsd: 0.25 }),
+        now: running,
+        log: (l) => lines.push(l),
+      });
+      expect(b.verdict.source).toBe("blend");
+      expect(unrecorded(store, "typesafe", T0)).toMatchObject({ calls: 2, spendUsd: 0.5 });
+      const c = await adjudicateOne(req("k3", "explain the cache", "agent"), {
+        ...base(cfg, { store }),
+        provider: ok(),
+        now: running,
+      });
+      expect(c.verdict.providerStatus).toBe("over_budget");
+    } finally {
+      release();
+    }
+    // The next record that gets the lock writes the carried calls and spend.
+    const st = recordSuccess(store, "typesafe", cfg, {
+      now: T0,
+      latencyMs: 10,
+      costUsd: 0.1,
+      budgetMs: 800,
+    });
+    expect(st.calls).toBe(4);
+    expect(st.spendUsd).toBeCloseTo(0.6, 9);
+    expect(unrecorded(store, "typesafe", T0)).toMatchObject({ calls: 0, spendUsd: 0 });
+  });
+
+  it("a failed record with a hanging provider still returns within budget + slack", async () => {
+    const cfg = adj();
+    const lines: string[] = [];
+    const store = openStore();
+    const release = holdLock();
+    try {
+      const t0 = Date.now();
+      const a = await adjudicateOne(req("k1", "refactor the storage adapter", "agent"), {
+        ...base(cfg, { store }),
+        provider: hanging(),
+        log: (l) => lines.push(l),
+      });
+      expect(a.verdict.providerStatus).toBe("timeout");
+      expect(Date.now() - t0).toBeLessThan(surfaceBudget(cfg, "agent") + SLACK);
+      expect(lines.some((l) => l.includes("breaker state not written"))).toBe(true);
+    } finally {
+      release();
+    }
   });
 });
 

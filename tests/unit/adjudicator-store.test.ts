@@ -620,3 +620,57 @@ describe("purge", () => {
     expect(() => schema.parse({ scope: "bogus", confirm: true })).toThrow();
   });
 });
+
+describe("bounded lock waits (task #51)", () => {
+  /** A second connection holding the write lock, as the MCP server's reindex would. */
+  function holdLock(path: string): Database.Database {
+    const holder = new Database(path);
+    holder.exec("BEGIN IMMEDIATE");
+    holder.exec("INSERT INTO meta (key, value) VALUES ('lock-probe', '1')");
+    return holder;
+  }
+
+  it("withLockWait caps the busy timeout for its body only and never raises it", () => {
+    const a = new SqliteAdapter(tmpDb("em-adj-lw-"), { vectors: false });
+    const s = a.adjudicator;
+    const busy = () => Number(a.db.pragma("busy_timeout", { simple: true }));
+    expect(busy()).toBe(2000);
+    expect(s.withLockWait(30, busy)).toBe(30);
+    expect(s.withLockWait(30, () => s.withLockWait(10_000, busy))).toBe(30);
+    expect(() =>
+      s.withLockWait(0, () => {
+        throw new Error("boom");
+      }),
+    ).toThrow("boom");
+    expect(busy()).toBe(2000);
+    a.close();
+  });
+
+  it("a held write lock: reads still answer, a bounded write fails fast, the timeout is restored", () => {
+    const path = tmpDb("em-adj-lock-");
+    const a = new SqliteAdapter(path, { vectors: false });
+    const s = a.adjudicator;
+    s.saveProviderState("p", { state: "open", retryAt: 123 });
+    s.cachePut("k1", VERDICT, "typesafe", 1000);
+    const holder = holdLock(path);
+    try {
+      expect(s.providerState("p")?.state).toBe("open");
+      // The hit is served even though its counter cannot be bumped.
+      const t0 = Date.now();
+      const hit = s.withLockWait(0, () => s.cacheGet("k1", 1500));
+      expect(hit?.verdict).toMatchObject({ key: "k1" });
+      expect(hit?.hits).toBe(0);
+      expect(() =>
+        s.atomically(() => s.saveProviderState("p", { state: "closed" }), { lockWaitMs: 50 }),
+      ).toThrow(/busy|locked/i);
+      expect(Date.now() - t0).toBeLessThan(1000);
+      expect(Number(a.db.pragma("busy_timeout", { simple: true }))).toBe(2000);
+    } finally {
+      holder.exec("ROLLBACK");
+      holder.close();
+    }
+    expect(s.providerState("p")?.state).toBe("open");
+    expect(s.cacheGet("k1", 1600)?.hits).toBe(1);
+    a.close();
+  });
+});

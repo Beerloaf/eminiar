@@ -610,8 +610,16 @@ export interface AdjudicatorStore {
    * IMMEDIATE), so a read-modify-write of the provider state (half-open claim, spend and call
    * counters) cannot interleave with another hook process. Nested calls join the outer one.
    * Optional: a store without it (a test double, the try-it wrapper) runs `fn` directly.
+   * `lockWaitMs` caps how long BEGIN IMMEDIATE (and every statement in `fn`) waits for another
+   * connection's lock before it throws SQLITE_BUSY (default: the connection's own busy timeout).
    */
-  atomically?<T>(fn: () => T): T;
+  atomically?<T>(fn: () => T, o?: { lockWaitMs?: number | undefined }): T;
+  /**
+   * Run `fn` with every lock wait capped at `ms` (SQLite busy_timeout; 0 = try once), then
+   * restore the connection's own timeout. It only ever lowers the wait. A busy database makes
+   * the statement throw instead of stalling the hook past its budget. Optional, like atomically.
+   */
+  withLockWait?<T>(ms: number, fn: () => T): T;
 
   biasAll(): AdjudicatorBiasRow[];
   biasUpsert(row: Omit<AdjudicatorBiasRow, "updatedAt"> & { updatedAt?: number | null }): void;

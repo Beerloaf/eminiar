@@ -6,7 +6,11 @@
  * `adjudicate()` NEVER throws and never waits past its budget: a provider that hangs is cut off
  * by a timer racing the call (its AbortSignal fires at the same moment), so the heuristic comes
  * back within budget + a few ms. Persistence and cache failures (DB busy, v8 not migrated) are
- * swallowed: the verdict is still returned, just not stored.
+ * swallowed: the verdict is still returned, just not stored. Every write waits for another
+ * process's lock no longer than the budget left (LOCK_WAIT_MAX_MS at most), and a breaker gate
+ * that cannot be read or written FAILS CLOSED: the provider is not called and the heuristic
+ * answers, so a busy database can never bypass an open breaker, the daily caps or an auth
+ * lockout.
  *
  * Cache: keyed by sha256(SCORER_VERSION | configured provider | model | surface | inputs | text),
  * where inputs are the hints, tool/role catalogues, tier ladder and weights (cacheKeyFor), so
@@ -24,7 +28,14 @@ import type { AdjudicatorConfig } from "../config.js";
 import type { AdjudicationInput, AdjudicationPatch, AdjudicatorStore } from "../storage/types.js";
 import type { AsyncJob } from "./async.js";
 import { blend } from "./blend.js";
-import { authLockout, gate, overBudget, recordFailure, recordSuccess } from "./breaker.js";
+import {
+  authLockout,
+  gate,
+  overBudget,
+  recordFailure,
+  recordSuccess,
+  unrecorded,
+} from "./breaker.js";
 import {
   currentKeyFingerprint,
   type Resolved,
@@ -55,6 +66,14 @@ export const PENDING_TTL_MS = 30_000;
 export const CACHE_KEY_CHARS = 2000;
 /** Prune the cache on about one write in this many (hooks are separate processes). */
 export const PRUNE_EVERY = 100;
+/**
+ * The longest any one statement waits for another process's write lock (MCP server reindex,
+ * usage ingest, another hook). Every wait is also capped by what is left of the call budget, so
+ * a held lock costs a hook at most its budget plus a few LOCK_WAIT_FLOOR_MS tries.
+ */
+export const LOCK_WAIT_MAX_MS = 250;
+/** Breaker and row writes after the budget is spent still get this long (counters matter). */
+export const LOCK_WAIT_FLOOR_MS = 25;
 
 export type CallMode = "inline" | "async" | "never";
 
@@ -290,12 +309,13 @@ export async function adjudicate(
       !!store && (cfg.enabled ? opts.persist !== false : enabled && opts.persist === true);
     const firstSurface = items[0]?.req.surface ?? "prompt";
     const budgetMs = Math.max(0, opts.budgetMs ?? surfaceBudget(cfg, firstSurface, r.local));
+    const locks = new LockBudget(start + budgetMs, now);
     const keyCtx: CacheKeyContext = { config: cfg, tools: toolsOf(opts), roles: opts.roles };
     for (const it of items) it.cacheKey = cacheKeyFor(it.req, r, keyCtx);
 
     if (!enabled) {
       for (const it of items) it.verdict = heuristicVerdict(it, "heuristic", "heuristic", "n/a");
-      return finish(items, opts, start, now, false);
+      return finish(items, opts, start, now, false, locks);
     }
 
     // 1. Cache (not for a configured heuristic: scoring is cheaper than the lookup).
@@ -303,7 +323,11 @@ export async function adjudicate(
     if (useCache && store) {
       const ttlMs = cfg.cache.ttlHours * 3_600_000;
       for (const it of items) {
-        const hit = safe(() => store.cacheGet(it.cacheKey, now(), ttlMs), log);
+        // The hit counter bump never waits: a locked database still serves the hit.
+        const hit = safe(
+          () => locks.run(store, 0, () => store.cacheGet(it.cacheKey, now(), ttlMs)),
+          log,
+        );
         if (!hit) continue;
         if (hit.verdict) {
           // A hit costs nothing and belongs to no earlier row.
@@ -315,13 +339,13 @@ export async function adjudicate(
       }
     }
     const misses = items.filter((it) => !it.verdict);
-    if (!misses.length) return finish(items, opts, start, now, persist);
+    if (!misses.length) return finish(items, opts, start, now, persist, locks);
 
     // 2. Gate: effective provider, call mode, provider instance, breaker / slow / budget.
     const fallback = (status: ProviderStatus) => {
       const source = r.configured === "heuristic" ? "heuristic" : "fallback";
       for (const it of misses) it.verdict = heuristicVerdict(it, r.configured, source, status);
-      return finish(items, opts, start, now, persist);
+      return finish(items, opts, start, now, persist, locks);
     };
     if (r.provider === "heuristic") return fallback(statusOfDegraded(r));
     const call = opts.call ?? "inline";
@@ -348,7 +372,7 @@ export async function adjudicate(
         else it.job = buildJob(it, cfg, opts, budgetMs);
       }
       // Rows first, so each job can carry the id of the row it will update.
-      const out = finish(items, opts, start, now, persist);
+      const out = finish(items, opts, start, now, persist, locks);
       for (const [i, it] of items.entries()) {
         if (!it.job) continue;
         const a = out[i] as Adjudication;
@@ -358,19 +382,39 @@ export async function adjudicate(
         if (!opts.spawn) log("adjudicator: async call without a spawn function");
         if (!spawned) continue;
         a.queued = true;
-        if (store) safe(() => store.cachePut(it.cacheKey, null, r.configured, now()), log);
+        if (store)
+          safe(
+            () => locks.run(store, 0, () => store.cachePut(it.cacheKey, null, r.configured, now())),
+            log,
+          );
       }
       return out;
     }
 
     let halfOpen = false;
     if (store) {
+      // Half of what is left may go to waiting for a lock the gate must write under (a
+      // half-open claim); the plain closed / open / over-budget answers only read.
       const g = safe(
-        () => gate(store, r.provider, cfg, { now: now(), remote: r.remote, keyFingerprint: keyFp }),
+        () =>
+          locks.guard(() =>
+            gate(store, r.provider, cfg, {
+              now: now(),
+              remote: r.remote,
+              keyFingerprint: keyFp,
+              lockWaitMs: Math.floor(locks.wait() / 2),
+            }),
+          ),
         log,
       );
-      if (g && !g.allow) return fallback(g.status);
-      halfOpen = !!g?.allow && g.halfOpen;
+      // No answer (database busy or broken): fail CLOSED. Calling the provider here would
+      // ignore an open breaker, an exhausted daily budget or a rejected key.
+      if (!g) {
+        log(`adjudicator: ${r.provider} gate unavailable; heuristic this call`);
+        return fallback("skipped");
+      }
+      if (!g.allow) return fallback(g.status);
+      halfOpen = g.halfOpen;
     }
 
     // 3. Provider, raced against the remaining budget.
@@ -391,40 +435,40 @@ export async function adjudicate(
       const kind = outcome.kind;
       log(`adjudicator: ${r.provider} ${kind}${outcome.status ? ` ${outcome.status}` : ""}`);
       if (store)
-        safe(
-          () =>
-            recordFailure(store, r.provider, cfg, {
-              now: now(),
-              kind,
-              status: outcome.status,
-              latencyMs: providerLatencyMs,
-              budgetMs,
-              halfOpen,
-              keyFingerprint: keyFp,
-              sample,
-            }),
-          log,
+        record(store, r.provider, now(), log, locks, () =>
+          recordFailure(store, r.provider, cfg, {
+            now: now(),
+            kind,
+            status: outcome.status,
+            latencyMs: providerLatencyMs,
+            budgetMs,
+            halfOpen,
+            keyFingerprint: keyFp,
+            sample,
+            lockWaitMs: locks.wait(LOCK_WAIT_FLOOR_MS),
+          }),
         );
       for (const it of misses) {
         it.verdict = heuristicVerdict(it, r.provider, "fallback", kind);
         it.verdict.providerLatencyMs = providerLatencyMs;
       }
-      return finish(items, opts, start, now, persist);
+      return finish(items, opts, start, now, persist, locks);
     }
 
     // 4. Blend each answered request; missing answers keep the heuristic (per key).
     const res = outcome.result;
     if (store)
-      safe(
-        () =>
-          recordSuccess(store, r.provider, cfg, {
-            now: now(),
-            latencyMs: res.latencyMs || providerLatencyMs,
-            costUsd: res.usage.costUsd,
-            budgetMs,
-            sample,
-          }),
-        log,
+      record(store, r.provider, now(), log, locks, () =>
+        recordSuccess(store, r.provider, cfg, {
+          now: now(),
+          // The time this call measured, not what the provider reports: the budget governs
+          // the wall clock, and a provider cannot report itself slower or faster than it was.
+          latencyMs: providerLatencyMs,
+          costUsd: res.usage.costUsd,
+          budgetMs,
+          sample,
+          lockWaitMs: locks.wait(LOCK_WAIT_FLOOR_MS),
+        }),
       );
     const byKey = new Map<string, ProviderAnswer>();
     for (const a of res.answers) if (!byKey.has(a.key)) byKey.set(a.key, a);
@@ -457,15 +501,21 @@ export async function adjudicate(
       it.providerModel = res.model || r.model;
       if (store) {
         const v = it.verdict;
-        safe(() => store.cachePut(it.cacheKey, v, r.configured, now()), log);
+        safe(
+          () => locks.run(store, 0, () => store.cachePut(it.cacheKey, v, r.configured, now())),
+          log,
+        );
       }
     }
     if (store && answered && (opts.random ?? Math.random)() < answered / PRUNE_EVERY)
       safe(
-        () => store.cachePrune(cfg.cache.maxEntries, cfg.cache.ttlHours * 3_600_000, now()),
+        () =>
+          locks.run(store, 0, () =>
+            store.cachePrune(cfg.cache.maxEntries, cfg.cache.ttlHours * 3_600_000, now()),
+          ),
         log,
       );
-    return finish(items, opts, start, now, persist);
+    return finish(items, opts, start, now, persist, locks);
   } catch (err) {
     // Last resort: whatever went wrong, every request still gets a heuristic verdict.
     log(`adjudicator: engine error ${(err as Error)?.message ?? String(err)}`);
@@ -549,6 +599,7 @@ function finish(
   start: number,
   now: () => number,
   persist: boolean,
+  locks: LockBudget,
 ): Adjudication[] {
   const log = opts.log ?? (() => {});
   const cfg = opts.config;
@@ -582,7 +633,7 @@ function finish(
         ...opts.row,
         ...opts.rows?.[it.index],
       };
-      const id = safe(() => store.insert(row), log);
+      const id = safe(() => locks.run(store, LOCK_WAIT_FLOOR_MS, () => store.insert(row)), log);
       if (id !== undefined) {
         out.rowId = id;
         verdict.id = id;
@@ -677,6 +728,77 @@ function buildJob(
   if (tools) job.tools = [...tools];
   if (opts.roles) job.roles = opts.roles.map((r) => ({ ...r }));
   return job;
+}
+
+/**
+ * How long this call's writes may wait for another process's lock: what is left of the budget,
+ * at most LOCK_WAIT_MAX_MS, at least the caller's floor. Once one write found the database
+ * busy, the rest only get their floor (try once): the lock is evidently held, and waiting for
+ * it again would spend the hook's time on bookkeeping.
+ */
+class LockBudget {
+  private busy = false;
+
+  constructor(
+    private readonly deadline: number,
+    private readonly now: () => number,
+  ) {}
+
+  wait(floor = 0): number {
+    if (this.busy) return floor;
+    return Math.max(floor, Math.min(LOCK_WAIT_MAX_MS, Math.floor(this.deadline - this.now())));
+  }
+
+  /** `fn`, noting a busy database before rethrowing its error. */
+  guard<T>(fn: () => T): T {
+    try {
+      return fn();
+    } catch (err) {
+      if (isBusy(err)) this.busy = true;
+      throw err;
+    }
+  }
+
+  /** `fn` with every lock wait capped at wait(floor). */
+  run<T>(store: AdjudicatorStore, floor: number, fn: () => T): T {
+    const ms = this.wait(floor);
+    return this.guard(() => bounded(store, ms, fn));
+  }
+}
+
+/** SQLITE_BUSY / SQLITE_LOCKED (better-sqlite3 sets `code`), or a message saying so. */
+function isBusy(err: unknown): boolean {
+  const code = (err as { code?: unknown })?.code;
+  if (typeof code === "string" && /^SQLITE_(BUSY|LOCKED)/.test(code)) return true;
+  return /database is (locked|busy)|SQLITE_BUSY/i.test((err as Error)?.message ?? "");
+}
+
+/** `fn` with every lock wait capped at `ms` when the store supports it. */
+function bounded<T>(store: AdjudicatorStore, ms: number, fn: () => T): T {
+  return store.withLockWait ? store.withLockWait(ms, fn) : fn();
+}
+
+/**
+ * A breaker record. When it cannot be written (database busy) the breaker module keeps its call
+ * and spend for the next record of this process; a hook process exits first, so say so.
+ */
+function record(
+  store: AdjudicatorStore,
+  provider: string,
+  now: number,
+  log: (line: string) => void,
+  locks: LockBudget,
+  fn: () => unknown,
+): void {
+  try {
+    locks.guard(fn);
+  } catch (err) {
+    const u = unrecorded(store, provider, now);
+    log(
+      `adjudicator: ${provider} breaker state not written (${(err as Error)?.message ?? String(err)}); ` +
+        `unrecorded today: ${u.calls} call(s), $${u.spendUsd.toFixed(6)}`,
+    );
+  }
 }
 
 function safe<T>(fn: () => T, log: (line: string) => void): T | undefined {
