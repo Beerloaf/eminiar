@@ -639,6 +639,14 @@
           "default": false,
           "type": "boolean"
         },
+        "remoteConsentOrigins": {
+          "maxItems": 64,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 512
+          }
+        },
         "timeouts": {
           "default": {},
           "type": "object",

@@ -69,6 +69,92 @@ export const PRESETS: Record<PresetId, Preset> = {
 };
 
 export const TYPESAFE_KEY_ENV = "TYPESAFE_API_KEY";
+/** TypeSafe's default endpoint (the config default of typesafe.baseUrl). */
+export const TYPESAFE_BASE_URL = "https://api.typesafe.ai/v1";
+
+/** scheme://host[:port] of a URL (default ports dropped, host lower-cased); undefined if unparsable. */
+export function originOf(url: string | undefined): string | undefined {
+  if (!url) return undefined;
+  try {
+    const u = new URL(url);
+    if (u.protocol !== "https:" && u.protocol !== "http:") return undefined;
+    return u.origin;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The remote origins eminiar ships: the non-local presets and TypeSafe's default endpoint.
+ * EMINIAR_ADJUDICATOR_REMOTE=1 (and a legacy `remoteConsent: true` with no
+ * remoteConsentOrigins list) consents to these and nothing else.
+ */
+export const BUILTIN_REMOTE_ORIGINS: readonly string[] = [
+  ...Object.values(PRESETS)
+    .filter((p) => !p.local && p.baseUrl)
+    .map((p) => originOf(p.baseUrl) as string),
+  originOf(TYPESAFE_BASE_URL) as string,
+];
+
+/** How remote consent was given for an origin. */
+export type ConsentVia = "config" | "env" | "legacy";
+
+/**
+ * Whether the user agreed to send text to `origin` (docs/design/adjudicator.md §5; task #33):
+ * - EMINIAR_ADJUDICATOR_REMOTE=0, or remoteConsent false, means no consent at all;
+ * - "config": the origin is in remoteConsentOrigins of ~/.eminiar/config.json (the CLI writes it
+ *   after the notice naming that host was shown and accepted);
+ * - "env": EMINIAR_ADJUDICATOR_REMOTE=1 and the origin is a built-in preset origin. The env var is
+ *   host-less, and a project's .claude/settings.json `env` block may set it, so it never covers a
+ *   custom baseUrl;
+ * - "legacy": remoteConsent true with no remoteConsentOrigins list (a config written before
+ *   origins were recorded) is treated like the env var: built-in origins only. The CLI asks again
+ *   and records the origin the next time the provider changes.
+ */
+export function consentFor(
+  a: Pick<AdjudicatorConfig, "remoteConsent" | "remoteConsentOrigins">,
+  origin: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): ConsentVia | undefined {
+  const flag = env.EMINIAR_ADJUDICATOR_REMOTE;
+  if (!origin || flag === "0" || !a.remoteConsent) return undefined;
+  if (consentedOrigins(a).includes(origin)) return "config";
+  if (!BUILTIN_REMOTE_ORIGINS.includes(origin)) return undefined;
+  if (flag === "1") return "env";
+  return a.remoteConsentOrigins === undefined ? "legacy" : undefined;
+}
+
+/** remoteConsentOrigins normalised to origins; entries that are not http(s) URLs are dropped. */
+export function consentedOrigins(a: Pick<AdjudicatorConfig, "remoteConsentOrigins">): string[] {
+  const out: string[] = [];
+  for (const s of a.remoteConsentOrigins ?? []) {
+    const o = originOf(s);
+    if (o && !out.includes(o)) out.push(o);
+  }
+  return out;
+}
+
+/**
+ * The remoteConsentOrigins list the CLI writes after the user accepted `origin`: the current list
+ * plus `origin`. A legacy config (remoteConsent true, no list) is migrated by also keeping
+ * `previous`, the origin of the provider configured before the change, which that consent covered.
+ */
+export function withConsentedOrigin(
+  a: Pick<AdjudicatorConfig, "remoteConsent" | "remoteConsentOrigins">,
+  origin: string,
+  previous?: string,
+): string[] {
+  const list = consentedOrigins(a);
+  if (
+    a.remoteConsentOrigins === undefined &&
+    a.remoteConsent &&
+    previous &&
+    !list.includes(previous)
+  )
+    list.push(previous);
+  if (!list.includes(origin)) list.push(origin);
+  return list;
+}
 
 /** True only for URLs whose host is this machine: localhost, 127.0.0.0/8, ::1. */
 export function isLoopback(url: string | undefined): boolean {
@@ -128,7 +214,15 @@ export interface Resolved {
   keyMasked: string;
   /** The key file exists but is not 0600, so it was ignored. */
   keyFileRefused?: boolean;
+  /** The configured remote target's origin (scheme://host[:port]); absent for local targets. */
+  origin?: string;
+  /**
+   * For a remote target: consent covers `origin` (consentFor). Local targets need none; for
+   * them it is the bare remoteConsent flag.
+   */
   consent: boolean;
+  /** How that consent was given. */
+  consentVia?: ConsentVia;
   /** The deadline hooks use for this provider's calls: timeouts.localMs for local providers. */
   local: boolean;
 }
@@ -217,6 +311,11 @@ export function resolveAdjudicator(
     consent: a.remoteConsent,
     local: !t.remote && a.provider !== "heuristic",
   };
+  const origin = t.remote ? originOf(t.baseUrl) : undefined;
+  const via = t.remote ? consentFor(a, origin, opts.env) : undefined;
+  if (t.remote) r.consent = via !== undefined;
+  if (via) r.consentVia = via;
+  if (origin) r.origin = origin;
   if (t.preset) r.preset = t.preset;
   if (t.baseUrl) r.baseUrl = t.baseUrl;
   if (t.model) r.model = t.model;
@@ -239,10 +338,12 @@ export function resolveAdjudicator(
   if (t.misconfigured) return degrade("misconfigured", t.misconfigured);
   if (a.provider === "embedding" && context === "hook")
     return degrade("hook_context", "the embedding provider runs only in the MCP server and CLI");
-  if (t.remote && !a.remoteConsent)
+  if (t.remote && !via)
     return degrade(
       "no_consent",
-      `${a.provider} sends redacted prompt text to ${hostOf(t.baseUrl)}: run \`eminiar adjudicator enable --accept-remote\``,
+      `${a.provider} sends redacted prompt text to ${origin ?? hostOf(t.baseUrl)}${
+        a.remoteConsent && origin ? ", which you have not agreed to (consent is per origin)" : ""
+      }: run \`eminiar adjudicator enable --accept-remote\``,
     );
   if (t.needsKey && key?.source !== "env" && key?.source !== "file")
     return degrade(

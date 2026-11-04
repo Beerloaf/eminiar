@@ -78,6 +78,13 @@ const buildAdjudicatorObject = () =>
       .optional(),
     /** Consent to send redacted prompt text to a remote provider; read only from ~/.eminiar/config.json or env. */
     remoteConsent: z.boolean().default(false),
+    /**
+     * The origins (scheme://host[:port]) the user agreed to, written by the CLI's consent prompt;
+     * read only from ~/.eminiar/config.json. Consent covers a remote provider only when its origin
+     * is listed here, or it is a built-in preset origin under EMINIAR_ADJUDICATOR_REMOTE=1 (or a
+     * legacy `remoteConsent: true` without this list). See resolveAdjudicator().
+     */
+    remoteConsentOrigins: z.array(z.string().max(512)).max(64).optional(),
     timeouts: z
       .object({
         promptMs: z.number().int().positive().default(1200),
@@ -507,6 +514,8 @@ function envOverrides(): Record<string, unknown> {
   if (provider && (PROVIDER_IDS as readonly string[]).includes(provider)) adj.provider = provider;
   const amode = process.env.EMINIAR_ADJUDICATOR_MODE;
   if (amode && (MODES as readonly string[]).includes(amode)) adj.mode = amode;
+  // EMINIAR_ADJUDICATOR_REMOTE=1 consents only to the built-in preset origins and =0 revokes
+  // every consent; resolveAdjudicator() reads the variable itself to tell the two apart.
   const remote = process.env.EMINIAR_ADJUDICATOR_REMOTE;
   if (remote === "0" || remote === "1") adj.remoteConsent = remote === "1";
   if (Object.keys(adj).length) o.adjudicator = adj;
@@ -517,8 +526,8 @@ function envOverrides(): Record<string, unknown> {
  * The adjudicator keys a committed <root>/eminiar.config.json may set (docs/design/adjudicator.md
  * §5 "Trust boundary"). A project file comes with any cloned repo, so it must never decide where
  * text or keys go, which key is sent, how much text leaves the machine, or how much is spent:
- * provider, typesafe, openai (preset, baseUrl, model, price), keyEnv, remoteConsent, privacy,
- * budget, timeouts and breaker come only from ~/.eminiar/config.json and EMINIAR_* env. What is
+ * provider, typesafe, openai (preset, baseUrl, model, price), keyEnv, remoteConsent,
+ * remoteConsentOrigins, privacy, budget, timeouts and breaker come only from ~/.eminiar/config.json and EMINIAR_* env. What is
  * left only turns the adjudicator on and tunes how verdicts are scored and used locally.
  */
 export const PROJECT_ADJUDICATOR_KEYS: readonly string[] = [

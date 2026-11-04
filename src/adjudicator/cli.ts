@@ -17,30 +17,24 @@ import {
   type Config,
   ConfigSchema,
   loadConfig,
+  projectAdjudicatorWarning,
 } from "../config.js";
 import type { ProjectContext } from "../context.js";
 import { paths } from "../paths.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import {
+  consentedOrigins,
+  keyFor,
   PRESETS,
   type PresetId,
   type Resolved,
   type ResolvedWithLockout,
   resolveAdjudicator,
-  TYPESAFE_KEY_ENV,
   withAuthLockout,
+  withConsentedOrigin,
 } from "./config.js";
 import type { ProviderDeps } from "./providers/http.js";
-import {
-  clearKey,
-  GENERIC_KEY_ENV,
-  type KeyId,
-  keyFileStatus,
-  mask,
-  resolveKey,
-  setKey,
-  storedKeyIds,
-} from "./secrets.js";
+import { clearKey, type KeyId, keyFileStatus, mask, setKey, storedKeyIds } from "./secrets.js";
 import {
   type AdjudicationRequest,
   type AdjudicatorProvider,
@@ -369,9 +363,63 @@ function hostOf(url: string | undefined): string {
   }
 }
 
-/** The exact statement of what leaves the machine (§17). */
-export function remoteNotice(r: Pick<Resolved, "baseUrl">, cfg: AdjudicatorConfig): string {
-  return `The text of your prompts and subagent tasks (redacted, at most ${cfg.privacy.maxChars} chars) is sent to ${hostOf(r.baseUrl)} to score them.`;
+/** The exact statement of what leaves the machine (§17), naming the origin consent is bound to. */
+export function remoteNotice(
+  r: Pick<Resolved, "baseUrl" | "origin">,
+  cfg: AdjudicatorConfig,
+): string {
+  return `The text of your prompts and subagent tasks (redacted, at most ${cfg.privacy.maxChars} chars) is sent to ${r.origin ?? hostOf(r.baseUrl)} to score them.`;
+}
+
+/** The consent fields of ~/.eminiar/config.json alone: never the env var or the project file. */
+function personalConsent(): Pick<AdjudicatorConfig, "remoteConsent" | "remoteConsentOrigins"> {
+  try {
+    const a = readRaw(paths().configFile).adjudicator;
+    if (!isObj(a)) return { remoteConsent: false };
+    const list = a.remoteConsentOrigins;
+    return {
+      remoteConsent: a.remoteConsent === true,
+      ...(Array.isArray(list)
+        ? { remoteConsentOrigins: list.filter((s): s is string => typeof s === "string") }
+        : {}),
+    };
+  } catch {
+    return { remoteConsent: false };
+  }
+}
+
+/**
+ * Whether the CLI must show the notice and ask before writing `r` (task #33): consent is bound to
+ * an origin, so a new host asks again. A legacy consent (remoteConsent true, no origin list) still
+ * covers, without asking, the provider it was given for (`previous`), and is then recorded.
+ */
+function mustAsk(r: Resolved, previous: string | undefined): boolean {
+  if (!r.configuredRemote) return false;
+  if (!r.consent) return true;
+  return r.consentVia === "legacy" && r.origin !== previous;
+}
+
+/**
+ * The consent fields to write once `r` is agreed to: remoteConsent true and its origin added to
+ * remoteConsentOrigins (a legacy config also keeps `previous`). Nothing when no origin is known
+ * or consent comes only from EMINIAR_ADJUDICATOR_REMOTE.
+ */
+function consentPatch(
+  r: Resolved,
+  previous: string | undefined,
+  asked: boolean,
+): Record<string, unknown> {
+  if (!r.configuredRemote || !r.origin) return {};
+  if (!asked && r.consentVia !== "legacy") return {};
+  const personal = personalConsent();
+  const list = withConsentedOrigin(personal, r.origin, previous);
+  return { remoteConsent: true, remoteConsentOrigins: list };
+}
+
+/** The origin of the currently configured remote target, or undefined (local or unparsable). */
+function currentOrigin(config: Config | AdjudicatorConfig, env: NodeJS.ProcessEnv) {
+  const r = resolveAdjudicator(config, { context: "cli", env });
+  return r.configuredRemote ? r.origin : undefined;
 }
 
 /**
@@ -396,7 +444,7 @@ export async function ensureConsent(
     );
     return false;
   }
-  return askNo(io, `Send that text to ${hostOf(r.baseUrl)}?`);
+  return askNo(io, `Send that text to ${r.origin ?? hostOf(r.baseUrl)}?`);
 }
 
 /** Read a key from a hidden TTY prompt or from stdin; "" when none was given. */
@@ -475,7 +523,7 @@ export async function setupAdjudicator(io: Io, o: SetupOptions): Promise<SetupRe
   let r = resolveAdjudicator(candidate(base, patch), { context: "cli", env: io.env });
   if (r.configuredRemote) {
     if (await ensureConsent(io, r, base, { acceptRemote: !!o.acceptRemote })) {
-      patch = { ...patch, remoteConsent: true };
+      patch = { ...patch, ...consentPatch(r, undefined, true) };
     } else {
       io.out(
         `Kept everything on this machine: using the heuristic. Switch later with \`eminiar adjudicator enable --provider ${choice.preset ?? choice.provider}\`.`,
@@ -498,11 +546,12 @@ export async function setupAdjudicator(io: Io, o: SetupOptions): Promise<SetupRe
 
   const need = keyNeed(r);
   if (need) {
-    const have = resolveKey(need.id, {
-      keyEnv: base.keyEnv,
-      providerEnv: r.providerEnv,
-      env: io.env,
-    });
+    // keyFor: a loopback target never takes a key from the environment, so none is reported.
+    const have = keyFor(r, io.env) ?? {
+      source: "none" as const,
+      key: undefined,
+      envName: undefined,
+    };
     if (have.source === "env") io.out(`Using the key in $${have.envName} (${mask(have.key)}).`);
     else if (have.source === "file")
       io.out(`A ${need.id} key is already stored (${mask(have.key)}).`);
@@ -612,7 +661,16 @@ export interface StatusReport {
   surfaces: string[];
   remote: boolean;
   host: string | null;
+  /** scheme://host[:port] that consent must cover; null for local providers. */
+  origin: string | null;
+  /** Consent covers `origin` (always false for a local provider, which needs none). */
   consent: boolean;
+  /** How consent was given: config (an origin you agreed to), env (EMINIAR_ADJUDICATOR_REMOTE=1, built-in hosts only) or legacy. */
+  consentVia: string | null;
+  /** The origins ~/.eminiar/config.json records consent for. */
+  consentedOrigins: string[];
+  /** projectAdjudicatorWarning(): adjudicator keys the project file sets that are ignored. */
+  projectIgnored: string | null;
   key: {
     id: string | null;
     source: string;
@@ -697,7 +755,11 @@ export async function statusReport(
       .map(([s]) => s),
     remote: r0.configuredRemote,
     host: r0.configuredRemote ? hostOf(r0.baseUrl) : null,
-    consent: a.remoteConsent,
+    origin: r0.configuredRemote ? (r0.origin ?? null) : null,
+    consent: r0.configuredRemote && r0.consent,
+    consentVia: r0.consentVia ?? null,
+    consentedOrigins: consentedOrigins(a),
+    projectIgnored: safe(() => projectAdjudicatorWarning(ctx.root)) ?? null,
     key: {
       id: need?.id ?? null,
       source: need ? r0.keySource : "n/a",
@@ -778,9 +840,14 @@ export function formatStatus(s: StatusReport): string {
   ];
   if (s.remote)
     lines.push(
-      `remote: sends redacted prompt text to ${s.host} · consent ${s.consent ? "given" : "NOT given"}`,
+      `remote: sends redacted prompt text to ${s.origin ?? s.host} · consent ${
+        s.consent
+          ? `given${s.consentVia === "env" ? " (EMINIAR_ADJUDICATOR_REMOTE=1, built-in hosts only)" : s.consentVia === "legacy" ? " (recorded before consent named a host; the next provider change asks again)" : ""}`
+          : `NOT given for this origin${s.consentedOrigins.length ? ` (given for ${s.consentedOrigins.join(", ")})` : ""}`
+      }`,
     );
   else lines.push("remote: no, nothing leaves this machine");
+  if (s.projectIgnored) lines.push(`warning: ${s.projectIgnored}`);
   if (s.key.id)
     lines.push(
       `key ${s.key.id}: ${s.key.source === "none" ? "none" : `${s.key.source} ${s.key.masked}`}${
@@ -862,6 +929,10 @@ export function adjudicatorDoctorChecks(
   const a = config.adjudicator;
   if (invalid.length)
     checks.push({ name: "adjudicator config", ok: false, detail: invalid.join(" · ") });
+  // Information, not a failure: the keys are dropped, so nothing unsafe happens. Shown while the
+  // adjudicator is off too, since a later `enable` would otherwise look like it uses them.
+  const ignored = safe(() => projectAdjudicatorWarning(o.root));
+  if (ignored) checks.push({ name: "adjudicator project config", ok: true, detail: ignored });
   if (!a.enabled) {
     if (!invalid.length)
       checks.push({
@@ -905,10 +976,10 @@ export function adjudicatorDoctorChecks(
   if (r0.configuredRemote)
     checks.push({
       name: "adjudicator consent",
-      ok: a.remoteConsent,
-      detail: a.remoteConsent
-        ? `given: redacted prompt text goes to ${hostOf(r0.baseUrl)}`
-        : "not given: `eminiar adjudicator enable --accept-remote`",
+      ok: r0.consent,
+      detail: r0.consent
+        ? `given${r0.consentVia === "env" ? " by EMINIAR_ADJUDICATOR_REMOTE=1" : ""}: redacted prompt text goes to ${r0.origin ?? hostOf(r0.baseUrl)}`
+        : `not given for ${r0.origin ?? hostOf(r0.baseUrl)}: \`eminiar adjudicator enable --accept-remote\``,
     });
   if (r0.configured !== "heuristic") {
     const lat = state?.latencies ?? [];
@@ -1120,13 +1191,15 @@ export async function adjudicatorCommand(
       }
       const next = candidate(current, patch);
       const r = resolveAdjudicator(next, { context: "cli", env: io.env });
-      if (r.configuredRemote && !current.remoteConsent) {
+      const previous = currentOrigin(current, io.env);
+      const ask = mustAsk(r, previous);
+      if (ask) {
         if (!(await ensureConsent(io, r, next, { acceptRemote: !!values["accept-remote"] }))) {
           io.err("Not enabled: no consent to send text off this machine. Nothing was changed.");
           return 1;
         }
-        patch.remoteConsent = true;
       } else if (r.configuredRemote) io.out(remoteNotice(r, next));
+      Object.assign(patch, consentPatch(r, previous, ask));
       if (values.project) {
         writeAdjudicatorPatch(projectFile(ctx.root), { enabled: true });
         io.out(`Wrote adjudicator.enabled: true to ${projectFile(ctx.root)} (commit it to share).`);
@@ -1220,13 +1293,16 @@ export async function adjudicatorCommand(
       }
       const next = candidate(config.adjudicator, patch);
       const r = resolveAdjudicator(next, { context: "cli", env: io.env });
-      if (r.configuredRemote && !config.adjudicator.remoteConsent) {
+      // Consent is bound to the origin: a new host (another preset, --base-url) asks again.
+      const previous = currentOrigin(config, io.env);
+      const ask = mustAsk(r, previous);
+      if (ask) {
         if (!(await ensureConsent(io, r, next, { acceptRemote: !!values["accept-remote"] }))) {
           io.err("Provider not changed: no consent to send text off this machine.");
           return 1;
         }
-        patch.remoteConsent = true;
-      }
+      } else if (r.configuredRemote) io.out(remoteNotice(r, next));
+      Object.assign(patch, consentPatch(r, previous, ask));
       writeAdjudicatorPatch(paths().configFile, patch);
       const ra = resolveAdjudicator(load(), { context: "cli", env: io.env });
       io.out(
@@ -1339,10 +1415,27 @@ export function keyIdFor(arg: string | undefined, r: Resolved): KeyId | undefine
   return undefined;
 }
 
-function providerEnvOf(id: KeyId): string | undefined {
-  if (id === "typesafe") return TYPESAFE_KEY_ENV;
-  const p = id.startsWith("openai:") ? (id.slice(7) as PresetId) : undefined;
-  return p && PRESETS[p] ? PRESETS[p].keyEnv : undefined;
+/**
+ * The resolution a key id would be sent with: `r` when it is the configured provider's id,
+ * otherwise the provider/preset that id belongs to on top of the current config (a preset other
+ * than the configured one with its default URL). keyFor() of it matches what a provider gets.
+ */
+function resolvedForKey(
+  id: KeyId,
+  a: AdjudicatorConfig,
+  r: Resolved,
+  env: NodeJS.ProcessEnv,
+): Resolved {
+  if (r.keyId === id) return r;
+  if (id === "typesafe")
+    return resolveAdjudicator({ ...a, provider: "typesafe" }, { context: "cli", env });
+  const preset = id.slice(7) as PresetId;
+  const openai =
+    preset === a.openai.preset ? a.openai : { preset, json: a.openai.json, price: undefined };
+  return resolveAdjudicator(
+    { ...a, provider: "openai-compatible", openai: openai as AdjudicatorConfig["openai"] },
+    { context: "cli", env },
+  );
 }
 
 async function keyCommand(
@@ -1416,10 +1509,9 @@ async function keyCommand(
         io.err((err as Error).message);
         return 1;
       }
-      const env = providerEnvOf(id);
-      for (const name of [config.adjudicator.keyEnv, env, GENERIC_KEY_ENV])
-        if (name && io.env[name]?.trim())
-          io.out(`Note: $${name} is set and takes precedence over the key file.`);
+      const k = keyFor(resolvedForKey(id, config.adjudicator, r, io.env), io.env);
+      if (k?.source === "env" && k.envName)
+        io.out(`Note: $${k.envName} is set and takes precedence over the key file.`);
       return 0;
     }
     case "clear": {
@@ -1442,11 +1534,12 @@ async function keyCommand(
       const need = keyNeed(r);
       if (need) ids.add(need.id);
       const rows = [...ids].map((id) => {
-        const k = resolveKey(id, {
-          keyEnv: config.adjudicator.keyEnv,
-          providerEnv: providerEnvOf(id),
-          env: io.env,
-        });
+        // The key that would actually be sent: a local (loopback) target never gets an env key.
+        const k = keyFor(resolvedForKey(id, config.adjudicator, r, io.env), io.env) ?? {
+          source: "none" as const,
+          key: undefined,
+          envName: undefined,
+        };
         return {
           id,
           source: k.source,

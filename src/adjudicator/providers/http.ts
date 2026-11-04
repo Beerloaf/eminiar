@@ -138,7 +138,9 @@ async function request<T>(
     let res: Response;
     let text: string;
     try {
-      const init: RequestInit = { method, headers, signal: ctl.signal };
+      // Never follow a redirect: a 3xx would re-send the prompt text and the key to a host the
+      // user did not agree to (task #33). It is answered below as an http_error instead.
+      const init: RequestInit = { method, headers, signal: ctl.signal, redirect: "manual" };
       if (body !== undefined) init.body = body;
       res = await doFetch(url, init);
       // The deadline also covers reading the body.
@@ -153,6 +155,16 @@ async function request<T>(
       o.signal?.removeEventListener("abort", onAbort);
     }
 
+    if ((res.status >= 300 && res.status < 400) || res.type === "opaqueredirect") {
+      const to = res.headers.get("location");
+      return fail(
+        new ProviderError(
+          "http_error",
+          `HTTP ${res.status || "redirect"}: redirect${to ? ` to ${redirectTarget(to, url)}` : ""} refused; set the provider's base URL to the final endpoint`,
+          { status: res.status },
+        ),
+      );
+    }
     if (res.status === 429 || res.status === 529) {
       const wait = retryWait(res.headers.get("retry-after"));
       const left = end - now() - wait;
@@ -228,6 +240,15 @@ function safeTarget(url: string): string {
   try {
     const u = new URL(url);
     return `${u.host}${u.pathname}`;
+  } catch {
+    return "(bad url)";
+  }
+}
+
+/** A Location header resolved against the request URL, as host and path only. */
+function redirectTarget(location: string, base: string): string {
+  try {
+    return safeTarget(new URL(location, base).href);
   } catch {
     return "(bad url)";
   }

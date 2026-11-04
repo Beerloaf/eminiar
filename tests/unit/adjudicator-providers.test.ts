@@ -1,4 +1,6 @@
 import { mkdtempSync, readFileSync } from "node:fs";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -304,6 +306,81 @@ function jevReply(
     usage: o.usage ?? { input_tokens: 1000, output_tokens: 70 },
   });
 }
+
+describe("redirects are never followed (#33)", () => {
+  /** A local HTTP server; every request it receives is recorded with its auth header and body. */
+  async function server(
+    handler: (req: IncomingMessage, res: ServerResponse) => void,
+  ): Promise<{ url: string; hits: string[]; close: () => Promise<void> }> {
+    const hits: string[] = [];
+    const s = createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => {
+        body += c;
+      });
+      req.on("end", () => {
+        hits.push(`${req.method} ${req.url} ${req.headers.authorization ?? "-"} ${body}`);
+        handler(req, res);
+      });
+    });
+    await new Promise<void>((r) => s.listen(0, "127.0.0.1", r));
+    const { port } = s.address() as AddressInfo;
+    return {
+      url: `http://127.0.0.1:${port}`,
+      hits,
+      close: () => new Promise<void>((r) => s.close(() => r())),
+    };
+  }
+
+  it("a 307 is an http_error and neither the prompt nor the key reaches the redirect target", async () => {
+    const other = await server((_q, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+    });
+    const first = await server((_q, res) => {
+      res.writeHead(307, { location: `${other.url}/steal` });
+      res.end();
+    });
+    try {
+      const err = await postJson(
+        `${first.url}/v1/chat/completions`,
+        { prompt: "secret text" },
+        {
+          deadlineMs: 2000,
+          key: SENTINEL,
+        },
+      ).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ProviderError);
+      expect((err as ProviderError).kind).toBe("http_error");
+      expect((err as ProviderError).status).toBe(307);
+      expect((err as ProviderError).message).toMatch(/redirect to 127\.0\.0\.1:\d+\/steal refused/);
+      expect((err as ProviderError).message).not.toContain(SENTINEL);
+      expect(first.hits).toHaveLength(1);
+      expect(other.hits).toEqual([]);
+      // GET (probe) is refused the same way.
+      await expect(
+        getJson(`${first.url}/v1/models`, { deadlineMs: 2000, key: SENTINEL }),
+      ).rejects.toMatchObject({
+        kind: "http_error",
+        status: 307,
+      });
+      expect(other.hits).toEqual([]);
+    } finally {
+      await first.close();
+      await other.close();
+    }
+  });
+
+  it("asks fetch not to follow redirects", async () => {
+    const seen: RequestInit[] = [];
+    const f: FetchLike = async (_u, init) => {
+      seen.push(init);
+      return new Response("{}", { status: 200 });
+    };
+    await postJson("https://h.example/v1", {}, { deadlineMs: 1000, fetch: f });
+    expect(seen[0]?.redirect).toBe("manual");
+  });
+});
 
 describe("typesafe (Jev) provider", () => {
   it("pins the model and never sends an alias", () => {

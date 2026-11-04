@@ -34,7 +34,7 @@ import {
   type Verdict,
 } from "../adjudicator/types.js";
 import type { AdjudicatorConfig, Config } from "../config.js";
-import { loadConfig } from "../config.js";
+import { loadConfig, projectAdjudicatorWarning } from "../config.js";
 import type { ProjectContext } from "../context.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import { getStorage } from "../storage/index.js";
@@ -317,6 +317,15 @@ export function chartsOf(rows: readonly Pick<AdjudicationRow, "ts" | "source" | 
   return { perDay, complexity };
 }
 
+/** The one-line project-file warning, or null; a read error never breaks the overview. */
+function projectIgnoredOf(root: string): string | null {
+  try {
+    return projectAdjudicatorWarning(root) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export function overviewPayload(
   ctx: ProjectContext,
   deps: AdjudicatorRouteDeps = {},
@@ -343,6 +352,10 @@ export function overviewPayload(
     keySource: r.keySource,
     keyFileRefused: r.keyFileRefused === true,
     consent: r.consent,
+    /** The origin remote consent must cover; null for a local provider. */
+    origin: r.configuredRemote ? (r.origin ?? null) : null,
+    /** projectAdjudicatorWarning(): adjudicator keys eminiar.config.json sets that are ignored. */
+    projectIgnored: projectIgnoredOf(ctx.root),
     health,
     apply: {
       checked: summary.applyChecked,

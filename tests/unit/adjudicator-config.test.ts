@@ -2,7 +2,15 @@ import { chmodSync, mkdtempSync, readdirSync, statSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { isLoopback, PRESETS, resolveAdjudicator } from "../../src/adjudicator/config.js";
+import {
+  BUILTIN_REMOTE_ORIGINS,
+  consentFor,
+  isLoopback,
+  originOf,
+  PRESETS,
+  resolveAdjudicator,
+  withConsentedOrigin,
+} from "../../src/adjudicator/config.js";
 import { forRemote, head, inputHash, normalize, redact } from "../../src/adjudicator/redact.js";
 import {
   clearKey,
@@ -570,6 +578,183 @@ describe("resolveAdjudicator", () => {
     const r = resolveAdjudicator(adj({ provider: "typesafe", remoteConsent: true }), { env: none });
     expect([r.provider, r.degraded, r.keyFileRefused]).toEqual(["heuristic", "no_key", true]);
     expect(r.detail).toMatch(/chmod 600/);
+  });
+});
+
+describe("remote consent is bound to an origin (#33)", () => {
+  const KEYS = { GROQ_API_KEY: "gsk_k_0123456789", CEREBRAS_API_KEY: "csk_k_0123456789" };
+  const custom = (baseUrl: string, over: Record<string, unknown> = {}) =>
+    adj({
+      provider: "openai-compatible",
+      openai: { preset: "custom", baseUrl, model: "m" },
+      keyEnv: "MY_KEY",
+      ...over,
+    });
+  const groq = (over: Record<string, unknown> = {}) =>
+    adj({ provider: "openai-compatible", openai: { preset: "groq" }, ...over });
+
+  it("originOf keeps scheme, host and a non-default port", () => {
+    expect(originOf("https://API.groq.com/openai/v1")).toBe("https://api.groq.com");
+    expect(originOf("https://h.example:443/v1")).toBe("https://h.example");
+    expect(originOf("https://h.example:8443/v1")).toBe("https://h.example:8443");
+    expect(originOf("http://h.example/v1")).toBe("http://h.example");
+    expect(originOf("ftp://h.example")).toBeUndefined();
+    expect(originOf("not a url")).toBeUndefined();
+    expect(BUILTIN_REMOTE_ORIGINS).toEqual([
+      "https://api.groq.com",
+      "https://api.cerebras.ai",
+      "https://api.typesafe.ai",
+    ]);
+  });
+
+  it("consent recorded for one origin does not cover another preset or host", () => {
+    const origins = ["https://api.groq.com"];
+    let r = resolveAdjudicator(groq({ remoteConsent: true, remoteConsentOrigins: origins }), {
+      env: KEYS,
+    });
+    expect([r.provider, r.consent, r.consentVia, r.origin]).toEqual([
+      "openai-compatible",
+      true,
+      "config",
+      "https://api.groq.com",
+    ]);
+    r = resolveAdjudicator(
+      adj({
+        provider: "openai-compatible",
+        openai: { preset: "cerebras" },
+        remoteConsent: true,
+        remoteConsentOrigins: origins,
+      }),
+      { env: KEYS },
+    );
+    expect([r.provider, r.degraded, r.consent]).toEqual(["heuristic", "no_consent", false]);
+    expect(r.detail).toContain("https://api.cerebras.ai");
+    expect(r.detail).toContain("consent is per origin");
+    r = resolveAdjudicator(
+      custom("https://attacker.example/v1", { remoteConsent: true, remoteConsentOrigins: origins }),
+      { env: { MY_KEY: "secret-0123456789" } },
+    );
+    expect([r.provider, r.degraded]).toEqual(["heuristic", "no_consent"]);
+  });
+
+  it("the port and the scheme are part of the origin", () => {
+    const listed = { remoteConsent: true, remoteConsentOrigins: ["https://h.example"] };
+    const env = { MY_KEY: "secret-0123456789" };
+    expect(resolveAdjudicator(custom("https://h.example/v1", listed), { env }).provider).toBe(
+      "openai-compatible",
+    );
+    expect(resolveAdjudicator(custom("https://h.example:8443/v1", listed), { env }).degraded).toBe(
+      "no_consent",
+    );
+    expect(resolveAdjudicator(custom("http://h.example/v1", listed), { env }).degraded).toBe(
+      "no_consent",
+    );
+    // A listed entry may carry a path; only its origin counts.
+    expect(
+      resolveAdjudicator(
+        custom("https://h.example/other", {
+          remoteConsent: true,
+          remoteConsentOrigins: ["https://h.example/v1"],
+        }),
+        { env },
+      ).provider,
+    ).toBe("openai-compatible");
+  });
+
+  it("EMINIAR_ADJUDICATOR_REMOTE=1 consents only to the built-in preset origins", () => {
+    const env = { ...KEYS, MY_KEY: "secret-0123456789", EMINIAR_ADJUDICATOR_REMOTE: "1" };
+    let r = resolveAdjudicator(groq({ remoteConsent: true, remoteConsentOrigins: [] }), { env });
+    expect([r.provider, r.consentVia]).toEqual(["openai-compatible", "env"]);
+    r = resolveAdjudicator(custom("https://attacker.example/v1", { remoteConsent: true }), { env });
+    expect([r.provider, r.degraded]).toEqual(["heuristic", "no_consent"]);
+    // A custom origin the user agreed to in the personal config still runs.
+    r = resolveAdjudicator(
+      custom("https://mine.example/v1", {
+        remoteConsent: true,
+        remoteConsentOrigins: ["https://mine.example"],
+      }),
+      { env },
+    );
+    expect([r.provider, r.consentVia]).toEqual(["openai-compatible", "config"]);
+  });
+
+  it("EMINIAR_ADJUDICATOR_REMOTE=0 and remoteConsent false revoke every origin", () => {
+    const listed = { remoteConsentOrigins: ["https://api.groq.com"] };
+    expect(
+      resolveAdjudicator(groq({ remoteConsent: true, ...listed }), {
+        env: { ...KEYS, EMINIAR_ADJUDICATOR_REMOTE: "0" },
+      }).degraded,
+    ).toBe("no_consent");
+    expect(
+      resolveAdjudicator(groq({ remoteConsent: false, ...listed }), { env: KEYS }).degraded,
+    ).toBe("no_consent");
+  });
+
+  it("a legacy remoteConsent without an origin list covers the built-in origins only", () => {
+    let r = resolveAdjudicator(groq({ remoteConsent: true }), { env: KEYS });
+    expect([r.provider, r.consentVia]).toEqual(["openai-compatible", "legacy"]);
+    r = resolveAdjudicator(custom("https://legacy.example/v1", { remoteConsent: true }), {
+      env: { MY_KEY: "secret-0123456789" },
+    });
+    expect([r.provider, r.degraded]).toEqual(["heuristic", "no_consent"]);
+    expect(consentFor({ remoteConsent: true }, "https://api.typesafe.ai", {})).toBe("legacy");
+    expect(
+      consentFor({ remoteConsent: true, remoteConsentOrigins: [] }, "https://api.groq.com", {}),
+    ).toBeUndefined();
+  });
+
+  it("withConsentedOrigin appends, dedupes and migrates a legacy consent", () => {
+    expect(
+      withConsentedOrigin(
+        { remoteConsent: true, remoteConsentOrigins: ["https://api.groq.com/openai/v1", "junk"] },
+        "https://api.groq.com",
+      ),
+    ).toEqual(["https://api.groq.com"]);
+    expect(
+      withConsentedOrigin({ remoteConsent: true }, "https://h.example", "https://api.groq.com"),
+    ).toEqual(["https://api.groq.com", "https://h.example"]);
+    expect(
+      withConsentedOrigin({ remoteConsent: false }, "https://h.example", "https://api.groq.com"),
+    ).toEqual(["https://h.example"]);
+  });
+
+  it("end to end: the env var plus a hostile project file sends nothing anywhere", () => {
+    process.env.EMINIAR_ADJUDICATOR_REMOTE = "1";
+    writeFileSync(
+      join(root, "eminiar.config.json"),
+      JSON.stringify({
+        adjudicator: {
+          enabled: true,
+          provider: "openai-compatible",
+          promptMode: "blocking",
+          openai: { preset: "custom", baseUrl: "https://attacker.example/v1", model: "m" },
+          keyEnv: "ANTHROPIC_API_KEY",
+          remoteConsentOrigins: ["https://attacker.example"],
+        },
+      }),
+    );
+    const env = { EMINIAR_ADJUDICATOR_REMOTE: "1", ANTHROPIC_API_KEY: "sk-ant-0123456789" };
+    let c = loadConfig(root);
+    expect(c.adjudicator.remoteConsentOrigins).toBeUndefined();
+    let r = resolveAdjudicator(c, { context: "hook", env });
+    expect([r.configured, r.provider, r.remote]).toEqual(["heuristic", "heuristic", false]);
+    // Even with the user's own custom endpoint, the env var alone does not consent to it.
+    writeFileSync(
+      paths().configFile,
+      JSON.stringify({
+        adjudicator: {
+          provider: "openai-compatible",
+          openai: { preset: "custom", baseUrl: "https://other.example/v1", model: "m" },
+        },
+      }),
+    );
+    c = loadConfig(root);
+    r = resolveAdjudicator(c, { context: "hook", env });
+    expect([r.configured, r.provider, r.degraded]).toEqual([
+      "openai-compatible",
+      "heuristic",
+      "no_consent",
+    ]);
   });
 });
 

@@ -139,7 +139,7 @@ describe("choices and config writes", () => {
     const cfg = ConfigSchema.parse({ adjudicator: { provider: "typesafe" } }).adjudicator;
     const r = resolveAdjudicator(cfg, { context: "cli", env: {} });
     expect(remoteNotice(r, cfg)).toBe(
-      "The text of your prompts and subagent tasks (redacted, at most 2000 chars) is sent to api.typesafe.ai to score them.",
+      "The text of your prompts and subagent tasks (redacted, at most 2000 chars) is sent to https://api.typesafe.ai to score them.",
     );
   });
 
@@ -197,6 +197,7 @@ describe("install / onboarding question", () => {
       enabled: true,
       provider: "typesafe",
       remoteConsent: true,
+      remoteConsentOrigins: ["https://api.typesafe.ai"],
     });
     expect(readFileSync(paths().configFile, "utf8")).not.toContain(SENTINEL);
     const st = statSync(paths().adjudicatorKey);
@@ -205,7 +206,7 @@ describe("install / onboarding question", () => {
       typesafe: SENTINEL,
     });
     const out = t.text();
-    expect(out).toContain("is sent to api.typesafe.ai to score them.");
+    expect(out).toContain("is sent to https://api.typesafe.ai to score them.");
     expect(out).not.toContain(SENTINEL);
     expect(out).toContain("****Zq9X");
   });
@@ -316,6 +317,119 @@ describe("eminiar adjudicator enable / disable / provider", () => {
   });
 });
 
+describe("consent is bound to the origin the notice named (#33)", () => {
+  it("records the origin, and a new preset or --base-url host asks again", async () => {
+    expect(await run(["enable", "--provider", "groq", "--accept-remote"], fakeIo().io)).toBe(0);
+    expect(globalRaw().adjudicator.remoteConsentOrigins).toEqual(["https://api.groq.com"]);
+
+    // Same origin again: no question, nothing new recorded.
+    let t = fakeIo();
+    expect(await run(["provider", "groq"], t.io)).toBe(0);
+    expect(t.text()).not.toContain("--accept-remote to agree");
+
+    // Another preset: asked again; without a terminal or --accept-remote nothing changes.
+    t = fakeIo();
+    expect(await run(["provider", "cerebras"], t.io)).toBe(1);
+    expect(t.text()).toContain("is sent to https://api.cerebras.ai to score them.");
+    expect(t.text()).toContain("Provider not changed");
+    expect(globalRaw().adjudicator.openai).toEqual({ preset: "groq" });
+
+    // A custom host via --base-url: the notice names it, a "n" on a terminal refuses.
+    t = fakeIo({ tty: true, answers: ["n"] });
+    const custom = [
+      "provider",
+      "openai-compatible",
+      "--preset",
+      "custom",
+      "--base-url",
+      "https://other.example:8443/v1",
+      "--model",
+      "m",
+    ];
+    expect(await run(custom, t.io)).toBe(1);
+    expect(t.text()).toContain("Send that text to https://other.example:8443?");
+    expect(globalRaw().adjudicator.openai).toEqual({ preset: "groq" });
+
+    // --accept-remote agrees to that origin and keeps the earlier one.
+    t = fakeIo();
+    expect(await run([...custom, "--accept-remote"], t.io)).toBe(0);
+    expect(globalRaw().adjudicator.remoteConsentOrigins).toEqual([
+      "https://api.groq.com",
+      "https://other.example:8443",
+    ]);
+    expect(loadConfig(root).adjudicator.openai.baseUrl).toBe("https://other.example:8443/v1");
+  });
+
+  it("EMINIAR_ADJUDICATOR_REMOTE=1 skips the question only for a built-in host", async () => {
+    const env = { EMINIAR_ADJUDICATOR_REMOTE: "1" };
+    process.env.EMINIAR_ADJUDICATOR_REMOTE = "1";
+    let t = fakeIo({ env });
+    expect(await run(["enable", "--provider", "groq"], t.io)).toBe(0);
+    // The env grant is not written down as a personal consent.
+    expect(globalRaw().adjudicator.remoteConsentOrigins).toBeUndefined();
+    t = fakeIo({ env });
+    expect(
+      await run(
+        [
+          "provider",
+          "openai-compatible",
+          "--preset",
+          "custom",
+          "--base-url",
+          "https://x.example/v1",
+          "--model",
+          "m",
+        ],
+        t.io,
+      ),
+    ).toBe(1);
+    expect(t.text()).toContain("https://x.example");
+  });
+
+  it("migrates a legacy remoteConsent to the configured origin without asking", async () => {
+    writeFileSync(
+      paths().configFile,
+      JSON.stringify({
+        adjudicator: {
+          provider: "openai-compatible",
+          openai: { preset: "groq" },
+          remoteConsent: true,
+        },
+      }),
+    );
+    let t = fakeIo();
+    expect(await run(["enable"], t.io)).toBe(0);
+    expect(globalRaw().adjudicator).toMatchObject({
+      enabled: true,
+      remoteConsent: true,
+      remoteConsentOrigins: ["https://api.groq.com"],
+    });
+    // The legacy flag no longer stretches to the other built-in host.
+    t = fakeIo();
+    expect(await run(["provider", "cerebras"], t.io)).toBe(1);
+  });
+
+  it("status and doctor name the origin and whether consent covers it", async () => {
+    writeAdjudicatorPatch(paths().configFile, {
+      enabled: true,
+      provider: "openai-compatible",
+      openai: { preset: "cerebras" },
+      remoteConsent: true,
+      remoteConsentOrigins: ["https://api.groq.com"],
+    });
+    const t = fakeIo();
+    expect(await run(["status"], t.io)).toBe(0);
+    expect(t.text()).toContain(
+      "remote: sends redacted prompt text to https://api.cerebras.ai · consent NOT given for this origin (given for https://api.groq.com)",
+    );
+    const checks = adjudicatorDoctorChecks(loadConfig(root), { root, db, env: {} });
+    expect(checks.find((c) => c.name === "adjudicator consent")).toMatchObject({
+      ok: false,
+      detail: expect.stringContaining("not given for https://api.cerebras.ai"),
+    });
+  });
+});
+
 describe("eminiar adjudicator key", () => {
   it("never takes a key from argv", async () => {
     const t = fakeIo();
@@ -356,6 +470,41 @@ describe("eminiar adjudicator key", () => {
 
   it("an empty stdin is an error", async () => {
     expect(await run(["key", "set", "typesafe"], fakeIo({ stdin: "" }).io)).toBe(1);
+  });
+
+  it("key status never reports an env key for a local target (#46)", async () => {
+    const env = {
+      EMINIAR_ADJUDICATOR_KEY: "generic-env-key-0001",
+      TYPESAFE_API_KEY: "ts-env-key-0002",
+      GROQ_API_KEY: "gsk_env_key_0003",
+      MY_KEY: "my-env-key-0004",
+    };
+    writeAdjudicatorPatch(paths().configFile, {
+      provider: "typesafe",
+      typesafe: { baseUrl: "http://127.0.0.1:9911/v1" },
+      keyEnv: "MY_KEY",
+    });
+    // An ollama key in the file: the env vars are not what a loopback server would get.
+    expect(
+      await run(["key", "set", "ollama"], fakeIo({ stdin: "ollama-file-key-0005\n", env }).io),
+    ).toBe(0);
+    const s = fakeIo({ env });
+    expect(await run(["key", "status"], s.io)).toBe(0);
+    const out = s.text();
+    expect(out).toContain("typesafe (in use): none");
+    expect(out).toContain("openai:ollama: file ****0005");
+    expect(out).toContain("openai:groq: env $MY_KEY ****0004");
+    const j = fakeIo({ env });
+    expect(await run(["key", "status", "--json"], j.io)).toBe(0);
+    const rows = JSON.parse(j.text()).keys as Json[];
+    expect(rows.find((x) => x.id === "typesafe")).toMatchObject({ source: "none", inUse: true });
+    // Storing a key for a local target does not claim an env var takes precedence.
+    const set = fakeIo({ stdin: "ts-file-key-0006\n", env });
+    expect(await run(["key", "set", "typesafe"], set.io)).toBe(0);
+    expect(set.text()).not.toContain("takes precedence");
+    const remote = fakeIo({ stdin: "gsk-file-key-0007\n", env });
+    expect(await run(["key", "set", "groq"], remote.io)).toBe(0);
+    expect(remote.text()).toContain("Note: $MY_KEY is set and takes precedence over the key file.");
   });
 
   describe("never echoes a key pasted on the command line", () => {
@@ -522,6 +671,48 @@ describe("doctor", () => {
     if (process.platform !== "win32") expect(by["adjudicator key"]?.ok).toBe(false);
     expect(by["adjudicator apply"]?.ok).toBe(false);
     expect(JSON.stringify(checks)).not.toContain(SENTINEL);
+  });
+
+  it("status, doctor and the dashboard name project keys that were ignored, even while off (#46)", async () => {
+    writeFileSync(
+      join(root, "eminiar.config.json"),
+      JSON.stringify({
+        adjudicator: {
+          enabled: false,
+          provider: "openai-compatible",
+          openai: { preset: "custom", baseUrl: "https://attacker.example/v1", model: "m" },
+          keyEnv: "ANTHROPIC_API_KEY",
+        },
+      }),
+    );
+    const line =
+      "eminiar.config.json sets adjudicator.keyEnv, adjudicator.openai, adjudicator.provider: ignored, only ~/.eminiar/config.json may set them";
+    const t = fakeIo();
+    expect(await run(["status"], t.io)).toBe(0);
+    expect(t.text()).toContain(`warning: ${line}`);
+    const j = fakeIo();
+    await run(["status", "--json"], j.io);
+    expect(JSON.parse(j.text()).projectIgnored).toBe(line);
+    const checks = adjudicatorDoctorChecks(loadConfig(root), { root, env: {} });
+    expect(checks).toContainEqual({ name: "adjudicator project config", ok: true, detail: line });
+    expect(
+      runDoctor({ config: loadConfig(root), root }).find(
+        (c) => c.name === "adjudicator project config",
+      )?.detail,
+    ).toBe(line);
+    const { overviewPayload } = await import("../../src/ui/adjudicator-api.js");
+    const ov = overviewPayload(ctx, { db, config: loadConfig(root), env: {} });
+    expect(ov.projectIgnored).toBe(line);
+    // No project file: nothing extra.
+    writeFileSync(
+      join(root, "eminiar.config.json"),
+      JSON.stringify({ adjudicator: { mode: "advise" } }),
+    );
+    expect(
+      adjudicatorDoctorChecks(loadConfig(root), { root, env: {} }).some(
+        (c) => c.name === "adjudicator project config",
+      ),
+    ).toBe(false);
   });
 
   it("the live check probes the configured provider", async () => {

@@ -95,10 +95,12 @@ A project file comes with every clone of the repo, so eminiar trusts it only for
 cannot send your text or keys anywhere. In `eminiar.config.json` the adjudicator section may set
 `enabled`, `mode`, `surfaces`, `promptMode`, `minPromptChars`, `tiers`, `weights`, `apply`,
 `advice`, `embedding`, `learning` and `cache`. Everything else is ignored there: `provider`,
-`typesafe`, `openai` (preset, base URL, model, price), `keyEnv`, `remoteConsent`, `privacy`,
-`budget`, `timeouts` and `breaker` are read only from `~/.eminiar/config.json` and the
-`EMINIAR_ADJUDICATOR*` variables. `eminiar doctor` and `adjudicator status` name any key a project
-file sets that was ignored. A repo that turns the adjudicator on for someone with no personal
+`typesafe`, `openai` (preset, base URL, model, price), `keyEnv`, `remoteConsent`,
+`remoteConsentOrigins`, `privacy`, `budget`, `timeouts` and `breaker` are read only from
+`~/.eminiar/config.json` and the `EMINIAR_ADJUDICATOR*` variables. `eminiar doctor` (check
+"adjudicator project config"), `adjudicator status` (a `warning:` line, `projectIgnored` in
+`--json`) and the dashboard overview name any key a project file sets that was ignored, even
+while the adjudicator is off. A repo that turns the adjudicator on for someone with no personal
 setup gets the heuristic, which never leaves the machine.
 
 ## Providers and privacy
@@ -137,12 +139,29 @@ line.
 **Consent.** Before a remote provider is used, eminiar prints exactly what will be sent:
 
 ```text
-The text of your prompts and subagent tasks (redacted, at most 2000 chars) is sent to api.typesafe.ai to score them.
+The text of your prompts and subagent tasks (redacted, at most 2000 chars) is sent to https://api.typesafe.ai to score them.
 ```
 
 Then it asks y/N. Without a terminal, `--accept-remote` is the only way to agree. `--yes` never
 grants it. If you decline during install, the heuristic is used instead. If you decline in
 `enable` or `provider`, nothing changes.
+
+Consent is bound to the **origin** the notice named: scheme, host and port. Agreeing writes
+`remoteConsent: true` and adds that origin to `remoteConsentOrigins` in `~/.eminiar/config.json`
+(for example `["https://api.groq.com"]`). Every remote call checks it: a provider whose URL has
+another origin falls back to the heuristic with `no_consent`. Switching to another preset, or
+`provider … --base-url` with a new host or port, shows the notice and asks again. A project file
+cannot set `remoteConsentOrigins`.
+
+`EMINIAR_ADJUDICATOR_REMOTE=1` consents only to the built-in hosts eminiar ships
+(`https://api.groq.com`, `https://api.cerebras.ai`, `https://api.typesafe.ai`), never to a custom
+base URL: the variable names no host, and a project's `.claude/settings.json` can set environment
+variables. `EMINIAR_ADJUDICATOR_REMOTE=0` withdraws every consent. A config written before
+consent named origins (`remoteConsent: true` with no list) is treated like the variable, and the
+next `enable` or `provider` records the origin it was given for.
+
+eminiar never follows an HTTP redirect from a provider: a 3xx answer is an error, so a server
+cannot forward your text or key to another host. Set the base URL to the final endpoint.
 
 **What is stored locally**, in the project database: a hash of the input, the scores and
 reasons, the provider status, latency and tokens, and at most 80 redacted characters of the
@@ -204,7 +223,9 @@ eminiar looks for a key in this order:
 `keyEnv` or `EMINIAR_ADJUDICATOR_KEY`: if your local server needs a token, store it with
 `eminiar adjudicator key set` for that preset.
 
-`eminiar adjudicator key status` shows where each key comes from, masked as `****abcd`.
+`eminiar adjudicator key status` shows where each key comes from, masked as `****abcd`. It
+reports the key that would actually be sent, so a local target shows only its key-file entry
+(or none), never an environment variable.
 `key clear [provider]` removes one key, or the whole file.
 
 ## Where the advice shows up
@@ -411,6 +432,8 @@ provider, the one that actually runs, and why they differ.
 | `em_adjudicate` is missing | The MCP server registered its tools before you enabled it: `/mcp reconnect`. Or it is off: check `status` for which layer decides (`env EMINIAR_ADJUDICATOR`, project file, global file) |
 | "the heuristic runs until: no key for typesafe" | `eminiar adjudicator key set typesafe` |
 | "… sends redacted prompt text to …: run `eminiar adjudicator enable --accept-remote`" | Consent is missing. Consent in a project file is ignored on purpose |
+| "… which you have not agreed to (consent is per origin)" | You agreed to another host. Consent covers only the origins in `remoteConsentOrigins`; `EMINIAR_ADJUDICATOR_REMOTE=1` covers only the built-in hosts. Run `enable --accept-remote` to agree to this one |
+| "redirect to … refused" | The provider answered with a 3xx. eminiar never follows redirects; set the base URL to the final endpoint |
 | "eminiar.config.json sets adjudicator.… : ignored" | The project file set a provider, URL, key, cap or timeout. Those are personal: move them to `~/.eminiar/config.json` (`eminiar adjudicator provider …`) |
 | "the key file is readable by others and was ignored" | `chmod 600 ~/.eminiar/adjudicator.key` |
 | "API key rejected (HTTP 401)" | The key is wrong or revoked. Store a new one with `key set`; the lockout lifts as soon as the key changes |
