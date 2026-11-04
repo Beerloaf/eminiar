@@ -14,7 +14,8 @@ export const emDoctor = defineTool({
     "Check eminiar's health: node version, data directory, SQLite FTS5, sqlite-vec, embedding model, project root resolution.",
   schema: {},
   handler: async (_args, ctx) => {
-    const checks = runDoctor();
+    const db = getStorage(ctx);
+    const checks = runDoctor({ db, config: ctx.config, root: ctx.root });
     checks.push({ name: "project", ok: true, detail: `${ctx.root} (id ${ctx.id})` });
     checks.push({
       name: "routing",
@@ -45,7 +46,6 @@ export const emDoctor = defineTool({
         ? `a failed launch at ${new Date(failed.timestamp).toISOString()} is cached; other sessions skip the server for 15 min — run \`eminiar doctor --fix\` in a terminal, then restart Claude Code`
         : "no cached launch failure",
     });
-    const db = getStorage(ctx);
     checks.push({ name: "embeddings", ok: true, detail: embeddingStatus(ctx, db) });
     checks.push({
       name: "sandbox languages",

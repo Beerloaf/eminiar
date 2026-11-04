@@ -9,8 +9,10 @@ Usage: eminiar <command> [options]
 
 Setup
   install [--no-model] [--method plugin|settings] [--cursor] [--team] [--yes] [--force]
-                               Install into Claude Code; --cursor also registers with Cursor
-                               (hooks, MCP server, skills under ~/.cursor)
+          [--adjudicator[=heuristic|embedding|typesafe|groq|cerebras|ollama|lmstudio|llamacpp]]
+          [--accept-remote]    Install into Claude Code; --cursor also registers with Cursor
+                               (hooks, MCP server, skills under ~/.cursor). An interactive
+                               install asks whether to turn on the adjudicator (default no)
   upgrade                      Update to the latest version and re-register
   uninstall [--purge-data]     Remove from Claude Code and Cursor (data kept unless --purge-data)
   doctor [--json] [--fix]      Check installation health; --fix re-pins node/root and clears
@@ -36,12 +38,21 @@ Use
   recall --explain "<prompt>" [--session ID]   Why hook recall would (not) fire for a prompt
   recall --file <path>         What a Read/Edit of the file would attach (memories, history)
   recall --replay [--limit N] [--since 30d]    Re-run recall over past prompts: hit rate, misses
-  purge <index|sessions|graph|memories|usage|all> --yes
+  purge <index|sessions|graph|memories|usage|adjudicator|all> --yes
   ui [--port 7331] [--no-open] Web dashboard: stats, memories, graph, search, sessions, actions
                                (alias: serve)
   statusline                   Claude Code statusLine command (reads JSON on stdin)
   hook [--event E] [--client claude|cursor]   Run the hook handler manually (reads JSON on stdin)
   version | help
+
+Adjudicator (opt-in: scores each request, suggests the tool, Claude model size and agent role)
+  adjudicator status [--json]  On/off, configured vs effective provider, key, consent, health
+  adjudicator enable [--provider P] [--preset X] [--mode advise|apply] [--project] [--accept-remote]
+  adjudicator disable [--project] | provider <id> [--preset X] [--base-url U] [--model M] | provider --detect
+  adjudicator key set [provider] [--from-env NAME] | key clear [provider] | key status
+                               Keys come from a hidden prompt or stdin, never argv (0600 key file)
+  adjudicator test "<text>" [--provider P] [--json] | eval [--provider P ...] [--fixture F] [--json]
+  adjudicator stats [--since 7d] [--json] [--reset-learning]   ("eminiar adjudicator help" for more)
 
 Agent swarms (opt-in: .eminiar/swarm.yaml)
   swarm init [--force]         Write a starter swarm.yaml and generate the worker agents
@@ -76,8 +87,17 @@ const commands: Record<string, Command> = {
   },
 
   async install(args) {
+    // `--adjudicator` takes a value only in the `=` form, so a bare flag never eats the next arg.
+    let adjudicator: string | true | undefined;
+    const rest = args.filter((a) => {
+      if (a === "--adjudicator") adjudicator = true;
+      else if (a.startsWith("--adjudicator="))
+        adjudicator = a.slice("--adjudicator=".length) || true;
+      else return true;
+      return false;
+    });
     const { values } = parseArgs({
-      args,
+      args: rest,
       options: {
         "no-model": { type: "boolean" },
         method: { type: "string" },
@@ -88,11 +108,14 @@ const commands: Record<string, Command> = {
         statusline: { type: "boolean" },
         cursor: { type: "boolean" },
         force: { type: "boolean" },
+        "accept-remote": { type: "boolean" },
       },
       strict: false,
     });
     const { install } = await import("./install/install.js");
     return install({
+      adjudicator,
+      acceptRemote: !!values["accept-remote"],
       force: !!values.force,
       cursor: !!values.cursor,
       noModel: !!values["no-model"],
@@ -487,18 +510,18 @@ const commands: Record<string, Command> = {
       allowPositionals: true,
       strict: false,
     });
-    const scope = positionals[0] as
-      | "index"
-      | "sessions"
-      | "graph"
-      | "memories"
-      | "usage"
-      | "all"
-      | undefined;
-    if (!scope || !values.yes) {
-      console.error(
-        "usage: eminiar purge <index|sessions|graph|memories|usage|all> --yes   (irreversible)",
-      );
+    const scopes = [
+      "index",
+      "sessions",
+      "graph",
+      "memories",
+      "usage",
+      "adjudicator",
+      "all",
+    ] as const;
+    const scope = positionals[0] as (typeof scopes)[number] | undefined;
+    if (!scope || !scopes.includes(scope) || !values.yes) {
+      console.error(`usage: eminiar purge <${scopes.join("|")}> --yes   (irreversible)`);
       return 2;
     }
     const { emPurge } = await import("./tools/em_purge.js");
@@ -539,6 +562,11 @@ const commands: Record<string, Command> = {
       root: getContext().root,
     });
     return 0;
+  },
+
+  async adjudicator(args) {
+    const { adjudicatorCommand } = await import("./adjudicator/cli.js");
+    return adjudicatorCommand(args, getContext());
   },
 
   async swarm(args) {

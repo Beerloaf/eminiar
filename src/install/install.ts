@@ -35,6 +35,13 @@ export interface InstallOptions {
   spec?: string | undefined;
   /** Re-pack and reinstall the stable copy even when its version number is unchanged. */
   force?: boolean;
+  /**
+   * `--adjudicator[=choice]` turns the adjudicator on (true = heuristic). Without it an
+   * interactive install asks (default no); `--yes` skips the question.
+   */
+  adjudicator?: string | true | undefined;
+  /** Consent to send redacted prompt text to a remote adjudicator provider; --yes never implies it. */
+  acceptRemote?: boolean;
 }
 
 export async function install(opts: InstallOptions): Promise<number> {
@@ -73,7 +80,7 @@ export async function install(opts: InstallOptions): Promise<number> {
   log.step("data directory");
   const p = ensureDirs();
   if (!existsSync(p.configFile))
-    writeFileSync(p.configFile, `${JSON.stringify(ConfigSchema.parse({}), null, 2)}\n`);
+    writeFileSync(p.configFile, `${JSON.stringify(frozenDefaults(), null, 2)}\n`);
   globalDb();
   log.ok(p.home);
 
@@ -157,6 +164,17 @@ export async function install(opts: InstallOptions): Promise<number> {
     wrote,
   });
 
+  log.step("adjudicator");
+  try {
+    const { defaultIo, setupAdjudicator } = await import("../adjudicator/cli.js");
+    await setupAdjudicator(
+      { ...defaultIo(), out: log.info, err: log.warn },
+      { choice: opts.adjudicator, yes: !!opts.yes, acceptRemote: !!opts.acceptRemote },
+    );
+  } catch (err) {
+    log.warn(`adjudicator not configured: ${(err as Error).message}`);
+  }
+
   if (opts.team) {
     log.step("team defaults");
     writeTeamFiles(resolveProjectRoot(), opts.marketplace, { cursor: !!opts.cursor, stable });
@@ -172,6 +190,15 @@ export async function install(opts: InstallOptions): Promise<number> {
     `\nRestart ${restart} to load eminiar. Try ${wantClaude ? "/em-doctor, then " : ""}em_execute with an intent.`,
   );
   return checks.every((c) => c.ok) ? 0 : 1;
+}
+
+/**
+ * The defaults written to a fresh ~/.eminiar/config.json. The adjudicator section is left out
+ * so later default changes reach users; it is written only when they turn the feature on.
+ */
+export function frozenDefaults(): Record<string, unknown> {
+  const { adjudicator: _off, ...rest } = ConfigSchema.parse({});
+  return rest;
 }
 
 function cursorDirHint(): string {

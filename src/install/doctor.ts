@@ -77,7 +77,25 @@ export async function fullDoctor(opts: { fix?: boolean } = {}): Promise<Check[]>
     }
   }
 
-  const checks = runDoctor();
+  let ctxDb:
+    | {
+        config: ReturnType<typeof getContext>["config"];
+        root: string;
+        db?: ReturnType<typeof getStorage>;
+      }
+    | undefined;
+  try {
+    const ctx = getContext();
+    ctxDb = { config: ctx.config, root: ctx.root };
+    try {
+      ctxDb.db = getStorage(ctx, { vectors: false });
+    } catch {
+      // the "project" check below reports a broken DB
+    }
+  } catch {
+    ctxDb = undefined;
+  }
+  const checks = runDoctor(ctxDb ?? {});
   // runDoctor treats a missing pin as informational; for a plugin install it is the
   // difference between the desktop app connecting or not.
   if (rec?.method === "plugin" && !pinnedRoot()) {
@@ -258,6 +276,15 @@ export async function fullDoctor(opts: { fix?: boolean } = {}): Promise<Check[]>
     }
   } catch (err) {
     checks.push({ name: "project", ok: false, detail: (err as Error).message });
+  }
+  // Live adjudicator probe (2 s): the provider's /models, or local server detection.
+  if (ctxDb?.config.adjudicator.enabled) {
+    try {
+      const { adjudicatorLiveChecks } = await import("../adjudicator/cli.js");
+      checks.push(...(await adjudicatorLiveChecks(ctxDb.config)));
+    } catch (err) {
+      checks.push({ name: "adjudicator probe", ok: false, detail: (err as Error).message });
+    }
   }
   checks.push({
     name: "sandbox languages",
