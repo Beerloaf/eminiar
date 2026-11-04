@@ -843,3 +843,177 @@ export interface SwarmSyncResult {
   changed: number;
   conflicts: number;
 }
+
+// --- adjudicator (mirror src/ui/adjudicator-api.ts) ----------------------------------
+
+type AdjRowFull = import("../../adjudicator/types.js").AdjudicationRow;
+export type AdjFeatures = import("../../adjudicator/types.js").Features;
+export type AdjProviderStatus = import("../../adjudicator/types.js").ProviderStatus;
+export type AdjReason = import("../../adjudicator/types.js").Reason;
+export type AdjScoreEntry = import("../../adjudicator/types.js").ScoreEntry;
+export type AdjScoreTable = import("../../adjudicator/types.js").ScoreTable;
+export type AdjSource = import("../../adjudicator/types.js").Source;
+export interface AdjLatency {
+  n: number;
+  p50: number | null;
+  p95: number | null;
+}
+export interface AdjProviderView {
+  configured: string;
+  effective: string;
+  /** Why the configured provider is not the effective one (no_key, no_consent, ...). */
+  degraded: string | null;
+  detail: string | null;
+  remote: boolean;
+  configuredRemote: boolean;
+  local: boolean;
+  preset: string | null;
+  model: string | null;
+  baseUrl: string | null;
+  price: { inPerM: number; outPerM: number } | null;
+}
+export interface AdjHealth {
+  provider: string;
+  configured: boolean;
+  remote: boolean;
+  /** closed | open | half_open | slow | any newer state; null = never called. */
+  state: string | null;
+  failures: number;
+  retryAt: number | null;
+  lastOkAt: number | null;
+  lastErrorAt: number | null;
+  lastErrorClass: string | null;
+  latency: AdjLatency;
+  spendTodayUsd: number;
+  dailyCapUsd: number | null;
+}
+export interface AdjSummary {
+  since: number | null;
+  total: number;
+  bySurface: Record<string, number>;
+  bySource: Record<string, number>;
+  byProviderStatus: Record<string, number>;
+  byAction: Record<string, number>;
+  byOutcome: Record<string, number>;
+  latency: AdjLatency;
+  providerLatency: AdjLatency;
+  rates: { follow: number | null; apply: number | null; respect: number | null };
+  costUsd: number;
+  savingsUsd: number;
+  netUsd: number;
+  applyIneffective: number;
+  applyChecked: number;
+}
+export interface AdjDayBucket {
+  day: string;
+  heuristic: number;
+  blend: number;
+  cache: number;
+  fallback: number;
+  total: number;
+}
+export type AdjReconcile =
+  | { scanned: number; updated: number; finalized: number; linked: number; learned: number }
+  | { error: string };
+export interface AdjOverview {
+  enabled: boolean;
+  mode: "advise" | "apply";
+  config: Record<string, unknown> & { provider?: string; mode?: string };
+  provider: AdjProviderView;
+  keySource: "env" | "file" | "none";
+  keyFileRefused: boolean;
+  consent: boolean;
+  health: AdjHealth[];
+  apply: { checked: number; ineffective: number; effective: number };
+  summary: AdjSummary;
+  fallbackRate: number | null;
+  charts: { perDay: AdjDayBucket[]; complexity: number[] };
+  chartsCut: boolean;
+  filters: { surfaces: string[]; providers: string[]; outcomes: string[]; sources: string[] };
+  reconcile: AdjReconcile;
+  since: number | null;
+  now: number;
+}
+/** A call-log row: the stored row without its scores JSON. */
+export type AdjDecisionRow = Omit<AdjRowFull, "scores"> & { hasScores: boolean };
+export interface AdjDecisionsPage {
+  rows: AdjDecisionRow[];
+  total: number;
+  limit: number;
+  offset: number;
+  since: number | null;
+  now: number;
+}
+/** The parsed scores JSON of one decision (engine.verdictColumns). */
+export interface AdjScores {
+  complexity: number;
+  complexityReasons: AdjReason[];
+  tool: AdjScoreTable;
+  tier: AdjScoreTable;
+  role: AdjScoreTable;
+  effort: string;
+  features?: AdjFeatures;
+  alpha?: Partial<Record<"complexity" | "tier" | "role" | "tool", number>>;
+  bias?: Record<string, number>;
+}
+export interface AdjDecisionDetail {
+  row: Omit<AdjRowFull, "scores">;
+  scores: AdjScores | null;
+  now: number;
+}
+export interface AdjTierTokens {
+  tasks: number;
+  tokens: number;
+  costUsd: number;
+  tokensPerTask: number | null;
+}
+export interface AdjSavings {
+  since: number | null;
+  usageAvailable: boolean;
+  realisedUsd: number;
+  redoPenaltyUsd: number;
+  creditedRows: number;
+  potentialUsd: number;
+  potentialRows: number;
+  spendUsd: number;
+  netUsd: number;
+  tokensPerSuccessByTier: Record<string, AdjTierTokens | undefined>;
+  matrix: Array<{ suggested: string; actual: string; n: number }>;
+  assumptions: string[];
+  now: number;
+}
+export interface AdjEvalPayload {
+  /** The last `eminiar adjudicator eval` report (shape owned by src/adjudicator/eval.ts), or null. */
+  report: Record<string, unknown> | null;
+  error?: string;
+  now: number;
+}
+export type AdjTryItReason =
+  | "used"
+  | "disabled"
+  | "not_requested"
+  | "heuristic_configured"
+  | "no_key"
+  | "no_consent"
+  | "hook_context"
+  | "misconfigured";
+export interface AdjTryIt {
+  enabled: boolean;
+  usedProvider: boolean;
+  reason: AdjTryItReason | string;
+  provider: AdjProviderView;
+  verdict: AdjScores & {
+    source: AdjSource;
+    provider: string;
+    providerStatus: AdjProviderStatus;
+    latencyMs: number;
+    providerLatencyMs?: number;
+    usage?: { inTok: number; outTok: number; costUsd: number | null };
+    version: string;
+  };
+  features: AdjFeatures;
+  providerModel: string | null;
+  advice: string;
+  chars: number;
+  persisted: false;
+}

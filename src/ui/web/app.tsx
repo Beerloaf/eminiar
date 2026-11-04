@@ -4,6 +4,7 @@ import { api, getRoot, type Status, setRoot } from "./api.js";
 import { ToastHost, useAsync } from "./components.js";
 import { navigate, useRoute, type View } from "./router.js";
 import { ago, cls } from "./util.js";
+import { Adjudicator } from "./views/Adjudicator.js";
 import { Architecture } from "./views/Architecture.js";
 import { Coverage } from "./views/Coverage.js";
 import { Docs } from "./views/Docs.js";
@@ -29,6 +30,7 @@ const TABS: Array<[View, string]> = [
   ["coverage", "Coverage"],
   ["sessions", "Sessions"],
   ["swarm", "Swarms"],
+  ["adjudicator", "Adjudicator"],
   ["system", "System"],
 ];
 
@@ -159,6 +161,7 @@ export function App(): JSX.Element {
         {view === "coverage" && <Coverage />}
         {view === "sessions" && <Sessions />}
         {view === "swarm" && <Swarm params={route.params} />}
+        {view === "adjudicator" && <Adjudicator params={route.params} />}
         {view === "system" && <System onChanged={() => setTick((x) => x + 1)} />}
       </main>
       <footer class="status">

@@ -62,6 +62,13 @@ const SHOTS = [
   { name: "memory-graph", hash: "#/memory?tab=graph", schemes: ["dark", "light"] },
   { name: "docs-graph", hash: "#/docs?tab=graph", schemes: ["dark"] },
   { name: "coverage", hash: "#/coverage", schemes: ["dark"] },
+  { name: "adjudicator", hash: "#/adjudicator", schemes: ["dark", "light"] },
+  {
+    name: "adjudicator-decision",
+    hash: "#/adjudicator",
+    schemes: ["dark"],
+    actions: ['document.querySelector("table.adj-calls tbody tr")?.click()'],
+  },
 ].filter((s) => !only.length || only.includes(s.name));
 
 const REDACT = `(() => {
