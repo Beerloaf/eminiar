@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { resetSecrets } from "../../src/adjudicator/secrets.js";
-import type { AdjudicatorProvider } from "../../src/adjudicator/types.js";
+import { type AdjudicatorProvider, EVAL_META_KEY } from "../../src/adjudicator/types.js";
 import { type Config, ConfigSchema } from "../../src/config.js";
 import type { ProjectContext } from "../../src/context.js";
 import { SqliteAdapter } from "../../src/storage/sqlite/adapter.js";
@@ -12,7 +12,6 @@ import {
   type AdjudicatorRouteDeps,
   adjudicatorRoute,
   chartsOf,
-  EVAL_META_KEY,
   safeUrl,
 } from "../../src/ui/adjudicator-api.js";
 

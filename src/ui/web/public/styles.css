@@ -2861,9 +2861,16 @@ button.sw-release {
 .adj-kpis .sub {
   overflow-wrap: anywhere;
 }
-.adj-scroll {
+/* a wide table or chart scrolls inside its own box, so phone widths never scroll the page */
+.adj-scroll,
+.scroll-x {
   overflow-x: auto;
   max-width: 100%;
+}
+/* cells keep one line: a squeezed table scrolls instead of stacking a cell's labels */
+.scroll-x > table th,
+.scroll-x > table td {
+  white-space: nowrap;
 }
 .adj-filters {
   margin-bottom: 8px;

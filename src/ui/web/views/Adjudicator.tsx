@@ -59,6 +59,7 @@ import {
   topIntents,
   topReasons,
   tryItReason,
+  usageGapNote,
 } from "./adjudicator-helpers.js";
 import { shortModel } from "./usage-helpers.js";
 
@@ -1293,6 +1294,7 @@ function HealthRow({ h, now }: { h: AdjHealth; now: number }): JSX.Element {
 function SavingsPanel({ s }: { s: AdjSavings }): JSX.Element {
   const tiers = Object.entries(s.tokensPerSuccessByTier).filter(([, v]) => v?.tasks);
   const maxTok = Math.max(1, ...tiers.map(([, v]) => v?.tokensPerTask ?? 0));
+  const gap = usageGapNote(s);
   const figures: Array<[string, number, string, string]> = [
     [
       "realised",
@@ -1308,12 +1310,9 @@ function SavingsPanel({ s }: { s: AdjSavings }): JSX.Element {
     <div class="card">
       <h3>
         savings
-        {!s.usageAvailable ? (
-          <span
-            class="right warn small"
-            title="actual and baseline costs come from usage ingest (config.usage.enabled)"
-          >
-            no usage data: figures stay empty
+        {gap ? (
+          <span class="right warn small" title={gap.help}>
+            {gap.label}
           </span>
         ) : null}
       </h3>

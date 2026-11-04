@@ -42,6 +42,7 @@ import {
   type AdjudicationRequest,
   type AdjudicatorProvider,
   type Dist,
+  EVAL_META_KEY,
   type ProviderAnswer,
   type ProviderId,
   type ProviderResult,
@@ -49,8 +50,8 @@ import {
   TIERS,
 } from "./types.js";
 
-/** Meta key of the last report (read by GET /api/adjudicator/eval). */
-export const EVAL_META_KEY = "adjudicator:eval:last";
+/** Meta key of the last report (read by GET /api/adjudicator/eval); declared in types.ts. */
+export { EVAL_META_KEY };
 export const EVAL_REPORT_VERSION = 1;
 /** Items per provider call, like a plan. */
 export const EVAL_CHUNK = 10;

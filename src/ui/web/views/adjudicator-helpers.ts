@@ -440,6 +440,37 @@ export function savingsNote(
   return "baseline model cost − actual cost at list prices, same tokens";
 }
 
+/** The savings report fields the usage-gap note reads (mirrors AdjSavings in ../api.ts). */
+export interface UsageGapInput {
+  usageAvailable: boolean;
+  realisedUsd: number;
+  creditedRows: number;
+}
+
+/**
+ * The savings panel's warning when no API calls are recorded, or null when there is nothing to
+ * warn about. Realised savings, spend and net come from the adjudications table (savings_usd
+ * written by reconcile, cost_usd of the adjudicator's own calls), so they stay valid without
+ * usage data; what cannot happen is pricing: reconcile cannot price new dispatches and the
+ * report cannot compute potential savings, both of which need api_calls rows.
+ */
+export function usageGapNote(s: UsageGapInput): { label: string; help: string } | null {
+  if (s.usageAvailable) return null;
+  const priced = s.creditedRows > 0 || s.realisedUsd !== 0;
+  return {
+    label: priced
+      ? "no API calls recorded: new dispatches and potential savings are not priced"
+      : "no API calls recorded: savings cannot be priced",
+    help:
+      "Savings are priced from Claude Code's API calls, which usage ingestion records " +
+      "(config.usage.enabled). Without them reconcile cannot price new dispatches and " +
+      "potential savings stay $0" +
+      (priced
+        ? "; realised and net still include the dispatches priced earlier."
+        : "; spend still counts the adjudicator's own provider calls."),
+  };
+}
+
 // --- features -------------------------------------------------------------------------
 
 /** Intents above `min`, strongest first. */

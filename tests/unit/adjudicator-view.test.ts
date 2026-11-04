@@ -26,6 +26,7 @@ import {
   topIntents,
   topReasons,
   tryItReason,
+  usageGapNote,
 } from "../../src/ui/web/views/adjudicator-helpers.js";
 
 const h = scoreHeuristic(
@@ -227,6 +228,31 @@ describe("call log", () => {
     expect(savingsNote({ ...base, action: "ignored" })).toMatch(/no credit/);
     expect(savingsNote({ ...base, savingsUsd: null, final: false })).toMatch(/not reconciled/);
     expect(savingsNote({ ...base, savingsUsd: -0.3, outcome: "failure" })).toMatch(/redo/);
+  });
+});
+
+describe("usageGapNote", () => {
+  it("says nothing when API calls are recorded, whatever the figures", () => {
+    expect(usageGapNote({ usageAvailable: true, realisedUsd: 0, creditedRows: 0 })).toBeNull();
+    expect(usageGapNote({ usageAvailable: true, realisedUsd: 7.79, creditedRows: 4 })).toBeNull();
+  });
+
+  it("does not call figures empty when dispatches were priced earlier", () => {
+    const n = usageGapNote({ usageAvailable: false, realisedUsd: 7.79, creditedRows: 4 });
+    expect(n?.label).toMatch(/new dispatches and potential savings are not priced/);
+    expect(n?.label).not.toMatch(/empty/);
+    expect(n?.help).toMatch(/realised and net still include/);
+  });
+
+  it("counts a redo penalty alone as priced", () => {
+    const n = usageGapNote({ usageAvailable: false, realisedUsd: -0.4, creditedRows: 0 });
+    expect(n?.label).toMatch(/not priced/);
+  });
+
+  it("says savings cannot be priced when nothing was", () => {
+    const n = usageGapNote({ usageAvailable: false, realisedUsd: 0, creditedRows: 0 });
+    expect(n?.label).toBe("no API calls recorded: savings cannot be priced");
+    expect(n?.help).toMatch(/config\.usage\.enabled/);
   });
 });
 

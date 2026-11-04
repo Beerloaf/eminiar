@@ -27,6 +27,7 @@ import {
   type AdjudicationOutcome,
   type AdjudicationRow,
   type AdjudicatorProvider,
+  EVAL_META_KEY,
   PROVIDER_IDS,
   type ProviderId,
   SURFACES,
@@ -66,7 +67,6 @@ export const DEFAULT_SINCE = "30d";
 export const TEST_TEXT_MAX = 20_000;
 /** Rows the overview's charts are drawn from (newest win when there are more). */
 export const CHART_ROWS_MAX = 20_000;
-export const EVAL_META_KEY = "adjudicator:eval:last";
 
 const DAY_MS = 86_400_000;
 

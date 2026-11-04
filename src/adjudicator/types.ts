@@ -7,6 +7,9 @@
 /** Bump when scoring changes so cached verdicts and stored rows from older scorers are told apart. */
 export const SCORER_VERSION = "1";
 
+/** Meta key of the last `eminiar adjudicator eval` report (written by eval.ts, read by the dashboard). */
+export const EVAL_META_KEY = "adjudicator:eval:last";
+
 export const SURFACES = ["prompt", "agent", "plan", "tool", "mcp", "test"] as const;
 export type Surface = (typeof SURFACES)[number];
 

@@ -336,7 +336,7 @@ export function savingsReport(db: StorageAdapter, opts: SavingsReportOptions = {
   const assumptions = [...SAVINGS_ASSUMPTIONS];
   if (!usageAvailable)
     assumptions.push(
-      "No API calls are recorded (usage ingestion off or not run yet): actual cost, baseline cost and savings stay empty.",
+      "No API calls are recorded (usage ingestion off or not run yet): new dispatches get no actual or baseline cost and potential savings stay $0; realised savings only count dispatches priced earlier.",
     );
 
   return {
