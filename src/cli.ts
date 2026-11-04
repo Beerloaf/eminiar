@@ -602,27 +602,56 @@ const commands: Record<string, Command> = {
   },
 };
 
+/**
+ * Resolves once everything written to `stream` so far has been handed to the OS. A pipe is
+ * written asynchronously, so exiting right after console.log would drop whatever the pipe has
+ * not taken yet (piped output stopped at 64 KiB). An empty write queues behind the earlier
+ * chunks, so its callback fires after they are flushed. A stream that errors (EPIPE: the reader
+ * went away) or is already closed has nothing left to flush; the listener also stops that
+ * error from surfacing as an uncaught exception.
+ */
+function flushed(stream: NodeJS.WriteStream): Promise<void> {
+  return new Promise((resolve) => {
+    if (stream.destroyed || !stream.writable) return resolve();
+    stream.on("error", () => resolve());
+    stream.write("", () => resolve());
+  });
+}
+
+/**
+ * Exits with `code` once stdout and stderr are flushed. The hard exit stays (rather than only
+ * setting process.exitCode) so a command that leaves a database, timer or server handle open
+ * still ends promptly; it just no longer cuts piped output short.
+ */
+async function exitFlushed(code: number): Promise<never> {
+  process.exitCode = code;
+  await Promise.all([flushed(process.stdout), flushed(process.stderr)]);
+  process.exit(code);
+}
+
 const [cmd = "help", ...rest] = process.argv.slice(2);
+const run = commands[cmd] ?? (cmd === "--version" || cmd === "-v" ? commands.version : undefined);
+let code: number;
 // Commands parse with strict: false, so `--help` would otherwise be ignored and
 // `npx eminiar install --help` would start installing.
 if (cmd === "--help" || cmd === "-h" || rest.includes("--help")) {
   console.log(USAGE);
-  process.exit(0);
-}
-const run = commands[cmd] ?? (cmd === "--version" || cmd === "-v" ? commands.version : undefined);
-if (!run) {
+  code = 0;
+} else if (!run) {
   console.error(`unknown command: ${cmd}\n`);
   console.log(USAGE);
-  process.exit(2);
+  code = 2;
+} else {
+  try {
+    code = await run(rest);
+  } catch (err) {
+    console.error(`eminiar ${cmd} failed: ${(err as Error).message}`);
+    if (process.env.EMINIAR_DEBUG) console.error((err as Error).stack);
+    // doctor is still useful when the main command fails; a usage error is about the
+    // transcripts or the usage tables, not the installation, so a hint is enough there.
+    if (cmd === "usage") console.error("run `eminiar doctor` to check the installation");
+    else if (cmd !== "doctor") console.error(formatDoctor(runDoctor()));
+    code = 1;
+  }
 }
-try {
-  process.exit(await run(rest));
-} catch (err) {
-  console.error(`eminiar ${cmd} failed: ${(err as Error).message}`);
-  if (process.env.EMINIAR_DEBUG) console.error((err as Error).stack);
-  // doctor is still useful when the main command fails; a usage error is about the
-  // transcripts or the usage tables, not the installation, so a hint is enough there.
-  if (cmd === "usage") console.error("run `eminiar doctor` to check the installation");
-  else if (cmd !== "doctor") console.error(formatDoctor(runDoctor()));
-  process.exit(1);
-}
+await exitFlushed(code);
