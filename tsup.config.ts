@@ -39,17 +39,21 @@ export default defineConfig([
   {
     ...shared,
     entry: { server: "src/server.ts", cli: "src/cli.ts" },
-    // Split into app-* chunks. With splitting:false esbuild turns every dynamic import()
-    // into a lazy __esm wrapper; once the lazily loaded graph (storage, memory, graph) reached
-    // zod through the adjudicator, zod itself was wrapped and the MCP SDK's top-level
-    // z.custom() ran before zod initialised: dist/server.js crashed at start with "Class2 is
-    // not a constructor" (unit tests never load the bundle). Real chunks have no such
-    // ordering hazard. Costs ~8 ms of server cold start (once per session) over the old
-    // single file. Chunks sit in dist/ itself so import.meta.url paths (pluginRoot) hold.
-    splitting: true,
-    esbuildOptions(options) {
-      options.chunkNames = "app-[name]-[hash]";
-    },
+    // One self-contained file per entry, no chunks. The MCP server and `eminiar ui` /
+    // `eminiar upgrade` are long-lived processes run from the stable copy that `eminiar
+    // upgrade` reinstalls in place: a chunk they had not loaded yet would vanish under them
+    // (ERR_MODULE_NOT_FOUND until /mcp reconnect). Without splitting esbuild turns each
+    // dynamic import() of an internal module into a lazy __esm wrapper, and wrappers spread
+    // to everything that module imports: once that reached zod while the MCP SDK imported zod
+    // eagerly, the SDK's top-level z.custom() ran before zod initialised and dist/server.js
+    // crashed at start ("Class2 is not a constructor"). So everything the server reaches
+    // imports internal modules statically (dynamic import() only for external packages), and
+    // scripts/check-bundle.mjs, run by `npm run build`, fails the build if dist/server.js has
+    // a lazy wrapper, either file references a chunk, or zod is wrapped while something loads
+    // it eagerly. The CLI keeps its per-command dynamic imports (lazy, so `eminiar --version`
+    // does not initialise everything); there zod is wrapped but only ever initialised by
+    // other wrapped modules, and the SDK is not bundled, which the guard also checks.
+    splitting: false,
     // Cleans dist except the hook build's output, which runs in parallel and cleans its own.
     clean: HOOK_OUTPUT.map((p) => `!${p}`),
   },

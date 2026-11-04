@@ -49,7 +49,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsup && tsup --config tsup.web.config.ts && node scripts/copy-grammars.mjs && tsx scripts/gen-schema.ts",
+    "build": "tsup && node scripts/check-bundle.mjs && tsup --config tsup.web.config.ts && node scripts/copy-grammars.mjs && tsx scripts/gen-schema.ts",
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.web.json",
     "test": "vitest run",

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { adjudicatePlan, planAdviceBlock } from "../adjudicator/swarm.js";
 import { getContext, type ProjectContext } from "../context.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import { getStorage } from "../storage/index.js";
@@ -453,10 +454,7 @@ async function dispatch(args: Args, callerCtx: ProjectContext): Promise<string> 
       // Adjudicator advice (opt-in): one batched scoring of the new tasks; nothing when off.
       let advice = "";
       if (ctx.config.adjudicator?.enabled && ctx.config.adjudicator.surfaces.plan) {
-        const a = await import("../adjudicator/swarm.js");
-        advice = a.planAdviceBlock(
-          await a.adjudicatePlan(ctx, db, run, swarm, rows, { sessionId }),
-        );
+        advice = planAdviceBlock(await adjudicatePlan(ctx, db, run, swarm, rows, { sessionId }));
       }
       return planned(db, rows, swarm, run, caller, advice);
     }

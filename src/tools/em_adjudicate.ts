@@ -10,7 +10,11 @@ import { resolveAdjudicator } from "../adjudicator/config.js";
 import { adjudicate } from "../adjudicator/engine.js";
 import { complexityBucket } from "../adjudicator/heuristic.js";
 import { applyFeedbackResult, type Feedback, reconcile } from "../adjudicator/learn.js";
-import type { EmbeddingFactory } from "../adjudicator/providers/embedding.js";
+import {
+  defaultEmbeddingFactory,
+  type EmbeddingFactory,
+} from "../adjudicator/providers/embedding.js";
+import { registerProvider } from "../adjudicator/providers/index.js";
 import { head } from "../adjudicator/redact.js";
 import { type SavingsReportOptions, savingsReport } from "../adjudicator/savings.js";
 import { learnedBias } from "../adjudicator/swarm.js";
@@ -23,6 +27,7 @@ import type {
 } from "../adjudicator/types.js";
 import type { Config } from "../config.js";
 import type { ProjectContext } from "../context.js";
+import { getProvider } from "../embeddings/provider.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import { getStorage } from "../storage/index.js";
 import { capOutput } from "../swarm/format.js";
@@ -233,8 +238,9 @@ export interface ServerProviderOptions {
 /**
  * Register the runtime-only providers the MCP server can run (the embedding provider) when
  * the adjudicator is enabled and embedding is the effective provider. Returns whether it
- * registered one. The embedding module is imported only then, so a disabled server never
- * loads it. `warm` never delays the return: the warm-up runs detached and its failure only
+ * registered one; a disabled server never runs the embedding module. It is imported
+ * statically: the server is one file (tsup.config.ts), and only the CLI and server reach
+ * this module, never a hook. `warm` never delays the return: the warm-up runs detached and its failure only
  * means the first plan or score call loads the model instead.
  */
 export async function registerServerProviders(
@@ -244,16 +250,10 @@ export async function registerServerProviders(
   if (!config.adjudicator?.enabled) return false;
   const r = resolveAdjudicator(config, { context: "server" });
   if (r.provider !== "embedding") return false;
-  const [{ registerProvider }, { defaultEmbeddingFactory }] = await Promise.all([
-    import("../adjudicator/providers/index.js"),
-    import("../adjudicator/providers/embedding.js"),
-  ]);
   const factory = opts.factory ?? defaultEmbeddingFactory(config);
   registerProvider("embedding", factory);
   if (opts.warm) {
-    const embedder =
-      opts.embedder ??
-      (async () => (await import("../embeddings/provider.js")).getProvider(config));
+    const embedder = opts.embedder ?? (() => getProvider(config));
     // Exemplar vectors first (usually from the disk cache), then the model itself: a cached
     // load never runs the model, which would leave it for the first query.
     void (async () => {

@@ -3,7 +3,9 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { getContext } from "./context.js";
 import { kickEmbedding } from "./embeddings/queue.js";
-import { drainReindexQueue } from "./graph/reindex.js";
+import { drainReindexQueue, reindexCode, reindexGitSignals } from "./graph/reindex.js";
+import { refreshHistorySummary } from "./history/model.js";
+import { reconcile } from "./memory/store.js";
 import { markServerAlive } from "./session/server-alive.js";
 import { getStorage } from "./storage/index.js";
 import { registerServerProviders } from "./tools/em_adjudicate.js";
@@ -30,7 +32,7 @@ const SANDBOX_TOOLS = new Set(["em_execute", "em_execute_file", "em_batch_execut
 // at start; enabling one later needs /mcp reconnect. The adjudicator's embedding provider is
 // registered here (never in a hook) when it is the effective provider, and its model warmed,
 // both in the background: start-up and tool listing never wait. Only the tools that score
-// (ADJUDICATOR_TOOLS) wait for the registration, not for the warm-up. Disabled: nothing loads.
+// (ADJUDICATOR_TOOLS) wait for the registration, not for the warm-up. Disabled: nothing runs.
 let startConfig: ReturnType<typeof getContext>["config"] | undefined;
 try {
   startConfig = getContext().config;
@@ -101,12 +103,13 @@ setImmediate(() => {
 
 // Warm the project in the background so the first em_* call is fast: parse
 // changed code into the graph, refresh git signals, embed pending chunks.
+// The server imports internal modules statically only: it is built as one file
+// (tsup.config.ts) so an in-place upgrade cannot pull a chunk from under it, and a
+// dynamic import() would make esbuild wrap modules lazily (scripts/check-bundle.mjs).
 const warm = setTimeout(async () => {
   try {
     const ctx = getContext();
     const db = getStorage(ctx);
-    const { reindexCode, reindexGitSignals } = await import("./graph/reindex.js");
-    const { reconcile } = await import("./memory/store.js");
     try {
       reconcile(ctx, db);
     } catch (err) {
@@ -116,7 +119,6 @@ const warm = setTimeout(async () => {
     try {
       reindexGitSignals(ctx, db);
       // hooks read the persisted history summary; rebuild it when HEAD moved
-      const { refreshHistorySummary } = await import("./history/model.js");
       refreshHistorySummary(ctx, db);
     } catch {
       // not a git repo
