@@ -10,6 +10,8 @@
  * - Tables: (1−α)·heuristic + α·provider, plus the noul adjustments, plus the learned bias; clamp
  *   at 0 and renormalise. Complexity: (1−α)·c_h + α·c_p.
  * - A tier table with confidence under `lowConfidence` moves one tier up (the safer choice).
+ *   The heuristic table already leans up through `weights.features.asymmetry` (heuristic.ts
+ *   header); this round-up only covers the near-ties left after blending.
  *
  * Bias keys are `<dimension>:<option>`, e.g. `tier:sonnet` or `role:coder` (learn.ts §7.7 resolves
  * the buckets and hands over the flat map).

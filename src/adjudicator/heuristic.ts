@@ -16,7 +16,7 @@
  * | impact         | +0.6   | impact analysis reasons over several files                     |
  * | bigfile        | +1.0   | a large file is a lot of context to digest                     |
  * | recall         | +0.6   | "is it safe / should we" is a judgement call                   |
- * | implement      | +0.9   | new behaviour                                                  |
+ * | implement      | +1.0   | new behaviour; a specific verb (wire, optimize) alone reaches 2 |
  * | debug          | +1.0   | open-ended investigation                                       |
  * | review         | +1.2   | needs to model the whole change                                |
  * | plan           | +1.4   | decomposition across workers                                   |
@@ -26,15 +26,31 @@
  * | run, ui        |  0     | neutral: say what, not how hard                                |
  * | scope          | ×1.2   | whole / across / codebase (0..1)                               |
  * | risk           | ×0.8   | security / race / migration / data loss (0..1)                 |
- * | paths          | ×0.3   | 0.3·log2(1+paths): more named files, more to touch             |
- * | words40/120    | +0.3/+0.6 | long requests carry more requirements (not cumulative)      |
+ * | perf           | +0.8   | performance work with a measured number (800ms, 40kb, 50k docs) |
+ * | paths          | ×0.3   | 0.3·log2(1+paths): more named files, more to touch (not reads) |
+ * | words40/120    | +0.3/+0.6 | long prose carries more requirements (not cumulative); pasted |
+ * |                |        | output never counts, and a bug report stops at words40         |
  * | stackTrace     | +0.4   | a crash to diagnose                                            |
  * | taskFiles      | +0.4   | plan task touching more than 3 files                           |
  * | taskDeps       | +0.2   | plan task with more than one dependency                        |
+ * | taskFloor      |  2     | a swarm task title ("T7: ...") is a planned unit: c ≥ this     |
  * | toolProvider   |  0     | blend weight of a provider's tool answer (§7.4); 0 = heuristic owns tools |
+ * | asymmetry      |  2     | tier cost ratio: under-tiering costs a redo, so being c units   |
+ * |                |        | above a tier's centre costs `asymmetry`× being c units below it |
+ *
+ * Read-only requests (no change, debug, review, plan or test-writing intent) are lookups: a
+ * mention of tests, docs or a path there is the object of the question, so the test intent and
+ * the paths term do not count, and scope counts half (the tool searches the breadth, not the
+ * model).
+ *
+ * Asymmetric tier loss (§7.3): the tier logit is −asymmetry·max(0, c − centre) −
+ * max(0, centre − c). Under-tiering costs a redo (the tokens of the failed attempt plus the
+ * retry, more than the saving), so with the default 2:1 a request between two centres goes up
+ * once it is a third of the way across: haiku→sonnet at c ≈ 1.07, sonnet→opus at c ≈ 2.47 for
+ * centres 0.6 / 2.0 / 3.4. asymmetry = 1 is the old symmetric nearest-centre rule.
  */
 
-import { extractIntents } from "./features.js";
+import { extractIntents, type FeatureExtras } from "./features.js";
 import {
   DEFAULT_ROLES,
   type Effort,
@@ -60,7 +76,7 @@ export const DEFAULT_FEATURE_WEIGHTS: Readonly<Record<string, number>> = Object.
   impact: 0.6,
   bigfile: 1.0,
   recall: 0.6,
-  implement: 0.9,
+  implement: 1.0,
   debug: 1.0,
   review: 1.2,
   plan: 1.4,
@@ -72,13 +88,16 @@ export const DEFAULT_FEATURE_WEIGHTS: Readonly<Record<string, number>> = Object.
   ui: 0,
   scope: 1.2,
   risk: 0.8,
+  perf: 0.8,
   paths: 0.3,
   words40: 0.3,
   words120: 0.6,
   stackTrace: 0.4,
   taskFiles: 0.4,
   taskDeps: 0.2,
+  taskFloor: 2,
   toolProvider: 0,
+  asymmetry: 2,
 });
 
 /** Default tier centres on the complexity axis (mirrors config `weights.tierCenters`). */
@@ -196,9 +215,22 @@ const CHANGES: Intent[] = [
   "ui",
 ];
 const READ_SCOPE = 0.5;
+/** Intents that make a request more than a lookup (the read-only rule above). */
+const WORK: Intent[] = [
+  "implement",
+  "edit_small",
+  "refactor",
+  "design",
+  "plan",
+  "review",
+  "debug",
+  "ui",
+];
+/** Intents that turn a long request into a design brief rather than a symptom report. */
+const BROAD: Intent[] = ["design", "plan", "refactor", "implement"];
 
 export function scoreComplexity(
-  f: Features,
+  f: Features & Partial<FeatureExtras>,
   w: Record<string, number>,
 ): { complexity: number; reasons: Reason[] } {
   const reasons: Reason[] = [];
@@ -208,9 +240,15 @@ export function scoreComplexity(
     c += weight;
     reasons.push({ feature, weight: r2(weight), note });
   };
+  const has = (i: Intent) => (f.intents[i] ?? 0) > 0;
+  // Test work is a phrase or the lead verb (≥ 0.8); a passing mention is the object of a read.
+  const readOnly = !WORK.some(has) && (f.intents.test ?? 0) < 0.8;
   term("base", w.base ?? 0, "base");
-  for (const [i, v] of Object.entries(f.intents) as Array<[Intent, number]>)
-    if (v > 0) term(`intent.${i}`, (w[i] ?? 0) * v, `${i} ${r2(v)} × ${w[i] ?? 0}`);
+  for (const [i, v] of Object.entries(f.intents) as Array<[Intent, number]>) {
+    if (!(v > 0)) continue;
+    if (readOnly && i === "test") continue; // "which tests cover X" is a lookup
+    term(`intent.${i}`, (w[i] ?? 0) * v, `${i} ${r2(v)} × ${w[i] ?? 0}`);
+  }
   if (f.scope > 0) {
     // Breadth makes a change bigger; for a read it is the tool's job (search the whole codebase).
     const changes = CHANGES.some((i) => (f.intents[i] ?? 0) > 0);
@@ -221,37 +259,52 @@ export function scoreComplexity(
     );
   }
   if (f.risk > 0) term("risk", (w.risk ?? 0) * f.risk, `risk ${r2(f.risk)}`);
-  if (f.paths > 0)
-    term("paths", (w.paths ?? 0) * Math.log2(1 + f.paths), `${f.paths} path(s) named`);
-  if (f.words > 120) term("words120", w.words120 ?? 0, `${f.words} words`);
-  else if (f.words > 40) term("words40", w.words40 ?? 0, `${f.words} words`);
+  if (f.perf) term("perf", (w.perf ?? 0) * f.perf, "performance work with a measured number");
+  const paths = f.prosePaths ?? f.paths;
+  if (paths > 0 && !readOnly)
+    term("paths", (w.paths ?? 0) * Math.log2(1 + paths), `${paths} path(s) named`);
+  // Length counts prose only; a symptom report's length describes the bug, not the fix.
+  const words = f.proseWords ?? f.words;
+  const report = has("debug") && !BROAD.some(has);
+  if (words > 120 && !report) term("words120", w.words120 ?? 0, `${words} words`);
+  else if (words > 40) term("words40", w.words40 ?? 0, `${words} words`);
   if (f.stackTrace) term("stackTrace", w.stackTrace ?? 0, "stack trace");
   if (f.task && f.task.files > 3)
     term("taskFiles", w.taskFiles ?? 0, `task touches ${f.task.files} files`);
   if (f.task && f.task.deps > 1) term("taskDeps", w.taskDeps ?? 0, `${f.task.deps} deps`);
+  const floor = w.taskFloor ?? 0;
+  if (f.taskTitle && c < floor) term("taskFloor", floor - c, `swarm task title: floor ${floor}`);
   return { complexity: clamp(c, 0, 4), reasons };
 }
 
 // --- tier (§7.3) ----------------------------------------------------------
 
+/**
+ * The tier table. `asymmetry` (≥ 1) is the under/over-tiering cost ratio from the header;
+ * the default 1 is the symmetric nearest-centre rule, scoreHeuristic passes `weights.features.asymmetry`.
+ */
 export function scoreTier(
   c: number,
   f: Pick<Features, "risk" | "chat">,
   ladder: readonly Tier[],
   centers: Record<string, number>,
+  asymmetry = 1,
 ): ScoreTable {
+  const a = Math.max(1, Number.isFinite(asymmetry) ? asymmetry : 1);
   const sonnetAt = ladder.indexOf("sonnet");
   const riskFrom = sonnetAt >= 0 ? sonnetAt : 1;
   const logits = ladder.map((t, i) => {
     const center = tierCenter(t, i, centers);
+    // Below the request (c > centre) this tier risks a redo: that gap costs `a` times more.
+    const under = c > center;
+    let s = -(under ? a : 1) * Math.abs(c - center);
     const reasons: Reason[] = [
       {
         feature: "complexity",
-        weight: r2(-Math.abs(c - center)),
-        note: `c ${r2(c)} vs centre ${center}`,
+        weight: r2(s),
+        note: `c ${r2(c)} vs centre ${center}${under && a !== 1 ? ` (under-tier ×${r2(a)})` : ""}`,
       },
     ];
-    let s = -Math.abs(c - center);
     if (f.risk > 0 && i >= riskFrom) {
       s += 0.4 * f.risk;
       reasons.push({ feature: "risk", weight: r2(0.4 * f.risk), note: `risk ${r2(f.risk)}` });
@@ -406,7 +459,7 @@ export function scoreHeuristic(
     complexity,
     complexityReasons: reasons,
     tool: scoreTool(f, complexity, catalogue.tools ?? TOOL_IDS),
-    tier: scoreTier(complexity, f, ladder, centers),
+    tier: scoreTier(complexity, f, ladder, centers, w.asymmetry),
     role: scoreRole(f, catalogue.roles, complexity),
     effort: effortFor(complexity),
   };

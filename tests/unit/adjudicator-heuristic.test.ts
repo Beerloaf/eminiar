@@ -256,6 +256,156 @@ describe("scoreHeuristic", () => {
   });
 });
 
+describe("under-escalation rules (task #23)", () => {
+  const ladder = ["haiku", "sonnet", "opus"] as const;
+  const centers = { haiku: 0.6, sonnet: 2, opus: 3.4 };
+  const calm = { risk: 0, chat: false };
+
+  it("weighs under-tiering `asymmetry` times over-tiering (default 2, configurable)", () => {
+    expect(DEFAULT_FEATURE_WEIGHTS.asymmetry).toBe(2);
+    // Symmetric midpoints are 1.3 and 2.7; at 2:1 the tier goes up a third of the way across.
+    expect(scoreTier(1.2, calm, ladder, centers).choice).toBe("haiku");
+    expect(scoreTier(1.0, calm, ladder, centers, 2).choice).toBe("haiku");
+    expect(scoreTier(1.2, calm, ladder, centers, 2).choice).toBe("sonnet");
+    expect(scoreTier(2.4, calm, ladder, centers, 2).choice).toBe("sonnet");
+    expect(scoreTier(2.6, calm, ladder, centers, 2).choice).toBe("opus");
+    const t = scoreTier(1.2, calm, ladder, centers, 2);
+    expect(t.entries.find((e) => e.option === "haiku")?.reasons[0]?.note).toContain("under-tier");
+    // Values below 1 would favour under-tiering; they clamp to the symmetric rule.
+    expect(scoreTier(1.2, calm, ladder, centers, 0.2)).toEqual(
+      scoreTier(1.2, calm, ladder, centers),
+    );
+    const f = extractFeatures("what would break if I change the Store interface"); // c = 1.2
+    expect(scoreHeuristic(f).tier.choice).toBe("sonnet");
+    expect(scoreHeuristic(f, { features: { asymmetry: 1 } }).tier.choice).toBe("haiku");
+  });
+
+  it("never scores a specific implement verb as complexity ≤ 1 on its own", () => {
+    for (const verb of ["optimize", "wire", "convert", "extract", "integrate", "implement"]) {
+      const s = score(`${verb} the retry logic in the loader`);
+      expect(complexityBucket(s.complexity)).toBeGreaterThanOrEqual(2);
+      expect(s.tier.choice).toBe("sonnet");
+    }
+    expect(extractIntents("make the cache expire entries").implement).toBe(0.8);
+    expect(extractIntents("the cache should make sense").implement).toBeUndefined();
+  });
+
+  it("reads breadth: call sites, counted units, enumerations", () => {
+    expect(extractFeatures("update every call site of loadConfig").scope).toBe(1);
+    expect(extractFeatures("add a timeout to all 12 hooks").scope).toBe(1);
+    expect(extractFeatures("wire the flag through the server, CLI and dashboard").scope).toBe(0.5);
+    // A generic change verb makes breadth count in full (it is a change, not a read).
+    const s = score("update every call site of loadConfig");
+    expect(s.complexityReasons.find((r) => r.feature === "scope")?.weight).toBe(1.2);
+    expect(s.tier.choice).toBe("sonnet");
+  });
+
+  it("treats migrations and platform moves as refactors, but not a changed number", () => {
+    for (const t of [
+      "drop the CommonJS build",
+      "make the package ESM-only",
+      "upgrade react to v19",
+      "move the tests from jest to vitest",
+      "replace the session store with redis",
+    ])
+      expect(extractIntents(t).refactor).toBe(1);
+    expect(extractIntents("change the default port from 3000 to 8080").refactor).toBeUndefined();
+    expect(score("change the default port from 3000 to 8080").tier.choice).toBe("haiku");
+    expect(extractIntents("bump the version to 2.0.1").refactor).toBeUndefined();
+  });
+
+  it("raises auth flows and security reviews through risk", () => {
+    expect(extractFeatures("add OAuth PKCE login to the dashboard").risk).toBe(1);
+    expect(extractFeatures("audit the sandbox escape paths").risk).toBeGreaterThan(0);
+    expect(score("do a security review of the sandbox escape paths").tier.choice).toBe("opus");
+    // Deleting code is reversible; deleting data is the risk.
+    expect(extractFeatures("delete the commented-out block in config.ts").risk).toBe(0);
+    expect(extractFeatures("delete the old user records").risk).toBeGreaterThan(0);
+  });
+
+  it("adds a term for performance work backed by a measured number", () => {
+    const f = extractFeatures("speed up search, it takes 900ms on 20k rows");
+    expect(f.perf).toBe(1);
+    expect(extractFeatures("speed up search").perf).toBe(0);
+    expect(extractFeatures("the dashboard has 3 tabs").perf).toBe(0);
+    const s = scoreHeuristic(f);
+    expect(s.complexityReasons.some((r) => r.feature === "perf")).toBe(true);
+    expect(complexityBucket(s.complexity)).toBeGreaterThanOrEqual(2);
+  });
+
+  it("floors swarm task titles at complexity 2 and reads the verb after the prefix as the lead", () => {
+    expect(extractIntents("T7: wire the store").implement).toBe(1);
+    for (const t of [
+      "T3: rename the flag",
+      "task #4: document the config keys",
+      "T12b) tidy imports",
+    ]) {
+      const s = score(t);
+      expect(s.complexity).toBeGreaterThanOrEqual(2);
+      expect(s.complexityReasons.some((r) => r.feature === "taskFloor")).toBe(true);
+    }
+    expect(score("rename the flag").complexityReasons.some((r) => r.feature === "taskFloor")).toBe(
+      false,
+    );
+    expect(score("T3: rename the flag", undefined).complexity).toBe(
+      scoreHeuristic(extractFeatures("T3: rename the flag"), { features: { taskFloor: 2 } })
+        .complexity,
+    );
+  });
+
+  it("counts pasted traces as debug evidence, not as length or named files", () => {
+    const frames = Array.from({ length: 40 }, (_, i) => `    at fn${i} (src/m${i}.ts:${i + 1}:3)`);
+    const trace = [
+      "FAIL tests/unit/store.test.ts > store > keeps order",
+      "AssertionError: expected [ 1, 2 ] to deeply equal [ 2, 1 ]",
+      ...frames,
+    ].join("\n");
+    for (const text of [
+      `the store test fails:\n${trace}`,
+      `look at this\n\`\`\`\n${trace}\n\`\`\``,
+    ]) {
+      const f = extractFeatures(text);
+      expect(f.pasted).toBe(true);
+      expect(f.proseWords).toBeLessThan(10);
+      expect(f.prosePaths).toBe(0);
+      expect(f.intents.debug).toBeGreaterThanOrEqual(0.8);
+      const s = scoreHeuristic(f);
+      expect(s.complexityReasons.some((r) => r.feature.startsWith("words"))).toBe(false);
+      expect(s.tier.choice).toBe("sonnet");
+    }
+    // A fenced snippet that is not output is not "pasted" evidence.
+    expect(extractFeatures("refactor this:\n```\nconst a = 1;\nconst b = 2;\n```").pasted).toBe(
+      false,
+    );
+  });
+
+  it("caps the length bonus of a symptom report at words40", () => {
+    const report = `after a reindex the recall list returns stale entries and ${"the old entries keep showing up in results ".repeat(20)}`;
+    const s = score(report);
+    expect(s.complexityReasons.some((r) => r.feature === "words40")).toBe(true);
+    expect(s.complexityReasons.some((r) => r.feature === "words120")).toBe(false);
+    const brief = score(
+      `design the sync layer so that ${"each replica converges on the same state ".repeat(20)}`,
+    );
+    expect(brief.complexityReasons.some((r) => r.feature === "words120")).toBe(true);
+  });
+
+  it("keeps lookups that mention a path, tests or docs on haiku", () => {
+    for (const t of [
+      "what depends on src/storage/adapter.ts",
+      "which tests cover the parser",
+      "where are the docs for the CLI in docs/cli.md",
+    ]) {
+      const s = score(t);
+      expect(s.tier.choice).toBe("haiku");
+      expect(s.complexityReasons.some((r) => r.feature === "paths")).toBe(false);
+      expect(s.complexityReasons.some((r) => r.feature === "intent.test")).toBe(false);
+    }
+    // Judging what a change would break is still reasoning.
+    expect(score("what would break if I change the Store interface").tier.choice).toBe("sonnet");
+  });
+});
+
 describe("eval set acceptance (§7.8)", () => {
   // Majority baselines from research-local-3: tier haiku 0.475, complexity "0" 0.30.
   const rows = EVAL_SET.map((it) => {
@@ -358,7 +508,7 @@ describe("blend", () => {
     expect(get(v.tier, "opus")).toBeCloseTo(0.3 * get(h.tier, "opus") + 0.7);
     expect(v.tier.choice).toBe("opus");
     expect(v.role.choice).toBe("architect");
-    expect(v.effort).toBe("high"); // c = 0.3·1.32 + 0.7·4 = 3.2
+    expect(v.effort).toBe("high"); // c = 0.3·1.4 + 0.7·4 = 3.22
     for (const t of [v.tier, v.role, v.tool]) expect(sum(t)).toBeCloseTo(1, 9);
     expect(v.complexityReasons.some((r) => r.feature === "provider")).toBe(true);
     expect(v.tier.entries[0]?.reasons.some((r) => r.feature === "provider")).toBe(true);
@@ -432,7 +582,15 @@ describe("blend", () => {
   });
 
   it("never rounds above the top of the ladder", () => {
-    const top = { ...h, tier: { ...h.tier, choice: "opus", confidence: 0.5 } };
+    // c = 2.72 sits just past the symmetric sonnet/opus midpoint: opus on top, low confidence.
+    const tier = scoreTier(2.72, { risk: 0, chat: false }, ["haiku", "sonnet", "opus"], {
+      haiku: 0.6,
+      sonnet: 2,
+      opus: 3.4,
+    });
+    expect(tier.choice).toBe("opus");
+    expect(tier.confidence).toBeLessThan(0.55);
+    const top = { ...h, tier };
     expect(
       blend(
         top,
