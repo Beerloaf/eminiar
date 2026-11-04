@@ -188,11 +188,12 @@ export function createOpenAIProvider(
       const outTok = parsed.data.usage?.completion_tokens ?? 0;
       return {
         answers,
-        // An unknown price (cerebras, custom without openai.price) is recorded as 0.
+        // An unknown price (cerebras, custom without openai.price) is null, not 0: the spend cap
+        // and stats tell "unknown" apart from "free".
         usage: {
           inTok,
           outTok,
-          costUsd: price ? (inTok * price.inPerM + outTok * price.outPerM) / 1e6 : 0,
+          costUsd: price ? (inTok * price.inPerM + outTok * price.outPerM) / 1e6 : null,
         },
         latencyMs: now() - start,
         model: parsed.data.model ?? r.model ?? "",

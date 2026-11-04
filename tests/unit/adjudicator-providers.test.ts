@@ -615,7 +615,7 @@ describe("openai-compatible provider", () => {
     });
   });
 
-  it("records 0 cost when the preset price is unknown", async () => {
+  it("records a null cost when the preset price is unknown", async () => {
     const { cfg, r, env } = openai(
       { openai: { preset: "cerebras" } },
       { CEREBRAS_API_KEY: SENTINEL },
@@ -626,7 +626,7 @@ describe("openai-compatible provider", () => {
       deadlineMs: 2000,
     });
     expect(f.calls[0]?.url).toBe("https://api.cerebras.ai/v1/chat/completions");
-    expect(res.usage.costUsd).toBe(0);
+    expect(res.usage.costUsd).toBeNull();
   });
 
   it("json auto: retries a response_format 400 once with json_object, then remembers", async () => {

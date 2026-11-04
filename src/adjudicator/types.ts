@@ -174,7 +174,8 @@ export interface ProviderAnswer {
 
 export interface ProviderResult {
   answers: ProviderAnswer[];
-  usage: { inTok: number; outTok: number; costUsd: number };
+  /** costUsd is null when the price is unknown (cerebras, custom without openai.price); 0 for local. */
+  usage: { inTok: number; outTok: number; costUsd: number | null };
   latencyMs: number;
   model: string;
 }
