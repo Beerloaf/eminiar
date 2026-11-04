@@ -1,5 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import {
+  type Dirent,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -143,7 +144,11 @@ interface Scenario {
 function scenario(extraEnv: Record<string, string> = {}): Scenario {
   const home = mkdtempSync(join(tmpdir(), "em-adj-e2e-home-"));
   const root = mkdtempSync(join(tmpdir(), "em-adj-e2e-root-"));
-  cleanup.push(home, root);
+  // The shims point NODE_COMPILE_CACHE at <home>/compile-cache. A child that outlives its CLI call
+  // (e.g. the em-server `eminiar doctor` probes and SIGTERMs) flushes its cache on the way out, into
+  // a home the test is scanning or deleting. Keep that cache outside the scanned home.
+  const cc = mkdtempSync(join(tmpdir(), "em-adj-e2e-cc-"));
+  cleanup.push(home, root, cc);
   writeFileSync(join(root, "package.json"), "{}");
   mkdirSync(join(root, ".git"));
   const env: NodeJS.ProcessEnv = { ...process.env };
@@ -155,6 +160,7 @@ function scenario(extraEnv: Record<string, string> = {}): Scenario {
     EMINIAR_PROJECT_ROOT: root,
     CLAUDE_PROJECT_DIR: root,
     EMINIAR_EMBEDDINGS: "0",
+    NODE_COMPILE_CACHE: cc,
     ...extraEnv,
   });
   return { home, root, env };
@@ -318,12 +324,26 @@ function adjRows(home: string): Array<Record<string, unknown>> {
 function filesContaining(dir: string, needles: string[], skip: string[] = []): string[] {
   const hits: string[] = [];
   const walk = (d: string) => {
-    for (const e of readdirSync(d, { withFileTypes: true })) {
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(d, { withFileTypes: true });
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") return; // removed while scanning
+      throw e;
+    }
+    for (const e of entries) {
       const p = join(d, e.name);
       if (skip.includes(p)) continue;
       if (e.isDirectory()) walk(p);
       else if (e.isFile()) {
-        const buf = readFileSync(p);
+        let buf: Buffer;
+        try {
+          buf = readFileSync(p);
+        } catch (err) {
+          // A temp file a still-exiting child renamed or removed between readdir and read.
+          if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+          throw err;
+        }
         for (const n of needles) if (buf.includes(n)) hits.push(`${p} contains ${n.slice(0, 12)}…`);
       }
     }
@@ -465,7 +485,7 @@ beforeAll(() => {
 afterAll(async () => {
   for (const c of children) c.kill("SIGKILL");
   for (const s of stubs) await s.stop();
-  for (const d of cleanup) rmSync(d, { recursive: true, force: true });
+  for (const d of cleanup) rmSync(d, { recursive: true, force: true, maxRetries: 5 });
 });
 
 // ---------------------------------------------------------------------------------------------

@@ -52,6 +52,7 @@ claude --plugin-dir "$PWD"   # run Claude Code with this checkout as the plugin
   not mock storage.
 - **SQL stays in `src/storage/sqlite/`.** Everything else goes through `StorageAdapter`, so a
   Postgres or libSQL adapter can be added later.
+- **Keep `TMPDIR` short.** A very long `TMPDIR` path overflows the Unix socket path limit of tsx's IPC socket and breaks the multi-process tests.
 - **Shims are POSIX `sh`.** The sandbox runs shell under `zsh` on macOS, so quote globs.
 
 ## Benchmarks

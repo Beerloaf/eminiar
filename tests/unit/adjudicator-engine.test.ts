@@ -404,14 +404,23 @@ describe("pipeline", () => {
 });
 
 describe("never throws, never waits past the budget", () => {
-  it("a hanging provider that ignores its signal: heuristic within budget + 20 ms", async () => {
+  it("a hanging provider that ignores its signal: abandoned at the budget, heuristic verdict, no blend", async () => {
     const cfg = adj();
-    const p = hanging();
+    let seen: AbortSignal | undefined;
+    const p = fake((_r, signal) => {
+      seen = signal;
+      return new Promise<ProviderResult>(() => {}); // never settles, whatever the signal says
+    });
     const t = performance.now();
     const [a] = await adjudicate([req("k1")], { ...base(cfg), provider: p, budgetMs: 100 });
     const elapsed = performance.now() - t;
-    expect(elapsed).toBeLessThan(120);
-    expect(elapsed).toBeGreaterThanOrEqual(95);
+    // Timers fire late on a busy machine (123-235 ms seen under 3x parallel load), so the upper
+    // bound is a generous margin over the budget: it still catches a call that waits on the
+    // provider (which never settles) or on a longer default timeout, without tracking the load.
+    // The structural checks below are what pin "abandoned at the deadline".
+    expect(elapsed).toBeLessThan(100 + 400);
+    expect(elapsed).toBeGreaterThanOrEqual(95); // never gives up before the budget
+    expect(seen?.aborted).toBe(true);
     expect(a?.verdict.source).toBe("fallback");
     expect(a?.verdict.providerStatus).toBe("timeout");
     expect(a?.verdict.tier.entries.length).toBeGreaterThan(0);
