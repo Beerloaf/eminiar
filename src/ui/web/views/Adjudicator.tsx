@@ -1654,7 +1654,7 @@ export function Adjudicator({ params }: { params: Record<string, string> }): JSX
       rate(s.rates.follow),
       [
         `apply ${rate(s.rates.apply)} · respected ${rate(s.rates.respect)}`,
-        keptModelLabel((s as { keptModel?: KeptModelCounts }).keptModel),
+        keptModelLabel(s.keptModel),
       ]
         .filter(Boolean)
         .join(" · "),
@@ -1793,10 +1793,7 @@ export function Adjudicator({ params }: { params: Record<string, string> }): JSX
               ) : !sav.data ? (
                 <Spinner />
               ) : (
-                <MatrixHeat
-                  matrix={sav.data.matrix}
-                  kept={(sav.data as { keptModel?: KeptModelCounts }).keptModel}
-                />
+                <MatrixHeat matrix={sav.data.matrix} kept={sav.data.keptModel} />
               )}
             </div>
           </div>

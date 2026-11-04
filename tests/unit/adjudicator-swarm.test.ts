@@ -616,7 +616,7 @@ describe("em_swarm plan advice and em_adjudicate", () => {
     const start = await call({ action: "start", swarm: "feat", goal: "on goal" });
     expect(start.match(/Adjudicator on:/g)).toHaveLength(1);
     expect(start).toContain(
-      "pass them as `model` and `effort` on the Agent call (`effort` needs Claude Code 2.1.292+; a pinned agent keeps its model)",
+      "says exactly what to pass on the Agent call (`model` and/or `effort`; pinned agents, CLAUDE_CODE_SUBAGENT_MODEL_FORCE and CLAUDE_CODE_EFFORT_LEVEL change what it asks for)",
     );
   });
 

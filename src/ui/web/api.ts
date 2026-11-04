@@ -887,9 +887,16 @@ export interface AdjHealth {
   spendTodayUsd: number;
   dailyCapUsd: number | null;
 }
+/** Dispatches whose model the advice did not name (kept pin, FORCE, fork), by reason. */
+export interface AdjKeptModel {
+  pin?: number | undefined;
+  force?: number | undefined;
+  fork?: number | undefined;
+}
 export interface AdjSummary {
   since: number | null;
   total: number;
+  keptModel?: AdjKeptModel;
   bySurface: Record<string, number>;
   bySource: Record<string, number>;
   byProviderStatus: Record<string, number>;
@@ -973,6 +980,7 @@ export interface AdjTierTokens {
 }
 export interface AdjSavings {
   since: number | null;
+  keptModel?: AdjKeptModel;
   usageAvailable: boolean;
   realisedUsd: number;
   redoPenaltyUsd: number;

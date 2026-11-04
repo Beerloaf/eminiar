@@ -374,7 +374,7 @@ export async function coordinatorBrief(
       '2. Spawn a worker per claimable task with the Agent tool: subagent_type from the list, a prompt that names "task #N" (the worker claims it), run_in_background: true for parallel work. eminiar refuses spawns over capacity and briefs each worker with the project knowledge.',
       ...(ctx.config.adjudicator?.enabled && ctx.config.adjudicator.surfaces.plan
         ? [
-            "   Adjudicator on: em_swarm plan shows a suggested model and effort per task; pass them as `model` and `effort` on the Agent call (`effort` needs Claude Code 2.1.292+; a pinned agent keeps its model).",
+            "   Adjudicator on: em_swarm plan shows a suggestion per task and says exactly what to pass on the Agent call (`model` and/or `effort`; pinned agents, CLAUDE_CODE_SUBAGENT_MODEL_FORCE and CLAUDE_CODE_EFFORT_LEVEL change what it asks for). Follow each line as written.",
           ]
         : []),
       '3. Watch: em_swarm {action:"status"} (or `eminiar swarm watch` under the Monitor tool). Workers post shared facts to the blackboard.',
