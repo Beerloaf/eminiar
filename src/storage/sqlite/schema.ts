@@ -546,6 +546,7 @@ CREATE INDEX IF NOT EXISTS adjudications_task ON adjudications(run_id, task_id);
 CREATE INDEX IF NOT EXISTS adjudications_hash ON adjudications(input_hash);
 CREATE INDEX IF NOT EXISTS adjudications_ts ON adjudications(ts);
 CREATE INDEX IF NOT EXISTS adjudications_final ON adjudications(final, ts);
+CREATE INDEX IF NOT EXISTS adjudications_tool_use ON adjudications(tool_use_id);
 CREATE TABLE IF NOT EXISTS adjudicator_cache (
   key TEXT PRIMARY KEY,
   verdict TEXT,
@@ -600,9 +601,15 @@ export const ADJUDICATOR_LATE_COLUMNS: ReadonlyArray<
   ["adjudicator_provider_state", "latency_budgets", "TEXT"],
 ];
 
+/** Indexes added to the v8 tables after v8 first ran (see ADJUDICATOR_LATE_COLUMNS). */
+export const ADJUDICATOR_LATE_INDEXES: ReadonlyArray<
+  readonly [table: string, index: string, columns: string]
+> = [["adjudications", "adjudications_tool_use", "tool_use_id"]];
+
 /**
- * Adds any ADJUDICATOR_LATE_COLUMNS a database lacks. Idempotent and cheap (one table_info per
- * table); tables that do not exist yet are left to the migration. Returns the columns added.
+ * Adds any ADJUDICATOR_LATE_COLUMNS and ADJUDICATOR_LATE_INDEXES a database lacks. Idempotent and
+ * cheap (one table_info per table, one sqlite_master lookup per index); tables that do not exist
+ * yet are left to the migration. Returns what it added: `table.column` and index names.
  */
 export function healAdjudicatorColumns(db: Database.Database): string[] {
   const added: string[] = [];
@@ -618,6 +625,18 @@ export function healAdjudicatorColumns(db: Database.Database): string[] {
     db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
     cols.add(column);
     added.push(`${table}.${column}`);
+  }
+  const indexExists = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?");
+  for (const [table, index, columns] of ADJUDICATOR_LATE_INDEXES) {
+    let cols = present.get(table);
+    if (cols === undefined) {
+      const info = db.pragma(`table_info(${table})`) as Array<{ name: string }>;
+      cols = info.length ? new Set(info.map((c) => c.name)) : null;
+      present.set(table, cols);
+    }
+    if (!cols || indexExists.get(index)) continue;
+    db.exec(`CREATE INDEX IF NOT EXISTS ${index} ON ${table}(${columns})`);
+    added.push(index);
   }
   return added;
 }

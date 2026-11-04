@@ -8,6 +8,7 @@ import type { Verdict } from "../../src/adjudicator/types.js";
 import { SqliteAdapter } from "../../src/storage/sqlite/adapter.js";
 import {
   ADJUDICATOR_LATE_COLUMNS,
+  ADJUDICATOR_LATE_INDEXES,
   healAdjudicatorColumns,
   migrations,
 } from "../../src/storage/sqlite/schema.js";
@@ -102,12 +103,19 @@ describe("schema migration v8: adjudicator tables", () => {
 describe("pre-release v8 databases (task #26)", () => {
   const colsOf = (db: Database.Database, table: string) =>
     (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((c) => c.name);
+  const hasIndex = (db: Database.Database, name: string) =>
+    !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?").get(name);
 
   /** The v8 DDL as it first ran on development machines: without the late columns. */
   function oldV8Sql(): string {
     let sql = migrations.find((m) => m.version === 8)!.sql!;
     for (const [, col, ddl] of ADJUDICATOR_LATE_COLUMNS) {
       sql = sql.replace(`  ${col} ${ddl},\n`, "").replace(`,\n  ${col} ${ddl}\n)`, "\n)");
+    }
+    for (const [table, index, cols] of ADJUDICATOR_LATE_INDEXES) {
+      const line = `CREATE INDEX IF NOT EXISTS ${index} ON ${table}(${cols});\n`;
+      expect(sql).toContain(line);
+      sql = sql.replace(line, "");
     }
     return sql;
   }
@@ -124,6 +132,7 @@ describe("pre-release v8 databases (task #26)", () => {
     raw.prepare("INSERT INTO meta (key, value) VALUES ('schema_version', '8')").run();
     for (const [table, col] of ADJUDICATOR_LATE_COLUMNS)
       expect(colsOf(raw, table)).not.toContain(col);
+    for (const [, index] of ADJUDICATOR_LATE_INDEXES) expect(hasIndex(raw, index)).toBe(false);
     raw
       .prepare(
         "INSERT INTO adjudicator_provider_state (provider, state, failures, spend_usd) VALUES ('openai', 'open', 2, 0.5)",
@@ -151,6 +160,7 @@ describe("pre-release v8 databases (task #26)", () => {
       });
       for (const [table, col] of ADJUDICATOR_LATE_COLUMNS)
         expect(colsOf(a.db, table)).toContain(col);
+      for (const [, index] of ADJUDICATOR_LATE_INDEXES) expect(hasIndex(a.db, index)).toBe(true);
       const saved = a.adjudicator.saveProviderState("openai", { calls: 3, authFingerprint: "fp1" });
       expect(saved).toMatchObject({ calls: 3, authFingerprint: "fp1", failures: 2 });
       expect(a.adjudicator.providerState("openai")).toMatchObject({
@@ -182,6 +192,7 @@ describe("pre-release v8 databases (task #26)", () => {
       "adjudicator_provider_state.auth_fingerprint",
       "adjudications.feedback_note",
       "adjudicator_provider_state.latency_budgets",
+      "adjudications_tool_use",
     ]);
     expect(healAdjudicatorColumns(raw)).toEqual([]);
     raw.close();
@@ -320,6 +331,28 @@ describe("SqliteAdjudicatorStore", () => {
     expect(a.adjudicator.nonFinal(100).map((r) => r.ts)).toEqual([10, 20, 30, 40, 50, 60]);
     expect(a.adjudicator.nonFinal(2).map((r) => r.ts)).toEqual([10, 20]);
     expect(a.adjudicator.nonFinal(100, 40).map((r) => r.ts)).toEqual([10, 20, 30]);
+  });
+
+  it("byToolUseId: newest match, surface and since filters, served by the index (#48)", () => {
+    a.adjudicator.insert(row({ ts: 10, surface: "agent", toolUseId: "tu1", inputHash: "a" }));
+    a.adjudicator.insert(row({ ts: 20, surface: "agent", toolUseId: "tu1", inputHash: "b" }));
+    a.adjudicator.insert(row({ ts: 30, surface: "prompt", toolUseId: "tu1", inputHash: "c" }));
+    a.adjudicator.insert(row({ ts: 40, surface: "agent", toolUseId: "tu2", inputHash: "d" }));
+    expect(a.adjudicator.byToolUseId("tu1")?.inputHash).toBe("c");
+    expect(a.adjudicator.byToolUseId("tu1", { surface: "agent" })?.inputHash).toBe("b");
+    expect(a.adjudicator.byToolUseId("tu1", { surface: "agent", since: 21 })).toBeUndefined();
+    expect(a.adjudicator.byToolUseId("tu1", { since: 15 })?.inputHash).toBe("c");
+    expect(a.adjudicator.byToolUseId("nope")).toBeUndefined();
+    // Older than the newest 200 agent rows is still found: no scan window.
+    for (let i = 0; i < 250; i++)
+      a.adjudicator.insert(row({ ts: 100 + i, surface: "agent", inputHash: `n${i}` }));
+    expect(a.adjudicator.byToolUseId("tu2", { surface: "agent" })?.inputHash).toBe("d");
+    const plan = a.db
+      .prepare(
+        "EXPLAIN QUERY PLAN SELECT * FROM adjudications WHERE tool_use_id = ? AND (? IS NULL OR surface = ?) AND ts >= ? ORDER BY ts DESC, id DESC LIMIT 1",
+      )
+      .all("tu1", "agent", "agent", 0) as { detail: string }[];
+    expect(plan.map((p) => p.detail).join(" ")).toContain("adjudications_tool_use");
   });
 
   it("cache: put, hit counting, pending marker, max age and prune", () => {

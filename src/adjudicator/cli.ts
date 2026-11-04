@@ -402,7 +402,7 @@ function mustAsk(r: Resolved, previous: string | undefined): boolean {
 /**
  * The consent fields to write once `r` is agreed to: remoteConsent true and its origin added to
  * remoteConsentOrigins (a legacy config also keeps `previous`). Nothing when no origin is known
- * or consent comes only from EMINIAR_ADJUDICATOR_REMOTE.
+ * or the user was not asked and holds no legacy consent.
  */
 function consentPatch(
   r: Resolved,
@@ -665,7 +665,7 @@ export interface StatusReport {
   origin: string | null;
   /** Consent covers `origin` (always false for a local provider, which needs none). */
   consent: boolean;
-  /** How consent was given: config (an origin you agreed to), env (EMINIAR_ADJUDICATOR_REMOTE=1, built-in hosts only) or legacy. */
+  /** How consent was given: config (an origin you agreed to) or legacy (remoteConsent true, no origin list). Env vars never grant it. */
   consentVia: string | null;
   /** The origins ~/.eminiar/config.json records consent for. */
   consentedOrigins: string[];
@@ -842,7 +842,7 @@ export function formatStatus(s: StatusReport): string {
     lines.push(
       `remote: sends redacted prompt text to ${s.origin ?? s.host} · consent ${
         s.consent
-          ? `given${s.consentVia === "env" ? " (EMINIAR_ADJUDICATOR_REMOTE=1, built-in hosts only)" : s.consentVia === "legacy" ? " (recorded before consent named a host; the next provider change asks again)" : ""}`
+          ? `given${s.consentVia === "legacy" ? " (recorded before consent named a host; the next provider change asks again)" : ""}`
           : `NOT given for this origin${s.consentedOrigins.length ? ` (given for ${s.consentedOrigins.join(", ")})` : ""}`
       }`,
     );
@@ -978,7 +978,7 @@ export function adjudicatorDoctorChecks(
       name: "adjudicator consent",
       ok: r0.consent,
       detail: r0.consent
-        ? `given${r0.consentVia === "env" ? " by EMINIAR_ADJUDICATOR_REMOTE=1" : ""}: redacted prompt text goes to ${r0.origin ?? hostOf(r0.baseUrl)}`
+        ? `given: redacted prompt text goes to ${r0.origin ?? hostOf(r0.baseUrl)}`
         : `not given for ${r0.origin ?? hostOf(r0.baseUrl)}: \`eminiar adjudicator enable --accept-remote\``,
     });
   if (r0.configured !== "heuristic") {

@@ -76,13 +76,16 @@ const buildAdjudicatorObject = () =>
       .string()
       .regex(/^[A-Za-z_][A-Za-z0-9_]*$/, "keyEnv is the name of an environment variable")
       .optional(),
-    /** Consent to send redacted prompt text to a remote provider; read only from ~/.eminiar/config.json or env. */
+    /**
+     * Consent to send redacted prompt text to a remote provider; granted only by
+     * ~/.eminiar/config.json. EMINIAR_ADJUDICATOR_REMOTE=0 withdraws it; no env var grants it.
+     */
     remoteConsent: z.boolean().default(false),
     /**
      * The origins (scheme://host[:port]) the user agreed to, written by the CLI's consent prompt;
      * read only from ~/.eminiar/config.json. Consent covers a remote provider only when its origin
-     * is listed here, or it is a built-in preset origin under EMINIAR_ADJUDICATOR_REMOTE=1 (or a
-     * legacy `remoteConsent: true` without this list). See resolveAdjudicator().
+     * is listed here (or, for a legacy `remoteConsent: true` without this list, a built-in preset
+     * origin of a provider the env did not pick). See resolveAdjudicator().
      */
     remoteConsentOrigins: z.array(z.string().max(512)).max(64).optional(),
     timeouts: z
@@ -510,14 +513,17 @@ function envOverrides(): Record<string, unknown> {
   const adj: Record<string, unknown> = {};
   const on = process.env.EMINIAR_ADJUDICATOR;
   if (on === "0" || on === "1") adj.enabled = on === "1";
+  // A remote provider picked here runs only when remoteConsentOrigins in ~/.eminiar/config.json
+  // lists its origin; otherwise resolveAdjudicator() degrades it with no_consent.
   const provider = process.env.EMINIAR_ADJUDICATOR_PROVIDER;
   if (provider && (PROVIDER_IDS as readonly string[]).includes(provider)) adj.provider = provider;
   const amode = process.env.EMINIAR_ADJUDICATOR_MODE;
   if (amode && (MODES as readonly string[]).includes(amode)) adj.mode = amode;
-  // EMINIAR_ADJUDICATOR_REMOTE=1 consents only to the built-in preset origins and =0 revokes
-  // every consent; resolveAdjudicator() reads the variable itself to tell the two apart.
-  const remote = process.env.EMINIAR_ADJUDICATOR_REMOTE;
-  if (remote === "0" || remote === "1") adj.remoteConsent = remote === "1";
+  // Env vars can only WITHDRAW remote consent (task #48): a cloned repo's .claude/settings.json
+  // `env` block reaches the session and its hooks, so EMINIAR_ADJUDICATOR_REMOTE=1 grants
+  // nothing. Consent comes only from ~/.eminiar/config.json (remoteConsentOrigins, written by the
+  // CLI after an explicit yes). =0 revokes every consent.
+  if (process.env.EMINIAR_ADJUDICATOR_REMOTE === "0") adj.remoteConsent = false;
   if (Object.keys(adj).length) o.adjudicator = adj;
   return o;
 }
@@ -527,7 +533,8 @@ function envOverrides(): Record<string, unknown> {
  * §5 "Trust boundary"). A project file comes with any cloned repo, so it must never decide where
  * text or keys go, which key is sent, how much text leaves the machine, or how much is spent:
  * provider, typesafe, openai (preset, baseUrl, model, price), keyEnv, remoteConsent,
- * remoteConsentOrigins, privacy, budget, timeouts and breaker come only from ~/.eminiar/config.json and EMINIAR_* env. What is
+ * remoteConsentOrigins, privacy, budget, timeouts and breaker come only from ~/.eminiar/config.json
+ * and EMINIAR_* env (which can withdraw remote consent but never grant it). What is
  * left only turns the adjudicator on and tunes how verdicts are scored and used locally.
  */
 export const PROJECT_ADJUDICATOR_KEYS: readonly string[] = [

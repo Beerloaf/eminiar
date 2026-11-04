@@ -117,7 +117,8 @@ const KEEP: string[] = [
   "token_count: 512 and max_tokens: 1024",
   "the password is required and must be rotated",
   "add a password field and a token input to the form",
-  "password: ${DB_PASSWORD}",
+  // A shell-style placeholder, not a template: built without a literal "${" in a plain string.
+  `password: $${"{"}DB_PASSWORD}`,
   "api_key: process.env.API_KEY",
   "secret: <your secret here>",
   "auth: true",

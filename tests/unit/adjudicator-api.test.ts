@@ -1,7 +1,7 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetSecrets } from "../../src/adjudicator/secrets.js";
 import { type AdjudicatorProvider, EVAL_META_KEY } from "../../src/adjudicator/types.js";
 import { type Config, ConfigSchema } from "../../src/config.js";
@@ -339,6 +339,17 @@ describe("POST /api/adjudicator/test", () => {
       { text, useProvider: true },
     );
     expect(noKey.body).toMatchObject({ usedProvider: false, reason: "no_key" });
+  });
+
+  it("runs the breaker's read-modify-write in the store's transaction (#48)", async () => {
+    const tx = vi.spyOn(db.adjudicator, "atomically");
+    const d = deps({ config: remoteCfg(), env: sentinelEnv(), provider: fakeProvider() });
+    const on = await call("/api/adjudicator/test", {}, d, "POST", { text, useProvider: true });
+    expect(on.body).toMatchObject({ usedProvider: true, reason: "used" });
+    // gate + recordSuccess, each in one BEGIN IMMEDIATE
+    expect(tx.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(db.adjudicator.providerState("openai-compatible")?.calls).toBe(1);
+    tx.mockRestore();
   });
 
   it("validates the body and the method", async () => {

@@ -360,13 +360,15 @@ describe("consent is bound to the origin the notice named (#33)", () => {
     expect(loadConfig(root).adjudicator.openai.baseUrl).toBe("https://other.example:8443/v1");
   });
 
-  it("EMINIAR_ADJUDICATOR_REMOTE=1 skips the question only for a built-in host", async () => {
+  it("EMINIAR_ADJUDICATOR_REMOTE=1 never skips the question, even for a built-in host (#48)", async () => {
     const env = { EMINIAR_ADJUDICATOR_REMOTE: "1" };
     process.env.EMINIAR_ADJUDICATOR_REMOTE = "1";
     let t = fakeIo({ env });
-    expect(await run(["enable", "--provider", "groq"], t.io)).toBe(0);
-    // The env grant is not written down as a personal consent.
-    expect(globalRaw().adjudicator.remoteConsentOrigins).toBeUndefined();
+    expect(await run(["enable", "--provider", "groq"], t.io)).toBe(1);
+    expect(t.text()).toContain("https://api.groq.com");
+    // Nothing is written down as a personal consent.
+    expect(globalRaw().adjudicator?.remoteConsentOrigins).toBeUndefined();
+    expect(globalRaw().adjudicator?.remoteConsent).not.toBe(true);
     t = fakeIo({ env });
     expect(
       await run(

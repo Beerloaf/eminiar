@@ -427,12 +427,14 @@ function tryItStore(store: AdjudicatorStore): AdjudicatorStore {
   const never = (): never => {
     throw new Error("try-it is never persisted");
   };
+  const atomically = store.atomically?.bind(store);
   return {
     insert: never,
     update: () => false,
     get: (id) => store.get(id),
     list: (f) => store.list(f),
     latestForSession: (s, surface) => store.latestForSession(s, surface),
+    byToolUseId: (id, f) => store.byToolUseId(id, f),
     forTask: (run, task) => store.forTask(run, task),
     nonFinal: (limit, olderThan) => store.nonFinal(limit, olderThan),
     cacheGet: () => undefined,
@@ -445,6 +447,8 @@ function tryItStore(store: AdjudicatorStore): AdjudicatorStore {
     biasReset: never,
     summary: (since) => store.summary(since),
     purge: never,
+    // The breaker's read-modify-write must stay atomic here too: a try-it call races hooks.
+    ...(atomically ? { atomically } : {}),
   };
 }
 

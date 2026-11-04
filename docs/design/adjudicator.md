@@ -81,8 +81,10 @@ It can be blended with one provider:
 **P4 Private by default.**
 
 - The heuristic, embedding and localhost providers keep all data on the machine.
-- Remote providers need explicit consent. `--yes` never implies it, and a committed project file
-  cannot grant it, nor choose the provider, its URL, the key or the caps (§5 "Trust boundary").
+- Remote providers need explicit consent, bound to the origin the notice named. `--yes` never
+  implies it; a committed project file cannot grant it, nor choose the provider, its URL, the key
+  or the caps (§5 "Trust boundary"); and no environment variable grants it (§5 "Remote
+  consent").
 - Remote providers also need a key, which lives only in `~/.eminiar/adjudicator.key` or an env
   var.
 - We store hashes, scores and an 80-char redacted head of the input. We never store prompts or
@@ -213,7 +215,8 @@ adjudicator: {
             price?: { inPerM: number, outPerM: number } },
   embedding: { k: 5, minSimilarity: 0.55 },
   keyEnv?: string,                // NAME of an env var, never a key
-  remoteConsent: false,           // read ONLY from ~/.eminiar/config.json or env
+  remoteConsent: false,           // granted ONLY by ~/.eminiar/config.json; env can only withdraw it
+  remoteConsentOrigins?: string[], // origins the user agreed to; written by the CLI, personal file only
   timeouts: { promptMs: 1200, agentMs: 800, planMs: 3000, localMs: 600, connectMs: 150 },
   minPromptChars: 12,
   tiers: ["haiku", "sonnet", "opus"],   // ordered ladder; "fable" may be inserted by the user
@@ -233,9 +236,10 @@ Rules:
 
 - **(a)** `envOverrides()` adds:
   - `EMINIAR_ADJUDICATOR=0|1` → `enabled`
-  - `EMINIAR_ADJUDICATOR_PROVIDER`
+  - `EMINIAR_ADJUDICATOR_PROVIDER` → `provider` (a remote one runs only if the personal config
+    already consents to its origin)
   - `EMINIAR_ADJUDICATOR_MODE`
-  - `EMINIAR_ADJUDICATOR_REMOTE=1` → `remoteConsent`
+  - `EMINIAR_ADJUDICATOR_REMOTE=0` → `remoteConsent: false` (withdraws). `=1` does nothing.
 - **(b)** `loadConfig` cuts the project layer's adjudicator section down to an allowlist before
   merging (see "Trust boundary" below). Teams commit that file, and consent is personal.
 - **(c)** A `superRefine` rejects any key inside `adjudicator` that matches
@@ -267,6 +271,40 @@ project file set `openai.baseUrl` and send the user's Groq key and prompts to an
   the config instead of dropping the key quietly.
 - A cloned repo can therefore turn the adjudicator on, but with no personal config only the
   heuristic runs.
+
+### Remote consent: bound to an origin, granted only by the personal config
+
+Consent is not a boolean. It is a list of origins (scheme, host and non-default port) the user
+agreed to: `remoteConsentOrigins` in `~/.eminiar/config.json`, next to the master flag
+`remoteConsent`. The CLI writes both only after it printed the notice naming that origin and the
+user answered y or passed `--accept-remote` (tasks #33, #48).
+
+`consentFor(a, origin, env)` in `src/adjudicator/config.ts` decides, for every remote path (engine
+gate, hooks, eval candidates, CLI test and probe, dashboard try-it):
+
+| situation | consent |
+|---|---|
+| `remoteConsent` false, or `EMINIAR_ADJUDICATOR_REMOTE=0` | none, for every origin |
+| `origin` listed in `remoteConsentOrigins` | `"config"` |
+| `remoteConsent: true` with no list (written before origins were recorded), built-in origin, provider not picked by `EMINIAR_ADJUDICATOR_PROVIDER` | `"legacy"`; the next `enable`/`provider` records the origin |
+| anything else, including `EMINIAR_ADJUDICATOR_REMOTE=1` | none: the provider degrades with `no_consent` |
+
+Environment variables can only withdraw consent. Claude Code applies a trusted project's
+`.claude/settings.json` `env` block to the session and its hooks, so a cloned repo can set any
+`EMINIAR_*` variable. If `EMINIAR_ADJUDICATOR=1`, `EMINIAR_ADJUDICATOR_PROVIDER=typesafe` and
+`EMINIAR_ADJUDICATOR_REMOTE=1` could grant consent, the repo could start sending the user's prompts
+to a remote host with the user's own stored key. So:
+
+- `EMINIAR_ADJUDICATOR=1` may turn the feature on (heuristic or local providers);
+- `EMINIAR_ADJUDICATOR_PROVIDER` may pick a remote provider, which runs only when
+  `remoteConsentOrigins` already lists its origin;
+- `EMINIAR_ADJUDICATOR_REMOTE=1` grants nothing; `=0` and `EMINIAR_ADJUDICATOR=0` still withdraw
+  and kill.
+
+A legacy consent was given for the provider the personal config named, so it never follows a
+provider the env swapped in. Regression test: `tests/unit/adjudicator-hooks.test.ts` "a project
+.claude/settings.json env block cannot grant remote consent (#48)" (stored keys, no consent,
+every fetch caught by a local stub server, nothing sent).
 
 ### PRESETS (`config.ts`)
 
@@ -795,6 +833,7 @@ Every savings figure is shown with its assumptions:
 | many prompts in parallel sessions | the cache plus the pending marker dedupe; the breaker is shared through SQLite |
 | a team's config turns the feature on | it can set `enabled` and the behaviour knobs only; the provider, URL, key, consent and caps come from the user's own config, so without one only the heuristic runs |
 | a cloned repo's config names a host or `keyEnv` | dropped by the project allowlist; doctor/status name the ignored keys |
+| a cloned repo's `.claude/settings.json` env sets `EMINIAR_ADJUDICATOR_REMOTE=1` and a remote provider | env cannot grant consent; without the origin in the personal `remoteConsentOrigins` the provider degrades with `no_consent` |
 
 ## 15. MCP surface: a new tool `em_adjudicate`, registered only when enabled
 

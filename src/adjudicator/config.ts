@@ -86,8 +86,8 @@ export function originOf(url: string | undefined): string | undefined {
 
 /**
  * The remote origins eminiar ships: the non-local presets and TypeSafe's default endpoint.
- * EMINIAR_ADJUDICATOR_REMOTE=1 (and a legacy `remoteConsent: true` with no
- * remoteConsentOrigins list) consents to these and nothing else.
+ * A legacy `remoteConsent: true` with no remoteConsentOrigins list consents to these and nothing
+ * else, and only for a provider the env did not pick.
  */
 export const BUILTIN_REMOTE_ORIGINS: readonly string[] = [
   ...Object.values(PRESETS)
@@ -97,31 +97,32 @@ export const BUILTIN_REMOTE_ORIGINS: readonly string[] = [
 ];
 
 /** How remote consent was given for an origin. */
-export type ConsentVia = "config" | "env" | "legacy";
+export type ConsentVia = "config" | "legacy";
 
 /**
- * Whether the user agreed to send text to `origin` (docs/design/adjudicator.md §5; task #33):
+ * Whether the user agreed to send text to `origin` (docs/design/adjudicator.md §5; tasks #33, #48).
+ * Env vars can only withdraw consent: a cloned repo's .claude/settings.json `env` block reaches
+ * the session and its hooks, so no EMINIAR_* variable may grant it.
  * - EMINIAR_ADJUDICATOR_REMOTE=0, or remoteConsent false, means no consent at all;
+ *   EMINIAR_ADJUDICATOR_REMOTE=1 grants nothing;
  * - "config": the origin is in remoteConsentOrigins of ~/.eminiar/config.json (the CLI writes it
  *   after the notice naming that host was shown and accepted);
- * - "env": EMINIAR_ADJUDICATOR_REMOTE=1 and the origin is a built-in preset origin. The env var is
- *   host-less, and a project's .claude/settings.json `env` block may set it, so it never covers a
- *   custom baseUrl;
- * - "legacy": remoteConsent true with no remoteConsentOrigins list (a config written before
- *   origins were recorded) is treated like the env var: built-in origins only. The CLI asks again
- *   and records the origin the next time the provider changes.
+ * - "legacy": remoteConsent true with no remoteConsentOrigins list (a personal config written
+ *   before origins were recorded) covers the built-in origins only, and not when
+ *   EMINIAR_ADJUDICATOR_PROVIDER picked the provider: that consent was given for the provider the
+ *   personal config named, and the env must not swap in another host. The CLI asks again and
+ *   records the origin the next time the provider changes.
  */
 export function consentFor(
   a: Pick<AdjudicatorConfig, "remoteConsent" | "remoteConsentOrigins">,
   origin: string | undefined,
   env: NodeJS.ProcessEnv = process.env,
 ): ConsentVia | undefined {
-  const flag = env.EMINIAR_ADJUDICATOR_REMOTE;
-  if (!origin || flag === "0" || !a.remoteConsent) return undefined;
+  if (!origin || env.EMINIAR_ADJUDICATOR_REMOTE === "0" || !a.remoteConsent) return undefined;
   if (consentedOrigins(a).includes(origin)) return "config";
-  if (!BUILTIN_REMOTE_ORIGINS.includes(origin)) return undefined;
-  if (flag === "1") return "env";
-  return a.remoteConsentOrigins === undefined ? "legacy" : undefined;
+  if (a.remoteConsentOrigins !== undefined || !BUILTIN_REMOTE_ORIGINS.includes(origin))
+    return undefined;
+  return env.EMINIAR_ADJUDICATOR_PROVIDER ? undefined : "legacy";
 }
 
 /** remoteConsentOrigins normalised to origins; entries that are not http(s) URLs are dropped. */

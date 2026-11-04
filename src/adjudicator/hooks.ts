@@ -473,8 +473,6 @@ export async function onPreAgent(
 
 /** How far back onPostAgent looks for the dispatch row (a foreground agent can run for hours). */
 export const POST_AGENT_LOOKBACK_MS = 24 * 3_600_000;
-/** At most this many recent agent rows are scanned for the tool_use_id (one SELECT). */
-const POST_AGENT_SCAN = 200;
 
 /**
  * The subagent an Agent/Task call started, from its PostToolUse payload. Claude Code passes the
@@ -544,9 +542,8 @@ export function onPostAgent(
     const main = coordinationRoot(ctx.root);
     if (main !== ctx.root) dbs.push(getStorage(getContext(main), { vectors: false }));
     for (const d of dbs) {
-      const row = d.adjudicator
-        .list({ surface: "agent", since, limit: POST_AGENT_SCAN })
-        .rows.find((r) => r.toolUseId === input.tool_use_id);
+      // One indexed lookup (adjudications_tool_use), not a scan of recent rows.
+      const row = d.adjudicator.byToolUseId(input.tool_use_id, { surface: "agent", since });
       if (!row) continue;
       if (row.agentId) {
         if (row.agentId !== link.agentId)

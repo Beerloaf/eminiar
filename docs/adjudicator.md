@@ -153,11 +153,18 @@ another origin falls back to the heuristic with `no_consent`. Switching to anoth
 `provider … --base-url` with a new host or port, shows the notice and asks again. A project file
 cannot set `remoteConsentOrigins`.
 
-`EMINIAR_ADJUDICATOR_REMOTE=1` consents only to the built-in hosts eminiar ships
-(`https://api.groq.com`, `https://api.cerebras.ai`, `https://api.typesafe.ai`), never to a custom
-base URL: the variable names no host, and a project's `.claude/settings.json` can set environment
-variables. `EMINIAR_ADJUDICATOR_REMOTE=0` withdraws every consent. A config written before
-consent named origins (`remoteConsent: true` with no list) is treated like the variable, and the
+No environment variable can grant consent: a project's `.claude/settings.json` can set
+environment variables for your session and its hooks, so a cloned repo must not be able to start
+sending your prompts anywhere. `EMINIAR_ADJUDICATOR=1` may turn the adjudicator on, and
+`EMINIAR_ADJUDICATOR_PROVIDER` may pick a remote provider, but that provider runs only when
+`remoteConsentOrigins` in `~/.eminiar/config.json` already lists its origin; otherwise the
+heuristic runs with `no_consent`. `EMINIAR_ADJUDICATOR_REMOTE=1` does nothing.
+`EMINIAR_ADJUDICATOR_REMOTE=0` withdraws every consent, and `EMINIAR_ADJUDICATOR=0` turns the
+adjudicator off.
+
+A config written before consent named origins (`remoteConsent: true` with no list) still covers
+the built-in hosts (`https://api.groq.com`, `https://api.cerebras.ai`, `https://api.typesafe.ai`)
+for the provider your config names, but not for one `EMINIAR_ADJUDICATOR_PROVIDER` swaps in. The
 next `enable` or `provider` records the origin it was given for.
 
 eminiar never follows an HTTP redirect from a provider: a 3xx answer is an error, so a server
@@ -432,7 +439,7 @@ provider, the one that actually runs, and why they differ.
 | `em_adjudicate` is missing | The MCP server registered its tools before you enabled it: `/mcp reconnect`. Or it is off: check `status` for which layer decides (`env EMINIAR_ADJUDICATOR`, project file, global file) |
 | "the heuristic runs until: no key for typesafe" | `eminiar adjudicator key set typesafe` |
 | "… sends redacted prompt text to …: run `eminiar adjudicator enable --accept-remote`" | Consent is missing. Consent in a project file is ignored on purpose |
-| "… which you have not agreed to (consent is per origin)" | You agreed to another host. Consent covers only the origins in `remoteConsentOrigins`; `EMINIAR_ADJUDICATOR_REMOTE=1` covers only the built-in hosts. Run `enable --accept-remote` to agree to this one |
+| "… which you have not agreed to (consent is per origin)" | You agreed to another host. Consent covers only the origins in `remoteConsentOrigins`; no environment variable grants it. Run `enable --accept-remote` to agree to this one |
 | "redirect to … refused" | The provider answered with a 3xx. eminiar never follows redirects; set the base URL to the final endpoint |
 | "eminiar.config.json sets adjudicator.… : ignored" | The project file set a provider, URL, key, cap or timeout. Those are personal: move them to `~/.eminiar/config.json` (`eminiar adjudicator provider …`) |
 | "the key file is readable by others and was ignored" | `chmod 600 ~/.eminiar/adjudicator.key` |

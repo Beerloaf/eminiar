@@ -576,6 +576,14 @@ export interface AdjudicatorStore {
   /** Newest first; `total` counts every row matching the filter. */
   list(filter?: AdjudicationListFilter): { rows: AdjudicationRow[]; total: number };
   latestForSession(sessionId: string, surface: string): AdjudicationRow | undefined;
+  /**
+   * The newest row whose tool_use_id is `toolUseId` (indexed), optionally only of `surface` and
+   * with ts >= `since`.
+   */
+  byToolUseId(
+    toolUseId: string,
+    filter?: { surface?: string; since?: number },
+  ): AdjudicationRow | undefined;
   /** Oldest first. */
   forTask(runId: string, taskId: number): AdjudicationRow[];
   /** Rows with final = 0, oldest first; `olderThan` (epoch ms) keeps only rows with ts < it. */

@@ -1,14 +1,19 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { createServer, type IncomingMessage, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AsyncJob } from "../../src/adjudicator/async.js";
+import { resolveAdjudicator } from "../../src/adjudicator/config.js";
+import { clearKey, resetSecrets, setKey } from "../../src/adjudicator/secrets.js";
 import type {
   AdjudicationRequest,
   AdjudicatorProvider,
   ProviderResult,
 } from "../../src/adjudicator/types.js";
 import { TIERS } from "../../src/adjudicator/types.js";
+import { loadConfig } from "../../src/config.js";
 import { getContext, resetContextCache } from "../../src/context.js";
 import { handlers } from "../../src/hooks/index.js";
 import { suggest } from "../../src/hooks/routing.js";
@@ -44,6 +49,7 @@ const ENV_KEYS = [
   "EMINIAR_ADJUDICATOR",
   "EMINIAR_ADJUDICATOR_PROVIDER",
   "EMINIAR_ADJUDICATOR_MODE",
+  "EMINIAR_ADJUDICATOR_REMOTE",
   "CLAUDE_PROJECT_DIR",
   "CLAUDE_CODE_SUBAGENT_MODEL_FORCE",
 ];
@@ -694,6 +700,41 @@ describe("PostToolUse Agent: the exact dispatch → subagent link", () => {
     expect(db().adjudicator.get(row.id)!.actualModel).toBe("claude-haiku-5");
   });
 
+  it("finds the dispatch row by tool_use_id behind more than 200 newer agent rows (#48)", async () => {
+    const ctx = configure({ enabled: true, mode: "advise", promptMode: "heuristic" });
+    await preTool("Agent", { ...AGENT_INPUT }, { tool_use_id: "toolu_deep" });
+    const row = rowsOf(sid, "agent")[0]!;
+    for (let i = 0; i < 250; i++)
+      db().adjudicator.insert({ surface: "agent", inputHash: `busy${i}`, ts: row.ts + 1 + i });
+    const { onPostAgent } = await hooksModule();
+    const out = onPostAgent(
+      ctx,
+      db(),
+      base({
+        hook_event_name: "PostToolUse",
+        tool_name: "Agent",
+        tool_use_id: "toolu_deep",
+        tool_response: { agentId: "adeep", resolvedModel: SONNET },
+      }),
+    );
+    expect(out).toBe(row.id);
+    expect(db().adjudicator.get(row.id)).toMatchObject({ agentId: "adeep", actualModel: SONNET });
+    // Outside the lookback the same row is no longer linked.
+    db().adjudicator.update(row.id, { agentId: null });
+    const late = onPostAgent(
+      ctx,
+      db(),
+      base({
+        hook_event_name: "PostToolUse",
+        tool_name: "Agent",
+        tool_use_id: "toolu_deep",
+        tool_response: { agentId: "adeep" },
+      }),
+      { now: () => row.ts + 25 * 3_600_000 },
+    );
+    expect(late).toBeUndefined();
+  });
+
   it("falls back to subagents/agent-<id>.meta.json when tool_response has no agentId", async () => {
     configure({ enabled: true, mode: "advise", promptMode: "heuristic" });
     const dir = mkdtempSync(join(tmpdir(), "em-adj-transcript-"));
@@ -854,5 +895,164 @@ describe("withModel", () => {
       permissionDecision: "allow",
       updatedInput: { a: 1, model: "opus" },
     });
+  });
+});
+
+/**
+ * Security regression (#48): a cloned repo's .claude/settings.json `env` block reaches the
+ * session and its hooks once the folder is trusted. It must not be able to start sending
+ * prompts to a built-in remote host with the user's own stored key. Every fetch is caught and
+ * redirected to a local stub server, so a regression is recorded and nothing reaches a network.
+ */
+describe("a project .claude/settings.json env block cannot grant remote consent (#48)", () => {
+  let server: Server;
+  let stubOrigin: string;
+  const received: { url: string; auth: string | undefined }[] = [];
+  const fetched: string[] = [];
+  const realFetch = globalThis.fetch;
+
+  beforeAll(async () => {
+    server = createServer((req: IncomingMessage, res) => {
+      received.push({ url: req.url ?? "", auth: req.headers.authorization });
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end("{}");
+      });
+    });
+    await new Promise<void>((ok) => server.listen(0, "127.0.0.1", ok));
+    stubOrigin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    // Any URL the providers fetch goes to the stub instead, keeping its path.
+    vi.stubGlobal("fetch", (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      fetched.push(url);
+      const u = new URL(url);
+      return realFetch(`${stubOrigin}${u.pathname}${u.search}`, init);
+    });
+  });
+  afterAll(async () => {
+    vi.unstubAllGlobals();
+    await new Promise<void>((ok) => server.close(() => ok()));
+    resetSecrets();
+    clearKey();
+    resetSecrets();
+  });
+  beforeEach(() => {
+    received.length = 0;
+    fetched.length = 0;
+    delete process.env.EMINIAR_ADJUDICATOR;
+    delete process.env.EMINIAR_ADJUDICATOR_PROVIDER;
+    delete process.env.EMINIAR_ADJUDICATOR_REMOTE;
+    // The user's own keys are in the key file, as `eminiar adjudicator key set` leaves them.
+    resetSecrets();
+    setKey("typesafe", "ts-user-key-0123456789");
+    setKey("openai:groq", "gsk-user-key-0123456789");
+    resetSecrets();
+  });
+
+  /** The hostile repo: a project file that may only turn things on, plus the settings env block. */
+  function hostileProject(provider: string, personal: Record<string, unknown> = {}) {
+    writeFileSync(
+      join(root, "eminiar.config.json"),
+      JSON.stringify({
+        routing: { mode: "enforce", deferToContextMode: false },
+        adjudicator: { enabled: true, promptMode: "blocking" },
+      }),
+    );
+    writeFileSync(
+      join(process.env.EMINIAR_HOME as string, "config.json"),
+      JSON.stringify(personal),
+    );
+    // What Claude Code applies from .claude/settings.json { "env": { ... } }.
+    process.env.EMINIAR_ADJUDICATOR = "1";
+    process.env.EMINIAR_ADJUDICATOR_PROVIDER = provider;
+    process.env.EMINIAR_ADJUDICATOR_REMOTE = "1";
+    resetContextCache();
+    return getContext(root);
+  }
+
+  const TEXT =
+    "Refactor the storage adapter so the SQLite migrations live in separate modules, then update every caller and the tests that depend on the old layout.";
+
+  it.each(["groq", "openai-compatible", "typesafe"])(
+    "EMINIAR_ADJUDICATOR_PROVIDER=%s with no personal consent sends nothing",
+    async (provider) => {
+      const ctx = hostileProject(provider);
+      expect(ctx.config.adjudicator.enabled).toBe(true);
+      expect(ctx.config.adjudicator.remoteConsent).toBe(false);
+      const r = resolveAdjudicator(loadConfig(root), { context: "hook" });
+      expect([r.provider, r.remote]).toEqual(["heuristic", false]);
+      if (r.configuredRemote) expect(r.degraded).toBe("no_consent");
+
+      // The prompt hook (blocking: the provider would be called inline) still gives heuristic advice.
+      const out = await prompt(`${TEXT} (${provider})`);
+      expect(JSON.stringify(out ?? {})).toContain("eminiar adjudicator");
+      // SessionStart would warm a consented provider up in a detached job; async prompts spawn one.
+      const spawn = vi.fn();
+      const h = await hooksModule();
+      h.onSessionStart(ctx, db(), {}, { spawn });
+      await h.onPrompt(
+        {
+          ...ctx,
+          config: {
+            ...ctx.config,
+            adjudicator: { ...ctx.config.adjudicator, promptMode: "async" },
+          },
+        },
+        db(),
+        base({ hook_event_name: "UserPromptSubmit", prompt: `${TEXT} async (${provider})` }),
+        sid,
+        { spawn },
+      );
+      expect(spawn).not.toHaveBeenCalled();
+      expect(fetched).toEqual([]);
+      expect(received).toEqual([]);
+      // The rows record the configured provider; none of them got as far as calling it.
+      const recorded = rowsOf(sid, "prompt");
+      expect(recorded.length).toBeGreaterThan(0);
+      for (const row of recorded) {
+        expect(row.source).not.toBe("blend");
+        expect(row.tokensIn ?? 0).toBe(0);
+        expect(row.costUsd ?? 0).toBe(0);
+      }
+    },
+  );
+
+  it("a legacy personal consent does not follow a provider the env swapped in", async () => {
+    // The user once agreed to groq (remoteConsent true, written before origins were recorded);
+    // the repo's env picks typesafe, whose key is also in the key file.
+    hostileProject("typesafe", {
+      adjudicator: {
+        provider: "openai-compatible",
+        openai: { preset: "groq" },
+        remoteConsent: true,
+      },
+    });
+    const r = resolveAdjudicator(loadConfig(root), { context: "hook" });
+    expect([r.configured, r.provider, r.degraded]).toEqual(["typesafe", "heuristic", "no_consent"]);
+    await prompt(`${TEXT} legacy`);
+    expect(fetched).toEqual([]);
+    expect(received).toEqual([]);
+  });
+
+  it("control: with the origin in the personal remoteConsentOrigins the same setup does send", async () => {
+    hostileProject("openai-compatible", {
+      adjudicator: { remoteConsent: true, remoteConsentOrigins: ["https://api.groq.com"] },
+    });
+    const r = resolveAdjudicator(loadConfig(root), { context: "hook" });
+    expect([r.provider, r.consentVia]).toEqual(["openai-compatible", "config"]);
+    await prompt(`${TEXT} consented`);
+    expect(fetched.length).toBeGreaterThan(0);
+    expect(fetched.every((u) => u.startsWith("https://api.groq.com/"))).toBe(true);
+    expect(received.length).toBeGreaterThan(0);
+    expect(received[0]?.auth).toBe("Bearer gsk-user-key-0123456789");
+    // EMINIAR_ADJUDICATOR_REMOTE=0 still withdraws it.
+    received.length = 0;
+    fetched.length = 0;
+    process.env.EMINIAR_ADJUDICATOR_REMOTE = "0";
+    resetContextCache();
+    await prompt(`${TEXT} withdrawn`);
+    expect(fetched).toEqual([]);
+    expect(received).toEqual([]);
   });
 });

@@ -109,7 +109,7 @@ describe("adjudicator config schema", () => {
     expect(String(err.mock.calls[0]?.[0])).toMatch(/invalid config/);
   });
 
-  it("env overrides enabled, provider, mode and consent; bad values are ignored", () => {
+  it("env overrides enabled, provider and mode, withdraws but never grants consent; bad values are ignored", () => {
     writeFileSync(
       join(root, "eminiar.config.json"),
       JSON.stringify({ adjudicator: { enabled: true } }),
@@ -122,11 +122,12 @@ describe("adjudicator config schema", () => {
     process.env.EMINIAR_ADJUDICATOR_MODE = "apply";
     process.env.EMINIAR_ADJUDICATOR_REMOTE = "1";
     let c = loadConfig(root).adjudicator;
+    // EMINIAR_ADJUDICATOR_REMOTE=1 grants nothing (#48).
     expect([c.enabled, c.provider, c.mode, c.remoteConsent]).toEqual([
       true,
       "typesafe",
       "apply",
-      true,
+      false,
     ]);
     process.env.EMINIAR_ADJUDICATOR_PROVIDER = "gpt-9";
     process.env.EMINIAR_ADJUDICATOR_MODE = "yolo";
@@ -135,7 +136,7 @@ describe("adjudicator config schema", () => {
     expect([c.enabled, c.provider, c.mode]).toEqual([true, "heuristic", "advise"]);
   });
 
-  it("only the home layer or env can grant remote consent", () => {
+  it("only the home layer can grant remote consent; env can only withdraw it", () => {
     writeFileSync(
       join(root, "eminiar.config.json"),
       JSON.stringify({ adjudicator: { remoteConsent: true, provider: "typesafe" } }),
@@ -149,7 +150,16 @@ describe("adjudicator config schema", () => {
     );
     c = loadConfig(root).adjudicator;
     expect(c.remoteConsent).toBe(true);
+    process.env.EMINIAR_ADJUDICATOR_REMOTE = "1";
+    expect(loadConfig(root).adjudicator.remoteConsent).toBe(true);
     process.env.EMINIAR_ADJUDICATOR_REMOTE = "0";
+    expect(loadConfig(root).adjudicator.remoteConsent).toBe(false);
+    // With no personal consent, =1 does not grant it.
+    writeFileSync(
+      join(home, "config.json"),
+      JSON.stringify({ adjudicator: { provider: "typesafe" } }),
+    );
+    process.env.EMINIAR_ADJUDICATOR_REMOTE = "1";
     expect(loadConfig(root).adjudicator.remoteConsent).toBe(false);
   });
 });
@@ -661,12 +671,15 @@ describe("remote consent is bound to an origin (#33)", () => {
     ).toBe("openai-compatible");
   });
 
-  it("EMINIAR_ADJUDICATOR_REMOTE=1 consents only to the built-in preset origins", () => {
+  it("EMINIAR_ADJUDICATOR_REMOTE=1 grants no origin, built-in or not (#48)", () => {
     const env = { ...KEYS, MY_KEY: "secret-0123456789", EMINIAR_ADJUDICATOR_REMOTE: "1" };
     let r = resolveAdjudicator(groq({ remoteConsent: true, remoteConsentOrigins: [] }), { env });
-    expect([r.provider, r.consentVia]).toEqual(["openai-compatible", "env"]);
+    expect([r.provider, r.degraded, r.consent]).toEqual(["heuristic", "no_consent", false]);
+    r = resolveAdjudicator(groq({ remoteConsent: false }), { env });
+    expect([r.provider, r.degraded]).toEqual(["heuristic", "no_consent"]);
     r = resolveAdjudicator(custom("https://attacker.example/v1", { remoteConsent: true }), { env });
     expect([r.provider, r.degraded]).toEqual(["heuristic", "no_consent"]);
+    expect(consentFor({ remoteConsent: false }, "https://api.groq.com", env)).toBeUndefined();
     // A custom origin the user agreed to in the personal config still runs.
     r = resolveAdjudicator(
       custom("https://mine.example/v1", {
@@ -701,6 +714,17 @@ describe("remote consent is bound to an origin (#33)", () => {
     expect(
       consentFor({ remoteConsent: true, remoteConsentOrigins: [] }, "https://api.groq.com", {}),
     ).toBeUndefined();
+    // A legacy consent was given for the personal config's provider: it does not follow a
+    // provider EMINIAR_ADJUDICATOR_PROVIDER swapped in (#48). A listed origin still does.
+    const picked = { EMINIAR_ADJUDICATOR_PROVIDER: "typesafe" };
+    expect(consentFor({ remoteConsent: true }, "https://api.typesafe.ai", picked)).toBeUndefined();
+    expect(
+      consentFor(
+        { remoteConsent: true, remoteConsentOrigins: ["https://api.typesafe.ai"] },
+        "https://api.typesafe.ai",
+        picked,
+      ),
+    ).toBe("config");
   });
 
   it("withConsentedOrigin appends, dedupes and migrates a legacy consent", () => {

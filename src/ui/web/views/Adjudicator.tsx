@@ -1130,15 +1130,34 @@ function LogRow({
 
 // --- cards -------------------------------------------------------------------------------
 
-function HealthCard({ ov }: { ov: AdjOverview }): JSX.Element {
+/**
+ * Overview fields the server sends that the shared AdjOverview type does not list yet: the origin
+ * remote consent must cover, and projectAdjudicatorWarning()'s line (task #48).
+ */
+type HealthOverview = AdjOverview & { origin?: string | null; projectIgnored?: string | null };
+
+/** The adjudicator keys a projectIgnored line names, e.g. ["keyEnv", "provider"]. */
+function ignoredKeysOf(line: string | null | undefined): string[] {
+  if (!line) return [];
+  const head = line.split(":")[0] ?? "";
+  return [...head.matchAll(/adjudicator\.([A-Za-z0-9_]+)/g)].map((m) => m[1] as string);
+}
+
+function HealthCard({ ov }: { ov: HealthOverview }): JSX.Element {
   const p = ov.provider;
   const configured = ov.health.find((h) => h.configured);
   const others = ov.health.filter((h) => !h.configured);
+  const ignored = ignoredKeysOf(ov.projectIgnored);
   return (
     <div class="card">
       <h3>
         provider
         <span class="right">
+          {ov.projectIgnored ? (
+            <ToneTag tone="warn" title={ov.projectIgnored}>
+              project config ignored: {ignored.length ? ignored.join(", ") : "some keys"}
+            </ToneTag>
+          ) : null}{" "}
           <ToneTag
             tone={ov.mode === "apply" ? "accent" : "muted"}
             title={
@@ -1196,7 +1215,11 @@ function HealthCard({ ov }: { ov: AdjOverview }): JSX.Element {
                 {ov.keyFileRefused ? (
                   <span class="bad small"> · key file refused (permissions)</span>
                 ) : null}
-                <span class="muted small"> · consent {ov.consent ? "given" : "not given"}</span>
+                <span class="muted small">
+                  {" "}
+                  · consent {ov.consent ? "given" : "not given"}
+                  {ov.origin ? ` for ${ov.origin}` : ""}
+                </span>
               </span>
             ) : (
               <span class="muted">not needed</span>

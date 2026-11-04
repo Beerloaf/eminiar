@@ -233,6 +233,20 @@ export class SqliteAdjudicatorStore implements AdjudicatorStore {
     return r ? toRow(r) : undefined;
   }
 
+  byToolUseId(
+    toolUseId: string,
+    filter: { surface?: string; since?: number } = {},
+  ): AdjudicationRow | undefined {
+    const r = this.prep(
+      `SELECT * FROM adjudications
+       WHERE tool_use_id = ? AND (? IS NULL OR surface = ?) AND ts >= ?
+       ORDER BY ts DESC, id DESC LIMIT 1`,
+    ).get(toolUseId, filter.surface ?? null, filter.surface ?? null, filter.since ?? 0) as
+      | Row
+      | undefined;
+    return r ? toRow(r) : undefined;
+  }
+
   forTask(runId: string, taskId: number): AdjudicationRow[] {
     return (
       this.prep("SELECT * FROM adjudications WHERE run_id = ? AND task_id = ? ORDER BY ts, id").all(
