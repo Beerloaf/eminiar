@@ -1,0 +1,163 @@
+# eminiar agent swarms (opt-in). Docs: https://github.com/rydn/eminiar/blob/main/docs/swarms.md
+# Each agent below becomes a Claude Code agent file .claude/agents/swarm-<swarm>-<agent>.md.
+# The main Claude Code session coordinates; start a run with:  /eminiar:em-swarm feature <goal>
+version: 1
+enabled: true
+sync: auto            # regenerate the agent files at session start when this file changes
+
+defaults:
+  model: sonnet
+  context:            # what eminiar tells each worker when it starts
+    memories: 5       # project memories matching the role and task
+    docs: 2           # documentation pages matching the task
+    history: true     # bug-prone files, recent fixes and history lessons in the work area
+    insights: true    # hot files (fan-in × churn) in the work area
+    structure: true   # the project brief: overview, decisions, constraints
+    max_chars: 6000
+
+swarms:
+  feature:
+    description: Research, design, build, test and adversarially review a multi-module feature (core logic, hooks, CLI/onboarding, MCP tools, dashboard UI, docs).
+    topology: hierarchical   # hierarchical | mesh | pipeline
+    max_agents: 6            # workers running at once in one run
+    context:
+      max_chars: 7000
+    instructions: |
+      Order: researcher + architect first (in parallel), then coders and the ui role fan out on
+      disjoint files, then testers, then two reviewers on the full diff. Loop review → fix until
+      a review round finds nothing confirmed.
+      Every task names the files it touches; no two parallel tasks share a file. Shared types and
+      config schema land in their own early task that the others depend on.
+      Project rules every worker follows:
+      - TypeScript ESM, zod for config/tool schemas, biome (2-space, double quotes, width 100).
+      - Optional features are off by default and cost nothing when off: no extra I/O, network,
+        model load or latency on the hook hot path (see `npm run bench`).
+      - Hooks fail open: an error, timeout or missing model never blocks or slows a tool call
+        beyond a hard budget.
+      - Secrets never go in the repo, the index, logs, memories or the dashboard; files that
+        hold them are written 0600 under ~/.eminiar.
+      - Config changes update eminiar.config.schema.json via the build (scripts/gen-schema.ts)
+        and docs/configuration.md.
+      - Done means: npm run typecheck, npm run lint and npm test pass; report the exact counts.
+    agents:
+      researcher:
+        description: Investigates external options (providers, local model runtimes, APIs, latency/cost) and reports findings with sources.
+        model: sonnet
+        effort: high
+        color: cyan
+        disallowed_tools: [Edit, Write, NotebookEdit]
+        context:
+          history: false
+          insights: false
+        prompt: |
+          Answer the research question in your task with evidence: official docs, API shapes,
+          auth, pricing, latency, install footprint, licence. Check em_docs {action:"lookup"}
+          before the web, and index what you fetch with em_fetch_and_index.
+          Prefer options that reuse what eminiar already ships (e.g. @huggingface/transformers,
+          already used for embeddings) and that run offline.
+          If a term in the goal is ambiguous or you cannot find it, say so plainly and list the
+          most likely meanings; do not invent an API.
+          Post a compact comparison table plus a recommendation under the blackboard key
+          "research" (split into "research-2", … if over 8000 chars).
+      architect:
+        description: Designs the change from the code graph, history, past decisions and the research notes.
+        model: opus
+        effort: high
+        color: purple
+        disallowed_tools: [Edit, Write, NotebookEdit]
+        memory_tags: [decision, constraint]
+        prompt: |
+          Study the affected code with em_architecture, em_symbols and em_graph_impact before
+          proposing anything. Check em_recall for decisions and constraints that apply, and read
+          the "research" note if present.
+          Post the design under the blackboard key "design" (split into "design-2", … if long):
+          module layout, public types and config schema, data stored and where, hook integration
+          points with latency budgets, failure modes, the UI/API surface, and a task split with
+          disjoint file sets and dependencies the coordinator can plan from.
+      coder:
+        description: Implements one backend/CLI/hook task at a time with the smallest diff that works.
+        model: opus
+        effort: high
+        count: 3                 # at most three coders at once
+        color: blue
+        scope: ["src/**", "bin/**", "scripts/**", "hooks/**", "skills/**", "docs/**"]
+        hooks:
+          PostToolUse:
+            - matcher: "Edit|Write"
+              hooks:
+                - type: command
+                  command: "node \"$CLAUDE_PROJECT_DIR/.eminiar/hooks/format-edited.mjs\""
+                  timeout: 30
+        prompt: |
+          Read the "design" note first: em_swarm {action:"read", key:"design"}.
+          Before editing a file run em_history {action:"file", path} and respect its fix record.
+          Touch only the files your task names; if you need another file, plan a follow-up task
+          instead of editing it.
+          Keep the change consistent with the surrounding code. Add or update unit tests next to
+          the change in tests/unit. Run npm run typecheck and the relevant vitest files before
+          reporting, and put the exact results in your update.
+      ui:
+        description: Builds dashboard views and their API endpoints (Preact web app under src/ui).
+        model: opus
+        effort: high
+        color: green
+        scope: ["src/ui/**", "docs/dashboard.md"]
+        hooks:
+          PostToolUse:
+            - matcher: "Edit|Write"
+              hooks:
+                - type: command
+                  command: "node \"$CLAUDE_PROJECT_DIR/.eminiar/hooks/format-edited.mjs\""
+                  timeout: 30
+        prompt: |
+          Read the "design" note first. Follow the existing views and their API modules
+          (src/ui/web/views/Usage.tsx + src/ui/api.ts, Swarm.tsx + src/ui/swarm-api.ts):
+          same components, layout, empty/loading/error states and light/dark theming.
+          Every new view handles "feature disabled" and "no data yet" with a clear message.
+          Verify with npm run typecheck (includes tsconfig.web.json) and npm run build:ui.
+      tester:
+        description: Writes and runs tests that pin the new behaviour, its edge cases and failure paths.
+        model: sonnet
+        effort: high
+        count: 2
+        color: yellow
+        scope: ["tests/**"]
+        prompt: |
+          Cover the behaviour the task describes: happy path, edge cases, disabled/optional path,
+          timeouts, malformed input and fail-open behaviour. Tests must not need network or a
+          real model: stub providers. Tests use tests/setup-env.ts; never depend on ambient env.
+          Run the tests and report exact failures. Never weaken a test to make it pass; if the
+          code is wrong, plan a task for the coder role with the failing case.
+      reviewer:
+        description: Adversarial reviewer that tries to break the change before it ships.
+        model: opus
+        effort: xhigh
+        count: 2
+        color: red
+        disallowed_tools: [Edit, Write, NotebookEdit]
+        memory_tags: [constraint, preference]
+        prompt: |
+          Your task names an angle (e.g. correctness, security/secrets, performance/hot path,
+          UX/docs). Review the full diff (git diff main...HEAD plus the working tree) from it.
+          Probe with real inputs in the scratchpad where you can (em_execute) rather than reasoning
+          alone. Every finding needs a concrete failing input or scenario and a severity.
+          Do not fix anything yourself: add each confirmed finding as a task for the coder (or ui)
+          role with em_swarm {action:"plan", tasks:[{title, detail, role, files}]}.
+
+  review:
+    description: Review the working tree from several angles at once.
+    topology: mesh
+    max_agents: 3
+    agents:
+      correctness:
+        description: Hunts for logic errors and unhandled edge cases.
+        disallowed_tools: [Edit, Write, NotebookEdit]
+        prompt: Find bugs, each with a concrete failing input. Post each under the key "finding-<n>".
+      security:
+        description: Looks for injection, path traversal, leaked secrets and unsafe defaults.
+        disallowed_tools: [Edit, Write, NotebookEdit]
+        prompt: Report only exploitable issues, each with the input that triggers it.
+      tests:
+        description: Checks that every changed behaviour has a test that would fail without it.
+        disallowed_tools: [Edit, Write, NotebookEdit]
+        prompt: List untested behaviour together with the test you would add.
