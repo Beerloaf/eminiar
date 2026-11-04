@@ -101,7 +101,10 @@ describe("heuristic generalisation on the second held-out set", () => {
   const under = rows.filter((r) => RANK[r.s.tier.choice]! < RANK[r.it.tier]!);
   const over = rows.filter((r) => RANK[r.s.tier.choice]! > RANK[r.it.tier]!);
   const opusRows = rows.filter((r) => r.it.tier === "opus");
-  const opusRecall = rate(opusRows.filter((r) => r.s.tier.choice === "opus").length, opusRows.length);
+  const opusRecall = rate(
+    opusRows.filter((r) => r.s.tier.choice === "opus").length,
+    opusRows.length,
+  );
   const haikuRows = rows.filter((r) => r.it.tier === "haiku");
   const haikuOver = rate(
     haikuRows.filter((r) => RANK[r.s.tier.choice]! > RANK.haiku!).length,

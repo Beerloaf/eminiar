@@ -14,7 +14,13 @@ import {
   storedKeyIds,
 } from "../../src/adjudicator/secrets.js";
 import { SCORER_VERSION, TIERS } from "../../src/adjudicator/types.js";
-import { type AdjudicatorConfig, ConfigSchema, loadConfig } from "../../src/config.js";
+import {
+  type AdjudicatorConfig,
+  AdjudicatorConfigSchema,
+  adjudicatorDefaults,
+  ConfigSchema,
+  loadConfig,
+} from "../../src/config.js";
 import { paths } from "../../src/paths.js";
 
 const ENV_KEYS = [
@@ -134,6 +140,64 @@ describe("adjudicator config schema", () => {
     expect(c.remoteConsent).toBe(true);
     process.env.EMINIAR_ADJUDICATOR_REMOTE = "0";
     expect(loadConfig(root).adjudicator.remoteConsent).toBe(false);
+  });
+});
+
+describe("loadConfig fast path for an untouched adjudicator section", () => {
+  it("adjudicatorDefaults() is exactly what the schema produces from {}", () => {
+    // Same keys in the same order, same values: the fast path must be indistinguishable.
+    const viaSchema = AdjudicatorConfigSchema.parse({});
+    expect(JSON.stringify(adjudicatorDefaults())).toBe(JSON.stringify(viaSchema));
+    expect(adjudicatorDefaults()).toStrictEqual(viaSchema);
+    expect(ConfigSchema.parse({}).adjudicator).toStrictEqual(viaSchema);
+    // a fresh object per call, so a caller mutating its config cannot change the next one
+    expect(adjudicatorDefaults().tiers).not.toBe(adjudicatorDefaults().tiers);
+  });
+
+  it("matches ConfigSchema.parse whether the section is absent, disabled or set", () => {
+    const cases: Array<[Record<string, unknown> | undefined, string | undefined]> = [
+      [undefined, undefined],
+      [undefined, "0"],
+      [{ enabled: false }, undefined],
+      [{ enabled: true }, undefined],
+      [undefined, "1"],
+      [{ provider: "typesafe", timeouts: { promptMs: 900 } }, "0"],
+    ];
+    for (const [section, env] of cases) {
+      for (const k of ENV_KEYS.slice(1)) delete process.env[k];
+      if (env) process.env.EMINIAR_ADJUDICATOR = env;
+      const file = { search: { defaultLimit: 7 }, ...(section ? { adjudicator: section } : {}) };
+      writeFileSync(join(root, "eminiar.config.json"), JSON.stringify(file));
+      const expected = ConfigSchema.parse({
+        ...file,
+        adjudicator: { ...section, ...(env ? { enabled: env === "1" } : {}) },
+      });
+      const got = loadConfig(root);
+      expect(JSON.stringify(got)).toBe(JSON.stringify(expected));
+    }
+  });
+
+  it("still refuses key fields and bad values in a disabled section", () => {
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    writeFileSync(
+      join(root, "eminiar.config.json"),
+      JSON.stringify({
+        search: { defaultLimit: 7 },
+        adjudicator: { enabled: false, apiKey: "sk-1" },
+      }),
+    );
+    let c = loadConfig(root);
+    expect(spy.mock.calls.join("")).toMatch(/eminiar adjudicator key set/);
+    expect(c.search.defaultLimit).toBe(5); // whole config fell back to defaults
+    expect(c.adjudicator).toStrictEqual(adjudicatorDefaults());
+    spy.mockClear();
+    writeFileSync(
+      join(root, "eminiar.config.json"),
+      JSON.stringify({ adjudicator: { enabled: "no" } }),
+    );
+    c = loadConfig(root);
+    expect(spy).toHaveBeenCalled();
+    expect(c.adjudicator.enabled).toBe(false);
   });
 });
 

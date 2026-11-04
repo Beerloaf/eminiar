@@ -16,6 +16,10 @@
 import { spawn as nodeSpawn } from "node:child_process";
 import type { AdjudicatorConfig } from "../config.js";
 import { AdjudicatorConfigSchema } from "../config.js";
+// Static on purpose: hook.ts already imports both, and a dynamic import() here made each its own
+// split chunk that every hook process loaded (src/hook.ts, tsup.config.ts).
+import { getContext } from "../context.js";
+import { getStorage } from "../storage/index.js";
 import type { AdjudicatorStore } from "../storage/types.js";
 import type { RuntimeContext } from "./config.js";
 import { adjudicate, type EngineOptions, verdictColumns } from "./engine.js";
@@ -190,10 +194,5 @@ export async function runAsyncJob(raw: string, deps: RunDeps = {}): Promise<RunR
 }
 
 async function openStore(projectRoot: string): Promise<AdjudicatorStore | undefined> {
-  const [{ getContext }, { getStorage }] = await Promise.all([
-    import("../context.js"),
-    import("../storage/index.js"),
-  ]);
-  const ctx = getContext(projectRoot);
-  return getStorage(ctx, { vectors: false }).adjudicator;
+  return getStorage(getContext(projectRoot), { vectors: false }).adjudicator;
 }
