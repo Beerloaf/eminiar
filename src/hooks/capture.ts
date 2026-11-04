@@ -131,6 +131,19 @@ export const userPromptSubmit: HookHandler = async (input) => {
       // recall is best effort; never block a prompt on it
     }
   }
+  // The adjudicator (off by default; loaded only when enabled): one advice line for Claude
+  // and, now and then, a main-session note for the user.
+  let systemMessage: string | undefined;
+  if (ctx.config.adjudicator.enabled && input.client !== "cursor") {
+    try {
+      const { onPrompt } = await import("../adjudicator/hooks.js");
+      const a = await onPrompt(ctx, db, input, sessionId);
+      if (a?.context) parts.push(a.context);
+      systemMessage = a?.systemMessage;
+    } catch {
+      // advice is optional
+    }
+  }
   // A crossed budget is said once per threshold; the Stop hook already ingested the
   // transcript, so this only reads totals.
   try {
@@ -138,8 +151,9 @@ export const userPromptSubmit: HookHandler = async (input) => {
   } catch {
     // budgets are advisory
   }
-  if (!parts.length) return undefined;
+  if (!parts.length) return systemMessage ? { systemMessage } : undefined;
   return {
+    ...(systemMessage ? { systemMessage } : {}),
     hookSpecificOutput: {
       hookEventName: "UserPromptSubmit",
       additionalContext: parts.join("\n\n"),
@@ -261,15 +275,25 @@ export const stop: HookHandler = (input) => {
   return undefined;
 };
 
-export const sessionEnd: HookHandler = (input) => {
+export const sessionEnd: HookHandler = async (input) => {
   // Workers of this session that never sent SubagentStop are closed (no-op without swarms).
-  swarmSessionEnd(getContext(input.cwd), input);
+  const ctx = getContext(input.cwd);
+  swarmSessionEnd(ctx, input);
   const { db, sessionId } = open(input);
   db.sessionUpsert({ id: sessionId, ended_at: Date.now() });
   db.eventInsert({
     ...withPriority(sessionId, [ev("session_start", { ended: input.reason ?? "unknown" })])[0]!,
   });
   ingestUsage(db, input, sessionId);
+  // The adjudicator (off by default) links outcomes and savings once the usage is in.
+  if (ctx.config.adjudicator.enabled && input.client !== "cursor") {
+    try {
+      const { onSessionEnd } = await import("../adjudicator/hooks.js");
+      onSessionEnd(ctx, db, input);
+    } catch {
+      // reconcile runs again at the next session end
+    }
+  }
   // keep the global DB warm so lifetime stats include this session's last calls
   globalDb();
   return undefined;
