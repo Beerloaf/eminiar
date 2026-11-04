@@ -5,6 +5,7 @@
  *
  *   onPrompt        UserPromptSubmit: one advice line, maybe a main-session note (cooldown)
  *   afterRouting    PreToolUse: Agent/Task → onPreAgent + withModel; other raw tools → onPreTool
+ *   onPostAgent     PostToolUse Agent/Task: the exact dispatch → subagent link (agentId)
  *   onSessionStart  one line when enabled but degraded; the ollama keep-alive warm-up
  *   onSessionEnd    reconcile; drop the session's main-advice counter
  *
@@ -13,15 +14,15 @@
  * the Cursor client, and never throw (advice must not break a hook).
  */
 
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { readdirSync, readFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import type { AdjudicatorConfig } from "../config.js";
 import { getContext, type ProjectContext } from "../context.js";
 import { hookLog } from "../hooks/log.js";
 import type { HookInput, HookOutput } from "../hooks/types.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import { getStorage } from "../storage/index.js";
-import type { AdjudicationInput } from "../storage/types.js";
+import type { AdjudicationInput, AdjudicationPatch } from "../storage/types.js";
 import { coordinationRoot, type SwarmSpawnCheck } from "../swarm/hooks.js";
 import type { TaskRow } from "../swarm/types.js";
 import { type AsyncJob, spawnAsyncJob } from "./async.js";
@@ -466,6 +467,104 @@ export async function onPreAgent(
   if (model) out.model = model;
   if (a.rowId !== undefined) out.rowId = a.rowId;
   return out;
+}
+
+// --- PostToolUse ----------------------------------------------------------------------
+
+/** How far back onPostAgent looks for the dispatch row (a foreground agent can run for hours). */
+export const POST_AGENT_LOOKBACK_MS = 24 * 3_600_000;
+/** At most this many recent agent rows are scanned for the tool_use_id (one SELECT). */
+const POST_AGENT_SCAN = 200;
+
+/**
+ * The subagent an Agent/Task call started, from its PostToolUse payload. Claude Code passes the
+ * tool's structured output as `tool_response` (the transcript's toolUseResult): both the
+ * foreground `completed` and the background `async_launched` shapes carry `agentId` (the id
+ * sidechain transcript entries, so api_calls.agent_id, use) and `resolvedModel` (the model the
+ * subagent started on). Without an agentId, the session's subagents/agent-<id>.meta.json whose
+ * `toolUseId` matches is the fallback.
+ */
+export function agentLinkOf(
+  input: Pick<HookInput, "tool_response" | "tool_use_id" | "transcript_path">,
+): { agentId: string; resolvedModel?: string } | undefined {
+  const r = input.tool_response;
+  const o = r && typeof r === "object" && !Array.isArray(r) ? (r as Record<string, unknown>) : {};
+  const resolvedModel = str(o.resolvedModel);
+  const agentId = str(o.agentId) ?? agentFromMeta(input.transcript_path, input.tool_use_id);
+  if (!agentId) return undefined;
+  return resolvedModel ? { agentId, resolvedModel } : { agentId };
+}
+
+/** The agent id whose `<session>/subagents/agent-<id>.meta.json` names this tool_use_id. */
+function agentFromMeta(
+  transcriptPath: string | undefined,
+  toolUseId: string | undefined,
+): string | undefined {
+  if (!transcriptPath || !toolUseId) return undefined;
+  const dir = join(dirname(transcriptPath), basename(transcriptPath, ".jsonl"), "subagents");
+  let names: string[];
+  try {
+    names = readdirSync(dir).filter((n) => /^agent-[A-Za-z0-9_-]+\.meta\.json$/.test(n));
+  } catch {
+    return undefined;
+  }
+  for (const n of names) {
+    try {
+      const m = JSON.parse(readFileSync(join(dir, n), "utf8")) as { toolUseId?: unknown };
+      if (m?.toolUseId === toolUseId) return n.slice("agent-".length, -".meta.json".length);
+    } catch {
+      // an unreadable meta file is skipped
+    }
+  }
+  return undefined;
+}
+
+/**
+ * PostToolUse for an Agent/Task call: the dispatch row PreToolUse wrote (same tool_use_id) gets
+ * the subagent's agentId, and its resolvedModel as actualModel until reconcile prices the
+ * subagent's own calls. An exact link, so parallel same-tier dispatches that the window
+ * matcher must leave ambiguous are linked too; reconcile already prefers row.agentId. A row
+ * that has an agent id keeps it. Returns the row id it linked; never throws.
+ */
+export function onPostAgent(
+  ctx: ProjectContext,
+  db: StorageAdapter,
+  input: HookInput,
+  deps: Pick<HookDeps, "now"> = {},
+): number | undefined {
+  try {
+    const cfg = ctx.config.adjudicator;
+    if (!active(cfg, input) || !cfg.surfaces.agent) return undefined;
+    if (!AGENT_TOOLS.has(input.tool_name ?? "") || !input.tool_use_id) return undefined;
+    const link = agentLinkOf(input);
+    if (!link) return undefined;
+    const since = (deps.now ?? Date.now)() - POST_AGENT_LOOKBACK_MS;
+    // A worker's dispatch row may live in the coordination root's ledger (onPreAgent findTask).
+    const dbs = [db];
+    const main = coordinationRoot(ctx.root);
+    if (main !== ctx.root) dbs.push(getStorage(getContext(main), { vectors: false }));
+    for (const d of dbs) {
+      const row = d.adjudicator
+        .list({ surface: "agent", since, limit: POST_AGENT_SCAN })
+        .rows.find((r) => r.toolUseId === input.tool_use_id);
+      if (!row) continue;
+      if (row.agentId) {
+        if (row.agentId !== link.agentId)
+          log(
+            `adjudicator: row ${row.id} keeps agent ${row.agentId}, dispatch says ${link.agentId}`,
+          );
+        return undefined;
+      }
+      const patch: AdjudicationPatch = { agentId: link.agentId };
+      if (link.resolvedModel && !row.actualModel) patch.actualModel = link.resolvedModel;
+      d.adjudicator.update(row.id, patch);
+      return row.id;
+    }
+    return undefined;
+  } catch (err) {
+    log(`adjudicator: onPostAgent ${(err as Error)?.message ?? String(err)}`);
+    return undefined;
+  }
 }
 
 /**

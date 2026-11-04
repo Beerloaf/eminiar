@@ -207,6 +207,13 @@ export interface Verdict extends ScoreSet {
   providerLatencyMs?: number;
   usage?: ProviderResult["usage"];
   version: string;
+  /**
+   * The heuristic's complexity before any provider blend (set by the engine on every verdict it
+   * returns). The learned-bias bucket is keyed by it both when bias is looked up (only the
+   * heuristic is known then) and when it is taught (learn.bucketsOf reads it from the row's
+   * scores JSON), so feedback lands in the bucket the same request reads.
+   */
+  heuristicComplexity?: number;
 }
 
 export type AdjudicationAction =

@@ -106,17 +106,10 @@ export interface EngineOptions {
   random?: (() => number) | undefined;
 }
 
-/**
- * A verdict as the engine returns it. `heuristicComplexity` is the heuristic's complexity before
- * any provider blend: the learned-bias bucket is keyed by it both when bias is looked up (only
- * the heuristic is known then) and when it is taught (learn.bucketsOf reads it from the row's
- * scores JSON), so feedback lands in the bucket the same request reads.
- */
-export type EngineVerdict = Verdict & { heuristicComplexity?: number };
-
 export interface Adjudication {
   request: AdjudicationRequest;
-  verdict: EngineVerdict;
+  /** Always carries `heuristicComplexity` (Verdict). */
+  verdict: Verdict;
   cacheKey: string;
   features: Features;
   /** The adjudications row, when one was inserted. */
@@ -202,7 +195,7 @@ function toolsOf(opts: EngineOptions): readonly string[] | undefined {
 
 /** The verdict columns of an adjudications row (insert, or the async job's update). */
 export function verdictColumns(
-  v: EngineVerdict,
+  v: Verdict,
   o: { features?: Features | undefined; providerModel?: string | undefined } = {},
 ): AdjudicationPatch {
   const u = v.usage;
@@ -561,7 +554,7 @@ function finish(
   const cfg = opts.config;
   const latencyMs = now() - start;
   return items.map((it) => {
-    const verdict: EngineVerdict = {
+    const verdict: Verdict = {
       ...(it.verdict as Verdict),
       latencyMs,
       heuristicComplexity: it.h.complexity,

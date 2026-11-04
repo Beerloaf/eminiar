@@ -178,13 +178,13 @@ function detectLoop(db: StorageAdapter, sessionId: string, key: string, summary:
     });
 }
 
-export const postToolUse: HookHandler = (input) => {
+export const postToolUse: HookHandler = async (input) => {
   if (!input.tool_name) return undefined;
   // A swarm worker's call feeds the swarm ledger too (a no-op for every other caller).
   if (input.agent_id) swarmActivity(getContext(input.cwd), input, false);
   // A swarm worker's Agent call returned: its spawn reservation is done.
-  if (input.tool_name === "Agent" || input.tool_name === "Task")
-    swarmAgentReturned(getContext(input.cwd), input);
+  const isAgent = input.tool_name === "Agent" || input.tool_name === "Task";
+  if (isAgent) swarmAgentReturned(getContext(input.cwd), input);
   const { db, root, sessionId } = open(input);
   const drafts = classifyToolCall({
     toolName: input.tool_name,
@@ -204,6 +204,19 @@ export const postToolUse: HookHandler = (input) => {
       /\.(m?[jt]sx?|c[jt]s|py|pyi|go|php)$/.test(d.payload.path)
     ) {
       db.reindexQueuePush(d.payload.path, String(d.payload.action ?? "edit"));
+    }
+  }
+  // The adjudicator (off by default; loaded only when enabled): the dispatch row of this
+  // Agent call gets the exact subagent id from tool_response.
+  if (isAgent && input.client !== "cursor") {
+    const ctx = getContext(input.cwd);
+    if (ctx.config.adjudicator.enabled) {
+      try {
+        const { onPostAgent } = await import("../adjudicator/hooks.js");
+        onPostAgent(ctx, db, input);
+      } catch {
+        // reconcile's window matching still links what it can
+      }
     }
   }
   return undefined;

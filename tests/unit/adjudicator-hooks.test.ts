@@ -29,6 +29,7 @@ vi.mock("../../src/adjudicator/hooks.js", async (importOriginal) => {
     onPreTool: vi.fn(actual.onPreTool),
     onSessionStart: vi.fn(actual.onSessionStart),
     onSessionEnd: vi.fn(actual.onSessionEnd),
+    onPostAgent: vi.fn(actual.onPostAgent),
   };
 });
 
@@ -108,6 +109,29 @@ const preTool = (tool: string, input: Record<string, unknown>, over: Partial<Hoo
     base({ hook_event_name: "PreToolUse", tool_name: tool, tool_input: input, ...over }),
   ) as Promise<HookOutput | undefined>;
 
+/** PostToolUse for an Agent call, with Claude Code's structured tool_response. */
+const postAgent = (
+  toolUseId: string,
+  response: unknown,
+  over: Partial<HookInput> = {},
+  input: Record<string, unknown> = AGENT_INPUT_BASE,
+) =>
+  handlers.PostToolUse!(
+    base({
+      hook_event_name: "PostToolUse",
+      tool_name: "Agent",
+      tool_input: input,
+      tool_use_id: toolUseId,
+      tool_response: response,
+      ...over,
+    }),
+  );
+
+const AGENT_INPUT_BASE: Record<string, unknown> = {
+  description: "find the parser",
+  prompt: "Find where the config parser is defined and list its callers.",
+};
+
 const AGENT_INPUT = {
   description: "find the parser",
   prompt: "Find where the config parser is defined and list its callers.",
@@ -180,6 +204,7 @@ describe("disabled adjudicator", () => {
     await prompt("Refactor the storage adapter so every store shares one transaction helper.");
     const pre = await preTool("Agent", { ...AGENT_INPUT });
     await preTool("Bash", { command: "pwd" });
+    await postAgent("toolu_off", { status: "async_launched", agentId: "aoff", resolvedModel: "x" });
     await handlers.SessionEnd!(base({ hook_event_name: "SessionEnd", reason: "exit" }));
     expect(seen.loaded).toBe(false);
     expect(rows()).toHaveLength(0);
@@ -192,6 +217,7 @@ describe("disabled adjudicator", () => {
     expect(m.afterRouting).not.toHaveBeenCalled();
     expect(m.onSessionStart).not.toHaveBeenCalled();
     expect(m.onSessionEnd).not.toHaveBeenCalled();
+    expect(m.onPostAgent).not.toHaveBeenCalled();
   });
 });
 
@@ -559,6 +585,149 @@ describe("PreToolUse non-Agent tools", () => {
   });
 });
 
+describe("PostToolUse Agent: the exact dispatch → subagent link", () => {
+  const SONNET = "claude-sonnet-5-5";
+
+  /** Two parallel same-tier dispatches in one session, plus each subagent's own calls. */
+  async function twoParallel(prefix: string) {
+    await preTool("Agent", { ...AGENT_INPUT, description: "first" }, { tool_use_id: `${prefix}1` });
+    await preTool(
+      "Agent",
+      { ...AGENT_INPUT, description: "second" },
+      { tool_use_id: `${prefix}2` },
+    );
+    const [r1, r2] = rowsOf(sid, "agent").sort((a, b) => a.id - b.id);
+    const t = Math.max(r1!.ts, r2!.ts);
+    db().apiCallsUpsert([
+      call({
+        sidechain: 1,
+        agent_id: `${prefix}-agent1`,
+        model: SONNET,
+        ts: t + 1_000,
+        input_tokens: 111,
+      }),
+      call({
+        sidechain: 1,
+        agent_id: `${prefix}-agent2`,
+        model: SONNET,
+        ts: t + 1_000,
+        input_tokens: 222,
+      }),
+      // A main-thread call past the link window: ingestion has seen the whole window.
+      call({ model: "claude-opus-5-5", ts: t + 2 * 60_000 }),
+    ]);
+    return { r1: r1!, r2: r2!, t };
+  }
+
+  it("links two parallel same-tier dispatches exactly, where window matching cannot", async () => {
+    configure({ enabled: true, mode: "advise", promptMode: "heuristic" });
+    const { reconcile } = await import("../../src/adjudicator/learn.js");
+
+    // Control: without PostToolUse, reconcile leaves both rows unlinked (ambiguous).
+    const control = await twoParallel("toolu_ctl");
+    reconcile(db(), { now: control.t + 5 * 60_000 });
+    expect(db().adjudicator.get(control.r1.id)!.agentId ?? null).toBeNull();
+    expect(db().adjudicator.get(control.r2.id)!.agentId ?? null).toBeNull();
+
+    sid = `S${++session}`;
+    const { r1, r2, t } = await twoParallel("toolu_par");
+    // Results arrive in the other order; the foreground and background shapes both carry agentId.
+    await postAgent("toolu_par2", {
+      isAsync: true,
+      status: "async_launched",
+      agentId: "toolu_par-agent2",
+      description: "second",
+      prompt: "p",
+      outputFile: "/tmp/x",
+      resolvedModel: SONNET,
+    });
+    await postAgent("toolu_par1", {
+      status: "completed",
+      agentId: "toolu_par-agent1",
+      agentType: "general-purpose",
+      content: [{ type: "text", text: "done" }],
+      resolvedModel: SONNET,
+      totalTokens: 10,
+      totalDurationMs: 5,
+      totalToolUseCount: 1,
+      usage: { input_tokens: 1, output_tokens: 1 },
+    });
+    const { onPostAgent } = await hooksModule();
+    expect(onPostAgent).toHaveBeenCalledTimes(2);
+    let a = db().adjudicator.get(r1.id)!;
+    let b = db().adjudicator.get(r2.id)!;
+    expect(a.agentId).toBe("toolu_par-agent1");
+    expect(b.agentId).toBe("toolu_par-agent2");
+    expect(a.actualModel).toBe(SONNET);
+    expect(b.actualModel).toBe(SONNET);
+
+    // Reconcile keeps the exact links and prices each row from its own subagent's calls.
+    reconcile(db(), { now: t + 5 * 60_000 });
+    a = db().adjudicator.get(r1.id)!;
+    b = db().adjudicator.get(r2.id)!;
+    expect(a.agentId).toBe("toolu_par-agent1");
+    expect(b.agentId).toBe("toolu_par-agent2");
+    expect(a.actualTokens).toBe(121);
+    expect(b.actualTokens).toBe(232);
+  });
+
+  it("keeps an existing link, ignores other tools and unknown ids, and never throws", async () => {
+    const ctx = configure({ enabled: true, mode: "advise", promptMode: "heuristic" });
+    await preTool("Agent", { ...AGENT_INPUT }, { tool_use_id: "toolu_keep" });
+    const row = rowsOf(sid, "agent")[0]!;
+    db().adjudicator.update(row.id, { agentId: "earlier", actualModel: "claude-haiku-5" });
+    const { onPostAgent } = await hooksModule();
+    const post = (over: Partial<HookInput>) =>
+      onPostAgent(ctx, db(), base({ hook_event_name: "PostToolUse", tool_name: "Agent", ...over }));
+    expect(
+      post({ tool_use_id: "toolu_keep", tool_response: { agentId: "later" } }),
+    ).toBeUndefined();
+    expect(db().adjudicator.get(row.id)!.agentId).toBe("earlier");
+    expect(post({ tool_use_id: "toolu_none", tool_response: { agentId: "x" } })).toBeUndefined();
+    expect(
+      post({ tool_name: "Bash", tool_use_id: "toolu_keep", tool_response: {} }),
+    ).toBeUndefined();
+    expect(
+      post({ tool_use_id: "toolu_keep", tool_response: "User rejected tool use" }),
+    ).toBeUndefined();
+    expect(post({ tool_use_id: "toolu_keep", tool_response: null })).toBeUndefined();
+    expect(db().adjudicator.get(row.id)!.actualModel).toBe("claude-haiku-5");
+  });
+
+  it("falls back to subagents/agent-<id>.meta.json when tool_response has no agentId", async () => {
+    configure({ enabled: true, mode: "advise", promptMode: "heuristic" });
+    const dir = mkdtempSync(join(tmpdir(), "em-adj-transcript-"));
+    const transcript = join(dir, `${sid}.jsonl`);
+    writeFileSync(transcript, "");
+    mkdirSync(join(dir, sid, "subagents"), { recursive: true });
+    writeFileSync(
+      join(dir, sid, "subagents", "agent-aother.meta.json"),
+      JSON.stringify({ agentType: "x", toolUseId: "toolu_other" }),
+    );
+    writeFileSync(join(dir, sid, "subagents", "agent-abad.meta.json"), "{not json");
+    writeFileSync(
+      join(dir, sid, "subagents", "agent-a5b21cc6.meta.json"),
+      JSON.stringify({ agentType: "general-purpose", toolUseId: "toolu_meta" }),
+    );
+    const { agentLinkOf } = await hooksModule();
+    expect(agentLinkOf({ tool_use_id: "toolu_meta", transcript_path: transcript })).toEqual({
+      agentId: "a5b21cc6",
+    });
+    expect(agentLinkOf({ tool_use_id: "toolu_gone", transcript_path: transcript })).toBeUndefined();
+    expect(agentLinkOf({ tool_use_id: "toolu_meta" })).toBeUndefined();
+
+    await preTool(
+      "Agent",
+      { ...AGENT_INPUT },
+      { tool_use_id: "toolu_meta", transcript_path: transcript },
+    );
+    await postAgent("toolu_meta", { status: "completed" }, { transcript_path: transcript });
+    const row = rowsOf(sid, "agent")[0]!;
+    expect(row.agentId).toBe("a5b21cc6");
+    expect(row.actualModel ?? null).toBeNull();
+  });
+});
+
 describe("Cursor, SessionStart and SessionEnd", () => {
   it("skips the Cursor client on every surface", async () => {
     configure(
@@ -576,6 +745,8 @@ describe("Cursor, SessionStart and SessionEnd", () => {
     const out = await preTool("Agent", { ...AGENT_INPUT }, { client: "cursor" });
     expect(out?.hookSpecificOutput?.updatedInput).toBeUndefined();
     expect(rowsOf(sid)).toHaveLength(0);
+    await postAgent("toolu_cursor", { agentId: "acur" }, { client: "cursor" });
+    expect((await hooksModule()).onPostAgent).not.toHaveBeenCalled();
   });
 
   it("SessionEnd reconciles: a settled row without a session goes final", async () => {
