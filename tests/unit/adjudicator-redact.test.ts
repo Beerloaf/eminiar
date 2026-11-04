@@ -103,7 +103,71 @@ const LEAKS: Array<[string, string, string]> = [
   ["mysql -p", "mysql -uroot -pS3cr3tRootPw db", "S3cr3tRootPw"],
   ["mysqldump -p", "mysqldump -h db -u root -p'quoted pw' app", "quoted pw"],
   ["prose with a password-like word", "the admin password is Wint3rIsComing", "Wint3rIsComing"],
+  ["prose secret is", "the stripe webhook signing secret is Hunt3rPw9xyz", "Hunt3rPw9xyz"],
   ["hex 24+", "secret hash 0123456789abcdef0123456789abcde", "0123456789abcdef0123456789abcde"],
+  // CLI password flags and credential files
+  ["docker login -p", "docker login -u deploy -p Hunt3rPw9 registry.example.com", "Hunt3rPw9"],
+  ["podman login -p quoted", "podman login -u me -p 'Hunt3r Pw9' quay.io", "Hunt3r Pw9"],
+  ["helm registry login -p", "helm registry login ghcr.io -u me -p Hunt3rPw9", "Hunt3rPw9"],
+  ["docker login --password", "docker login --password Hunt3rPw9 x.io", "Hunt3rPw9"],
+  [
+    "echo | docker login --password-stdin",
+    "echo Hunt3rPw9 | docker login -u me --password-stdin ghcr.io",
+    "Hunt3rPw9",
+  ],
+  [
+    "printf | --password-stdin",
+    "printf '%s' 'Hunt3rPw9' | podman login --password-stdin -u me quay.io",
+    "Hunt3rPw9",
+  ],
+  ["--password-stdin <<<", "docker login -u me --password-stdin <<< 'Hunt3rPw9' x.io", "Hunt3rPw9"],
+  ["sshpass -p", "sshpass -p 'Hunt3rPw9' ssh admin@10.0.0.4", "Hunt3rPw9"],
+  ["sshpass -p attached", "sshpass -pHunt3rPw9 ssh admin@host", "Hunt3rPw9"],
+  ["sshpass -v -p", "sshpass -v -p Hunt3rPw9 ssh -p 2222 admin@host", "Hunt3rPw9"],
+  ["redis-cli -a", "redis-cli -h cache -a Hunt3rPw9 ping", "Hunt3rPw9"],
+  ["mongosh -p", "mongosh --host db -u admin -p Hunt3rPw9", "Hunt3rPw9"],
+  ["ldapsearch -w", "ldapsearch -x -D cn=admin -w Hunt3rPw9 -b dc=x", "Hunt3rPw9"],
+  ["zip -P", "zip -r -P Hunt3rPw9 out.zip dir", "Hunt3rPw9"],
+  ["7z -p", "7z a -pHunt3rPw9 out.7z dir", "Hunt3rPw9"],
+  ["htpasswd -b", "htpasswd -b .htpasswd admin Hunt3rPw9", "Hunt3rPw9"],
+  ["htpasswd -nb", "htpasswd -nb admin Hunt3rPw9", "Hunt3rPw9"],
+  ["openssl pass:", "openssl rsa -in k.pem -passin pass:Hunt3rPw9 -out x.pem", "Hunt3rPw9"],
+  ["keytool -storepass", "keytool -list -keystore ks.jks -storepass Hunt3rPw9", "Hunt3rPw9"],
+  ["smbclient -U user%pass", "smbclient //srv/share -U admin%Hunt3rPw9", "Hunt3rPw9"],
+  ["--token=", "gh auth --token=Hunt3rPw9xyz", "Hunt3rPw9xyz"],
+  [
+    "kubectl --from-literal",
+    "kubectl create secret generic db --from-literal=password=Hunt3rPw9",
+    "Hunt3rPw9",
+  ],
+  [
+    ".netrc one line",
+    "my ~/.netrc has: machine api.heroku.com login me password Hunt3rPw9",
+    "Hunt3rPw9",
+  ],
+  [".netrc password first", "machine github.com password Hunt3rPw9 login me", "Hunt3rPw9"],
+  [
+    ".netrc multi-line",
+    "machine api.heroku.com\n  login me@x.io\n  password Hunt3rPw9\n",
+    "Hunt3rPw9",
+  ],
+  [".netrc default", "default login anonymous password Hunt3rPw9", "Hunt3rPw9"],
+  [".netrc login/password lines", "login me\npassword Hunt3rPw9", "Hunt3rPw9"],
+  ["Cookie header", "Cookie: session=Hunt3rPw9xyzLongSessionValue", "Hunt3rPw9xyz"],
+  ["Cookie second value", "cookie: a=1; csrftoken=Hunt3rPw9xyz", "Hunt3rPw9xyz"],
+  [
+    "Set-Cookie",
+    "Set-Cookie: sid=Hunt3rPw9xyz; Path=/; HttpOnly; Secure; SameSite=Lax",
+    "Hunt3rPw9xyz",
+  ],
+  ["curl -H Cookie", "curl -H 'Cookie: sid=Hunt3rPw9xyz' https://x", "Hunt3rPw9xyz"],
+  ["curl -b", "curl -b 'sid=Hunt3rPw9xyz; theme=dark' https://x", "Hunt3rPw9xyz"],
+  ["curl --cookie", "curl --cookie sid=Hunt3rPw9xyz https://x", "Hunt3rPw9xyz"],
+  // invisible and compatibility characters inside a secret's name
+  ["zero-width in name", "PASS​WORD=Hunt3rPw9", "Hunt3rPw9"],
+  ["BOM and soft hyphen in name", "DB_PAS­S=Hunt3rPw9 ﻿API_KEY=Hunt3rPw8", "Hunt3rPw"],
+  ["fullwidth =", "DB_PASSWORD＝Hunt3rPw9", "Hunt3rPw9"],
+  ["fullwidth name", "ＤＢ_ＰＡＳＳ=Hunt3rPw9", "Hunt3rPw9"],
 ];
 
 /** Must come back exactly as given. */
@@ -136,6 +200,31 @@ const KEEP: string[] = [
   "secret_key_name: MY_SECRET",
   "use pk_test in docs",
   "-----BEGIN PUBLIC KEY-----",
+  // short flags that are not passwords
+  "mkdir -p src/a/b && cp -p a.txt b.txt",
+  "ssh -p 22 admin@host",
+  "scp -P 2222 file host:/tmp",
+  "psql -h db -p 5432 -U postgres app",
+  "docker login ghcr.io && docker run -p 8080:80 nginx",
+  "docker login -u me --password-stdin ghcr.io",
+  "echo $CR_PAT | docker login ghcr.io -u me --password-stdin",
+  'echo "$TOKEN" | docker login --password-stdin',
+  "sshpass -f pw.txt ssh -p 22 admin@host",
+  "sshpass -e ssh -p 2222 admin@host",
+  "redis-cli -h cache -p 6379 ping",
+  "git checkout -b feature/redact",
+  "htpasswd -c .htpasswd admin",
+  "openssl rsa -in k.pem -passin env:KEY_PASS",
+  "keytool -list -storepass:env STORE_PASS",
+  "curl -b cookies.txt https://x",
+  "gzip -P 4 big.log",
+  "tar -czpf out.tgz dir",
+  // prose that only mentions the words
+  "the machine password is managed by vault",
+  "by default the password is required",
+  "the token is expired and the secret was rotated",
+  "the login page password field is blank",
+  "set a cookie: it expires",
 ];
 
 describe("redact: secrets are masked", () => {
@@ -159,6 +248,38 @@ describe("redact: secrets are masked", () => {
     expect(
       redact("a\n-----BEGIN PGP PRIVATE KEY BLOCK-----\nx\n-----END PGP PRIVATE KEY BLOCK-----\nb"),
     ).toBe("a\n[private key]\nb");
+  });
+
+  it("keeps the command and the names around a masked CLI password or cookie", () => {
+    expect(redact("docker login -u deploy -p Hunt3rPw9 registry.example.com")).toBe(
+      "docker login -u deploy -p *** registry.example.com",
+    );
+    expect(redact("sshpass -p 'Hunt3rPw9' ssh -p 22 admin@host")).toBe(
+      "sshpass -p '***' ssh -p 22 admin@host",
+    );
+    expect(redact("docker login -u me -p pw1x && docker run -p 8080:80 nginx")).toBe(
+      "docker login -u me -p *** && docker run -p 8080:80 nginx",
+    );
+    expect(redact("htpasswd -nb admin Hunt3rPw9")).toBe("htpasswd -nb admin ***");
+    expect(redact("smbclient //s/x -U admin%Hunt3rPw9")).toBe("smbclient //s/x -U admin%***");
+    expect(redact("machine github.com login me password Hunt3rPw9")).toBe(
+      "machine github.com login me password ***",
+    );
+    expect(redact('machine x.io login me password "a b"')).toBe(
+      'machine x.io login me password "***"',
+    );
+    expect(redact("Cookie: a=1; csrftoken=Hunt3rPw9xyz")).toBe("Cookie: a=***; csrftoken=***");
+    expect(redact("Set-Cookie: sid=Hunt3rPw9; Path=/; Max-Age=3600; HttpOnly")).toBe(
+      "Set-Cookie: sid=***; Path=/; Max-Age=3600; HttpOnly",
+    );
+    expect(redact("echo Hunt3rPw9 | docker login --password-stdin")).toBe(
+      "echo *** | docker login --password-stdin",
+    );
+  });
+
+  it("strips invisible characters and applies NFKC before matching", () => {
+    expect(redact("PASS​WORD=Hunt3rPw9")).toBe("PASSWORD=***");
+    expect(redact("DB_PASSWORD＝Hunt3rPw9")).toBe("DB_PASSWORD=***");
   });
 
   it("masks a YAML block scalar only as deep as it is indented", () => {
@@ -221,7 +342,9 @@ describe("redact: performance", () => {
   it("redacts 100 KB of realistic text in under 20 ms", () => {
     const chunk =
       "Please fix the race in src/session/store.ts where keyEnv is read twice; export DB_PASS=Tr0ub4dor&3x and " +
-      'run `curl -u admin:pw https://x` then {"password": "a b c"} and ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123 ok.\n';
+      'run `curl -u admin:pw https://x` then {"password": "a b c"} and ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123 ok.\n' +
+      "docker login -u me -p pw1x x.io; sshpass -p pw ssh -p 22 h; machine x.io login me password pw\n" +
+      "curl -H 'Cookie: sid=abc; t=1' -b 'a=b' https://x and mkdir -p out\n";
     const text = chunk.repeat(Math.ceil(100_000 / chunk.length)).slice(0, 100_000);
     const best = Math.min(time(text), time(text), time(text));
     expect(best).toBeLessThan(20);
@@ -256,6 +379,33 @@ describe("redact: performance", () => {
       "http://a:b@".repeat(n / 11),
       "--password ".repeat(n / 11),
       " -u a:".repeat(n / 6),
+      "docker login ".repeat(n / 13),
+      "docker login -p".repeat(n / 15),
+      "redis-cli -a".repeat(n / 12),
+      "sshpass -v x".repeat(n / 12),
+      "sshpass".concat(" -f x".repeat(n / 5)),
+      "htpasswd -b".repeat(n / 11),
+      "htpasswd".concat(" -b a".repeat(n / 5)),
+      "echo a ".repeat(n / 7),
+      "echo a | ".repeat(n / 9),
+      "--password-stdin ".repeat(n / 17),
+      "--password-stdin <<<".repeat(n / 20),
+      "machine a ".repeat(n / 10),
+      "machine a login b ".repeat(n / 18),
+      "machine a".concat(" ".repeat(n)),
+      "machine a".concat("\n".repeat(n)),
+      "login a\n".repeat(n / 8),
+      "Cookie: ".repeat(n / 8),
+      "Cookie: ".concat("a=b;".repeat(n / 4)),
+      "Cookie: a".concat("=".repeat(n)),
+      "curl -b".repeat(n / 7),
+      " -U a%".repeat(n / 6),
+      "-passin pass:".repeat(n / 13),
+      "-storepass ".repeat(n / 11),
+      "7z -p".repeat(n / 5),
+      "secret is 1".repeat(n / 11),
+      "​".repeat(n),
+      "a​=".repeat(n / 3),
     ];
     for (const s of inputs) expect(time(s), s.slice(0, 20)).toBeLessThan(100);
   });

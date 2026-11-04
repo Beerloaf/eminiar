@@ -159,6 +159,38 @@ function maskYamlBlocks(text: string): string {
   return lines.join("\n");
 }
 
+/** Set-Cookie attributes: their values are not secrets and stay readable. */
+const COOKIE_ATTRIBUTES = new Set([
+  "path",
+  "domain",
+  "expires",
+  "max-age",
+  "samesite",
+  "secure",
+  "httponly",
+  "priority",
+  "partitioned",
+  "version",
+  "comment",
+]);
+
+/** `a=1; b=2; Path=/` → `a=***; b=***; Path=/`. */
+function maskCookiePairs(pairs: string): string {
+  return pairs.replace(
+    /(^|;[ \t]*)([^=;]+)=([^;]*)/g,
+    (m, sep: string, name: string, value: string) =>
+      !value || value === "***" || COOKIE_ATTRIBUTES.has(name.trim().toLowerCase())
+        ? m
+        : `${sep}${name}=***`,
+  );
+}
+
+/**
+ * Characters that are invisible or change direction: a zero-width space inside `PASS​WORD=` would
+ * otherwise split the name so the rules miss it. Stripped before any rule runs.
+ */
+const INVISIBLE = /[­᠎​-‏‪-‮⁠-⁤⁦-⁩﻿]/g;
+
 type Rule =
   | [RegExp, string | ((...m: string[]) => string)]
   | ["assignments", typeof maskAssignments];
@@ -190,9 +222,65 @@ const RULES: Rule[] = [
     /\b((?:mysql|mysqldump|mysqladmin|mariadb|mariadb-dump)\b[^\n]{0,300}?(?<!\S)-p)(?![\s*])(?:(["'])[^\n]{0,256}?\2|[^\s"']+)/g,
     "$1$2***$2",
   ],
-  // Prose: "the password is Wint3rIsComing" (only when the word looks like a password).
+  // Tools whose short password flag takes the next word, only on that tool's own command (the
+  // context stops at ; & | so `docker login … && docker run -p 8080:80` keeps the port):
+  // registry logins -p, mongo* -p, redis-cli -a, ldap* -w, zip/unzip -P, mosquitto_* -P.
   [
-    /\b(pass(?:word|phrase|wd)[ \t]+(?:is|was)[ \t]*:?[ \t]+)(["']?)(?=[^\s"']{0,128}[\d!@#$%^&*])(?!\*\*\*)[^\s"']{4,128}\2/gi,
+    /\b((?:(?:(?:docker|podman|nerdctl|buildah|skopeo|oras|finch)(?:[ \t]+registry)?|helm[ \t]+registry|crane[ \t]+auth)[ \t]+login\b[^\n;&|]{0,300}?(?<!\S)-p|mongo(?:sh|dump|restore|import|export|stat|top|files)?\b[^\n;&|]{0,300}?(?<!\S)-p|redis-cli\b[^\n;&|]{0,300}?(?<!\S)-a|ldap(?:search|add|modify|delete|whoami|passwd|compare|modrdn|exop)\b[^\n;&|]{0,300}?(?<!\S)-w|(?:zip|unzip|zipcloak)\b[^\n;&|]{0,300}?(?<!\S)-P|mosquitto_(?:pub|sub|rr)\b[^\n;&|]{0,300}?(?<!\S)-P)[ \t]+)(?!-|\*\*\*)(?:(["'])[^\n]{0,256}?\2|[^\s"']+)/g,
+    "$1$2***$2",
+  ],
+  // 7z -p<password> (attached, like mysql)
+  [
+    /\b(7z[az]?\b[^\n;&|]{0,300}?(?<!\S)-p)(?![\s*])(?:(["'])[^\n]{0,256}?\2|[^\s"']+)/g,
+    "$1$2***$2",
+  ],
+  // sshpass -p <password> / -p<password>: only sshpass's own options may come before it, so
+  // `sshpass -f file ssh -p 22 host` keeps ssh's port.
+  [
+    /\b(sshpass(?:[ \t]+(?:-[fdP][ \t]*[^\s-]\S*|-[a-oq-zA-Z]\S*)){0,3}[ \t]+-p[ \t]*)(?!-|\*\*\*)(?:(["'])[^\n]{0,256}?\2|[^\s"']+)/g,
+    "$1$2***$2",
+  ],
+  // htpasswd -b[n] [file] user password: the last word is the password.
+  [
+    /\b(htpasswd((?:[ \t]+-[A-Za-z]+){1,4})[ \t]+)([^\s-]\S*)[ \t]+([^\s-]\S*)(?:[ \t]+([^\s-]\S*))?/g,
+    (m: string, pre = "", flags = "", a = "", b = "", c?: string) => {
+      if (!/b/.test(flags)) return m;
+      if (/n/.test(flags))
+        return b === "***" ? m : `${pre}${a} ***${c === undefined ? "" : ` ${c}`}`;
+      return c === undefined || c === "***" ? m : `${pre}${a} ${b} ***`;
+    },
+  ],
+  // echo <password> | docker login --password-stdin, and … --password-stdin <<< <password>
+  [
+    /(?<!\S)((?:echo(?:[ \t]+-[neE]+)?|printf(?:[ \t]+(["'])%s(?:\\n)?\2)?)[ \t]+)(["']?)(?!\$|\*\*\*)[^\s"'|]{1,256}\3(?=[ \t]*\|[^\n]{0,200}?--password-stdin\b)/g,
+    "$1$3***$3",
+  ],
+  [/(--password-stdin\b[^\n]{0,200}?<<<[ \t]*)(["']?)(?!\$|\*\*\*)[^\s"']{1,256}\2/g, "$1$2***$2"],
+  // openssl -pass/-passin/-passout pass:<password> (env:/file:/fd: name a source, kept)
+  [/(?<!\S)(-pass(?:in|out)?[ \t]+pass:)(?!\*\*\*)[^\s"']+/g, "$1***"],
+  // keytool -storepass x / -keypass x (… -storepass:env VAR names a source, kept)
+  [
+    /(?<!\S)(-(?:store|key|srcstore|deststore|srckey|destkey)pass[ \t]+)(?!-|\*\*\*)(?:(["'])[^\n]{0,256}?\2|[^\s"']+)/g,
+    "$1$2***$2",
+  ],
+  // smbclient / rpcclient -U user%password (the user stays)
+  [/(?<!\S)(-U[ \t]*)(["']?)([^\s%"']+)%(?!\*\*\*)[^\s"']+\2/g, "$1$2$3%***$2"],
+  // .netrc: `machine host login me password x` on one line or across lines, `default …`, and a
+  // bare `login me` / `password x` pair of lines.
+  [
+    /((?:\bmachine[ \t]+[^\s]+|^[ \t]*default\b)(?:\s+(?:login|account)[ \t]+[^\s]+){0,2}\s+password[ \t]+|^[ \t]*login[ \t]+[^\s]+[ \t]*\n[ \t]*password[ \t]+)(?!\*\*\*)("[^"\n]{0,256}"|[^\s"]+)/gm,
+    (_m: string, pre = "", v = "") => `${pre}${v.startsWith('"') ? '"***"' : "***"}`,
+  ],
+  // Cookie / Set-Cookie headers (and curl --cookie / -b): every cookie value goes, the names and
+  // the Set-Cookie attributes (Path, Expires, …) stay.
+  [
+    /(\b(?:Set-)?Cookie["']?[ \t]*:[ \t]*["']?|(?:\bcurl\b[^\n;&|]{0,300}?(?<!\S)-b|(?<!\S)--cookie)(?:[ \t]+|=)["']?)([^\s=;,"'`]+=[^\s;,"'`]*(?:;[ \t]*[^\s=;,"'`]+(?:=[^\s;,"'`]*)?)*)/gi,
+    (_m: string, pre = "", pairs = "") => pre + maskCookiePairs(pairs),
+  ],
+  // Prose: "the password is Wint3rIsComing", "the signing secret was x9-y" (only when the word
+  // looks like a secret: it has a digit or a symbol).
+  [
+    /\b((?:pass(?:word|phrase|wd)|secret|token|api[ -]?key|access[ -]key)[ \t]+(?:is|was)[ \t]*:?[ \t]+)(["']?)(?=[^\s"']{0,128}[\d!@#$%^&*])(?!\*\*\*)[^\s"']{4,128}\2/gi,
     "$1$2***$2",
   ],
   [/\b(sk|rk|pk)_(live|test)_[A-Za-z0-9]{10,}/g, "$1_$2_***"],
@@ -219,9 +307,13 @@ const RULES: Rule[] = [
   ],
 ];
 
-/** Mask secrets, emails and long hex/base64 runs. Idempotent; linear in the input. */
+/**
+ * Mask secrets, emails and long hex/base64 runs. Idempotent; linear in the input. The text is
+ * NFKC-normalised (fullwidth `＝` becomes `=`) and stripped of invisible characters first, so
+ * neither can hide a secret's name from the rules.
+ */
 export function redact(text: string): string {
-  let out = maskYamlBlocks(text);
+  let out = maskYamlBlocks(text.normalize("NFKC").replace(INVISIBLE, ""));
   for (const rule of RULES) {
     if (rule[0] === "assignments") out = rule[1](out);
     else if (typeof rule[1] === "string") out = out.replace(rule[0], rule[1]);
