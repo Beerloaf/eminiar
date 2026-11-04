@@ -92,8 +92,7 @@ const NOT_A_SECRET_VALUE =
 // the regex backtracks badly on long identifier runs), and only for a secret name does the
 // sticky ASSIGN_VALUE read the value. A non-secret name never consumes the text after it, so
 // `.env: FOO_KEY=x` and `https://…?token=x` are still found.
-const ASSIGN_NAME =
-  /(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+)(["'`]?[ \t]*(?::=|=>|[:=])[ \t]*)/g;
+const ASSIGN_NAME = /(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+)(["'`]?[ \t]*(?::=|=>|[:=])[ \t]*)/g;
 // A quoted value may contain spaces and escapes and is capped, so an unclosed quote stays cheap.
 // A bare value runs to whitespace or a quote, or to a `&` / `;` / `,` that ends the value (the
 // end of the text, or the next `name=` pair); it never starts with `=`, `<`, a bracket or a YAML
@@ -176,15 +175,11 @@ const RULES: Rule[] = [
   // Authorization / Proxy-Authorization headers: the scheme stays, the credentials go.
   [
     /\b((?:Proxy-)?Authorization["']?[ \t]*[:=][ \t]*["']?)(?!(?:(?:Basic|Bearer|Token|Digest|Negotiate|NTLM|ApiKey|Key)[ \t]+)?\*\*\*)(?:(Basic|Bearer|Token|Digest|Negotiate|NTLM|ApiKey|Key)[ \t]+)?[^\s"'`]+/gi,
-    (_m: string, pre = "", scheme = "") =>
-      `${pre}${scheme ? `${scheme} ` : ""}***`,
+    (_m: string, pre = "", scheme = "") => `${pre}${scheme ? `${scheme} ` : ""}***`,
   ],
   [/\bBearer[ \t]+(?!\*\*\*)[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer ***"],
   // curl -u / --user user:pass (the user stays)
-  [
-    /(?<!\S)(-u|--user)([ \t]*=?[ \t]*)(["']?)([^\s:"'@]+):(?!\*\*\*)[^\s"']+\3/g,
-    "$1$2$3$4:***$3",
-  ],
+  [/(?<!\S)(-u|--user)([ \t]*=?[ \t]*)(["']?)([^\s:"'@]+):(?!\*\*\*)[^\s"']+\3/g, "$1$2$3$4:***$3"],
   // --password x, --token x, --api-key x, --client-secret x … (the `=` form is an assignment)
   [
     /(?<!\S)(--(?:[a-z0-9]+-){0,4}(?:password|passwd|pass|passphrase|token|secret|api-?key|access-key|secret-key|auth-token|credentials?))([ \t]+)(?!-|\*\*\*)(?:(["'])[^\n]{0,256}?\3|[^\s"']+)/gi,
@@ -215,10 +210,7 @@ const RULES: Rule[] = [
   [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, "[jwt]"],
   ["assignments", maskAssignments],
   // (the local part starts at the start of its run, not at every \b inside it: `--a-a-a…`)
-  [
-    /(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g,
-    "[email]",
-  ],
+  [/(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, "[email]"],
   [/\b[0-9a-fA-F]{24,}\b/g, "[hex]"],
   // base64 / base64url runs of 32+ chars mixing upper, lower and digits (not a word or a path)
   [
@@ -240,9 +232,7 @@ export function redact(text: string): string {
 
 /** The redacted head kept in the DB: at most n chars (code points), with "…" when cut. */
 export function head(text: string, n = 80): string {
-  const chars = Array.from(
-    redact(normalize(maskYamlBlocks(text))).replace(/\s+/g, " "),
-  );
+  const chars = Array.from(redact(normalize(maskYamlBlocks(text))).replace(/\s+/g, " "));
   if (chars.length <= n) return chars.join("");
   return `${chars.slice(0, Math.max(0, n - 1)).join("")}…`;
 }
