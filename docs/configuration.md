@@ -146,6 +146,73 @@ eminiar merges four layers. A later layer overrides an earlier one.
 
 See [Usage insights](usage.md) for the sources, the privacy notes and the savings model.
 
+### `adjudicator`
+
+Optional and off by default. See [Adjudicator](adjudicator.md). Two rules apply to this section
+only:
+
+- It must not hold a key. A field named like `apiKey`, `token`, `secret` or `password` makes the
+  config invalid. Keys go in `~/.eminiar/adjudicator.key` (`eminiar adjudicator key set`) or an
+  environment variable named by `keyEnv`.
+- `remoteConsent` is read from `~/.eminiar/config.json` and the environment only. It is ignored
+  in the committed `eminiar.config.json`.
+
+| Key | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Turn the adjudicator on. `EMINIAR_ADJUDICATOR=0` is the kill switch |
+| `provider` | `"heuristic"` | `heuristic`, `embedding`, `typesafe` (Jev) or `openai-compatible` |
+| `mode` | `"advise"` | `advise` only suggests; `apply` may set the Agent `model` (best effort) |
+| `surfaces.prompt` | `true` | Score prompts (UserPromptSubmit) |
+| `surfaces.agent` | `true` | Score subagent dispatches (PreToolUse on `Agent`) |
+| `surfaces.plan` | `true` | Add suggestions to `em_swarm plan` |
+| `surfaces.tools` | `false` | Hint when a raw tool call contradicts the prompt's advised `em_*` tool |
+| `promptMode` | `"async"` | How the provider runs on a prompt: `async` (detached; the heuristic answers now), `blocking` (inline within `timeouts.promptMs`) or `heuristic` (never) |
+| `typesafe.model` | `"jev-1.14.0"` | Jev model. `jev-latest` and `jev-preview` are replaced by the pinned version |
+| `typesafe.baseUrl` | `"https://api.typesafe.ai/v1"` | Jev endpoint |
+| `openai.preset` | `"groq"` | `groq`, `cerebras`, `ollama`, `lmstudio`, `llamacpp` or `custom` |
+| `openai.baseUrl` | unset (the preset's) | Overrides the preset's URL; required for `custom`. A non-loopback URL makes any preset remote |
+| `openai.model` | unset (the preset's) | Overrides the preset's model; required for `custom` |
+| `openai.json` | `"auto"` | `schema` (strict JSON schema), `object` (JSON mode) or `auto` (schema, falling back to JSON mode when the server rejects it) |
+| `openai.price.inPerM` | unset (the preset's) | USD per million input tokens. Without a price, a preset with an unknown price reports no cost |
+| `openai.price.outPerM` | unset (the preset's) | USD per million output tokens |
+| `embedding.k` | `5` | Nearest examples that vote |
+| `embedding.minSimilarity` | `0.55` | Cosine similarity below which an example does not count; with none, the heuristic answers |
+| `keyEnv` | unset | The NAME of an environment variable holding the key, never the key |
+| `remoteConsent` | `false` | Consent to send redacted text to a remote provider. Set by `enable`/`provider` after you agree |
+| `timeouts.promptMs` | `1200` | Provider deadline on prompts (remote providers) |
+| `timeouts.agentMs` | `800` | Provider deadline on dispatches and tool hints (remote providers) |
+| `timeouts.planMs` | `3000` | Deadline for a plan batch, `em_adjudicate score` and each eval chunk |
+| `timeouts.localMs` | `600` | Provider deadline on prompts and dispatches for local providers |
+| `timeouts.connectMs` | `150` | Port probe timeout for `provider --detect` |
+| `minPromptChars` | `12` | Shorter prompts are not scored |
+| `tiers` | `["haiku", "sonnet", "opus"]` | The model ladder, smallest first. Add `"fable"` to allow it |
+| `weights.providerMax` | `0.7` | Largest weight a Jev or OpenAI-compatible answer gets in the blend |
+| `weights.embeddingMax` | `0.4` | Largest weight an embedding answer gets |
+| `weights.selfReportScale` | `0.6` | Multiplier on a model's self-reported confidence (Jev's calibrated confidence is used as is) |
+| `weights.lowConfidence` | `0.55` | A tier choice below this confidence moves one tier up |
+| `weights.tierCenters` | `{"haiku": 0.6, "sonnet": 2.0, "opus": 3.4}` | The complexity each tier fits best |
+| `weights.features` | `{}` | Per-feature weight overrides, for example `{"design": 2.0}`. `asymmetry` (default 2) sets how strongly the tier leans up; `toolProvider` above 0 lets a provider vote on the tool |
+| `apply.scope` | `"swarm"` | In apply mode, set the model on swarm worker dispatches only (`swarm`) or on every dispatch (`all`) |
+| `apply.minConfidence` | `0.7` | Apply only at or above this tier confidence |
+| `apply.floor` | `"haiku"` | Smallest tier apply mode sets |
+| `apply.ceiling` | `"opus"` | Largest tier apply mode sets |
+| `apply.respectFrontmatter` | `true` | Leave a dispatch alone when its agent file pins a `model` (`inherit` is not a pin) |
+| `advice.mainSession` | `"user"` | Main-session `/model` note: `user` (shown to you), `context` (to Claude) or `off` |
+| `advice.cooldownPrompts` | `8` | At most one main-session note per this many prompts |
+| `learning.enabled` | `true` | Learn a bias from outcomes and feedback |
+| `learning.maxBias` | `0.3` | Bound on the learned bias |
+| `learning.minSamples` | `5` | Outcomes a bucket needs before its bias applies |
+| `learning.halfLife` | `50` | Outcomes after which an old outcome counts half |
+| `learning.costWeight` | `0.05` | How much a bucket's cost pulls its bias down |
+| `cache.ttlHours` | `24` | Lifetime of a cached blended verdict |
+| `cache.maxEntries` | `2000` | Verdict cache size |
+| `breaker.failures` | `2` | Consecutive failures that open the circuit breaker |
+| `breaker.cooldownSec` | `120` | How long an open breaker or the slow guard skips the provider |
+| `budget.dailyUsd` | `0.5` | Spend cap per remote provider per UTC day |
+| `budget.dailyCalls` | `2000` | Call cap per remote provider per UTC day (`0` = unlimited). Limits providers whose price is unknown |
+| `privacy.maxChars` | `2000` | Characters of redacted text a remote provider receives per item |
+| `privacy.storeHead` | `true` | Keep the first 80 redacted characters of each input in the database |
+
 ## Environment variables
 
 | Variable | Effect |
@@ -157,3 +224,8 @@ See [Usage insights](usage.md) for the sources, the privacy notes and the saving
 | `EMINIAR_PROJECT_ROOT` | Sets the project root. Otherwise `CLAUDE_PROJECT_DIR`, then the current directory |
 | `EMINIAR_DEBUG` | Prints stack traces from the CLI |
 | `EMINIAR_CLAUDE_DIR` | Where Claude Code keeps its transcripts (default `~/.claude`) |
+| `EMINIAR_ADJUDICATOR=0` / `=1` | Turns the adjudicator off (the kill switch) or on, over every config file |
+| `EMINIAR_ADJUDICATOR_PROVIDER` | Overrides `adjudicator.provider` |
+| `EMINIAR_ADJUDICATOR_MODE` | Overrides `adjudicator.mode` (`advise` or `apply`) |
+| `EMINIAR_ADJUDICATOR_REMOTE=0` / `=1` | Overrides `adjudicator.remoteConsent` |
+| `EMINIAR_ADJUDICATOR_KEY` | Adjudicator provider key, checked after `keyEnv` and the provider's own variable (`TYPESAFE_API_KEY`, `GROQ_API_KEY`, `CEREBRAS_API_KEY`) and before `~/.eminiar/adjudicator.key` |

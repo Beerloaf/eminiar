@@ -200,6 +200,55 @@ API (JSON, loopback only):
 
 Run ids look like `20261028-a1b2c3`. Anything else is a 400, and an unknown run is a 404.
 
+### Adjudicator
+
+What the opt-in [adjudicator](adjudicator.md) decided, whether its advice was followed, and what
+it saved. The config is read again on every request, so `eminiar adjudicator enable` shows up
+without restarting the dashboard. The range switch (7d, 30d, 90d, all; default 30 days) applies
+to the whole tab.
+
+- **Off.** While the adjudicator is off, the tab explains what it does, its privacy model and
+  `eminiar adjudicator enable`, and offers the try-it box (heuristic only) and the last eval
+  report. Decisions recorded while it was on are still shown.
+- **Tiles.** Decisions by surface; advice followed, with the apply and respect rates; the
+  fallback rate with the provider statuses behind it; provider latency p50 and p95, and end to
+  end; the adjudicator's own spend; net savings, with a **how is this computed?** link that
+  lists the assumptions.
+- **Decisions per day**, stacked by where the verdict came from: heuristic, blend, cache or
+  fallback (UTC days).
+- **Provider card.** Configured and effective provider and why they differ, mode, key source
+  (`env`, `file` or `none`; never the key), consent, apply effectiveness ("n of m"), and per
+  provider the breaker state, retry time, last error class, p50/p95 latency and today's spend
+  against the daily cap. A rejected key shows as "API key rejected".
+- **Complexity** histogram (0 trivial to 4 very complex) and a **suggested tier × model that
+  ran** heatmap for dispatches and plan tasks.
+- **Call log.** Paged, filterable by surface, provider and outcome. Each row shows the stored
+  80-character redacted head of the input. Click a row to open the decision drawer: the
+  features, the tier, tool and role tables as bars split into heuristic, provider and learned
+  parts with their reasons, the complexity terms, the blend weights and bias, the provider
+  status, latency and tokens, and the outcome with the actual model, tokens and savings.
+- **Savings.** Realised, potential, spend and net, the assumptions, and tokens per successful
+  task by tier.
+- **Try it.** Paste a prompt or task to score it. The provider is used only when the
+  adjudicator is on, you tick the box, and the provider has its consent and key. Nothing is
+  stored and the text is not sent back, but a provider call counts against the daily caps.
+- **Last eval.** The report saved by `eminiar adjudicator eval --save`.
+
+Links: `#/adjudicator?range=7d` and `#/adjudicator?id=<decision id>` (opens the drawer).
+
+API (JSON, loopback only). The GETs that read decisions first link new outcomes
+(reconcile, up to 500 rows). No payload contains a key, a masked key, or input text beyond the
+stored head.
+
+| Route | Returns |
+|---|---|
+| `GET /api/adjudicator?since=` | on/off, mode, the sanitised config, configured and effective provider, key source, consent, provider health, apply effectiveness, the summary, the fallback rate and the chart data (default `since=30d`) |
+| `GET /api/adjudicator/decisions?since&surface&provider&outcome&limit&offset` | decision rows without score tables (`limit` 1–500, default 50) |
+| `GET /api/adjudicator/decision?id=` | one decision with its parsed score tables |
+| `GET /api/adjudicator/savings?since=` | realised, potential, spend, net, assumptions, tokens per successful task by tier, the tier matrix |
+| `GET /api/adjudicator/eval` | the last saved eval report, or `null` |
+| `POST /api/adjudicator/test` | `{text (1–20000 chars), useProvider?}`: a verdict that is never stored |
+
 ## Deep links
 
 Views have hash routes, so you can bookmark or share a link to a view:

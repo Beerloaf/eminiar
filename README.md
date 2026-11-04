@@ -134,6 +134,15 @@ reviews what comes back. Every worker starts with the memories, history risk and
 its task. Capacity limits, a shared blackboard and a live Swarms tab in the dashboard come with
 it. Nothing changes until you run `eminiar swarm init` ([details](docs/swarms.md)).
 
+### ⚖️ Adjudicator (opt-in)
+
+Scores how complex each prompt, subagent dispatch and swarm task is, and suggests the `em_*` tool
+to start with, the Claude model size and the agent role, so small work goes to small models. A
+local heuristic always runs; you can blend in Jev, an OpenAI-compatible endpoint (Groq, Cerebras,
+Ollama, LM Studio, llama.cpp) or the local embedding model. Remote providers need your consent
+and a key, and only redacted text leaves the machine. Off by default, and it costs nothing while
+off: `eminiar adjudicator enable` ([details](docs/adjudicator.md)).
+
 ### 📊 Local dashboard
 
 `eminiar ui` opens a local web app with token savings, usage and cost, a source explorer with
@@ -244,6 +253,7 @@ Read more in [How it works](docs/how-it-works.md).
 | [Documentation knowledge base](docs/documentation-kb.md) | Discover, index and look up docs |
 | [Usage insights](docs/usage.md) | Tokens, cache, cost, billing blocks, insights and savings per session |
 | [Agent swarms](docs/swarms.md) | Opt-in worker swarms: the swarm file, topologies, the tool and CLI |
+| [Adjudicator](docs/adjudicator.md) | Opt-in tool, model and agent-role suggestions: providers, privacy, savings, accuracy |
 | [Dashboard](docs/dashboard.md) | The `eminiar ui` web app |
 | [Configuration](docs/configuration.md) | Every config key with its default |
 | [CLI](docs/cli.md) | The `eminiar` command |
@@ -256,7 +266,9 @@ Your code, tool output and memories stay on your machine. eminiar uses the netwo
 
 - download the embedding model once (you can skip this with `install --no-model`);
 - fetch web pages and documentation that you or Claude ask it to index;
-- look up package metadata in the npm, PyPI and Go registries when it adds documentation.
+- look up package metadata in the npm, PyPI and Go registries when it adds documentation;
+- only if you turn on the adjudicator with a remote provider and agree to it: send redacted
+  prompt and task text to that provider ([what is sent](docs/adjudicator.md#providers-and-privacy)).
 
 The dashboard listens on `127.0.0.1` only.
 
