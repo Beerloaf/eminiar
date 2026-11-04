@@ -13,22 +13,35 @@
  * Spend: `spendUsd` accumulates per UTC day. At `budget.dailyUsd` or above a REMOTE provider is
  * skipped (local providers cost nothing and are never capped). A call whose price is unknown
  * (costUsd null) adds no dollars: its row keeps cost_usd NULL so stats can show "unknown".
+ * `calls` counts every call that reached the provider on the same UTC day; at
+ * `budget.dailyCalls` (0 = unlimited) a remote provider is skipped too, which is what limits a
+ * provider whose price is unknown.
+ *
+ * Auth: a 401/403 sets state "auth_failed" with the fingerprint (sha256 of the key, first 12
+ * hex, never the key) of the key that was rejected. The provider is skipped (status
+ * "auth_failed") without any network call until the key changes or AUTH_LOCKOUT_MS passes.
  *
  * Every function is synchronous (better-sqlite3) and swallows nothing: the engine wraps them.
  */
 
+import { createHash } from "node:crypto";
 import type { AdjudicatorConfig } from "../config.js";
 import type { AdjudicatorProviderState, AdjudicatorStore } from "../storage/types.js";
 import type { ProviderStatus } from "./types.js";
 
 /** The slow guard needs at least this many latencies before a p95 means anything. */
 export const SLOW_MIN_SAMPLES = 5;
+/** How long a rejected key keeps the provider skipped when the key does not change. */
+export const AUTH_LOCKOUT_MS = 3_600_000;
 
 export type GateDecision =
   | { allow: true; halfOpen: boolean; state: AdjudicatorProviderState | undefined }
   | {
       allow: false;
-      status: Extract<ProviderStatus, "breaker_open" | "slow_guard" | "over_budget">;
+      status: Extract<
+        ProviderStatus,
+        "breaker_open" | "slow_guard" | "over_budget" | "auth_failed"
+      >;
     };
 
 export type FailureClass = "timeout" | "http_error" | "rate_limited" | "invalid" | "no_key";
@@ -51,6 +64,58 @@ export function spendToday(s: AdjudicatorProviderState | undefined, now: number)
   return s.spendUsd;
 }
 
+/** Calls made today: a stored count from an earlier UTC day counts as 0. */
+export function callsToday(s: AdjudicatorProviderState | undefined, now: number): number {
+  if (!s || s.spendDay !== utcDay(now)) return 0;
+  return s.calls ?? 0;
+}
+
+/** Identifies a key without revealing it: sha256(key), first 12 hex chars. */
+export function keyFingerprint(key: string): string {
+  return createHash("sha256").update(key).digest("hex").slice(0, 12);
+}
+
+/** HTTP 401/403: the provider rejected the key. */
+export function isAuthFailure(kind: FailureClass, status?: number): boolean {
+  return kind === "http_error" && (status === 401 || status === 403);
+}
+
+export interface AuthLockout {
+  /** The provider is skipped for the key in use (or for an unknown key). */
+  locked: boolean;
+  /** When the lockout ends even if the key does not change. */
+  until: number | null;
+  /** Fingerprint of the rejected key (never the key). */
+  fingerprint: string | null;
+  /** The key in use differs from the rejected one, so the next call retries. */
+  keyChanged: boolean;
+  /** lastErrorClass, e.g. "http_error:401". */
+  errorClass: string | null;
+}
+
+/**
+ * The auth lockout of a stored state, for the gate and for status/doctor/dashboard ("API key
+ * rejected"). undefined when the provider is not in state auth_failed. `keyFingerprint` is
+ * the fingerprint of the key in use now; when it is omitted the key is assumed unchanged.
+ */
+export function authLockout(
+  s: AdjudicatorProviderState | undefined,
+  now: number,
+  currentFingerprint?: string | null,
+): AuthLockout | undefined {
+  if (s?.state !== "auth_failed") return undefined;
+  const keyChanged =
+    currentFingerprint !== undefined && (currentFingerprint ?? null) !== s.authFingerprint;
+  const expired = s.retryAt === null || now >= s.retryAt;
+  return {
+    locked: !keyChanged && !expired,
+    until: s.retryAt,
+    fingerprint: s.authFingerprint,
+    keyChanged,
+    errorClass: s.lastErrorClass,
+  };
+}
+
 /**
  * May this provider be called now? Claims the half-open slot when an open breaker has cooled
  * down, and resets an expired slow state (with an empty latency ring).
@@ -59,11 +124,22 @@ export function gate(
   store: AdjudicatorStore,
   provider: string,
   cfg: Pick<AdjudicatorConfig, "breaker" | "budget">,
-  o: { now: number; remote: boolean },
+  o: { now: number; remote: boolean; keyFingerprint?: string | null | undefined },
 ): GateDecision {
   let s = store.providerState(provider);
   const cooldownMs = cfg.breaker.cooldownSec * 1000;
   let halfOpen = false;
+
+  if (s?.state === "auth_failed") {
+    // Rejected key: skip without a call until the key changes or the lockout expires.
+    const lock = authLockout(s, o.now, o.keyFingerprint);
+    if (lock?.locked) return { allow: false, status: "auth_failed" };
+    s = store.saveProviderState(provider, {
+      state: "closed",
+      retryAt: null,
+      authFingerprint: null,
+    });
+  }
 
   if (s?.state === "open" || s?.state === "half_open") {
     // half_open with a future retryAt: another process holds the trial call.
@@ -75,12 +151,23 @@ export function gate(
     s = store.saveProviderState(provider, { state: "closed", retryAt: null, latencies: [] });
   }
 
-  if (o.remote && spendToday(s, o.now) >= cfg.budget.dailyUsd) {
+  if (o.remote && overBudget(s, cfg, o.now)) {
     // Hand the half-open slot back: the breaker did not get its trial call.
     if (halfOpen) store.saveProviderState(provider, { state: "open", retryAt: o.now });
     return { allow: false, status: "over_budget" };
   }
   return { allow: true, halfOpen, state: s };
+}
+
+/** Today's USD spend reached budget.dailyUsd, or today's calls reached budget.dailyCalls (> 0). */
+export function overBudget(
+  s: AdjudicatorProviderState | undefined,
+  cfg: Pick<AdjudicatorConfig, "budget">,
+  now: number,
+): boolean {
+  if (spendToday(s, now) >= cfg.budget.dailyUsd) return true;
+  const cap = cfg.budget.dailyCalls;
+  return typeof cap === "number" && cap > 0 && callsToday(s, now) >= cap;
 }
 
 /** A successful call: close the breaker, record latency and spend, then apply the slow guard. */
@@ -103,6 +190,8 @@ export function recordSuccess(
     latencies,
     spendDay: day,
     spendUsd: spent,
+    calls: callsToday(s, o.now) + 1,
+    authFingerprint: null,
   });
 }
 
@@ -125,10 +214,28 @@ export function recordFailure(
     latencyMs?: number | undefined;
     budgetMs: number;
     halfOpen: boolean;
+    /** Fingerprint of the key the call used (keyFingerprint); stored on a 401/403. */
+    keyFingerprint?: string | null | undefined;
   },
 ): AdjudicatorProviderState {
   const s = store.providerState(provider);
   const cooldownMs = cfg.breaker.cooldownSec * 1000;
+  const errorClass = o.status !== undefined ? `${o.kind}:${o.status}` : o.kind;
+  // Every call that reached the provider counts towards budget.dailyCalls (no_key never sent one).
+  const day = { spendDay: utcDay(o.now), spendUsd: spendToday(s, o.now) };
+  const calls = callsToday(s, o.now) + (o.kind === "no_key" ? 0 : 1);
+  if (isAuthFailure(o.kind, o.status)) {
+    // Not a breaker failure: retrying will not help until the key changes.
+    return store.saveProviderState(provider, {
+      state: "auth_failed",
+      retryAt: o.now + AUTH_LOCKOUT_MS,
+      authFingerprint: o.keyFingerprint ?? null,
+      lastErrorAt: o.now,
+      lastErrorClass: errorClass,
+      ...day,
+      calls,
+    });
+  }
   const counts = countsAsFailure(o.kind, o.status);
   const failures = counts ? (s?.failures ?? 0) + 1 : (s?.failures ?? 0);
   const latencies =
@@ -156,8 +263,10 @@ export function recordFailure(
     failures,
     retryAt,
     lastErrorAt: o.now,
-    lastErrorClass: o.status !== undefined ? `${o.kind}:${o.status}` : o.kind,
+    lastErrorClass: errorClass,
     latencies,
+    ...day,
+    calls,
   });
 }
 

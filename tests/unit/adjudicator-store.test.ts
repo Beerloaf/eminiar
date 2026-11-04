@@ -76,6 +76,11 @@ describe("schema migration v8: adjudicator tables", () => {
       // The v7 swarm ledger is still there and usable.
       expect(names).toContain("swarm_runs");
       expect(a.adjudicator.insert(row())).toBeGreaterThan(0);
+      // The provider state carries the daily call count and the rejected-key fingerprint.
+      const cols = (
+        a.db.prepare("PRAGMA table_info(adjudicator_provider_state)").all() as { name: string }[]
+      ).map((c) => c.name);
+      expect(cols).toEqual(expect.arrayContaining(["calls", "auth_fingerprint"]));
     } finally {
       a.close();
     }
@@ -254,6 +259,8 @@ describe("SqliteAdjudicatorStore", () => {
       latencies: [],
       spendUsd: 0,
       spendDay: null,
+      calls: 0,
+      authFingerprint: null,
     });
     s.saveProviderState("typesafe", {
       state: "open",
@@ -274,6 +281,19 @@ describe("SqliteAdjudicatorStore", () => {
     expect(st.latencies).toHaveLength(50);
     expect(st.latencies[0]).toBe(10);
     expect(st.latencies[49]).toBe(59);
+    // Daily calls and the auth lockout round-trip.
+    s.saveProviderState("typesafe", {
+      state: "auth_failed",
+      calls: 7,
+      authFingerprint: "0123456789ab",
+    });
+    expect(s.providerState("typesafe")).toMatchObject({
+      state: "auth_failed",
+      calls: 7,
+      authFingerprint: "0123456789ab",
+      spendUsd: 0.0125,
+    });
+    expect(s.saveProviderState("typesafe", { authFingerprint: null }).authFingerprint).toBeNull();
     // null clears a field; other providers are independent.
     expect(s.saveProviderState("typesafe", { retryAt: null }).retryAt).toBeNull();
     expect(s.providerState("openai-compatible")).toBeUndefined();

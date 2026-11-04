@@ -1,4 +1,6 @@
 import type { AdjudicatorConfig, Config } from "../config.js";
+import type { AdjudicatorProviderState } from "../storage/types.js";
+import { authLockout, keyFingerprint } from "./breaker.js";
 import { type KeyId, type KeySource, mask, resolveKey } from "./secrets.js";
 import type { ProviderId } from "./types.js";
 
@@ -89,6 +91,15 @@ export function isLoopback(url: string | undefined): boolean {
 export type RuntimeContext = "hook" | "server" | "cli";
 
 export type Degraded = "no_key" | "no_consent" | "hook_context" | "misconfigured";
+
+/**
+ * Degraded plus "auth_failed": resolveAdjudicator() never returns it (it reads no state);
+ * withAuthLockout() sets it from the store while a rejected key locks the provider out.
+ */
+export type DegradedReason = Degraded | "auth_failed";
+
+/** A Resolved whose `degraded` may also be "auth_failed" (withAuthLockout). */
+export type ResolvedWithLockout = Omit<Resolved, "degraded"> & { degraded?: DegradedReason };
 
 export interface Resolved {
   enabled: boolean;
@@ -236,6 +247,43 @@ export function resolveAdjudicator(
         : `no key for ${t.keyId}: run \`eminiar adjudicator key set\``,
     );
   return r;
+}
+
+/**
+ * keyFingerprint() of the key the effective provider would send; null when it uses no key or
+ * none is set. Never the key itself.
+ */
+export function currentKeyFingerprint(
+  r: Pick<Resolved, "keyId" | "keyEnv" | "providerEnv">,
+  env?: NodeJS.ProcessEnv,
+): string | null {
+  if (!r.keyId) return null;
+  const k = resolveKey(r.keyId, { keyEnv: r.keyEnv, providerEnv: r.providerEnv, env });
+  return k.key ? keyFingerprint(k.key) : null;
+}
+
+/**
+ * For status/doctor/dashboard: `r` degraded to "auth_failed" ("API key rejected") while the
+ * stored provider state is locked out for the key in use; otherwise `r` unchanged.
+ */
+export function withAuthLockout(
+  r: Resolved,
+  state: AdjudicatorProviderState | undefined,
+  o: { now?: number; env?: NodeJS.ProcessEnv } = {},
+): ResolvedWithLockout {
+  if (r.provider === "heuristic") return r;
+  const lock = authLockout(state, o.now ?? Date.now(), currentKeyFingerprint(r, o.env));
+  if (!lock?.locked) return r;
+  const code = lock.errorClass?.split(":")[1];
+  const until = lock.until !== null ? ` until ${new Date(lock.until).toISOString()}` : "";
+  return {
+    ...r,
+    provider: "heuristic",
+    degraded: "auth_failed",
+    detail: `API key rejected${code ? ` (HTTP ${code})` : ""}: skipped${until} or until the key changes (\`eminiar adjudicator key set\`)`,
+    remote: false,
+    local: false,
+  };
 }
 
 function hostOf(url: string | undefined): string {

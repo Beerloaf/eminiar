@@ -563,7 +563,9 @@ CREATE TABLE IF NOT EXISTS adjudicator_provider_state (
   last_error_class TEXT,
   latencies TEXT,
   spend_day TEXT,
-  spend_usd REAL NOT NULL DEFAULT 0
+  spend_usd REAL NOT NULL DEFAULT 0,
+  calls INTEGER NOT NULL DEFAULT 0,
+  auth_fingerprint TEXT
 );
 CREATE TABLE IF NOT EXISTS adjudicator_bias (
   dimension TEXT NOT NULL,

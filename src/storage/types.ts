@@ -492,7 +492,7 @@ export interface AdjudicatorCacheEntry {
 /** Breaker, latency ring and daily spend of one provider (§9). */
 export interface AdjudicatorProviderState {
   provider: string;
-  /** closed | open | half_open | slow */
+  /** closed | open | half_open | slow | auth_failed */
   state: string;
   failures: number;
   retryAt: number | null;
@@ -501,9 +501,16 @@ export interface AdjudicatorProviderState {
   lastErrorClass: string | null;
   /** The last ≤ 50 provider latencies in ms, oldest first. */
   latencies: number[];
-  /** UTC day (YYYY-MM-DD) that `spendUsd` belongs to. */
+  /** UTC day (YYYY-MM-DD) that `spendUsd` and `calls` belong to. */
   spendDay: string | null;
   spendUsd: number;
+  /** Provider calls made on `spendDay` (budget.dailyCalls). */
+  calls: number;
+  /**
+   * state "auth_failed": sha256(key)[0:12] of the key the provider rejected (401/403); never
+   * the key. The provider is skipped until the key changes or retryAt passes.
+   */
+  authFingerprint: string | null;
 }
 
 /** One learned bucket (§7.7): decayed counts n/s/f and the bias they yield. */

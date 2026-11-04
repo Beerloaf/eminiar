@@ -23,8 +23,13 @@ import type { AdjudicatorConfig } from "../config.js";
 import type { AdjudicationInput, AdjudicationPatch, AdjudicatorStore } from "../storage/types.js";
 import type { AsyncJob } from "./async.js";
 import { blend } from "./blend.js";
-import { gate, recordFailure, recordSuccess } from "./breaker.js";
-import { type Resolved, type RuntimeContext, resolveAdjudicator } from "./config.js";
+import { authLockout, gate, overBudget, recordFailure, recordSuccess } from "./breaker.js";
+import {
+  currentKeyFingerprint,
+  type Resolved,
+  type RuntimeContext,
+  resolveAdjudicator,
+} from "./config.js";
 import { extractFeatures } from "./features.js";
 import { type Catalogue, DEFAULT_TIERS, scoreHeuristic } from "./heuristic.js";
 import { createProvider, type ProviderDeps, ProviderError } from "./providers/index.js";
@@ -278,9 +283,12 @@ export async function adjudicate(
           );
     if (!provider) return fallback("skipped");
 
+    // Fingerprint of the key in use (never the key): a 401/403 locks out only this key.
+    const keyFp = safe(() => currentKeyFingerprint(r, opts.env), log) ?? null;
+
     if (call === "async") {
       // The hook only peeks at the breaker; the child claims a half-open slot when it runs.
-      const peek = store ? safe(() => peekGate(store, r, cfg, now()), log) : undefined;
+      const peek = store ? safe(() => peekGate(store, r, cfg, now(), keyFp), log) : undefined;
       if (peek) return fallback(peek);
       for (const it of misses) {
         it.verdict = heuristicVerdict(it, r.configured, "fallback", "skipped");
@@ -305,7 +313,10 @@ export async function adjudicate(
 
     let halfOpen = false;
     if (store) {
-      const g = safe(() => gate(store, r.provider, cfg, { now: now(), remote: r.remote }), log);
+      const g = safe(
+        () => gate(store, r.provider, cfg, { now: now(), remote: r.remote, keyFingerprint: keyFp }),
+        log,
+      );
       if (g && !g.allow) return fallback(g.status);
       halfOpen = !!g?.allow && g.halfOpen;
     }
@@ -334,6 +345,7 @@ export async function adjudicate(
               latencyMs: providerLatencyMs,
               budgetMs,
               halfOpen,
+              keyFingerprint: keyFp,
             }),
           log,
         );
@@ -560,20 +572,21 @@ async function callWithin(
   }
 }
 
-/** A read-only gate for the async path: open, slow or over budget without claiming anything. */
+/** A read-only gate for the async path: locked out, open, slow or over budget, claiming nothing. */
 function peekGate(
   store: AdjudicatorStore,
   r: Resolved,
   cfg: AdjudicatorConfig,
   now: number,
+  keyFp: string | null,
 ): ProviderStatus | undefined {
   const s = store.providerState(r.provider);
   if (!s) return undefined;
+  if (authLockout(s, now, keyFp)?.locked) return "auth_failed";
   if ((s.state === "open" || s.state === "half_open") && s.retryAt !== null && now < s.retryAt)
     return "breaker_open";
   if (s.state === "slow" && s.retryAt !== null && now < s.retryAt) return "slow_guard";
-  const today = new Date(now).toISOString().slice(0, 10);
-  if (r.remote && s.spendDay === today && s.spendUsd >= cfg.budget.dailyUsd) return "over_budget";
+  if (r.remote && overBudget(s, cfg, now)) return "over_budget";
   return undefined;
 }
 

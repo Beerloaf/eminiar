@@ -134,6 +134,11 @@ const AdjudicatorObject = z.object({
   budget: z
     .object({
       dailyUsd: z.number().nonnegative().default(0.5),
+      /**
+       * Calls per remote provider per UTC day; 0 = unlimited. Caps providers whose price is
+       * unknown (cost null), which dailyUsd cannot limit.
+       */
+      dailyCalls: z.number().int().nonnegative().default(2000),
     })
     .prefault({}),
   privacy: z

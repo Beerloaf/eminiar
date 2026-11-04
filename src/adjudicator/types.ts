@@ -35,6 +35,7 @@ export type ProviderStatus =
   | "breaker_open"
   | "slow_guard"
   | "over_budget"
+  | "auth_failed"
   | "no_key"
   | "no_consent"
   | "skipped"

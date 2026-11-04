@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -10,13 +10,24 @@ import {
   spawnAsyncJob,
 } from "../../src/adjudicator/async.js";
 import {
+  AUTH_LOCKOUT_MS,
+  authLockout,
+  callsToday,
   countsAsFailure,
   gate,
+  isAuthFailure,
+  keyFingerprint,
   p95,
+  recordFailure,
   SLOW_MIN_SAMPLES,
   utcDay,
 } from "../../src/adjudicator/breaker.js";
-import { type Resolved, resolveAdjudicator } from "../../src/adjudicator/config.js";
+import {
+  currentKeyFingerprint,
+  type Resolved,
+  resolveAdjudicator,
+  withAuthLockout,
+} from "../../src/adjudicator/config.js";
 import {
   adjudicate,
   adjudicateOne,
@@ -518,6 +529,229 @@ describe("slow guard and daily cap", () => {
       allow: false,
       status: "over_budget",
     });
+  });
+
+  it("stops an unpriced provider at budget.dailyCalls; a new UTC day resets it", async () => {
+    const cfg = adj({ budget: { dailyUsd: 0.5, dailyCalls: 2 } });
+    let now = T0;
+    const clock = () => now;
+    const unpriced = ok({ costUsd: null });
+    const text = (i: number) => `distinct unpriced prompt ${i} about a cross cutting change`;
+    for (const i of [1, 2]) {
+      const r = await adjudicateOne(req(`u${i}`, text(i)), {
+        ...base(cfg),
+        provider: unpriced,
+        now: clock,
+      });
+      expect(r.verdict.source).toBe("blend");
+    }
+    const st = openStore().providerState("typesafe");
+    expect(st?.calls).toBe(2);
+    expect(st?.spendUsd).toBe(0);
+    const capped = await adjudicateOne(req("u3", text(3)), {
+      ...base(cfg),
+      provider: unpriced,
+      now: clock,
+    });
+    expect(capped.verdict.providerStatus).toBe("over_budget");
+    expect(unpriced.calls).toHaveLength(2);
+
+    now = T0 + 24 * 3_600_000;
+    const next = await adjudicateOne(req("u4", text(4)), {
+      ...base(cfg),
+      provider: unpriced,
+      now: clock,
+    });
+    expect(next.verdict.source).toBe("blend");
+    expect(openStore().providerState("typesafe")?.calls).toBe(1);
+  });
+
+  it("dailyCalls: failed calls count, 0 is unlimited, local providers are never capped", () => {
+    const store = openStore();
+    recordFailure(store, "typesafe", adj(), {
+      now: T0,
+      kind: "timeout",
+      budgetMs: 100,
+      halfOpen: false,
+    });
+    recordFailure(store, "typesafe", adj(), {
+      now: T0,
+      kind: "no_key",
+      budgetMs: 100,
+      halfOpen: false,
+    });
+    expect(callsToday(store.providerState("typesafe"), T0)).toBe(1);
+    expect(callsToday(store.providerState("typesafe"), T0 + 24 * 3_600_000)).toBe(0);
+
+    store.saveProviderState("p", { spendDay: utcDay(T0), calls: 5000 });
+    const on = adj({ budget: { dailyCalls: 2000 } });
+    const off = adj({ budget: { dailyCalls: 0 } });
+    expect(on.budget.dailyCalls).toBe(2000);
+    expect(adj().budget.dailyCalls).toBe(2000);
+    expect(gate(store, "p", on, { now: T0, remote: true })).toEqual({
+      allow: false,
+      status: "over_budget",
+    });
+    expect(gate(store, "p", on, { now: T0, remote: false }).allow).toBe(true);
+    expect(gate(store, "p", off, { now: T0, remote: true }).allow).toBe(true);
+  });
+
+  it("401: the next call skips without network; a new key is retried", async () => {
+    const cfg = adj();
+    let now = T0;
+    const clock = () => now;
+    const rejected = failing(() => new ProviderError("http_error", "HTTP 401", { status: 401 }));
+    const first = await adjudicateOne(req("a1", "first prompt about auth"), {
+      ...base(cfg),
+      provider: rejected,
+      now: clock,
+    });
+    expect(first.verdict.providerStatus).toBe("http_error");
+    const st = openStore().providerState("typesafe");
+    expect(st?.state).toBe("auth_failed");
+    expect(st?.authFingerprint).toBe(keyFingerprint(SENTINEL));
+    expect(st?.retryAt).toBe(T0 + AUTH_LOCKOUT_MS);
+    expect(st?.failures).toBe(0);
+    expect(st?.lastErrorClass).toBe("http_error:401");
+
+    now = T0 + 60_000;
+    const second = await adjudicateOne(req("a2", "second prompt about auth"), {
+      ...base(cfg),
+      provider: rejected,
+      now: clock,
+    });
+    expect(second.verdict.providerStatus).toBe("auth_failed");
+    expect(second.verdict.source).toBe("fallback");
+    expect(rejected.calls).toHaveLength(1);
+
+    // The async hook path peeks too, and spawns nothing.
+    const jobs: AsyncJob[] = [];
+    const queued = await adjudicateOne(req("a3", "third prompt about auth"), {
+      ...base(cfg),
+      provider: rejected,
+      call: "async",
+      spawn: (j) => jobs.push(j) > 0,
+      now: clock,
+    });
+    expect(queued.verdict.providerStatus).toBe("auth_failed");
+    expect(jobs).toHaveLength(0);
+
+    // A changed key is retried at once.
+    const env2 = { TYPESAFE_API_KEY: "sk-a-brand-new-key-0987654321" } as NodeJS.ProcessEnv;
+    const good = ok();
+    const retried = await adjudicateOne(req("a4", "fourth prompt about auth"), {
+      ...base(cfg),
+      env: env2,
+      resolved: resolveAdjudicator(cfg, { env: env2 }),
+      provider: good,
+      now: clock,
+    });
+    expect(retried.verdict.source).toBe("blend");
+    expect(good.calls).toHaveLength(1);
+    const after = openStore().providerState("typesafe");
+    expect(after?.state).toBe("closed");
+    expect(after?.authFingerprint).toBeNull();
+  });
+
+  it("403 locks out for AUTH_LOCKOUT_MS when the key does not change", async () => {
+    const cfg = adj();
+    let now = T0;
+    const clock = () => now;
+    const forbidden = failing(() => new ProviderError("http_error", "HTTP 403", { status: 403 }));
+    await adjudicateOne(req("f1", "first forbidden prompt"), {
+      ...base(cfg),
+      provider: forbidden,
+      now: clock,
+    });
+    now = T0 + AUTH_LOCKOUT_MS - 1;
+    const locked = await adjudicateOne(req("f2", "second forbidden prompt"), {
+      ...base(cfg),
+      provider: forbidden,
+      now: clock,
+    });
+    expect(locked.verdict.providerStatus).toBe("auth_failed");
+    expect(forbidden.calls).toHaveLength(1);
+
+    now = T0 + AUTH_LOCKOUT_MS;
+    const good = ok();
+    const retried = await adjudicateOne(req("f3", "third forbidden prompt"), {
+      ...base(cfg),
+      provider: good,
+      now: clock,
+    });
+    expect(retried.verdict.source).toBe("blend");
+  });
+
+  it("other 4xx keep the T6 behaviour: no lockout, no breaker failure", () => {
+    const store = openStore();
+    const s = recordFailure(store, "typesafe", adj(), {
+      now: T0,
+      kind: "http_error",
+      status: 400,
+      budgetMs: 100,
+      halfOpen: false,
+      keyFingerprint: keyFingerprint(SENTINEL),
+    });
+    expect(s.state).toBe("closed");
+    expect(s.failures).toBe(0);
+    expect(s.authFingerprint).toBeNull();
+    expect(isAuthFailure("http_error", 401)).toBe(true);
+    expect(isAuthFailure("http_error", 403)).toBe(true);
+    expect(isAuthFailure("http_error", 404)).toBe(false);
+    expect(isAuthFailure("rate_limited", 401)).toBe(false);
+  });
+
+  it("the key fingerprint never equals or contains the key", async () => {
+    const fp = keyFingerprint(SENTINEL);
+    expect(fp).toMatch(/^[0-9a-f]{12}$/);
+    expect(fp).not.toBe(SENTINEL);
+    expect(SENTINEL).not.toContain(fp);
+    expect(fp).not.toContain(SENTINEL);
+    expect(keyFingerprint("other-key")).not.toBe(fp);
+    const cfg = adj();
+    expect(currentKeyFingerprint(resolved(cfg), ENV)).toBe(fp);
+    expect(currentKeyFingerprint(resolveAdjudicator(cfg, { env: {} }), {})).toBeNull();
+
+    await adjudicateOne(req("s1", "sentinel prompt"), {
+      ...base(cfg),
+      provider: failing(() => new ProviderError("http_error", "HTTP 401", { status: 401 })),
+    });
+    const st = openStore().providerState("typesafe");
+    expect(JSON.stringify(st)).not.toContain(SENTINEL);
+    for (const f of [dbPath, `${dbPath}-wal`])
+      if (existsSync(f)) expect(readFileSync(f).includes(Buffer.from(SENTINEL))).toBe(false);
+  });
+
+  it("authLockout / withAuthLockout report the rejected key for status and doctor", () => {
+    const store = openStore();
+    const cfg = adj();
+    const r = resolved(cfg);
+    expect(withAuthLockout(r, undefined, { now: T0, env: ENV })).toBe(r);
+    recordFailure(store, "typesafe", cfg, {
+      now: T0,
+      kind: "http_error",
+      status: 401,
+      budgetMs: 100,
+      halfOpen: false,
+      keyFingerprint: keyFingerprint(SENTINEL),
+    });
+    const st = store.providerState("typesafe");
+    expect(authLockout(st, T0 + 1)).toMatchObject({
+      locked: true,
+      until: T0 + AUTH_LOCKOUT_MS,
+      fingerprint: keyFingerprint(SENTINEL),
+      keyChanged: false,
+      errorClass: "http_error:401",
+    });
+    expect(authLockout(st, T0 + 1, "000000000000")?.locked).toBe(false);
+    expect(authLockout(st, T0 + AUTH_LOCKOUT_MS)?.locked).toBe(false);
+    const w = withAuthLockout(r, st, { now: T0 + 1, env: ENV });
+    expect(w.degraded).toBe("auth_failed");
+    expect(w.provider).toBe("heuristic");
+    expect(w.detail).toContain("API key rejected (HTTP 401)");
+    expect(w.detail).not.toContain(SENTINEL);
+    const other = { TYPESAFE_API_KEY: "sk-different" } as NodeJS.ProcessEnv;
+    expect(withAuthLockout(r, st, { now: T0 + 1, env: other }).degraded).toBeUndefined();
   });
 
   it("p95 is nearest-rank", () => {

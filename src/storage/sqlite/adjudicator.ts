@@ -301,6 +301,8 @@ export class SqliteAdjudicatorStore implements AdjudicatorStore {
       latencies: parseLatencies(r.latencies),
       spendDay: (r.spend_day as string | null) ?? null,
       spendUsd: Number(r.spend_usd ?? 0),
+      calls: Number(r.calls ?? 0),
+      authFingerprint: (r.auth_fingerprint as string | null) ?? null,
     };
   }
 
@@ -319,6 +321,8 @@ export class SqliteAdjudicatorStore implements AdjudicatorStore {
       latencies: [],
       spendDay: null,
       spendUsd: 0,
+      calls: 0,
+      authFingerprint: null,
     };
     const next: AdjudicatorProviderState = { ...base, provider };
     for (const [k, v] of Object.entries(patch)) {
@@ -327,13 +331,14 @@ export class SqliteAdjudicatorStore implements AdjudicatorStore {
     next.latencies = next.latencies.slice(-LATENCY_RING);
     this.prep(
       `INSERT INTO adjudicator_provider_state (provider, state, failures, retry_at, last_ok_at,
-         last_error_at, last_error_class, latencies, spend_day, spend_usd)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         last_error_at, last_error_class, latencies, spend_day, spend_usd, calls, auth_fingerprint)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(provider) DO UPDATE SET state = excluded.state, failures = excluded.failures,
          retry_at = excluded.retry_at, last_ok_at = excluded.last_ok_at,
          last_error_at = excluded.last_error_at, last_error_class = excluded.last_error_class,
          latencies = excluded.latencies, spend_day = excluded.spend_day,
-         spend_usd = excluded.spend_usd`,
+         spend_usd = excluded.spend_usd, calls = excluded.calls,
+         auth_fingerprint = excluded.auth_fingerprint`,
     ).run(
       provider,
       next.state,
@@ -345,6 +350,8 @@ export class SqliteAdjudicatorStore implements AdjudicatorStore {
       JSON.stringify(next.latencies),
       next.spendDay,
       next.spendUsd,
+      next.calls,
+      next.authFingerprint,
     );
     return next;
   }
