@@ -17,12 +17,18 @@ import {
   type Config,
   ConfigSchema,
   loadConfig,
+  parseJsonSafe,
+  personalConfigProblem,
   personalConfigTrusted,
   projectAdjudicatorWarning,
 } from "../config.js";
 import type { ProjectContext } from "../context.js";
 import { paths } from "../paths.js";
 import type { StorageAdapter } from "../storage/adapter.js";
+import { getStorage } from "../storage/index.js";
+import { formatStats } from "../tools/em_adjudicate.js";
+import { parseSince } from "../tools/em_usage.js";
+import { callsToday, p95, spendToday } from "./breaker.js";
 import {
   consentedOrigins,
   keyFor,
@@ -34,9 +40,15 @@ import {
   withAuthLockout,
   withConsentedOrigin,
 } from "./config.js";
+import { adjudicateOne, surfaceBudget } from "./engine.js";
 import { subagentModelForced } from "./env.js";
-import type { ProviderDeps } from "./providers/http.js";
+import * as ev from "./eval.js";
+import { reconcile } from "./learn.js";
+import { defaultEmbeddingFactory } from "./providers/embedding.js";
+import { PROBE_TIMEOUT_MS, type ProviderDeps } from "./providers/http.js";
+import { createProvider, hasProvider, registerProvider } from "./providers/index.js";
 import { isSecretName } from "./redact.js";
+import { SAVINGS_ASSUMPTIONS, savingsReport } from "./savings.js";
 import { clearKey, type KeyId, keyFileStatus, mask, setKey, storedKeyIds } from "./secrets.js";
 import {
   type AdjudicationRequest,
@@ -50,7 +62,8 @@ import {
 
 /**
  * `eminiar adjudicator …` (docs/design/adjudicator.md §17) and the install/onboarding question
- * (§18). Loaded lazily from src/cli.ts. Keys are never read from argv: a hidden TTY prompt,
+ * (§18). Loaded lazily from src/cli.ts; the MCP server reaches it through src/doctor.ts, so its
+ * own internal imports stay static (the server is one file: tsup.config.ts). Keys are never read from argv: a hidden TTY prompt,
  * stdin, or the NAME of an env var (`--from-env`). Consent to send text off the machine is a
  * y/N on a TTY or `--accept-remote`; `--yes` never implies it.
  */
@@ -151,7 +164,8 @@ function readRaw(file: string): Record<string, unknown> {
   if (!existsSync(file)) return {};
   let v: unknown;
   try {
-    v = JSON.parse(readFileSync(file, "utf8"));
+    // No __proto__/constructor/prototype key survives (task #62): applyPatch assigns into it.
+    v = parseJsonSafe(readFileSync(file, "utf8"));
   } catch (err) {
     throw new Error(`${file} is not valid JSON (${(err as Error).message}); fix it first`);
   }
@@ -165,6 +179,7 @@ function applyPatch(
   patch: Record<string, unknown>,
 ): Record<string, unknown> {
   for (const [k, v] of Object.entries(patch)) {
+    if (k === "__proto__" || k === "constructor" || k === "prototype") continue;
     if (v === null) delete target[k];
     else if (isObj(v)) target[k] = applyPatch(isObj(target[k]) ? { ...target[k] } : {}, v);
     else target[k] = v;
@@ -437,9 +452,10 @@ export function remoteNotice(
  * and key settings there, and a key stored there could be committed, so the caller writes nothing.
  */
 function personalFileUntrusted(io: Io, root: string, file = paths().configFile): boolean {
-  if (personalConfigTrusted(root, file)) return false;
+  const problem = personalConfigProblem(root, file);
+  if (!problem) return false;
   io.err(
-    `${file} is inside this project (EMINIAR_HOME or HOME points into it): the adjudicator ignores provider, consent and key settings there, and a key stored there could be committed. Nothing was changed; run this from a shell where EMINIAR_HOME and HOME point outside the project.`,
+    `${file} ${problem}: the adjudicator ignores provider, consent and key settings there, and a key stored there could be committed. Nothing was changed; run this from a shell where EMINIAR_HOME and HOME are absolute paths outside the project.`,
   );
   return true;
 }
@@ -796,7 +812,6 @@ export interface CliDeps {
 
 async function storage(ctx: ProjectContext, deps: CliDeps): Promise<StorageAdapter> {
   if (deps.db) return deps.db;
-  const { getStorage } = await import("../storage/index.js");
   return getStorage(ctx, { vectors: false });
 }
 
@@ -868,8 +883,6 @@ async function healthOf(
   state: ReturnType<StorageAdapter["adjudicator"]["providerState"]>,
   now: number,
 ): Promise<Pick<StatusReport, "breaker" | "last24h" | "apply">> {
-  const { callsToday, p95, spendToday } = await import("./breaker.js");
-  const { surfaceBudget } = await import("./engine.js");
   const breaker =
     r.configured === "heuristic"
       ? null
@@ -1151,7 +1164,6 @@ export async function adjudicatorLiveChecks(
   if (r.provider === "heuristic") return [];
   const p = await providerFor(r, config, o.deps ?? {}, env);
   if (!p) return [];
-  const { PROBE_TIMEOUT_MS } = await import("./providers/http.js");
   try {
     const res = await p.probe({ signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
     return [
@@ -1173,9 +1185,7 @@ async function providerFor(
   env: NodeJS.ProcessEnv,
 ): Promise<AdjudicatorProvider | null> {
   if (deps.provider !== undefined) return deps.provider;
-  const { createProvider, hasProvider, registerProvider } = await import("./providers/index.js");
   if (r.provider === "embedding" && !hasProvider("embedding")) {
-    const { defaultEmbeddingFactory } = await import("./providers/embedding.js");
     registerProvider("embedding", defaultEmbeddingFactory(config));
   }
   return createProvider(r, config.adjudicator, { env, ...(deps.providerDeps ?? {}) });
@@ -1441,7 +1451,6 @@ export async function adjudicatorCommand(
 
     case "stats": {
       const config = load();
-      const { parseSince } = await import("../tools/em_usage.js");
       let since: number | undefined;
       try {
         since = parseSince(str(values.since), io.now());
@@ -1458,8 +1467,6 @@ export async function adjudicatorCommand(
         io.out(`Learned bias reset: ${n} bucket(s) cleared.`);
       }
       if (values.json) {
-        const { reconcile } = await import("./learn.js");
-        const { savingsReport } = await import("./savings.js");
         try {
           reconcile(db, { config, limit: 500 });
         } catch {
@@ -1475,9 +1482,7 @@ export async function adjudicatorCommand(
         io.out(JSON.stringify({ summary, savings }, null, 2));
         return 0;
       }
-      const { formatStats } = await import("../tools/em_adjudicate.js");
       io.out(formatStats(db, config, since));
-      const { SAVINGS_ASSUMPTIONS } = await import("./savings.js");
       if (Array.isArray(SAVINGS_ASSUMPTIONS) && SAVINGS_ASSUMPTIONS.length)
         io.out(`assumptions: ${SAVINGS_ASSUMPTIONS.join(" · ")}`);
       return 0;
@@ -1749,7 +1754,6 @@ async function testCommand(
   }
   const full: Config = { ...config, adjudicator: cfg };
   const r = resolveAdjudicator(full, { context: "cli", env: io.env });
-  const { adjudicateOne } = await import("./engine.js");
   const req: AdjudicationRequest = { key: "test", surface: "test", text };
   const base = { ignoreEnabled: true, persist: false, context: "cli" as const, env: io.env };
   const heuristic = (
@@ -1792,7 +1796,6 @@ async function testCommand(
     if (r.provider === "embedding") await warmEmbedding(r, full, deps);
     const p = await providerFor(r, full, deps, io.env);
     if (p) {
-      const { PROBE_TIMEOUT_MS } = await import("./providers/http.js");
       try {
         out.probe = await p.probe({ signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
       } catch (err) {
@@ -1882,8 +1885,6 @@ async function testCommand(
 
 async function warmEmbedding(r: Resolved, config: Config, deps: CliDeps): Promise<void> {
   if (deps.provider !== undefined) return;
-  const { hasProvider, registerProvider } = await import("./providers/index.js");
-  const { defaultEmbeddingFactory } = await import("./providers/embedding.js");
   const factory = defaultEmbeddingFactory(config);
   if (!hasProvider("embedding")) registerProvider("embedding", factory);
   try {
@@ -1910,7 +1911,6 @@ async function evalCommand(
   io: Io,
   deps: CliDeps,
 ): Promise<number> {
-  const ev = await import("./eval.js");
   const ids: ProviderId[] = [];
   for (const raw of o.ids.length ? o.ids : [config.adjudicator.provider]) {
     const c = parseChoice(raw);

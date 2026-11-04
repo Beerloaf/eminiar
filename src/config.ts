@@ -495,23 +495,57 @@ export const ConfigSchema = BaseConfigSchema.extend({ adjudicator: AdjudicatorCo
 
 export type Config = z.infer<typeof ConfigSchema>;
 
+/**
+ * Keys a config object never has and must never be copied (task #62): JSON.parse makes
+ * `"__proto__"` an OWN key, and assigning it (`out[k] = v`, as a merge does) calls the prototype
+ * setter, so a committed file could hand every later read inherited keys that no allowlist sees.
+ * `constructor` and `prototype` are the other two steps of the usual pollution chain.
+ */
+const UNSAFE_KEYS: ReadonlySet<string> = new Set(["__proto__", "constructor", "prototype"]);
+
+/**
+ * A plain copy of a JSON value: own enumerable keys only, without __proto__, constructor and
+ * prototype at any depth, every object an ordinary one created here. Everything read from a
+ * config file goes through it before it is merged, cut down or parsed.
+ */
+export function ownJson(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(ownJson);
+  if (typeof v !== "object" || v === null) return v;
+  const out: Record<string, unknown> = {};
+  for (const k of Object.keys(v)) {
+    if (UNSAFE_KEYS.has(k)) continue;
+    out[k] = ownJson((v as Record<string, unknown>)[k]);
+  }
+  return out;
+}
+
+/** JSON.parse, then ownJson: no prototype keys survive at any depth. Throws like JSON.parse. */
+export function parseJsonSafe(text: string): unknown {
+  return ownJson(JSON.parse(text));
+}
+
 function readJson(file: string): Record<string, unknown> {
   if (!existsSync(file)) return {};
   try {
-    return JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    const raw = parseJsonSafe(readFileSync(file, "utf8"));
+    return isPlainObject(raw) ? raw : {};
   } catch (err) {
     process.stderr.write(`eminiar: ignoring malformed ${file}: ${(err as Error).message}\n`);
     return {};
   }
 }
 
+/** `b` over `a`, recursively for objects; own keys only, the UNSAFE_KEYS never copied. */
 function deepMerge(
   a: Record<string, unknown>,
   b: Record<string, unknown>,
 ): Record<string, unknown> {
-  const out: Record<string, unknown> = { ...a };
-  for (const [k, v] of Object.entries(b)) {
-    const cur = out[k];
+  const out: Record<string, unknown> = {};
+  for (const k of Object.keys(a)) if (!UNSAFE_KEYS.has(k)) out[k] = a[k];
+  for (const k of Object.keys(b)) {
+    if (UNSAFE_KEYS.has(k)) continue;
+    const v = b[k];
+    const cur = Object.hasOwn(out, k) ? out[k] : undefined;
     if (isPlainObject(cur) && isPlainObject(v)) out[k] = deepMerge(cur, v);
     else out[k] = v;
   }
@@ -604,15 +638,17 @@ function personalAdjudicatorWarning(projectRoot: string): string | undefined {
   const file = paths().configFile;
   const raw = readJsonQuiet(file);
   const dropped = raw ? droppedProjectAdjudicatorKeys(raw) : [];
-  if (!dropped.length || personalConfigTrusted(projectRoot, file)) return undefined;
-  return `adjudicator.${dropped.join(", adjudicator.")} ignored: ${file} is inside this project (EMINIAR_HOME or HOME points into it), and only a config outside the project may set ${dropped.length === 1 ? "it" : "them"}`;
+  if (!dropped.length) return undefined;
+  const problem = personalConfigProblem(projectRoot, file);
+  if (!problem) return undefined;
+  return `adjudicator.${dropped.join(", adjudicator.")} ignored: ${file} ${problem}, and only a config at an absolute path outside the project may set ${dropped.length === 1 ? "it" : "them"}`;
 }
 
 /** A JSON object file, or undefined when it is missing, malformed or not an object. */
 function readJsonQuiet(file: string): Record<string, unknown> | undefined {
   if (!existsSync(file)) return undefined;
   try {
-    const raw: unknown = JSON.parse(readFileSync(file, "utf8"));
+    const raw = parseJsonSafe(readFileSync(file, "utf8"));
     return isPlainObject(raw) ? raw : undefined;
   } catch {
     return undefined; // loadConfig already reports a malformed file
@@ -662,81 +698,123 @@ function accountHome(): string | undefined {
   }
 }
 
+/** How many ancestors gitWorktrees climbs, and how many work trees it lists, at most. */
+const MAX_GIT_DEPTH = 128;
+const MAX_WORKTREES = 256;
+
 /**
- * The work tree enclosing `start` (the nearest ancestor holding `.git`) and every work tree of
- * that repository: the main one and each linked `git worktree`. Read from the files git keeps
- * (`.git` file → gitdir → commondir → worktrees/<name>/gitdir), so no git process is spawned.
+ * Every git work tree that encloses `start` or shares a repository with one: each ancestor
+ * holding `.git` (not only the nearest, so the superproject of a submodule and a repo nested in
+ * another are both found), the main and linked work trees of each (`git worktree`), and the
+ * superproject that owns a submodule's git dir (`gitdir: <super>/.git/modules/<name>`), with the
+ * same walk from there. Read from the files git keeps (`.git` file → gitdir → commondir →
+ * worktrees/<name>/gitdir), so no git process is spawned.
  */
 function gitWorktrees(start: string): string[] {
-  const out: string[] = [];
-  let dir = start;
-  for (;;) {
+  const out = new Set<string>();
+  const visited = new Set<string>();
+  const modulesMark = `${sep}.git${sep}modules${sep}`;
+
+  /** One directory holding `.git`: it, its repository's other work trees, its superproject. */
+  const visit = (dir: string, isFile: boolean): void => {
+    if (visited.has(dir) || out.size >= MAX_WORKTREES) return;
+    visited.add(dir);
+    out.add(dir);
     const dotGit = join(dir, ".git");
-    let isFile: boolean | undefined;
     try {
-      isFile = statSync(dotGit).isFile();
-    } catch {
-      isFile = undefined;
-    }
-    if (isFile !== undefined) {
-      out.push(dir);
-      try {
-        let gitDir = dotGit;
-        if (isFile) {
-          const m = /^gitdir:\s*(.+)$/m.exec(readFileSync(dotGit, "utf8"));
-          if (!m?.[1]) return out;
-          gitDir = resolve(dir, m[1].trim());
-        }
-        let common = gitDir;
-        try {
-          common = resolve(gitDir, readFileSync(join(gitDir, "commondir"), "utf8").trim());
-        } catch {
-          // a main work tree's .git directory is its own common dir
-        }
-        if (basename(common) === ".git") out.push(dirname(common));
-        const wt = join(common, "worktrees");
-        let names: string[] = [];
-        try {
-          names = readdirSync(wt).slice(0, 256);
-        } catch {
-          // no linked work trees
-        }
-        for (const name of names) {
-          try {
-            const g = readFileSync(join(wt, name, "gitdir"), "utf8").trim();
-            if (g) out.push(dirname(resolve(wt, name, g)));
-          } catch {
-            // a pruned or half-written entry
-          }
-        }
-      } catch {
-        // an unreadable .git: the enclosing work tree alone is still an anchor
+      let gitDir = dotGit;
+      if (isFile) {
+        const m = /^gitdir:\s*(.+)$/m.exec(readFileSync(dotGit, "utf8"));
+        if (!m?.[1]) return;
+        gitDir = resolve(dir, m[1].trim());
       }
-      return out;
+      // A submodule's git dir lives in its superproject's .git/modules: anchor that work tree.
+      const cmp = CASE_INSENSITIVE_FS ? gitDir.toLowerCase() : gitDir;
+      const at = cmp.indexOf(modulesMark);
+      if (at > 0) climb(gitDir.slice(0, at));
+      let common = gitDir;
+      try {
+        common = resolve(gitDir, readFileSync(join(gitDir, "commondir"), "utf8").trim());
+      } catch {
+        // a main work tree's .git directory is its own common dir
+      }
+      if (basename(common) === ".git") out.add(dirname(common));
+      const wt = join(common, "worktrees");
+      let names: string[] = [];
+      try {
+        names = readdirSync(wt).slice(0, MAX_WORKTREES);
+      } catch {
+        // no linked work trees
+      }
+      for (const name of names) {
+        try {
+          const g = readFileSync(join(wt, name, "gitdir"), "utf8").trim();
+          if (g) out.add(dirname(resolve(wt, name, g)));
+        } catch {
+          // a pruned or half-written entry
+        }
+      }
+    } catch {
+      // an unreadable .git: the enclosing work tree alone is still an anchor
     }
-    const parent = dirname(dir);
-    if (parent === dir) return out;
-    dir = parent;
-  }
+  };
+
+  /** `from` and every ancestor of it that holds `.git`. */
+  const climb = (from: string): void => {
+    let dir = from;
+    for (let i = 0; i < MAX_GIT_DEPTH; i++) {
+      let isFile: boolean | undefined;
+      try {
+        isFile = statSync(join(dir, ".git")).isFile();
+      } catch {
+        isFile = undefined;
+      }
+      if (isFile !== undefined) visit(dir, isFile);
+      const parent = dirname(dir);
+      if (parent === dir) return;
+      dir = parent;
+    }
+  };
+
+  climb(start);
+  return [...out];
 }
 
 /**
  * Whether `file` (default: paths().configFile; also the key file) is the user's own and may set
- * the adjudicator keys that decide where text and keys go (task #54). A trusted project's
+ * the adjudicator keys that decide where text and keys go (tasks #54, #63). A trusted project's
  * .claude/settings.json `env` block reaches the hooks, so it could point EMINIAR_HOME (or HOME,
- * which os.homedir() reads) at a config.json the repo ships. The anchor the repo cannot move is
- * the account's own home from the user database: a file directly in <account home>/.eminiar is
- * always trusted. Any other location is trusted only when its real path is outside the project
- * root, the current directory and every git work tree of either (a cloned repo cannot write
- * outside its own checkout without running code). The file need not exist yet.
+ * which os.homedir() reads) at a config.json the repo ships. The rules:
+ * - a relative path (a relative EMINIAR_HOME or HOME) is never trusted: it resolves against
+ *   whatever directory the process starts in, which the repo decides;
+ * - the anchor the repo cannot move is the account's own home from the user database: a file
+ *   directly in <account home>/.eminiar is always trusted;
+ * - any other location is trusted only when its real path is neither inside nor an ancestor of
+ *   (its folder is not at or above) the project root, the current directory, or any git work
+ *   tree enclosing either, including the superproject of a submodule and linked work trees. A
+ *   cloned repo cannot write outside its own checkout without running code.
+ * The file need not exist yet.
  */
 export function personalConfigTrusted(
   projectRoot: string,
   file: string = paths().configFile,
 ): boolean {
+  return personalConfigProblem(projectRoot, file) === undefined;
+}
+
+/**
+ * Why personalConfigTrusted refuses `file`, as a phrase that follows the path ("<file> is …"),
+ * or undefined when it is trusted.
+ */
+export function personalConfigProblem(
+  projectRoot: string,
+  file: string = paths().configFile,
+): string | undefined {
+  if (!isAbsolute(file))
+    return "is a relative path (EMINIAR_HOME or HOME is relative, so the directory a session starts in decides where it points)";
   const real = realPath(file);
   const home = accountHome();
-  if (home && samePath(dirname(real), realPath(join(home, ".eminiar")))) return true;
+  if (home && samePath(dirname(real), realPath(join(home, ".eminiar")))) return undefined;
   const anchors = new Set<string>();
   for (const start of [projectRoot, process.cwd()]) {
     if (!start) continue;
@@ -744,8 +822,11 @@ export function personalConfigTrusted(
     anchors.add(r);
     for (const w of gitWorktrees(r)) anchors.add(realPath(w));
   }
-  for (const a of anchors) if (isInside(real, a)) return false;
-  return true;
+  const folder = dirname(real);
+  for (const a of anchors)
+    if (isInside(real, a) || isInside(a, folder))
+      return "is inside this project or a folder above it (EMINIAR_HOME or HOME points there)";
+  return undefined;
 }
 
 /**
@@ -758,8 +839,8 @@ function projectLayer(raw: Record<string, unknown>): Record<string, unknown> {
   if (!isPlainObject(adj)) return raw;
   if (findSecretFields(adj).length) return raw;
   const kept: Record<string, unknown> = {};
-  for (const k of PROJECT_ADJUDICATOR_KEYS) if (k in adj) kept[k] = adj[k];
-  return { ...raw, adjudicator: kept };
+  for (const k of PROJECT_ADJUDICATOR_KEYS) if (Object.hasOwn(adj, k)) kept[k] = adj[k];
+  return { ...(ownJson(raw) as Record<string, unknown>), adjudicator: kept };
 }
 
 /**
@@ -786,7 +867,8 @@ export function loadConfig(projectRoot: string): Config {
     ),
     envOverrides(),
   );
-  const parsed = parseConfig(merged);
+  // zod reads inherited properties: hand it a plain own-key copy, never the merged object.
+  const parsed = parseConfig(ownJson(merged) as Record<string, unknown>);
   if (parsed.success) return parsed.data;
   process.stderr.write(`eminiar: invalid config, using defaults: ${parsed.error.message}\n`);
   return { ...BaseConfigSchema.parse({}), adjudicator: adjudicatorDefaults() };

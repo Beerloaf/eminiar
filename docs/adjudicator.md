@@ -101,18 +101,24 @@ cannot send your text or keys anywhere. In `eminiar.config.json` the adjudicator
 "adjudicator project config"), `adjudicator status` (a `warning:` line, `projectIgnored` in
 `--json`) and the dashboard overview name any key a project file sets that was ignored, even
 while the adjudicator is off. A repo that turns the adjudicator on for someone with no personal
-setup gets the heuristic, which never leaves the machine.
+setup gets the heuristic, which never leaves the machine. Keys named `__proto__`,
+`constructor` or `prototype` are dropped from every config file at any depth, so they cannot
+smuggle settings past this list.
 
 The same `.claude/settings.json` `env` block could also move `EMINIAR_HOME` (or `HOME`) into the
 repo, so that a `config.json` the repo ships is read as your personal one. eminiar anchors the
 personal config to your account: `~/.eminiar/config.json` in the home directory from the
-system's user database (not `$HOME`) is always yours. A `config.json` anywhere else is honoured
-only when its real path, after symlinks, is outside the project root, the current directory and
-every git work tree of that repository. A personal config inside the project gets the same
+system's user database (not `$HOME`) is always yours. A relative `EMINIAR_HOME` or `HOME` is
+never trusted, since the folder a session starts in decides where it points. A `config.json`
+anywhere else is honoured only when its real path, after symlinks, is neither inside nor above
+the project root, the current directory and every git work tree around them: linked work trees,
+and the superproject when you work inside a git submodule. A personal config there gets the same
 treatment as `eminiar.config.json`: only the keys listed above apply, and doctor, status and the
 dashboard name the ones it ignored. `enable`, `provider` and `key set` refuse to write there (a
-key stored inside a repo could be committed). Keep a custom `EMINIAR_HOME` outside your projects;
-temporary directories, as tests and CI use, are fine.
+key stored inside a repo could be committed). Keep a custom `EMINIAR_HOME` an absolute path
+outside your projects; temporary directories, as tests and CI use, are fine. A tree with no git
+at all (an unpacked archive) has no work tree to anchor on: don't let its `.claude/settings.json`
+set `EMINIAR_HOME` or `HOME` before you have read it.
 
 ## Providers and privacy
 

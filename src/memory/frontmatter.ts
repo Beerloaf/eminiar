@@ -41,7 +41,8 @@ export function parseMemoryFile(text: string): {
   const meta: MemoryMeta = {};
   for (const raw of header.split(/\r?\n/)) {
     const m = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(raw);
-    if (!m) continue;
+    // `__proto__: [a, b]` would set meta's prototype (a memory file can come with the repo).
+    if (!m || m[1] === "__proto__" || m[1] === "constructor" || m[1] === "prototype") continue;
     let value = m[2]!.replace(/\s+#.*$/, "").trim();
     if (value.startsWith("[") && value.endsWith("]")) {
       value = value.slice(1, -1);

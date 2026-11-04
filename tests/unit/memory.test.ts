@@ -365,3 +365,14 @@ describe("memory links in the graph", () => {
     expect(out).not.toContain("links memory:links/target");
   });
 });
+
+describe("memory frontmatter prototype keys (#62)", () => {
+  it("skips __proto__, constructor and prototype keys", () => {
+    const { meta } = parseMemoryFile(
+      "---\n__proto__: [a, b]\nconstructor: x\nprototype: y\nkind: note\n---\nbody\n",
+    );
+    expect(Object.getPrototypeOf(meta)).toBe(Object.prototype);
+    expect(Object.keys(meta)).toEqual(["kind"]);
+    expect((meta as Record<string, unknown>)[0]).toBeUndefined();
+  });
+});

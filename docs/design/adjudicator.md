@@ -271,6 +271,41 @@ project file set `openai.baseUrl` and send the user's Groq key and prompts to an
   the config instead of dropping the key quietly.
 - A cloned repo can therefore turn the adjudicator on, but with no personal config only the
   heuristic runs.
+- Prototype keys are dropped from every config layer (task #62). `JSON.parse` makes
+  `"__proto__"` an own key, and a merge that assigns it calls the prototype setter, so the
+  merged object inherited keys no allowlist saw and zod read them: security review #61 sent the
+  prompt and `$GITHUB_TOKEN` to an attacker's host from a committed file alone. `readJson` and
+  `readJsonQuiet` parse with `parseJsonSafe()` (= `ownJson(JSON.parse(text))`), which copies own
+  enumerable keys only and drops `__proto__`, `constructor` and `prototype` at every depth;
+  `deepMerge` skips the same keys and reads own keys only (`Object.hasOwn`); `projectLayer`
+  keeps an allowlisted key only when it is an own key; and `loadConfig` hands zod an `ownJson`
+  copy, never the merged object. The CLI's `readRaw` (which rewrites the config files) and the
+  memory frontmatter parser drop the same keys.
+
+### Trust anchor: which personal config may set the egress keys
+
+A trusted project's `.claude/settings.json` `env` block reaches the hooks, so it can move
+`EMINIAR_HOME` (or `HOME`, which `os.homedir()` reads) to a `config.json` the repo ships.
+`personalConfigTrusted(root, file)` (with `personalConfigProblem` giving the reason) decides
+whether that file may set the keys outside `PROJECT_ADJUDICATOR_KEYS`; an untrusted file gets
+the project layer's cut, and the CLI refuses to write consent or keys there.
+
+- A relative path is never trusted (task #63): a relative `EMINIAR_HOME` or `HOME` resolves
+  against the directory the session starts in, which the repo decides.
+- A file directly in `<account home>/.eminiar`, the home from the user database
+  (`os.userInfo()`, not `$HOME`), is always trusted (task #54).
+- Any other file is trusted only when its real path (symlinks resolved, case-insensitive on
+  macOS and Windows) is neither inside nor above (its folder at or above) any anchor: the project
+  root, `process.cwd()`, and every git work tree around either. `gitWorktrees()` climbs every
+  ancestor holding `.git` (not only the nearest), lists each repository's main and linked work
+  trees from `commondir` and `worktrees/*/gitdir`, and follows a submodule's
+  `gitdir: <super>/.git/modules/<name>` to the superproject's work tree (task #63; security
+  review #61 showed a submodule pointing `EMINIAR_HOME` at `../.em` in its superproject). No git
+  process is spawned.
+- An absolute `EMINIAR_HOME` in an unrelated place (CI and test temp directories) stays trusted.
+  The residual gap: a tree with no git at all (an unpacked archive) whose settings name an
+  absolute path to a sibling folder of the project; nothing on disk marks where such a tree
+  starts.
 
 ### Remote consent: bound to an origin, granted only by the personal config
 

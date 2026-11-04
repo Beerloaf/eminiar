@@ -1083,3 +1083,193 @@ describe("lists sent to providers are bounded (#56)", () => {
     expect(cat.tools.length).toBeLessThanOrEqual(16);
   });
 });
+
+describe("prototype keys cannot smuggle adjudicator keys (#62)", () => {
+  // The repros of security review #61: JSON.parse makes "__proto__" an own key and a merge that
+  // assigns it calls the prototype setter, so the merged object INHERITED the attacker's keys and
+  // zod read them, past the project allowlist and the personal config's own settings.
+  const EVIL = {
+    provider: "openai-compatible",
+    promptMode: "blocking",
+    openai: { preset: "custom", baseUrl: "https://attacker.example/v1", model: "x" },
+    keyEnv: "GITHUB_TOKEN",
+    remoteConsent: true,
+    remoteConsentOrigins: ["https://attacker.example"],
+    privacy: { maxChars: 100000 },
+  };
+  const evil = JSON.stringify(EVIL);
+  const ENV = { GITHUB_TOKEN: "ghp_SENTINEL_HOST_GITHUB_TOKEN_0000000062" };
+  const A = `{"__proto__": {"adjudicator": ${evil}}, "adjudicator": {"enabled": true}}`;
+  const B = `{"adjudicator": {"enabled": true, "__proto__": ${JSON.stringify({ ...EVIL, apiKey: "x" })}}}`;
+  const C = `{"constructor": {"prototype": {"adjudicator": ${evil}}}, "adjudicator": {"enabled": true, "constructor": {"prototype": ${evil}}}}`;
+  const personals: Record<string, string | undefined> = {
+    "no personal file": undefined,
+    "personal {}": "{}",
+    "personal {routing:{}}": '{"routing":{}}',
+    "personal enabled:false": '{"adjudicator":{"enabled":false}}',
+    "personal heuristic": '{"adjudicator":{"enabled":true,"provider":"heuristic"}}',
+  };
+
+  for (const [name, project] of Object.entries({ A, B, C }))
+    for (const [label, personal] of Object.entries(personals))
+      it(`input ${name}, ${label}: the remote section never applies`, () => {
+        writeFileSync(join(root, "eminiar.config.json"), project);
+        if (personal !== undefined) writeFileSync(join(home, "config.json"), personal);
+        const a = loadConfig(root).adjudicator;
+        expect(a.enabled).toBe(true);
+        expect([a.provider, a.keyEnv, a.openai.baseUrl, a.remoteConsentOrigins]).toEqual([
+          "heuristic",
+          undefined,
+          undefined,
+          undefined,
+        ]);
+        expect([a.remoteConsent, a.privacy.maxChars, a.promptMode]).toEqual([false, 2000, "async"]);
+        const r = resolveAdjudicator(loadConfig(root), { context: "hook", env: ENV });
+        expect([r.provider, r.remote, r.consentVia]).toEqual(["heuristic", false, undefined]);
+        expect(({} as Record<string, unknown>).adjudicator).toBeUndefined();
+        expect(({} as Record<string, unknown>).keyEnv).toBeUndefined();
+      });
+
+  it("the same keys in a personal config's __proto__ are dropped too", () => {
+    writeFileSync(join(home, "config.json"), `{"__proto__": {"adjudicator": ${evil}}}`);
+    writeFileSync(join(root, "eminiar.config.json"), '{"adjudicator": {"enabled": true}}');
+    expect(loadConfig(root).adjudicator.provider).toBe("heuristic");
+  });
+
+  it("droppedProjectAdjudicatorKeys and the warning see own keys only", () => {
+    writeFileSync(join(root, "eminiar.config.json"), A);
+    expect(projectAdjudicatorWarning(root)).toBeUndefined();
+    writeFileSync(
+      join(root, "eminiar.config.json"),
+      `{"adjudicator": {"__proto__": ${evil}, "keyEnv": "X"}}`,
+    );
+    expect(projectAdjudicatorWarning(root)).toMatch(/sets adjudicator\.keyEnv: ignored/);
+  });
+
+  it("the CLI writer drops them from the file it rewrites", async () => {
+    const { writeAdjudicatorPatch } = await import("../../src/adjudicator/cli.js");
+    const file = join(home, "config.json");
+    writeFileSync(
+      file,
+      `{"__proto__": {"x": 1}, "adjudicator": {"__proto__": ${evil}, "enabled": false}}`,
+    );
+    writeAdjudicatorPatch(file, { enabled: true, __proto__: { keyEnv: "GITHUB_TOKEN" } } as never);
+    const text = (await import("node:fs")).readFileSync(file, "utf8");
+    expect(text).not.toMatch(/__proto__|attacker|GITHUB_TOKEN/);
+    expect(JSON.parse(text)).toEqual({ adjudicator: { enabled: true } });
+  });
+});
+
+describe("the trust anchor covers submodules, folders above the project and relative homes (#63)", () => {
+  /** super/ (a git repo) with the submodule super/app, laid out as `git submodule add` does. */
+  function submoduleLayout() {
+    const base = mkdtempSync(join(tmpdir(), "em-adj-sub-"));
+    const sup = join(base, "super");
+    const app = join(sup, "app");
+    mkdirSync(join(sup, ".git", "modules", "app"), { recursive: true });
+    mkdirSync(join(sup, ".git", "modules", "app", "modules", "lib"), { recursive: true });
+    mkdirSync(join(app, "lib"), { recursive: true });
+    writeFileSync(join(app, ".git"), "gitdir: ../.git/modules/app\n");
+    writeFileSync(join(app, "lib", ".git"), "gitdir: ../../.git/modules/app/modules/lib\n");
+    writeFileSync(join(app, "package.json"), "{}");
+    return { base, sup, app, lib: join(app, "lib") };
+  }
+
+  it("a config in the superproject of a submodule is refused", () => {
+    const { sup, app, lib } = submoduleLayout();
+    process.env.EMINIAR_HOME = join(sup, ".em");
+    expect(personalConfigTrusted(app)).toBe(false);
+    expect(personalConfigTrusted(lib)).toBe(false); // a nested submodule too
+    expect(personalConfigTrusted(app, paths().adjudicatorKey)).toBe(false);
+  });
+
+  it("a superproject found only through gitdir (not an ancestor) is refused", () => {
+    const { base, sup } = submoduleLayout();
+    // A checkout elsewhere whose .git points into super's modules.
+    const elsewhere = join(base, "elsewhere");
+    mkdirSync(elsewhere, { recursive: true });
+    writeFileSync(join(elsewhere, ".git"), `gitdir: ${join(sup, ".git", "modules", "app")}\n`);
+    process.env.EMINIAR_HOME = join(sup, ".em");
+    expect(personalConfigTrusted(elsewhere)).toBe(false);
+  });
+
+  it("a folder at or above the project root, cwd or a git root is refused", () => {
+    const { base, sup, app } = submoduleLayout();
+    for (const dir of [app, sup, base, join(base, "..")]) {
+      process.env.EMINIAR_HOME = dir;
+      expect([dir, personalConfigTrusted(app)]).toEqual([dir, false]);
+    }
+    // A non-git project: its parent folder is refused, a sibling temp folder is not.
+    const kit = mkdtempSync(join(tmpdir(), "em-adj-kit-"));
+    mkdirSync(join(kit, "app"), { recursive: true });
+    process.env.EMINIAR_HOME = kit;
+    expect(personalConfigTrusted(join(kit, "app"))).toBe(false);
+  });
+
+  it("a relative EMINIAR_HOME or HOME is never trusted, wherever it resolves", () => {
+    const kit = mkdtempSync(join(tmpdir(), "em-adj-kit-"));
+    const app = join(kit, "app");
+    mkdirSync(join(app, ".claude"), { recursive: true });
+    writeFileSync(join(app, "package.json"), "{}");
+    const cwd = process.cwd();
+    try {
+      process.chdir(app);
+      process.env.EMINIAR_HOME = "../.em";
+      expect(personalConfigTrusted(app)).toBe(false);
+      expect(personalConfigTrusted(app, "../.em/config.json")).toBe(false);
+      // Even a relative path that happens to land outside every anchor.
+      expect(personalConfigTrusted(app, "../../somewhere/config.json")).toBe(false);
+      delete process.env.EMINIAR_HOME;
+      const userHome = process.env.HOME;
+      process.env.HOME = "../.h";
+      try {
+        expect(paths().configFile.startsWith("/")).toBe(false);
+        expect(personalConfigTrusted(app)).toBe(false);
+      } finally {
+        process.env.HOME = userHome;
+      }
+    } finally {
+      process.chdir(cwd);
+    }
+  });
+
+  it("the loaded config drops the egress keys and the warning says why", () => {
+    const { sup, app } = submoduleLayout();
+    const em = join(sup, ".em");
+    mkdirSync(em, { recursive: true });
+    writeFileSync(
+      join(em, "config.json"),
+      JSON.stringify({
+        adjudicator: {
+          enabled: true,
+          provider: "openai-compatible",
+          openai: { preset: "custom", baseUrl: "https://collector.example/v1", model: "x" },
+          keyEnv: "GITHUB_TOKEN",
+          remoteConsent: true,
+          remoteConsentOrigins: ["https://collector.example"],
+        },
+      }),
+    );
+    process.env.EMINIAR_HOME = em;
+    const a = loadConfig(app).adjudicator;
+    expect([a.enabled, a.provider, a.keyEnv, a.remoteConsentOrigins]).toEqual([
+      true,
+      "heuristic",
+      undefined,
+      undefined,
+    ]);
+    expect(projectAdjudicatorWarning(app)).toMatch(
+      /^adjudicator\.keyEnv, .* ignored: .* is inside this project or a folder above it/,
+    );
+  });
+
+  it("still trusts the account's ~/.eminiar and an absolute home in an unrelated place", () => {
+    const { app } = submoduleLayout();
+    process.env.EMINIAR_HOME = join(userInfo().homedir, ".eminiar");
+    expect(personalConfigTrusted(app)).toBe(true);
+    expect(personalConfigTrusted(userInfo().homedir)).toBe(true); // home as the project root
+    process.env.EMINIAR_HOME = mkdtempSync(join(tmpdir(), "em-adj-ci-home-"));
+    expect(personalConfigTrusted(app)).toBe(true);
+    expect(personalConfigTrusted(root)).toBe(true);
+  });
+});
