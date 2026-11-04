@@ -39,10 +39,17 @@ export default defineConfig([
   {
     ...shared,
     entry: { server: "src/server.ts", cli: "src/cli.ts" },
-    // One self-contained file per entry: the server and CLI each read and compile a
-    // single module at start-up instead of a dozen shared chunks (~5 ms less cold start
-    // with the compile cache warm). Costs some duplicated code on disk, never in memory.
-    splitting: false,
+    // Split into app-* chunks. With splitting:false esbuild turns every dynamic import()
+    // into a lazy __esm wrapper; once the lazily loaded graph (storage, memory, graph) reached
+    // zod through the adjudicator, zod itself was wrapped and the MCP SDK's top-level
+    // z.custom() ran before zod initialised: dist/server.js crashed at start with "Class2 is
+    // not a constructor" (unit tests never load the bundle). Real chunks have no such
+    // ordering hazard. Costs ~8 ms of server cold start (once per session) over the old
+    // single file. Chunks sit in dist/ itself so import.meta.url paths (pluginRoot) hold.
+    splitting: true,
+    esbuildOptions(options) {
+      options.chunkNames = "app-[name]-[hash]";
+    },
     // Cleans dist except the hook build's output, which runs in parallel and cleans its own.
     clean: HOOK_OUTPUT.map((p) => `!${p}`),
   },
