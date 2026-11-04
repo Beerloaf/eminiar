@@ -1203,9 +1203,11 @@ export const ADJUDICATOR_USAGE = `eminiar adjudicator <command>   (opt-in; off b
   provider --detect                   Look for Ollama / LM Studio / llama.cpp on this machine
   key set [provider] [--from-env NAME]   Store a key (hidden prompt or stdin; never argv) in the
                                       0600 key file, or the NAME of the env var holding it
-  key clear [provider] | key status   Remove a key / show where each key comes from (masked)
+  key clear [provider]                Remove a stored key
+  key status [--json]                 Show where each key comes from (masked)
   test "<text>" [--provider P] [--json]  Probe the provider and score one sample, side by side
-  eval [--provider P ...] [--fixture f.json|.js|.mjs] [--replace] [--repeat N] [--save] [--json]
+  eval [--provider P ...] [--providers a,b] [--fixture f.json|.js|.mjs] [--replace] [--repeat N]
+       [--save] [--json]              Compare providers against the heuristic on labelled requests
   stats [--since 7d] [--json] [--reset-learning]
 Providers: heuristic (offline) · embedding (local model) · typesafe = Jev (api.typesafe.ai)
   · openai-compatible presets ${PRESET_IDS.join(", ")}`;
