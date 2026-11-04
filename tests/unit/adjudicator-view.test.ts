@@ -14,6 +14,7 @@ import {
   evalTable,
   featureFacts,
   heat,
+  keptModelLabel,
   matrixGrid,
   ms,
   PARTS,
@@ -180,6 +181,16 @@ describe("matrix", () => {
     expect(g.max).toBe(5);
     expect(g.total).toBe(11);
     expect(g.agree).toBe(8);
+  });
+
+  it("names the dispatches left out of the matrix because the advice named no model (#78)", () => {
+    expect(keptModelLabel(undefined)).toBe("");
+    expect(keptModelLabel({ pin: 0, force: 0, fork: 0 })).toBe("");
+    expect(keptModelLabel({ pin: 2 })).toBe("2 kept their pin");
+    expect(keptModelLabel({ pin: 1, force: 3, fork: 1 })).toBe(
+      "1 kept their pin · 3 under CLAUDE_CODE_SUBAGENT_MODEL_FORCE · 1 fork",
+    );
+    expect(keptModelLabel({ fork: 2 })).toBe("2 forks");
   });
 
   it("heat is 0 for empty cells and grows with the count", () => {

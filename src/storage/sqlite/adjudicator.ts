@@ -15,6 +15,15 @@ import { healAdjudicatorColumns } from "./schema.js";
 
 type Row = Record<string, unknown>;
 
+/**
+ * The row's KeptModel flag ('pin' | 'force' | 'fork' | NULL) from its scores JSON, with the keys
+ * src/adjudicator/savings.ts KEPT_MODEL_FLAG names; NULL for scores that are not valid JSON.
+ */
+const KEPT_MODEL_SQL = `CASE WHEN scores IS NOT NULL AND json_valid(scores) THEN
+    CASE WHEN json_extract(scores, '$.pinDeferred') = 1 THEN 'pin'
+         WHEN json_extract(scores, '$.forced') = 1 THEN 'force'
+         WHEN json_extract(scores, '$.fork') = 1 THEN 'fork' END END`;
+
 /** Every `adjudications` column except id, as [camelCase field, snake_case column]. */
 const COLUMNS: ReadonlyArray<readonly [Exclude<keyof AdjudicationRow, "id">, string]> = [
   ["ts", "ts"],
@@ -472,12 +481,14 @@ export class SqliteAdjudicatorStore implements AdjudicatorStore {
       since === undefined
         ? this.prep(
             `SELECT surface, source, provider_status, action, outcome, latency_ms,
-               provider_latency_ms, cost_usd, savings_usd, model_final, actual_model
+               provider_latency_ms, cost_usd, savings_usd, model_final, actual_model,
+               ${KEPT_MODEL_SQL} AS kept_model
              FROM adjudications`,
           ).all()
         : this.prep(
             `SELECT surface, source, provider_status, action, outcome, latency_ms,
-               provider_latency_ms, cost_usd, savings_usd, model_final, actual_model
+               provider_latency_ms, cost_usd, savings_usd, model_final, actual_model,
+               ${KEPT_MODEL_SQL} AS kept_model
              FROM adjudications WHERE ts >= ?`,
           ).all(since)
     ) as Row[];
@@ -492,7 +503,14 @@ export class SqliteAdjudicatorStore implements AdjudicatorStore {
     let savingsUsd = 0;
     let applyIneffective = 0;
     let applyChecked = 0;
+    const keptModel = { pin: 0, force: 0, fork: 0 };
     for (const r of rows) {
+      // Advised rows whose model the advice did not name (savings.ts keptModel): counted apart.
+      if (
+        r.action === "advised" &&
+        (r.kept_model === "pin" || r.kept_model === "force" || r.kept_model === "fork")
+      )
+        keptModel[r.kept_model] += 1;
       bump(bySurface, r.surface);
       bump(bySource, r.source);
       bump(byProviderStatus, r.provider_status);
@@ -520,10 +538,19 @@ export class SqliteAdjudicatorStore implements AdjudicatorStore {
       latency: latencyStats(latency),
       providerLatency: latencyStats(providerLatency),
       rates: {
-        follow: ratio(a("followed"), a("advised") + a("followed") + a("ignored")),
+        follow: ratio(
+          a("followed"),
+          a("advised") -
+            keptModel.pin -
+            keptModel.force -
+            keptModel.fork +
+            a("followed") +
+            a("ignored"),
+        ),
         apply: ratio(a("applied"), a("applied") + a("respected")),
         respect: ratio(a("respected"), a("applied") + a("respected")),
       },
+      keptModel,
       costUsd,
       savingsUsd,
       netUsd: savingsUsd - costUsd,

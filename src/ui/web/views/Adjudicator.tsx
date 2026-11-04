@@ -37,6 +37,8 @@ import {
   featureFacts,
   featureLabel,
   heat,
+  type KeptModelCounts,
+  keptModelLabel,
   type LogFilters,
   matrixGrid,
   ms,
@@ -246,9 +248,24 @@ function ComplexityHistogram({ counts }: { counts: number[] }): JSX.Element {
   );
 }
 
-function MatrixHeat({ matrix }: { matrix: AdjSavings["matrix"] }): JSX.Element {
+function MatrixHeat({
+  matrix,
+  kept,
+}: {
+  matrix: AdjSavings["matrix"];
+  /** Dispatches left out of the matrix: the advice named no model (pin, FORCE, fork). */
+  kept?: KeptModelCounts | undefined;
+}): JSX.Element {
   const g = matrixGrid(matrix);
-  if (!g.total) return <Empty>no agent or plan dispatches with a known model yet</Empty>;
+  const outside = keptModelLabel(kept);
+  if (!g.total)
+    return (
+      <Empty>
+        {outside
+          ? `no dispatch ran on a model the advice chose (${outside})`
+          : "no agent or plan dispatches with a known model yet"}
+      </Empty>
+    );
   return (
     <>
       <div class="adj-scroll">
@@ -292,6 +309,7 @@ function MatrixHeat({ matrix }: { matrix: AdjSavings["matrix"] }): JSX.Element {
       <div class="sub">
         {g.agree} of {g.total} ran on the suggested tier ({Math.round((g.agree / g.total) * 100)}%)
         · outlined cells are agreement
+        {outside ? ` · not counted: ${outside} (the advice named no model)` : ""}
       </div>
     </>
   );
@@ -1634,8 +1652,13 @@ export function Adjudicator({ params }: { params: Record<string, string> }): JSX
     [
       "advice followed",
       rate(s.rates.follow),
-      `apply ${rate(s.rates.apply)} · respected ${rate(s.rates.respect)}`,
-      "followed ÷ (advised + followed + ignored); apply = applied ÷ (applied + respected)",
+      [
+        `apply ${rate(s.rates.apply)} · respected ${rate(s.rates.respect)}`,
+        keptModelLabel((s as { keptModel?: KeptModelCounts }).keptModel),
+      ]
+        .filter(Boolean)
+        .join(" · "),
+      "followed ÷ (advised + followed + ignored), leaving out advised dispatches whose advice named no model (a kept pin, CLAUDE_CODE_SUBAGENT_MODEL_FORCE, a fork); apply = applied ÷ (applied + respected)",
     ],
     [
       "fallback rate",
@@ -1770,7 +1793,10 @@ export function Adjudicator({ params }: { params: Record<string, string> }): JSX
               ) : !sav.data ? (
                 <Spinner />
               ) : (
-                <MatrixHeat matrix={sav.data.matrix} />
+                <MatrixHeat
+                  matrix={sav.data.matrix}
+                  kept={(sav.data as { keptModel?: KeptModelCounts }).keptModel}
+                />
               )}
             </div>
           </div>

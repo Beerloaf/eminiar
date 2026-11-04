@@ -26,6 +26,7 @@ export const SAVINGS_ASSUMPTIONS: readonly string[] = Object.freeze([
   "List prices, with cache pricing unchanged.",
   "Credit only for dispatches that were followed or applied; a failed attempt that was redone is charged its full cost.",
   "No credit for a dispatch to an agent whose model pin the advice kept (pinned, or a pin that could not be read): the adjudicator chose nothing there.",
+  "No credit while CLAUDE_CODE_SUBAGENT_MODEL_FORCE is on, nor for a fork (it runs on the main session's model): Claude Code, not the advice, sets the model.",
   "The adjudicator's own provider spend is subtracted.",
   "No credit for tool advice: em_stats already counts context kept out by em_* tools. Only the tool-advice follow rate is reported.",
   "Main-session advice yields potential savings only and is never added to net: the counterfactual cannot be observed.",
@@ -61,18 +62,82 @@ export function isPinned(model: string | null | undefined): model is string {
 }
 
 /**
- * The dispatch's advice kept the agent's model pin (onPreAgent stores `pinDeferred` in the row's
- * scores JSON when the pin is pinned or unknown and apply.respectFrontmatter is on): no model was
- * advised, so reconcile neither detects a follow nor credits savings for it.
+ * Why the advice named no model for a dispatch (docs/adjudicator.md "What the advice tells you to
+ * pass"), from the flag onPreAgent and plan advice store in the row's scores JSON:
+ *   pin    `pinDeferred`: the agent's model pin was kept (pinned, or unknown) under
+ *          apply.respectFrontmatter
+ *   force  `forced`: CLAUDE_CODE_SUBAGENT_MODEL_FORCE is on, so Claude Code sets the model
+ *   fork   `fork`: a fork runs on the main session's model
+ * Reconcile neither detects a follow nor credits savings for such a row, and the follow rate and
+ * the suggested-tier matrix leave it out.
  */
-export function pinDeferred(row: Pick<AdjudicationRow, "scores">): boolean {
-  if (!row.scores) return false;
+export type KeptModel = "pin" | "force" | "fork";
+
+/** The scores JSON key of each KeptModel. */
+export const KEPT_MODEL_FLAG: Readonly<Record<KeptModel, string>> = Object.freeze({
+  pin: "pinDeferred",
+  force: "forced",
+  fork: "fork",
+});
+
+/** The KeptModel flag stored in the row's scores JSON, if any. */
+export function keptModel(row: Pick<AdjudicationRow, "scores">): KeptModel | undefined {
+  if (!row.scores) return undefined;
   try {
     const s: unknown = JSON.parse(row.scores);
-    return !!s && typeof s === "object" && (s as { pinDeferred?: unknown }).pinDeferred === true;
+    if (!s || typeof s !== "object" || Array.isArray(s)) return undefined;
+    const o = s as Record<string, unknown>;
+    for (const k of Object.keys(KEPT_MODEL_FLAG) as KeptModel[])
+      if (o[KEPT_MODEL_FLAG[k]] === true) return k;
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The advice kept the agent's model pin (see KeptModel): no follow, no credit. */
+export function pinDeferred(row: Pick<AdjudicationRow, "scores">): boolean {
+  return keptModel(row) === "pin";
+}
+
+/**
+ * `raw` scores JSON with the KeptModel flag set (and the other two cleared), plus `extra` keys;
+ * undefined when `raw` is not a JSON object.
+ */
+export function withKeptModel(
+  raw: string | null | undefined,
+  kept: KeptModel | undefined,
+  extra: Record<string, unknown> = {},
+): string | undefined {
+  try {
+    const parsed: unknown = raw ? JSON.parse(raw) : {};
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const o: Record<string, unknown> = { ...(parsed as Record<string, unknown>), ...extra };
+    for (const k of Object.values(KEPT_MODEL_FLAG)) delete o[k];
+    if (kept) o[KEPT_MODEL_FLAG[kept]] = true;
+    return JSON.stringify(o);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * A row whose advice kept the agent's pin and that ran on it: no model was passed, and the model
+ * that ran is the pinned one (or cannot be compared: an unknown pin, no usage yet).
+ */
+export function keptPin(
+  row: Pick<AdjudicationRow, "scores" | "modelRequested" | "actualModel">,
+): boolean {
+  if (keptModel(row) !== "pin" || row.modelRequested) return false;
+  let pinModel: unknown;
+  try {
+    pinModel = (JSON.parse(row.scores as string) as { pin?: { model?: unknown } })?.pin?.model;
   } catch {
     return false;
   }
+  const want = typeof pinModel === "string" ? (tierOf(pinModel) ?? pinModel) : undefined;
+  const ran = row.actualModel ? (tierOf(row.actualModel) ?? row.actualModel) : undefined;
+  return !want || !ran || want === ran;
 }
 
 export interface BaselineQuery {
@@ -273,6 +338,12 @@ export interface SavingsReport {
    * plan rows of swarm tasks no agent row tracks (each task counted once).
    */
   matrix: Array<{ suggested: string; actual: string; n: number }>;
+  /**
+   * Dispatches (counted like the matrix) left out of it because the advice named no model: pin =
+   * the advice kept the agent's pin and it ran on it, force = CLAUDE_CODE_SUBAGENT_MODEL_FORCE set
+   * the model, fork = a fork ran on the main session's model.
+   */
+  keptModel: Record<KeptModel, number>;
   assumptions: string[];
 }
 
@@ -300,6 +371,7 @@ export function savingsReport(db: StorageAdapter, opts: SavingsReportOptions = {
   let spendUsd = 0;
   const byTier: Partial<Record<Tier, TierTokens>> = {};
   const matrix = new Map<string, { suggested: string; actual: string; n: number }>();
+  const kept: Record<KeptModel, number> = { pin: 0, force: 0, fork: 0 };
   // A swarm task has a plan row and, once dispatched, an agent row; reconcile gives both the
   // worker's calls. Count the task once: by its agent row(s), by the plan row only when no
   // agent row tracks the task (the rule reconcile teaches by). Agent rows follow their plan
@@ -319,7 +391,11 @@ export function savingsReport(db: StorageAdapter, opts: SavingsReportOptions = {
       if (r.savingsUsd < 0 && r.outcome === "failure") redoPenaltyUsd += r.savingsUsd;
       if (CREDITED.has(r.action ?? "")) creditedRows++;
     }
-    if (counts(r) && r.tier && r.actualModel) {
+    // A row whose model Claude Code chose (FORCE, a fork, a kept pin) is no agreement or
+    // disagreement with the advice: it is counted on its own.
+    const outside = counts(r) && r.actualModel ? keptModel(r) : undefined;
+    if (outside && (outside !== "pin" || keptPin(r))) kept[outside]++;
+    else if (counts(r) && r.tier && r.actualModel) {
       const actual = tierOf(r.actualModel) ?? r.actualModel;
       const k = `${r.tier}\u0000${actual}`;
       const m = matrix.get(k);
@@ -383,6 +459,7 @@ export function savingsReport(db: StorageAdapter, opts: SavingsReportOptions = {
     netUsd: realisedUsd - spendUsd,
     tokensPerSuccessByTier: byTier,
     matrix: [...matrix.values()].sort((a, b) => b.n - a.n),
+    keptModel: kept,
     assumptions,
   };
 }

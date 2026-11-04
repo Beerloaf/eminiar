@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { adjudicatePlan, planAdviceBlock } from "../adjudicator/swarm.js";
+import { adjudicatePlan, planAdviceBlock, planNextHint } from "../adjudicator/swarm.js";
 import { getContext, type ProjectContext } from "../context.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import { getStorage } from "../storage/index.js";
@@ -279,6 +279,8 @@ function planned(
   run: RunRow,
   caller: Caller,
   advice = "",
+  /** planNextHint: what to pass on the Agent call, worded like the advice block's head. */
+  adviceHint = "",
 ): string {
   const all = db.swarm.tasks(run.id);
   const byId = new Map(all.map((t) => [t.id, t]));
@@ -297,9 +299,7 @@ function planned(
     ? `Next: spawn one worker per claimable task with the Agent tool: subagent_type ${types}${
         rows.some((t) => !t.role) ? " (a task without a role fits any)" : ""
       }, and a prompt that names "task #N" (the worker claims it)${
-        advice
-          ? ", passing each task's suggested model and effort below as `model` and `effort`"
-          : ""
+        advice ? adviceHint : ""
       }; run_in_background: true runs them in parallel. Watch with em_swarm {action:"status"}.`
     : "Next: the coordinator spawns workers for these; name the new task ids in your final message.";
   return capOutput(
@@ -457,18 +457,29 @@ async function dispatch(args: Args, callerCtx: ProjectContext): Promise<string> 
       // The tasks are already stored, so the advice fails open: an error here must not make
       // the plan look failed (a retry would plan every task twice).
       let advice = "";
+      let adviceHint = "";
       let adviceNote = "";
       if (ctx.config.adjudicator?.enabled && ctx.config.adjudicator.surfaces.plan) {
+        const unavailable = "Adjudicator advice unavailable for this plan (the tasks are planned).";
         try {
-          advice = planAdviceBlock(await adjudicatePlan(ctx, db, run, swarm, rows, { sessionId }));
+          // adjudicatePlan does not throw: it logs its error (stderr here) and calls onError.
+          const list = await adjudicatePlan(ctx, db, run, swarm, rows, {
+            sessionId,
+            log: (line) => process.stderr.write(`eminiar: ${line}\n`),
+            onError: () => {
+              adviceNote = unavailable;
+            },
+          });
+          advice = planAdviceBlock(list);
+          adviceHint = planNextHint(list);
         } catch (err) {
           process.stderr.write(
             `eminiar: adjudicator plan advice skipped: ${(err as Error)?.message ?? String(err)}\n`,
           );
-          adviceNote = "Adjudicator advice unavailable for this plan (the tasks are planned).";
+          adviceNote = unavailable;
         }
       }
-      const out = planned(db, rows, swarm, run, caller, advice);
+      const out = planned(db, rows, swarm, run, caller, advice, adviceHint);
       return adviceNote ? `${out}\n${adviceNote}` : out;
     }
 

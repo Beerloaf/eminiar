@@ -550,11 +550,18 @@ export interface AdjudicationSummary {
   latency: LatencyStats;
   providerLatency: LatencyStats;
   /**
-   * follow = followed / (advised + followed + ignored): advice-mode dispatches whose advice
-   * was taken. apply = applied / (applied + respected) and respect = respected /
-   * (applied + respected): apply-mode dispatches. null when the denominator is 0.
+   * follow = followed / (advised + followed + ignored − keptModel): advice-mode dispatches whose
+   * advice was taken, leaving out the advised rows that named no model. apply = applied /
+   * (applied + respected) and respect = respected / (applied + respected): apply-mode
+   * dispatches. null when the denominator is 0.
    */
   rates: { follow: number | null; apply: number | null; respect: number | null };
+  /**
+   * Advised rows whose advice named no model (src/adjudicator/savings.ts keptModel): the agent's
+   * pin was kept, CLAUDE_CODE_SUBAGENT_MODEL_FORCE set the model, or a fork ran on the main
+   * session's model. Out of the follow rate's denominator.
+   */
+  keptModel: { pin: number; force: number; fork: number };
   /** Σ cost_usd: the adjudicator's own provider spend. */
   costUsd: number;
   /** Σ savings_usd as reconcile credited it. */

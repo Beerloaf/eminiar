@@ -385,6 +385,26 @@ export function matrixGrid(
   };
 }
 
+/** Dispatches whose model the advice did not name (savings.ts KeptModel), by reason. */
+export interface KeptModelCounts {
+  pin?: number | undefined;
+  force?: number | undefined;
+  fork?: number | undefined;
+}
+
+/**
+ * "2 kept their pin · 1 under FORCE · 1 fork": the dispatches left out of the matrix and the
+ * follow rate because Claude Code, not the advice, chose their model; "" when there are none.
+ */
+export function keptModelLabel(k: KeptModelCounts | undefined): string {
+  if (!k) return "";
+  const parts: string[] = [];
+  if (k.pin) parts.push(`${k.pin} kept their pin`);
+  if (k.force) parts.push(`${k.force} under CLAUDE_CODE_SUBAGENT_MODEL_FORCE`);
+  if (k.fork) parts.push(`${k.fork} fork${k.fork === 1 ? "" : "s"}`);
+  return parts.join(" · ");
+}
+
 /** Cell fill strength 0.08..0.9 (0 for an empty cell); text flips to white past 0.55. */
 export function heat(n: number, max: number): number {
   if (!(n > 0) || !(max > 0)) return 0;

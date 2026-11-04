@@ -4,7 +4,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { resolveAgentPin } from "../../src/adjudicator/agent-pin.js";
+import { FORK_AGENT, isFork, resolveAgentPin } from "../../src/adjudicator/agent-pin.js";
 import type { AsyncJob } from "../../src/adjudicator/async.js";
 import { resolveAdjudicator } from "../../src/adjudicator/config.js";
 import { clearKey, resetSecrets, setKey } from "../../src/adjudicator/secrets.js";
@@ -777,6 +777,97 @@ describe("onPreAgent", () => {
         delete process.env.CLAUDE_CODE_EFFORT_LEVEL;
       }
     });
+
+    it("a fork gets no model, effort or pin advice and is never applied (#74)", async () => {
+      const FORK = {
+        subagent_type: "fork",
+        description: "refactor",
+        prompt:
+          "Redesign the storage layer across all modules and migrate every caller to the new adapter interface",
+      };
+      const { a, r } = await advise(FORK);
+      expect(a?.note).toMatch(
+        /^adjudicator: fork runs on the main session's model; no `model` or `effort` to pass \(complexity \d, conf [\d.]+\)$/,
+      );
+      expect(a?.note).not.toMatch(/pin|pass effort|pass model|role /);
+      expect(a?.model).toBeUndefined();
+      expect(r.action).toBe("advised");
+      const sc = JSON.parse(r.scores!);
+      expect(sc).toMatchObject({ fork: true, pin: { status: "unpinned", source: "builtin" } });
+      expect(sc.pinDeferred).toBeUndefined();
+
+      // apply mode (scope all) never sets a model on a fork, even under FORCE
+      const ctx = configure({
+        enabled: true,
+        mode: "apply",
+        promptMode: "heuristic",
+        apply: { scope: "all", minConfidence: 0 },
+      });
+      const { onPreAgent } = await hooksModule();
+      for (const force of [undefined, "1"]) {
+        if (force) process.env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE = force;
+        try {
+          const ap = await onPreAgent(
+            ctx,
+            base({ tool_name: "Agent", tool_input: { ...FORK, description: `apply ${force}` } }),
+            undefined,
+          );
+          expect(ap?.model).toBeUndefined();
+          expect(ap?.action).toBe("respected");
+          expect(ap?.note).toMatch(/^adjudicator: fork runs on the main session's model/);
+          const ar = db().adjudicator.get(ap!.rowId!)!;
+          expect(ar.modelFinal).toBeNull();
+          expect(JSON.parse(ar.scores!)).toMatchObject({ fork: true });
+          expect(JSON.parse(ar.scores!).forced).toBeUndefined();
+        } finally {
+          delete process.env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE;
+        }
+      }
+    });
+
+    it("FORCE: the model is informational, no pin is named, the row is flagged forced (#76)", async () => {
+      mkdirSync(join(root, ".claude", "agents"), { recursive: true });
+      writeFileSync(
+        join(root, ".claude", "agents", "force-pinned.md"),
+        "---\nname: force-pinned\nmodel: opus\n---\nbody\n",
+      );
+      process.env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE = "1";
+      process.env.CLAUDE_CODE_SUBAGENT_MODEL = "haiku";
+      try {
+        const free = await advise({ ...LIST, subagent_type: "general-purpose", model: "opus" });
+        expect(free.a?.note).toMatch(
+          /^adjudicator: CLAUDE_CODE_SUBAGENT_MODEL_FORCE sets the model \(adjudicator would pick \w+; complexity \d, conf [\d.]+\); pass effort:'\w+' \(Claude Code 2\.1\.292\+\)/,
+        );
+        expect(free.a?.note).not.toMatch(/pass model/);
+        expect(free.a?.model).toBeUndefined();
+        expect(free.r.action).toBe("advised");
+        // without the adjudicator FORCE would run CLAUDE_CODE_SUBAGENT_MODEL
+        expect(free.r.baselineModel).toBe("haiku");
+        const sc = JSON.parse(free.r.scores!);
+        expect(sc.forced).toBe(true);
+        expect(sc.pinDeferred).toBeUndefined();
+
+        const ctx = configure({ enabled: true, mode: "advise" });
+        const { onPreAgent } = await hooksModule();
+        const pinned = await onPreAgent(
+          ctx,
+          base({
+            tool_name: "Agent",
+            tool_input: { ...LIST, description: "pinned", subagent_type: "force-pinned" },
+          }),
+          undefined,
+        );
+        expect(pinned?.note).not.toMatch(/pinned opus|remove the model pin|pass model/);
+        expect(pinned?.note).toMatch(/CLAUDE_CODE_SUBAGENT_MODEL_FORCE sets the model/);
+        const pr = db().adjudicator.get(pinned!.rowId!)!;
+        expect(JSON.parse(pr.scores!)).toMatchObject({ forced: true });
+        expect(JSON.parse(pr.scores!).pinDeferred).toBeUndefined();
+        expect(pr.baselineModel).toBe("haiku");
+      } finally {
+        delete process.env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE;
+        delete process.env.CLAUDE_CODE_SUBAGENT_MODEL;
+      }
+    });
   });
 });
 
@@ -1149,6 +1240,21 @@ describe("resolveAgentPin: Claude Code's agent lookup order", () => {
       source: "managed",
       model: "sonnet",
     });
+  });
+
+  it("a fork has no pin: it runs on the main session's model (#74)", () => {
+    const { proj, put, look } = world();
+    expect(FORK_AGENT).toBe("fork");
+    expect(isFork("fork")).toBe(true);
+    expect(isFork("Fork")).toBe(false);
+    expect(look("fork")).toEqual({
+      status: "unpinned",
+      source: "builtin",
+      reason: "a fork runs on the main session's model",
+    });
+    // Claude Code's fork is not a definition: a file named fork does not pin it.
+    put(join(proj, ".claude", "agents"), "fork.md", md("fork", "opus"));
+    expect(look("fork").status).toBe("unpinned");
   });
 
   it("built-ins: no pin for general-purpose/Explore/Plan, fixed models for the others", () => {

@@ -28,7 +28,7 @@ import { getStorage } from "../storage/index.js";
 import type { AdjudicationInput, AdjudicationPatch } from "../storage/types.js";
 import { coordinationRoot, type SwarmSpawnCheck } from "../swarm/hooks.js";
 import type { TaskRow } from "../swarm/types.js";
-import { type AgentPin, resolveAgentPin } from "./agent-pin.js";
+import { type AgentPin, isFork, resolveAgentPin } from "./agent-pin.js";
 import { type AsyncJob, spawnAsyncJob } from "./async.js";
 import { resolveAdjudicator } from "./config.js";
 import { adjudicateOne, cacheKeyFor, type EngineOptions } from "./engine.js";
@@ -37,8 +37,15 @@ import { extractFeatures } from "./features.js";
 import { topIntent } from "./heuristic.js";
 import { biasFor, reconcile } from "./learn.js";
 import type { FetchLike } from "./providers/http.js";
-import { isPinned, resolveBaseline, tierOf, tierRank } from "./savings.js";
-import { effortForced, pinnedPart } from "./swarm.js";
+import {
+  isPinned,
+  type KeptModel,
+  resolveBaseline,
+  tierOf,
+  tierRank,
+  withKeptModel,
+} from "./savings.js";
+import { dispatchRule, effortForced, keptModelOf, pinnedPart } from "./swarm.js";
 import {
   type AdjudicationAction,
   type AdjudicationRequest,
@@ -309,16 +316,13 @@ function withPin(
   db: StorageAdapter,
   rowId: number,
   pin: AgentPin,
-  deferred = false,
+  kept: KeptModel | undefined,
 ): { scores?: string } {
   try {
-    const raw = db.adjudicator.get(rowId)?.scores;
-    const parsed: unknown = raw ? JSON.parse(raw) : {};
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-    // `pinDeferred`: the advice kept the agent's pin, so reconcile credits no savings (savings.ts).
-    return {
-      scores: JSON.stringify({ ...parsed, pin, ...(deferred ? { pinDeferred: true } : {}) }),
-    };
+    // The KeptModel flag (pinDeferred / forced / fork): the advice named no model, so reconcile
+    // neither detects a follow nor credits savings for the row (savings.ts).
+    const scores = withKeptModel(db.adjudicator.get(rowId)?.scores, kept, { pin });
+    return scores === undefined ? {} : { scores };
   } catch {
     return {};
   }
@@ -395,13 +399,31 @@ export async function onPreAgent(
   const pinnedRespected = cfg.apply.respectFrontmatter && isPinned(pinned);
   const pinUnknown = cfg.apply.respectFrontmatter && pin.status === "unknown";
   const isForced = subagentModelForced(env);
+  const fork = isFork(agentType);
+  // One rule table for plan advice, the plan's Next line and this note (swarm.ts dispatchRule).
+  const rule = dispatchRule({
+    fork,
+    forced: isForced,
+    pin: pinnedRespected || pinUnknown,
+    effortSet: !!str(ti.effort) || effortForced(env),
+  });
   const applyMode = cfg.mode === "apply";
   const inScope = cfg.apply.scope === "all" || !!worker;
-  const mayApply =
-    applyMode && inScope && !isForced && !explicit && !pinnedRespected && !pinUnknown;
+  const mayApply = applyMode && inScope && rule.model === "pass" && !explicit;
   const sessionId =
     input.session_id && input.session_id !== "unknown" ? input.session_id : undefined;
-  const baseline = resolveBaseline(db, { pinned, sessionId, ts: now });
+  // Without the adjudicator: FORCE runs CLAUDE_CODE_SUBAGENT_MODEL (else the main session's model)
+  // and ignores pins; a fork runs on the main session's model.
+  const baseline = resolveBaseline(db, {
+    pinned:
+      rule.model === "fork"
+        ? undefined
+        : rule.model === "forced"
+          ? str(env.CLAUDE_CODE_SUBAGENT_MODEL)
+          : pinned,
+    sessionId,
+    ts: now,
+  });
 
   const row: Partial<AdjudicationInput> = {
     modelRequested: explicit ?? null,
@@ -443,12 +465,17 @@ export async function onPreAgent(
   if (!applyMode || !inScope) {
     action = "advised";
     modelFinal = explicit ?? null;
+  } else if (fork) {
+    // A fork runs on the main session's model: nothing to apply or keep.
+    action = "respected";
+    modelFinal = null;
   } else if (isForced || explicit || pinnedRespected) {
     action = "respected";
-    modelFinal =
-      explicit ??
-      (isForced ? (str(env.CLAUDE_CODE_SUBAGENT_MODEL) ?? null) : null) ??
-      (isPinned(pinned) ? pinned : null);
+    // Under FORCE Claude Code ignores the call's model and the pin: CLAUDE_CODE_SUBAGENT_MODEL
+    // runs, else the main session's model (unknown here).
+    modelFinal = isForced
+      ? (str(env.CLAUDE_CODE_SUBAGENT_MODEL) ?? null)
+      : (explicit ?? (isPinned(pinned) ? pinned : null));
   } else if (clamped && conf >= cfg.apply.minConfidence && !pinUnknown) {
     action = "applied";
     model = clamped;
@@ -457,15 +484,16 @@ export async function onPreAgent(
     action = "advised";
     modelFinal = null;
   }
-  // Advise mode respects a pin like apply mode: no model to pass, and no savings credit later
-  // (also when the coordinator passes a model anyway: it was not advised).
-  const pinDeferred = (pinnedRespected || pinUnknown) && !isForced && !model;
+  // Advise mode respects a pin, FORCE and a fork like apply mode: no model to pass, and no
+  // savings credit later (also when the coordinator passes a model anyway: it was not advised).
+  const kept = model ? undefined : keptModelOf(rule);
+  const pinDeferred = kept === "pin";
   if (a.rowId !== undefined) {
     try {
       db.adjudicator.update(a.rowId, {
         action,
         modelFinal,
-        ...withPin(db, a.rowId, pin, pinDeferred),
+        ...withPin(db, a.rowId, pin, kept),
       });
     } catch {
       // the row keeps its verdict without the action
@@ -473,12 +501,19 @@ export async function onPreAgent(
   }
 
   const why = `complexity ${c}, conf ${conf.toFixed(2)}`;
+  if (rule.model === "fork") {
+    // A fork runs on the main session's model and takes no per-call effort: nothing to pass.
+    const note = `adjudicator: fork runs on the main session's model; no \`model\` or \`effort\` to pass (${why})`;
+    const out: AgentAdvice = { action, note: clip(note, ADVICE_MAX) };
+    if (a.rowId !== undefined) out.rowId = a.rowId;
+    return out;
+  }
   // The Agent call takes `effort` (Claude Code 2.1.292+) unless CLAUDE_CODE_EFFORT_LEVEL outranks
   // it or the call already passes one; the hook never sets it.
   const effortHint =
-    str(ti.effort) || effortForced(env)
-      ? `suggested effort ${effort}`
-      : `pass effort:'${effort}' (Claude Code ${AGENT_EFFORT_SINCE}+)`;
+    rule.effort === "pass"
+      ? `pass effort:'${effort}' (Claude Code ${AGENT_EFFORT_SINCE}+)`
+      : `suggested effort ${effort}`;
   const extras = [effortHint];
   if (role && role !== "none") extras.push(`role ${role}`);
   if (applyMode && inScope && pinUnknown && !isForced && !explicit)
@@ -486,6 +521,11 @@ export async function onPreAgent(
   let note: string;
   if (action === "applied") {
     note = `adjudicator: model ${model} applied (${why}); ${extras.join(", ")}`;
+  } else if (rule.model === "forced") {
+    // Claude Code ignores `model` on the call and the agent's pin: the model is informational.
+    note = `adjudicator: CLAUDE_CODE_SUBAGENT_MODEL_FORCE sets the model${
+      clamped ? ` (adjudicator would pick ${clamped}; ${why})` : ` (${why})`
+    }; ${extras.join(", ")}`;
   } else if (pinDeferred && !explicit) {
     const part = pinnedPart(
       { status: pinUnknown ? "unknown" : "pinned", model: pinned, source: pin.source },

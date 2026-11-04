@@ -8,6 +8,7 @@
  *   4 user        ~/.claude/agents/
  *   5 plugin      the plugin's agents/ (or its manifest `agents` paths), only by scoped name
  *   built-ins     general-purpose, Explore, Plan (no pin), statusline-setup, claude-code-guide
+ *   fork          `fork` (Agent(fork)) is no definition: it runs on the main session's model
  *
  * Project, user and managed directories are scanned recursively and an agent is identified by its
  * frontmatter `name` alone (the file name does not matter). A plugin agent is `plugin:agent`, or
@@ -44,6 +45,18 @@ export interface PinLookup {
   env?: NodeJS.ProcessEnv | undefined;
   /** Test seam: the managed settings directory (null: none). */
   managedDir?: string | null | undefined;
+}
+
+/**
+ * The subagent_type of a fork (sub-agents.md "Fork the current conversation"): it inherits the
+ * main session's system prompt, tools and model, so it has no pin, no `model` and no per-call
+ * `effort` to advise.
+ */
+export const FORK_AGENT = "fork";
+
+/** The dispatch starts a fork. */
+export function isFork(agentType: string | undefined): boolean {
+  return agentType === FORK_AGENT;
 }
 
 /** Built-in agent types and the model each one runs on when no file overrides it. */
@@ -307,6 +320,12 @@ function pluginDefs(segments: string[], env: NodeJS.ProcessEnv, home: string): F
 /** The model pin of the agent a dispatch names, in Claude Code's lookup order. */
 export function resolveAgentPin(agentType: string, q: PinLookup): AgentPin {
   try {
+    if (isFork(agentType))
+      return {
+        status: "unpinned",
+        source: "builtin",
+        reason: "a fork runs on the main session's model",
+      };
     const env = q.env ?? process.env;
     const home = homeOf(env);
 

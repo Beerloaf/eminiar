@@ -3,14 +3,25 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
-/** #66: lets a test make adjudicatePlan throw; every other call reaches the real module. */
-const planFault = vi.hoisted(() => ({ error: undefined as Error | undefined }));
+/**
+ * #66: lets a test make adjudicatePlan throw; `internal` makes the real one fail inside (a task
+ * without `files`), so its own catch logs and calls onError. Every other call is untouched.
+ */
+const planFault = vi.hoisted(() => ({
+  error: undefined as Error | undefined,
+  internal: false,
+}));
 vi.mock("../../src/adjudicator/swarm.js", async (importOriginal) => {
   const real = await importOriginal<typeof import("../../src/adjudicator/swarm.js")>();
   return {
     ...real,
     adjudicatePlan: async (...args: Parameters<typeof real.adjudicatePlan>) => {
       if (planFault.error) throw planFault.error;
+      if (planFault.internal) {
+        const [c, d, r, sw, tasks, o] = args;
+        const broken = tasks.map((t) => ({ ...t, files: undefined }) as unknown as TaskRow);
+        return real.adjudicatePlan(c, d, r, sw, broken, o);
+      }
       return real.adjudicatePlan(...args);
     },
   };
@@ -25,13 +36,17 @@ import {
 } from "../../src/adjudicator/providers/index.js";
 import {
   adjudicatePlan,
+  dispatchRule,
   effortForced,
+  keptModelOf,
   modelForced,
   type PlanAdvice,
   planAdviceBlock,
   planAdviceEnabled,
   planAdviceHead,
   planLines,
+  planNextHint,
+  planPassing,
   taskRequest,
 } from "../../src/adjudicator/swarm.js";
 import {
@@ -301,6 +316,94 @@ describe("plan advice: model pins and the Agent call's effort (#68)", () => {
     expect(planAdviceBlock([base], {})).not.toMatch(/set only in the agent file/);
   });
 
+  it("one rule table decides model and effort for every surface (#73-#76)", () => {
+    // fork > FORCE > pin > pass; effort is informational with the env or an effort on the call
+    expect(dispatchRule({ fork: true, forced: true, pin: true, effortSet: false })).toEqual({
+      model: "fork",
+      effort: "fork",
+    });
+    expect(dispatchRule({ forced: true, pin: true, effortSet: false })).toEqual({
+      model: "forced",
+      effort: "pass",
+    });
+    expect(dispatchRule({ forced: false, pin: true, effortSet: true })).toEqual({
+      model: "pin",
+      effort: "informational",
+    });
+    expect(dispatchRule({ forced: false, effortSet: false })).toEqual({
+      model: "pass",
+      effort: "pass",
+    });
+    expect(
+      (["pass", "pin", "forced", "fork"] as const).map((model) =>
+        keptModelOf({ model, effort: "pass" }),
+      ),
+    ).toEqual([undefined, "pin", "force", "fork"]);
+  });
+
+  it("the Next hint and the head agree for pins, FORCE and the effort env (#73)", () => {
+    const pinned: PlanAdvice = { ...base, pin: { status: "pinned", model: "opus" } };
+    const cases: Array<{
+      advice: PlanAdvice[];
+      env: NodeJS.ProcessEnv;
+      next: string;
+      head: RegExp;
+    }> = [
+      {
+        advice: [base],
+        env: {},
+        next: ", passing `model` and `effort` as each suggestion below says",
+        head: /pass the model as `model` and the effort as `effort`/,
+      },
+      {
+        advice: [pinned, { ...pinned, taskId: 4 }],
+        env: {},
+        next: ", passing `effort` as each suggestion below says; leave `model` unset for pinned agents",
+        head: /^Adjudicator suggestions: pass the effort as `effort` \(Claude Code 2\.1\.292 or later\) on each Agent call; a pinned agent keeps its model: pass no `model`:$/,
+      },
+      {
+        advice: [pinned, { ...base, taskId: 4 }],
+        env: {},
+        next: ", passing `model` and `effort` as each suggestion below says; leave `model` unset for pinned agents",
+        head: /pass the model as `model` and the effort as `effort`.*; a pinned agent keeps its model: pass no `model`:$/,
+      },
+      {
+        advice: [pinned],
+        env: { CLAUDE_CODE_EFFORT_LEVEL: "high" },
+        next: "; the suggestions below are informational: leave `model` unset for pinned agents and pass no `effort` (CLAUDE_CODE_EFFORT_LEVEL is set and outranks `effort`)",
+        head: /^Adjudicator suggestions: informational only \(effort: CLAUDE_CODE_EFFORT_LEVEL is set and outranks `effort`\); a pinned agent keeps its model: pass no `model`:$/,
+      },
+      {
+        advice: [{ ...base, forced: true }],
+        env: { CLAUDE_CODE_SUBAGENT_MODEL_FORCE: "1" },
+        next: ", passing `effort` as each suggestion below says; leave `model` unset (CLAUDE_CODE_SUBAGENT_MODEL_FORCE sets it)",
+        head: /the model is informational; pass the effort as `effort`/,
+      },
+      {
+        advice: [{ ...base, forced: true }],
+        env: { CLAUDE_CODE_SUBAGENT_MODEL_FORCE: "1", CLAUDE_CODE_EFFORT_LEVEL: "max" },
+        next: "; the suggestions below are informational: leave `model` unset (CLAUDE_CODE_SUBAGENT_MODEL_FORCE sets it) and pass no `effort` (CLAUDE_CODE_EFFORT_LEVEL is set and outranks `effort`)",
+        head: /the model is informational; CLAUDE_CODE_EFFORT_LEVEL is set and outranks `effort`, so effort is too/,
+      },
+    ];
+    for (const c of cases) {
+      const label = JSON.stringify({ env: c.env, pins: c.advice.map((a) => !!a.pin) });
+      expect(planNextHint(c.advice, c.env), label).toBe(c.next);
+      expect(planAdviceHead(c.advice, c.env), label).toMatch(c.head);
+      const p = planPassing(c.advice, c.env);
+      // the Next hint names `model` exactly when the head tells the coordinator to pass it
+      expect(/passing `model`/.test(planNextHint(c.advice, c.env)), label).toBe(p.model);
+      expect(/pass the model as `model`/.test(planAdviceHead(c.advice, c.env)), label).toBe(
+        p.model,
+      );
+    }
+    expect(planNextHint([], {})).toBe("");
+    // under FORCE a line names the model as informational and never a pin
+    expect(planLines([{ ...base, forced: true }])[0]).toBe(
+      "#3 → swarm-feat-coder · model haiku (informational) · effort low (complexity 1, conf 0.90)",
+    );
+  });
+
   it("the effort ladder reaches max only at the top of the scale", () => {
     expect(EFFORTS).toEqual(["low", "medium", "high", "xhigh", "max"]);
     expect([3.5, 3.6, MAX_EFFORT_AT - 0.01, MAX_EFFORT_AT, 4].map(effortFor)).toEqual([
@@ -386,6 +489,61 @@ describe("plan advice: model pins and the Agent call's effort (#68)", () => {
       const a = await plan({ apply: { respectFrontmatter: false } });
       expect(a.every((x) => x.pin === undefined)).toBe(true);
       expect(planLines(a).every((l) => / · model \w+ · effort /.test(l))).toBe(true);
+    });
+
+    it("flags the plan rows of kept pins (pinDeferred) and leaves the others alone", async () => {
+      const a = await plan({});
+      const flags = a.map((x) => JSON.parse(db.adjudicator.get(x.rowId!)?.scores ?? "{}"));
+      expect(flags.map((f) => f.pinDeferred)).toEqual([true, undefined, true]);
+      expect(flags[0].pin).toMatchObject({ status: "pinned", model: "opus" });
+      expect(flags.every((f) => f.forced === undefined)).toBe(true);
+    });
+
+    it("names no pin under CLAUDE_CODE_SUBAGENT_MODEL_FORCE and flags the rows forced (#75)", async () => {
+      const ctx = { root, config: configWith({ enabled: true }) };
+      const run = db.swarm.runCreate({
+        id: `force-${Math.random().toString(36).slice(2, 8)}`,
+        swarm: "pins",
+        goal: "g",
+        topology: "hierarchical",
+      });
+      const tasks = ["pinned", "free", "ghost"].map((role) =>
+        db.swarm.taskAdd({ run_id: run.id, title: `Rename a thing in ${role}`, role }),
+      );
+      const env = { CLAUDE_CODE_SUBAGENT_MODEL_FORCE: "1", CLAUDE_CODE_SUBAGENT_MODEL: "haiku" };
+      const a = await adjudicatePlan(ctx, db, run, spec, tasks, { provider: null, env });
+      expect(a.every((x) => x.pin === undefined && x.forced === true)).toBe(true);
+      const block = planAdviceBlock(a, env);
+      expect(block).not.toMatch(/pinned|pin is unknown|remove the pin/);
+      expect(block).toMatch(/· model \w+ \(informational\) · effort /);
+      for (const x of a) {
+        const sc = JSON.parse(db.adjudicator.get(x.rowId!)?.scores ?? "{}");
+        expect(sc.forced).toBe(true);
+        expect(sc.pinDeferred).toBeUndefined();
+      }
+    });
+
+    it("logs and reports an internal advice error instead of swallowing it", async () => {
+      const ctx = { root, config: configWith({ enabled: true }) };
+      const run = db.swarm.runCreate({
+        id: `err-${Math.random().toString(36).slice(2, 8)}`,
+        swarm: "pins",
+        goal: "g",
+        topology: "hierarchical",
+      });
+      const task = db.swarm.taskAdd({ run_id: run.id, title: "x", role: "free" });
+      const logs: string[] = [];
+      const errors: unknown[] = [];
+      const broken = { ...task, files: undefined } as unknown as TaskRow;
+      const a = await adjudicatePlan(ctx, db, run, spec, [broken], {
+        provider: null,
+        env: {},
+        log: (l) => logs.push(l),
+        onError: (e) => errors.push(e),
+      });
+      expect(a).toEqual([]);
+      expect(errors).toHaveLength(1);
+      expect(logs.join("\n")).toMatch(/^adjudicator: plan advice skipped: /);
     });
   });
 });
@@ -483,7 +641,7 @@ describe("em_swarm plan advice and em_adjudicate", () => {
     expect(calls[0]).toHaveLength(3);
     expect(calls[0]?.every((r) => r.surface === "plan")).toBe(true);
     expect(out).toContain(
-      "passing each task's suggested model and effort below as `model` and `effort`",
+      'names "task #N" (the worker claims it), passing `model` and `effort` as each suggestion below says; run_in_background',
     );
     expect(out).toContain(
       "Adjudicator suggestions: pass the model as `model` and the effort as `effort` on each Agent call",
@@ -570,13 +728,40 @@ describe("em_swarm plan advice and em_adjudicate", () => {
     expect(out).toMatch(/^Planned 1 task\(s\) in run /);
     expect(out).toContain("Implement exponential backoff in the downloader (coder)");
     expect(out).not.toContain("Adjudicator suggestions");
-    expect(out).not.toContain("passing each task's suggested model");
+    expect(out).not.toContain("as each suggestion below says");
     expect(out.split("\n").at(-1)).toBe(
       "Adjudicator advice unavailable for this plan (the tasks are planned).",
     );
     expect(writes.join("")).toContain("adjudicator plan advice skipped: Cannot find module");
     const tasks = db.swarm.tasks(run.id);
     expect(tasks).toHaveLength(1);
+  });
+
+  it("reports advice unavailable when adjudicatePlan fails inside, on stderr too (#73)", async () => {
+    enable();
+    const { p } = fakeProvider();
+    registerProvider("embedding", () => p);
+    await call({ action: "start", swarm: "feat", goal: "advice fails inside" });
+    const writes: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      writes.push(String(chunk));
+      return true;
+    });
+    planFault.internal = true;
+    let out: string;
+    try {
+      out = await call({ action: "plan", tasks: [{ title: "Add a retry", role: "coder" }] });
+    } finally {
+      planFault.internal = false;
+      spy.mockRestore();
+    }
+    expect(out).toMatch(/^Planned 1 task\(s\) in run /);
+    expect(out).not.toContain("Adjudicator suggestions");
+    expect(out).not.toContain("as each suggestion below says");
+    expect(out.split("\n").at(-1)).toBe(
+      "Adjudicator advice unavailable for this plan (the tasks are planned).",
+    );
+    expect(writes.join("")).toMatch(/eminiar: adjudicator: plan advice skipped: /);
   });
 
   it("skips plan advice when surfaces.plan is off, and adjudicatePlan is a no-op when disabled", async () => {
@@ -749,6 +934,122 @@ describe("em_swarm plan advice and em_adjudicate", () => {
         .text,
     ).toMatch(/adjudicator is off/);
     expect((await runAdjudicate({ action: "stats" }, ctx, { db })).isError).toBeFalsy();
+  });
+});
+
+describe("em_swarm plan with pinned swarm agents (#73, #75)", () => {
+  const PINNED_YAML = `
+version: 1
+swarms:
+  pin:
+    description: pinned swarm
+    max_agents: 3
+    agents:
+      coder:
+        description: writes and refactors code
+        model: opus
+      reviewer:
+        description: reviews changes
+        model: opus
+`;
+  let ctx: ProjectContext;
+  let main: CallerStamp;
+  const saved = {
+    force: process.env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE,
+    sub: process.env.CLAUDE_CODE_SUBAGENT_MODEL,
+    home: process.env.HOME,
+  };
+  type Args = Parameters<typeof emSwarm.handler>[0];
+  const call = async (args: Args) => {
+    const r = await emSwarm.handler({ ...args, ...main }, ctx);
+    return r.content.map((c) => c.text).join("\n");
+  };
+  const plan = async (env: Record<string, string>) => {
+    Object.assign(process.env, env);
+    try {
+      await call({ action: "start", swarm: "pin", goal: `pins ${Object.keys(env).join(",")}` });
+      const out = await call({
+        action: "plan",
+        tasks: [
+          { title: "Rename the helper in utils", role: "coder" },
+          { title: "Review the change for security issues", role: "reviewer" },
+        ],
+      });
+      const db = getStorage(ctx, { vectors: false });
+      for (const r of db.swarm.runs({ status: "active", limit: 50 }))
+        await call({ action: "finish", run: r.id, status: "cancelled" });
+      return out;
+    } finally {
+      for (const k of Object.keys(env)) delete process.env[k];
+    }
+  };
+  const nextOf = (out: string) => out.split("\n").find((l) => l.startsWith("Next:")) ?? "";
+  const headOf = (out: string) =>
+    out.split("\n").find((l) => l.startsWith("Adjudicator suggestions")) ?? "";
+
+  beforeAll(() => {
+    process.env.EMINIAR_HOME = mkdtempSync(join(tmpdir(), "em-home-adj-pinswarm-"));
+    process.env.HOME = mkdtempSync(join(tmpdir(), "em-user-adj-pinswarm-"));
+    delete process.env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE;
+    delete process.env.CLAUDE_CODE_SUBAGENT_MODEL;
+    resetSwarmSecret();
+    main = signCaller({ kind: "main", sessionId: "sess-adj-pinswarm" });
+    const root = mkdtempSync(join(tmpdir(), "em-adj-pinswarm-"));
+    writeFileSync(join(root, "package.json"), "{}");
+    mkdirSync(join(root, ".eminiar"), { recursive: true });
+    writeFileSync(join(root, ".eminiar", "swarm.yaml"), PINNED_YAML);
+    resetContextCache();
+    resetSwarmConfigCache();
+    ctx = getContext(root);
+    ctx.config = {
+      ...ctx.config,
+      adjudicator: configWith({ enabled: true, provider: "heuristic" }).adjudicator,
+    };
+  });
+  afterAll(() => {
+    closeAllStorage();
+    delete process.env.EMINIAR_HOME;
+    for (const [k, v] of [
+      ["CLAUDE_CODE_SUBAGENT_MODEL_FORCE", saved.force],
+      ["CLAUDE_CODE_SUBAGENT_MODEL", saved.sub],
+      ["HOME", saved.home],
+    ] as const)
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+  });
+
+  it("never tells the coordinator to pass `model` to pinned agents", async () => {
+    const out = await plan({});
+    expect(headOf(out)).toMatch(/a pinned agent keeps its model: pass no `model`:$/);
+    expect(headOf(out)).not.toMatch(/pass the model as `model`/);
+    expect(nextOf(out)).toContain(
+      "passing `effort` as each suggestion below says; leave `model` unset for pinned agents",
+    );
+    expect(nextOf(out)).not.toMatch(/passing `model`|suggested model/);
+    expect(out).toMatch(/ · pinned opus \(/);
+  });
+
+  it("with CLAUDE_CODE_EFFORT_LEVEL set, Next passes nothing, like the head", async () => {
+    const out = await plan({ CLAUDE_CODE_EFFORT_LEVEL: "high" });
+    expect(headOf(out)).toMatch(/^Adjudicator suggestions: informational only/);
+    expect(nextOf(out)).toContain(
+      "the suggestions below are informational: leave `model` unset for pinned agents and pass no `effort`",
+    );
+    expect(nextOf(out)).not.toMatch(/passing `/);
+  });
+
+  it("under FORCE names no pin and calls the model informational everywhere", async () => {
+    const out = await plan({
+      CLAUDE_CODE_SUBAGENT_MODEL_FORCE: "1",
+      CLAUDE_CODE_SUBAGENT_MODEL: "haiku",
+    });
+    expect(headOf(out)).toMatch(/the model is informational/);
+    expect(out).not.toMatch(/pinned opus|remove the pin/);
+    expect(out).toMatch(/ · model \w+ \(informational\) · /);
+    expect(nextOf(out)).toContain(
+      "passing `effort` as each suggestion below says; leave `model` unset (CLAUDE_CODE_SUBAGENT_MODEL_FORCE sets it)",
+    );
+    expect(nextOf(out)).not.toMatch(/passing `model`/);
   });
 });
 

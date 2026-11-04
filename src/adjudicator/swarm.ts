@@ -6,9 +6,15 @@
  * the plan did. An agent whose definition pins a model (or whose pin cannot be read) keeps it, like
  * apply mode: the line names the pin and what the adjudicator would pick, never a model to pass.
  *
+ * What a suggestion tells the coordinator to pass follows ONE rule table, dispatchRule, shared
+ * with the PreToolUse(Agent) note (hooks.ts onPreAgent) and the plan's "Next:" line (em_swarm):
+ * a fork names neither `model` nor `effort`; under CLAUDE_CODE_SUBAGENT_MODEL_FORCE the model is
+ * informational; a respected pin is kept (pass no `model`); CLAUDE_CODE_EFFORT_LEVEL, or an
+ * `effort` already on the call, makes the effort informational.
+ *
  * Everything here is a no-op while the adjudicator is off or `surfaces.plan` is false, and it
  * never throws: the plan is already committed when this runs, so a scoring failure costs the
- * advice, never the plan.
+ * advice, never the plan (the error goes to `log` and `onError`).
  */
 
 import type { Config } from "../config.js";
@@ -20,7 +26,7 @@ import { type Adjudication, adjudicate, type EngineOptions } from "./engine.js";
 import { subagentModelForced } from "./env.js";
 import { complexityBucket, topIntent } from "./heuristic.js";
 import { biasFromRows, type LearningConfig } from "./learn.js";
-import { isPinned, tierOf } from "./savings.js";
+import { isPinned, type KeptModel, tierOf, withKeptModel } from "./savings.js";
 import {
   type AdjudicationRequest,
   type AdjudicatorProvider,
@@ -41,6 +47,57 @@ export function planAdviceEnabled(config: Pick<Config, "adjudicator">): boolean 
 /** The env flag that makes Claude Code ignore `model` on the Agent call (Claude Code's on/off rule). */
 export function modelForced(env: NodeJS.ProcessEnv = process.env): boolean {
   return subagentModelForced(env);
+}
+
+/**
+ * What the advice for one Agent call tells the coordinator to pass (docs/adjudicator.md "What the
+ * advice tells you to pass"). Checked against code.claude.com/docs/en/sub-agents.md:
+ *
+ *   dispatch                         model                         effort
+ *   fork (subagent_type "fork")      fork: runs on the main        fork: per-call effort is for
+ *                                    session's model               non-fork subagents only
+ *   CLAUDE_CODE_SUBAGENT_MODEL_FORCE forced: informational (the    per the effort rule
+ *                                    call's model and pins are
+ *                                    ignored)
+ *   pin respected (pinned/unknown)   pin: pass no `model`          per the effort rule
+ *   otherwise                        pass                          per the effort rule
+ *
+ * Effort rule: CLAUDE_CODE_EFFORT_LEVEL set, or `effort` already on the call → informational
+ * (the env outranks the call); else pass `effort` (Claude Code AGENT_EFFORT_SINCE+).
+ * A model other than `pass` is never credited with savings (savings.ts KeptModel).
+ */
+export interface DispatchRule {
+  model: "pass" | "pin" | "forced" | "fork";
+  effort: "pass" | "informational" | "fork";
+}
+
+export interface DispatchFacts {
+  fork?: boolean | undefined;
+  /** CLAUDE_CODE_SUBAGENT_MODEL_FORCE is on. */
+  forced: boolean;
+  /** The agent's pin (pinned or unknown) is respected under apply.respectFrontmatter. */
+  pin?: boolean | undefined;
+  /** CLAUDE_CODE_EFFORT_LEVEL is set, or the call already passes `effort`. */
+  effortSet: boolean;
+}
+
+export function dispatchRule(f: DispatchFacts): DispatchRule {
+  if (f.fork) return { model: "fork", effort: "fork" };
+  return {
+    model: f.forced ? "forced" : f.pin ? "pin" : "pass",
+    effort: f.effortSet ? "informational" : "pass",
+  };
+}
+
+/** The row flag (savings.ts KeptModel) of a rule whose model the advice does not name. */
+export function keptModelOf(rule: DispatchRule): KeptModel | undefined {
+  return rule.model === "pin"
+    ? "pin"
+    : rule.model === "forced"
+      ? "force"
+      : rule.model === "fork"
+        ? "fork"
+        : undefined;
 }
 
 /**
@@ -70,6 +127,8 @@ export interface PlanAdvice {
   rowId?: number | undefined;
   /** Set when the agent's model pin is respected: the line then names it instead of `model`. */
   pin?: PlanPin | undefined;
+  /** CLAUDE_CODE_SUBAGENT_MODEL_FORCE was on: the model is informational and no pin is named. */
+  forced?: boolean | undefined;
 }
 
 export interface PlanOptions {
@@ -79,6 +138,8 @@ export interface PlanOptions {
   env?: NodeJS.ProcessEnv | undefined;
   now?: (() => number) | undefined;
   log?: ((line: string) => void) | undefined;
+  /** Called when the advice fails (after `log`): the caller can say the advice is unavailable. */
+  onError?: ((err: unknown) => void) | undefined;
 }
 
 /** The request for one planned task. */
@@ -196,15 +257,41 @@ export async function adjudicatePlan(
       }
       return p;
     };
+    // Under FORCE Claude Code ignores the agents' `model` too: no pin to name (dispatchRule).
+    const forced = modelForced(env);
     return out.map((a, i) => {
       const advice = adviceOf(a, tasks[i] as TaskRow, swarm);
-      const pin = respectedPin(advice.agentType, cfg.apply.respectFrontmatter, lookup);
-      if (pin) advice.pin = pin;
+      if (forced) advice.forced = true;
+      else {
+        const pin = respectedPin(advice.agentType, cfg.apply.respectFrontmatter, lookup);
+        if (pin) advice.pin = pin;
+      }
+      markPlanRow(db, advice);
       return advice;
     });
   } catch (err) {
     opts.log?.(`adjudicator: plan advice skipped: ${(err as Error)?.message ?? String(err)}`);
+    opts.onError?.(err);
     return [];
+  }
+}
+
+/**
+ * Store the KeptModel flag on the task's plan row (and the pin under `pin`), so a plan row that no
+ * agent row tracks is counted like a dispatch: no follow, no credit, not in the matrix.
+ */
+function markPlanRow(db: StorageAdapter, a: PlanAdvice): void {
+  const kept = keptModelOf(dispatchRule({ forced: !!a.forced, pin: !!a.pin, effortSet: false }));
+  if (!kept || a.rowId === undefined) return;
+  try {
+    const scores = withKeptModel(
+      db.adjudicator.get(a.rowId)?.scores,
+      kept,
+      a.pin ? { pin: a.pin } : {},
+    );
+    if (scores !== undefined) db.adjudicator.update(a.rowId, { scores });
+  } catch {
+    // the row keeps its verdict without the flag
   }
 }
 
@@ -236,7 +323,11 @@ export function planLines(advice: readonly PlanAdvice[]): string[] {
   return advice.map((a) => {
     const parts = [
       a.agentType ?? "any role",
-      ...(a.pin ? [pinnedPart(a.pin, a.model)] : a.model ? [`model ${a.model}`] : []),
+      ...(a.pin
+        ? [pinnedPart(a.pin, a.model)]
+        : a.model
+          ? [a.forced ? `model ${a.model} (informational)` : `model ${a.model}`]
+          : []),
       `effort ${a.effort}`,
     ];
     let line = `#${a.taskId} → ${parts.join(" · ")} (complexity ${complexityBucket(a.complexity)}, conf ${r2(a.confidence)})`;
@@ -262,22 +353,79 @@ export function effortForced(env: NodeJS.ProcessEnv = process.env): boolean {
   return !!v;
 }
 
+/**
+ * What a plan's suggestions, taken together, tell the coordinator to pass (dispatchRule per task):
+ * `model` when some task's model is to be passed, `effort` unless it is informational, and whether
+ * some agents keep their pin or FORCE sets the model. The block head and the "Next:" line both
+ * read it, so they never disagree.
+ */
+export interface PlanPassing {
+  model: boolean;
+  effort: boolean;
+  pinned: boolean;
+  forced: boolean;
+}
+
+export function planPassing(
+  advice: readonly PlanAdvice[],
+  env: NodeJS.ProcessEnv = process.env,
+): PlanPassing {
+  const forced = modelForced(env);
+  const effortSet = effortForced(env);
+  const rules = advice.map((a) =>
+    dispatchRule({ forced: forced || !!a.forced, pin: !!a.pin, effortSet }),
+  );
+  return {
+    model: rules.some((r, i) => r.model === "pass" && !!advice[i]?.model),
+    effort: rules.some((r) => r.effort === "pass"),
+    pinned: rules.some((r) => r.model === "pin"),
+    forced: rules.some((r) => r.model === "forced"),
+  };
+}
+
+const EFFORT_NOTE = "CLAUDE_CODE_EFFORT_LEVEL is set and outranks `effort`";
+const FORCE_NOTE =
+  "CLAUDE_CODE_SUBAGENT_MODEL_FORCE is on, so Claude Code ignores `model` on the Agent call and the agents' model pins";
+
 /** The block's first line: what to pass on the Agent call, given FORCE, the effort env and pins. */
 export function planAdviceHead(
   advice: readonly PlanAdvice[],
   env: NodeJS.ProcessEnv = process.env,
 ): string {
-  const effortSet = effortForced(env);
-  const effortNote = "CLAUDE_CODE_EFFORT_LEVEL is set and outranks `effort`";
-  const pins = advice.some((a) => a.pin) ? "; a pinned agent keeps its model: pass no `model`" : "";
-  if (modelForced(env))
-    return `Adjudicator suggestions (CLAUDE_CODE_SUBAGENT_MODEL_FORCE is on, so Claude Code ignores \`model\` on the Agent call; the model is informational; ${
-      effortSet
-        ? `${effortNote}, so effort is too`
-        : `pass the effort as \`effort\` (Claude Code ${AGENT_EFFORT_SINCE} or later)`
+  const p = planPassing(advice, env);
+  const effortPass = `pass the effort as \`effort\` (Claude Code ${AGENT_EFFORT_SINCE} or later)`;
+  if (p.forced)
+    return `Adjudicator suggestions (${FORCE_NOTE}; the model is informational; ${
+      p.effort ? effortPass : `${EFFORT_NOTE}, so effort is too`
     }):`;
-  const pass = effortSet
-    ? `pass the model as \`model\` on each Agent call (effort is informational: ${effortNote})`
-    : `pass the model as \`model\` and the effort as \`effort\` on each Agent call (\`effort\` needs Claude Code ${AGENT_EFFORT_SINCE} or later)`;
+  const pins = p.pinned ? "; a pinned agent keeps its model: pass no `model`" : "";
+  let pass: string;
+  if (p.model && p.effort)
+    pass = `pass the model as \`model\` and the effort as \`effort\` on each Agent call (\`effort\` needs Claude Code ${AGENT_EFFORT_SINCE} or later)`;
+  else if (p.model)
+    pass = `pass the model as \`model\` on each Agent call (effort is informational: ${EFFORT_NOTE})`;
+  else if (p.effort) pass = `${effortPass} on each Agent call`;
+  else pass = `informational only (effort: ${EFFORT_NOTE})`;
   return `Adjudicator suggestions: ${pass}${pins}:`;
+}
+
+/**
+ * The tail of em_swarm plan's "Next:" line (after "names \"task #N\" (the worker claims it)"):
+ * the same instruction as the advice head, "" without advice.
+ */
+export function planNextHint(
+  advice: readonly PlanAdvice[],
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  if (!advice.length) return "";
+  const p = planPassing(advice, env);
+  const keep = p.forced
+    ? "leave `model` unset (CLAUDE_CODE_SUBAGENT_MODEL_FORCE sets it)"
+    : p.pinned
+      ? "leave `model` unset for pinned agents"
+      : "";
+  const pass = [p.model ? "`model`" : "", p.effort ? "`effort`" : ""].filter(Boolean).join(" and ");
+  if (!pass)
+    return `; the suggestions below are informational: ${keep ? `${keep} and ` : ""}pass no \`effort\` (${EFFORT_NOTE})`;
+  return `, passing ${pass} as each suggestion below says${keep ? `; ${keep}` : ""}`;
 }

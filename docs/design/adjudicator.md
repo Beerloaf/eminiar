@@ -738,6 +738,30 @@ Then:
   opus (adjudicator would pick haiku; remove the model pin in <file> to let it choose)", and the
   row's scores JSON gets `pinDeferred: true`, so reconcile detects no follow and credits no
   savings for it.
+- One rule table decides what every surface tells the coordinator to pass (`swarm.ts`
+  `dispatchRule`, shared by plan advice, the plan's "Next:" line and `onPreAgent`; checked
+  against sub-agents.md):
+
+  | Dispatch | `model` | `effort` | Row flag (scores JSON) |
+  |---|---|---|---|
+  | fork (`subagent_type: "fork"`) | none: runs on the main session's model | none: per-call effort is for non-fork subagents | `fork: true` |
+  | `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` on | informational (call `model` and pins ignored) | effort rule | `forced: true` |
+  | pin respected (pinned or unknown) | none: the pin is kept | effort rule | `pinDeferred: true` |
+  | otherwise | pass | effort rule | none |
+
+  Effort rule: pass `effort` unless `CLAUDE_CODE_EFFORT_LEVEL` is set or the call already
+  passes one (then informational). The first matching row wins. A fork gets only an
+  informational note ("adjudicator: fork runs on the main session's model; no `model` or
+  `effort` to pass (…)") and is never applied (`respected` in apply mode); `resolveAgentPin`
+  treats `fork` as a built-in with no pin. Under FORCE the note is "adjudicator:
+  CLAUDE_CODE_SUBAGENT_MODEL_FORCE sets the model (adjudicator would pick X; …); pass effort:…",
+  and the baseline is `CLAUDE_CODE_SUBAGENT_MODEL` (else the session model), not the pin.
+- A flagged row (savings.ts `keptModel`: pin, force or fork) gets no follow detection and no
+  credit; the follow rate leaves advised flagged rows out of its denominator
+  (`summary().keptModel`), and `savingsReport` counts them apart from the suggested-tier ×
+  actual-model matrix (`keptModel`: a pin row only when no `model` was passed and it ran on the
+  pinned tier; otherwise it stays in the matrix). Plan rows carry the same flag, so a plan row no
+  agent row tracks is counted the same way.
 
 Effectiveness check: `reconcile` compares `model_final` with the model that `api_calls` show for
 the agent. Each mismatch counts as `apply_ineffective`. `status` and doctor report "apply did not
@@ -860,7 +884,8 @@ Every savings figure is shown with its assumptions:
    turns, so the dashboard shows tokens per successful task by tier next to it.
 2. List prices, with cache pricing unchanged.
 3. Credit only for dispatches that were followed or applied, and none for a dispatch whose advice
-   kept the agent's model pin (`pinDeferred` in the row's scores: pinned or unknown).
+   named no model: it kept the agent's model pin (`pinDeferred` in the row's scores: pinned or
+   unknown), `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` was on (`forced`), or it was a fork (`fork`).
 4. The adjudicator's own spend is subtracted.
 5. No credit for tool advice: eminiar's `em_stats` already counts context kept out by `em_*`
    tools, so crediting it here would double-count. We report only the tool-advice follow rate.
@@ -875,7 +900,8 @@ Every savings figure is shown with its assumptions:
 | key file permissions too open | not read; doctor fails with a `chmod 600` hint |
 | breaker open, slow p95, or over the daily budget | provider skipped; status recorded |
 | DB busy or locked, or v8 not migrated | the verdict is still returned but not persisted. `hooks.ts` wraps each surface in try/catch and never throws into the dispatcher |
-| `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` on (`1`/`true`/`yes`/`on`) | no apply; action respected; status and doctor warn when mode is apply |
+| `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` on (`1`/`true`/`yes`/`on`) | no apply; action respected; the advice calls the model informational and names no pin; the row gets `forced` (no credit); status and doctor warn when mode is apply |
+| a fork (`subagent_type: "fork"`) | no apply, no `model` or `effort` advice; the row gets `fork` (no credit) |
 | explicit Agent model, or pinned frontmatter | no apply; action respected |
 | model outside the org's `availableModels` | Claude Code substitutes another; reconcile records `actual_model` and the mismatch |
 | Claude Code ignores a hook-set model | detected as `apply_ineffective`; status and doctor recommend advise |
@@ -944,12 +970,17 @@ is embedding.
     the role's agent pins a model (resolveAgentPin; respected unless
     `apply.respectFrontmatter` is off), "#5 → swarm-feature-coder · pinned opus (adjudicator
     would pick haiku; remove the pin in swarm.yaml to let it choose) · effort low (…)"; an
-    unreadable definition shows "model pin is unknown (…)".
+    unreadable definition shows "model pin is unknown (…)". Under FORCE no pin is named and the
+    model reads "model haiku (informational)".
   - Add "role suggested: tester (planned: coder)" when the role differs.
   - The advice step fails open: the tasks are already stored, so an error there logs to
-    stderr and the plan returns its normal text plus "Adjudicator advice unavailable for this
-    plan (the tasks are planned)." (a reported failure would make the coordinator plan twice).
-- The "Next:" text tells the coordinator to pass `model` and `effort` on each Agent call.
+    stderr (em_swarm passes `log` and `onError` to adjudicatePlan, which never throws) and the
+    plan returns its normal text plus "Adjudicator advice unavailable for this plan (the tasks
+    are planned)." (a reported failure would make the coordinator plan twice).
+- The "Next:" text comes from the same rule as the advice head (`planPassing` /
+  `planNextHint`): it names `model` only when some task has a model to pass (FORCE off, agent
+  not pinned), `effort` only when it is not informational, and adds "leave `model` unset for
+  pinned agents" (or "… (CLAUDE_CODE_SUBAGENT_MODEL_FORCE sets it)") as needed.
 - No `PlanTask` schema change, no `swarm.yaml` key, no new `TaskRow` columns, no new
   `EVENT_KINDS`. The swarm ledger stays stable, and the suggestions live in `adjudications`.
 - `coordinatorBrief` (`src/swarm/brief.ts`, steps block L371-378) gets one line when enabled:
@@ -1065,8 +1096,8 @@ POST.
 - `GET /api/adjudicator/decision?id`: the full row, including the parsed scores (features,
   tables, reasons, α, bias).
 - `GET /api/adjudicator/savings?since`: realised, potential, adjudicator spend, net,
-  `assumptions[]`, tokens per successful task by tier, and the suggested-tier × actual-model
-  matrix.
+  `assumptions[]`, tokens per successful task by tier, the suggested-tier × actual-model
+  matrix, and `keptModel` (dispatches left out of the matrix: kept pin, FORCE, fork).
 - `GET /api/adjudicator/eval`: the last eval report, or null.
 - `POST /api/adjudicator/test {text, useProvider?: boolean}`: uses the heuristic, plus the
   provider only if enabled, consented and keyed. Never persisted.

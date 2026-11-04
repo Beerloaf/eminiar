@@ -27,12 +27,15 @@ import {
 import {
   FALLBACK_MODEL,
   isPinned,
+  keptModel,
+  keptPin,
   pinDeferred,
   promptWindows,
   repriceAt,
   resolveBaseline,
   savingsReport,
   tierOf,
+  withKeptModel,
 } from "../../src/adjudicator/savings.js";
 import type { AdjudicatorProvider } from "../../src/adjudicator/types.js";
 import { ConfigSchema } from "../../src/config.js";
@@ -564,6 +567,46 @@ describe("reconcile: savings credit", () => {
     expect(pinDeferred({ scores: null })).toBe(false);
   });
 
+  it("credits nothing under CLAUDE_CODE_SUBAGENT_MODEL_FORCE or for a fork (#76, #74)", () => {
+    // The main session is on sonnet; the forced worker ran on haiku (FORCE's model).
+    db.apiCallsUpsert([call({ ts: NOW - 40 * MIN, model: "claude-sonnet-5-5" })]);
+    const t = swarmTask("done", "F1");
+    db.apiCallsUpsert([call({ agent_id: "F1", sidechain: 1, model: "claude-haiku-4-5" })]);
+    const plan = row({ surface: "plan", runId: "R1", taskId: t, tier: "haiku", action: "advised" });
+    const forced = row({
+      runId: "R1",
+      taskId: t,
+      parentId: plan,
+      action: "advised",
+      tier: "haiku",
+      modelRequested: "haiku",
+      scores: JSON.stringify({ pin: { status: "unpinned" }, forced: true }),
+    });
+    reconcile(db, { now: NOW });
+    const r = db.adjudicator.get(forced);
+    expect(r?.action).toBe("advised");
+    expect(r?.actualCostUsd).toBeCloseTo(HAIKU, 10);
+    expect(r?.savingsUsd ?? null).toBeNull();
+    expect(savingsReport(db).creditedRows).toBe(0);
+    expect(
+      savingsReport(db).assumptions.some((a) => a.includes("CLAUDE_CODE_SUBAGENT_MODEL_FORCE")),
+    ).toBe(true);
+
+    expect(keptModel({ scores: JSON.stringify({ forced: true }) })).toBe("force");
+    expect(keptModel({ scores: JSON.stringify({ fork: true }) })).toBe("fork");
+    expect(keptModel({ scores: JSON.stringify({ pinDeferred: true }) })).toBe("pin");
+    expect(keptModel({ scores: JSON.stringify({ forced: false }) })).toBeUndefined();
+    expect(keptModel({ scores: "[1]" })).toBeUndefined();
+    // withKeptModel sets one flag, clears the others and keeps the rest
+    expect(JSON.parse(withKeptModel('{"a":1,"pinDeferred":true}', "force", { pin: 2 })!)).toEqual({
+      a: 1,
+      pin: 2,
+      forced: true,
+    });
+    expect(withKeptModel("[]", "pin")).toBeUndefined();
+    expect(JSON.parse(withKeptModel(null, undefined)!)).toEqual({});
+  });
+
   it("charges a redone failed attempt its full cost", () => {
     const t = swarmTask("active", "A1");
     db.apiCallsUpsert([
@@ -706,6 +749,86 @@ describe("savingsReport", () => {
     ]);
     expect(rep.tokensPerSuccessByTier.haiku).toMatchObject({ tasks: 3, tokens: 9000 });
     expect(rep.tokensPerSuccessByTier.sonnet).toMatchObject({ tasks: 1, tokens: 1500 });
+  });
+
+  it("counts a dispatch that kept its pin apart from the matrix and the follow rate (#78)", () => {
+    const pinScores = JSON.stringify({
+      pin: { status: "pinned", model: "opus" },
+      pinDeferred: true,
+    });
+    // P1 kept its opus pin and ran on it: out of the matrix, counted as kept.
+    const t1 = swarmTask("done", "P1");
+    db.apiCallsUpsert([call({ agent_id: "P1", sidechain: 1, model: "claude-opus-5-5" })]);
+    const plan1 = row({
+      surface: "plan",
+      runId: "R1",
+      taskId: t1,
+      tier: "haiku",
+      action: "advised",
+    });
+    row({ runId: "R1", taskId: t1, parentId: plan1, action: "advised", scores: pinScores });
+    // P2's coordinator passed haiku over the kept pin: it stays in the matrix.
+    const t2 = swarmTask("done", "P2");
+    db.apiCallsUpsert([call({ agent_id: "P2", sidechain: 1, model: "claude-haiku-4-5" })]);
+    const plan2 = row({
+      surface: "plan",
+      runId: "R1",
+      taskId: t2,
+      tier: "haiku",
+      action: "advised",
+    });
+    row({
+      runId: "R1",
+      taskId: t2,
+      parentId: plan2,
+      action: "advised",
+      modelRequested: "haiku",
+      scores: pinScores,
+    });
+    // F1 ran under FORCE, K1 was a fork: both counted apart.
+    const t3 = swarmTask("done", "F1");
+    db.apiCallsUpsert([call({ agent_id: "F1", sidechain: 1, model: "claude-sonnet-5-5" })]);
+    row({ runId: "R1", taskId: t3, tier: "haiku", action: "advised", scores: '{"forced":true}' });
+    const t4 = swarmTask("done", "K1");
+    db.apiCallsUpsert([call({ agent_id: "K1", sidechain: 1, model: "claude-sonnet-5-5" })]);
+    row({ runId: "R1", taskId: t4, tier: "opus", action: "advised", scores: '{"fork":true}' });
+    // A followed unpinned dispatch, so the follow rate has a numerator.
+    const t5 = swarmTask("done", "U1");
+    db.apiCallsUpsert([call({ agent_id: "U1", sidechain: 1, model: "claude-haiku-4-5" })]);
+    const plan5 = row({
+      surface: "plan",
+      runId: "R1",
+      taskId: t5,
+      tier: "haiku",
+      action: "advised",
+    });
+    row({ runId: "R1", taskId: t5, parentId: plan5, action: "advised", modelRequested: "haiku" });
+    reconcile(db, { now: NOW });
+
+    const rep = savingsReport(db);
+    expect(rep.matrix).toEqual([{ suggested: "haiku", actual: "haiku", n: 2 }]);
+    expect(rep.keptModel).toEqual({ pin: 1, force: 1, fork: 1 });
+
+    const s = db.adjudicator.summary();
+    // advised rows: 3 plan rows + P1, P2, F1, K1 = 7; U1 followed. Out: P1, P2 (pinDeferred), F1, K1.
+    expect(s.byAction).toMatchObject({ advised: 7, followed: 1 });
+    expect(s.keptModel).toEqual({ pin: 2, force: 1, fork: 1 });
+    expect(s.rates.follow).toBeCloseTo(1 / (7 - 4 + 1), 10);
+
+    expect(
+      keptPin({ scores: pinScores, modelRequested: null, actualModel: "claude-opus-5-5" }),
+    ).toBe(true);
+    expect(
+      keptPin({ scores: pinScores, modelRequested: null, actualModel: "claude-haiku-4-5" }),
+    ).toBe(false);
+    expect(keptPin({ scores: pinScores, modelRequested: "haiku", actualModel: null })).toBe(false);
+    expect(
+      keptPin({
+        scores: JSON.stringify({ pin: { status: "unknown" }, pinDeferred: true }),
+        modelRequested: null,
+        actualModel: "claude-sonnet-5-5",
+      }),
+    ).toBe(true);
   });
 
   it("says so when no usage is recorded", () => {
