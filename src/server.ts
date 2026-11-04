@@ -6,8 +6,9 @@ import { kickEmbedding } from "./embeddings/queue.js";
 import { drainReindexQueue } from "./graph/reindex.js";
 import { markServerAlive } from "./session/server-alive.js";
 import { getStorage } from "./storage/index.js";
+import { registerServerProviders } from "./tools/em_adjudicate.js";
 import { tools } from "./tools/index.js";
-import { errorResult } from "./tools/types.js";
+import { availableTools, errorResult } from "./tools/types.js";
 import { pluginRoot, version } from "./version.js";
 
 // `em-server --probe` is the installer's and doctor's cheap "can this copy start?" check:
@@ -25,7 +26,22 @@ const server = new McpServer({ name: "eminiar", version: version() });
 // be re-parsed; the drain still starts first and overlaps the child process instead.
 const SANDBOX_TOOLS = new Set(["em_execute", "em_execute_file", "em_batch_execute"]);
 
-for (const tool of tools) {
+// Opt-in tools (em_adjudicate) are listed only when their feature is on for the config loaded
+// at start; enabling one later needs /mcp reconnect. The adjudicator's embedding provider is
+// registered here (never in a hook) when it is the effective provider.
+let startConfig: ReturnType<typeof getContext>["config"] | undefined;
+try {
+  startConfig = getContext().config;
+} catch (err) {
+  process.stderr.write(`eminiar: config not loaded at start: ${(err as Error).message}\n`);
+}
+const listed = startConfig ? availableTools(tools, startConfig) : tools.filter((t) => !t.available);
+if (startConfig)
+  await registerServerProviders(startConfig).catch((err: unknown) =>
+    process.stderr.write(`eminiar: adjudicator provider skipped: ${(err as Error).message}\n`),
+  );
+
+for (const tool of listed) {
   server.registerTool(
     tool.name,
     {

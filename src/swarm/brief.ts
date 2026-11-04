@@ -372,6 +372,11 @@ export async function coordinatorBrief(
       "Steps:",
       '1. Plan: em_swarm {action:"plan", tasks:[{key, title, detail, role, deps, files}]}: small tasks one worker can finish, each naming its files; deps take task ids or earlier keys.',
       '2. Spawn a worker per claimable task with the Agent tool: subagent_type from the list, a prompt that names "task #N" (the worker claims it), run_in_background: true for parallel work. eminiar refuses spawns over capacity and briefs each worker with the project knowledge.',
+      ...(ctx.config.adjudicator?.enabled && ctx.config.adjudicator.surfaces.plan
+        ? [
+            "   Adjudicator on: em_swarm plan shows a suggested model per task; pass it as `model` on the Agent call (effort is advice).",
+          ]
+        : []),
       '3. Watch: em_swarm {action:"status"} (or `eminiar swarm watch` under the Monitor tool). Workers post shared facts to the blackboard.',
       '4. Review each result. Reopen with em_swarm {action:"update", task, status:"pending"} or plan follow-ups; tasks marked auto-closed were never reported by their worker, so check them.',
       '5. Finish: em_swarm {action:"finish", status:"done", summary, remember:true}, and record durable decisions with em_remember.',
