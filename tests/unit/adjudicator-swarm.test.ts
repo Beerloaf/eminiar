@@ -193,7 +193,7 @@ describe("plan advice helpers", () => {
     expect(planAdviceBlock([])).toBe("");
     expect(planAdviceBlock(a, {})).toMatch(/^Adjudicator suggestions: pass the model as `model`/);
     expect(planAdviceBlock(a, { CLAUDE_CODE_SUBAGENT_MODEL_FORCE: "1" })).toMatch(
-      /CLAUDE_CODE_SUBAGENT_MODEL_FORCE is set/,
+      /CLAUDE_CODE_SUBAGENT_MODEL_FORCE is on/,
     );
     expect(modelForced({ CLAUDE_CODE_SUBAGENT_MODEL_FORCE: "0" })).toBe(false);
     expect(modelForced({})).toBe(false);
