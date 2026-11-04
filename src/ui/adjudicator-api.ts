@@ -428,6 +428,7 @@ function tryItStore(store: AdjudicatorStore): AdjudicatorStore {
     throw new Error("try-it is never persisted");
   };
   const atomically = store.atomically?.bind(store);
+  const withLockWait = store.withLockWait?.bind(store);
   return {
     insert: never,
     update: () => false,
@@ -449,6 +450,8 @@ function tryItStore(store: AdjudicatorStore): AdjudicatorStore {
     purge: never,
     // The breaker's read-modify-write must stay atomic here too: a try-it call races hooks.
     ...(atomically ? { atomically } : {}),
+    // ...and its lock waits stay bounded by the call budget, as in the hooks.
+    ...(withLockWait ? { withLockWait } : {}),
   };
 }
 
