@@ -6,9 +6,12 @@
  * States: closed → open after `breaker.failures` consecutive timeouts, 5xx, 429/529 or refused
  * connections. Open lasts `cooldownSec`; then ONE call goes through as half_open (claimed by
  * writing half_open with a fresh retryAt, so a parallel hook still sees the provider as open).
- * Success closes it, a failure reopens it. "slow" is set when the p95 of the last latencies
- * exceeds the surface budget; the provider is skipped for `cooldownSec`, after which the ring
- * starts over.
+ * Success closes it, a failure reopens it. "slow" is set when, over at least SLOW_MIN_SAMPLES
+ * recent calls, the p95 of latency / budget exceeds 1: each sample is judged against the budget
+ * of the call that produced it (stored alongside it), so a 4 s warm-up under a 10 s budget never
+ * makes a later 150 ms call under a 1.2 s budget look slow. Warm-up and test/probe calls
+ * (surface "test") pass `sample: false` and stay out of the ring. The provider is skipped for
+ * `cooldownSec`, after which the ring starts over.
  *
  * Spend: `spendUsd` accumulates per UTC day. At `budget.dailyUsd` or above a REMOTE provider is
  * skipped (local providers cost nothing and are never capped). A call whose price is unknown
@@ -22,6 +25,9 @@
  * "auth_failed") without any network call until the key changes or AUTH_LOCKOUT_MS passes.
  *
  * Every function is synchronous (better-sqlite3) and swallows nothing: the engine wraps them.
+ * gate, recordSuccess and recordFailure each read and write the state inside one
+ * store.atomically() (BEGIN IMMEDIATE), so parallel hook processes cannot all claim the
+ * half-open slot or lose a spend/call increment.
  */
 
 import { createHash } from "node:crypto";
@@ -29,8 +35,11 @@ import type { AdjudicatorConfig } from "../config.js";
 import type { AdjudicatorProviderState, AdjudicatorStore } from "../storage/types.js";
 import type { ProviderStatus } from "./types.js";
 
-/** The slow guard needs at least this many latencies before a p95 means anything. */
-export const SLOW_MIN_SAMPLES = 5;
+/**
+ * The slow guard needs at least this many samples before it can trip. Below 20, nearest-rank
+ * p95 is the maximum, so a single outlier would decide.
+ */
+export const SLOW_MIN_SAMPLES = 20;
 /** How long a rejected key keeps the provider skipped when the key does not change. */
 export const AUTH_LOCKOUT_MS = 3_600_000;
 
@@ -126,6 +135,15 @@ export function gate(
   cfg: Pick<AdjudicatorConfig, "breaker" | "budget">,
   o: { now: number; remote: boolean; keyFingerprint?: string | null | undefined },
 ): GateDecision {
+  return atomically(store, () => gateTx(store, provider, cfg, o));
+}
+
+function gateTx(
+  store: AdjudicatorStore,
+  provider: string,
+  cfg: Pick<AdjudicatorConfig, "breaker" | "budget">,
+  o: { now: number; remote: boolean; keyFingerprint?: string | null | undefined },
+): GateDecision {
   let s = store.providerState(provider);
   const cooldownMs = cfg.breaker.cooldownSec * 1000;
   let halfOpen = false;
@@ -148,7 +166,12 @@ export function gate(
     halfOpen = true;
   } else if (s?.state === "slow") {
     if (s.retryAt !== null && o.now < s.retryAt) return { allow: false, status: "slow_guard" };
-    s = store.saveProviderState(provider, { state: "closed", retryAt: null, latencies: [] });
+    s = store.saveProviderState(provider, {
+      state: "closed",
+      retryAt: null,
+      latencies: [],
+      latencyBudgets: [],
+    });
   }
 
   if (o.remote && overBudget(s, cfg, o.now)) {
@@ -175,23 +198,32 @@ export function recordSuccess(
   store: AdjudicatorStore,
   provider: string,
   cfg: Pick<AdjudicatorConfig, "breaker">,
-  o: { now: number; latencyMs: number; costUsd: number | null; budgetMs: number },
+  o: {
+    now: number;
+    latencyMs: number;
+    costUsd: number | null;
+    budgetMs: number;
+    /** false: a warm-up or test call; its latency stays out of the slow guard (default true). */
+    sample?: boolean | undefined;
+  },
 ): AdjudicatorProviderState {
-  const s = store.providerState(provider);
-  const day = utcDay(o.now);
-  const spent = spendToday(s, o.now) + (o.costUsd ?? 0);
-  const latencies = [...(s?.latencies ?? []), Math.max(0, Math.round(o.latencyMs))];
-  const slow = isSlow(latencies, o.budgetMs);
-  return store.saveProviderState(provider, {
-    state: slow ? "slow" : "closed",
-    failures: 0,
-    retryAt: slow ? o.now + cfg.breaker.cooldownSec * 1000 : null,
-    lastOkAt: o.now,
-    latencies,
-    spendDay: day,
-    spendUsd: spent,
-    calls: callsToday(s, o.now) + 1,
-    authFingerprint: null,
+  return atomically(store, () => {
+    const s = store.providerState(provider);
+    const day = utcDay(o.now);
+    const spent = spendToday(s, o.now) + (o.costUsd ?? 0);
+    const ring = o.sample === false ? ringOf(s) : addSample(s, o.latencyMs, o.budgetMs);
+    const slow = isSlow(ring);
+    return store.saveProviderState(provider, {
+      state: slow ? "slow" : "closed",
+      failures: 0,
+      retryAt: slow ? o.now + cfg.breaker.cooldownSec * 1000 : null,
+      lastOkAt: o.now,
+      ...ring,
+      spendDay: day,
+      spendUsd: spent,
+      calls: callsToday(s, o.now) + 1,
+      authFingerprint: null,
+    });
   });
 }
 
@@ -214,9 +246,20 @@ export function recordFailure(
     latencyMs?: number | undefined;
     budgetMs: number;
     halfOpen: boolean;
+    /** false: a warm-up or test call; its latency stays out of the slow guard (default true). */
+    sample?: boolean | undefined;
     /** Fingerprint of the key the call used (keyFingerprint); stored on a 401/403. */
     keyFingerprint?: string | null | undefined;
   },
+): AdjudicatorProviderState {
+  return atomically(store, () => recordFailureTx(store, provider, cfg, o));
+}
+
+function recordFailureTx(
+  store: AdjudicatorStore,
+  provider: string,
+  cfg: Pick<AdjudicatorConfig, "breaker">,
+  o: Parameters<typeof recordFailure>[3],
 ): AdjudicatorProviderState {
   const s = store.providerState(provider);
   const cooldownMs = cfg.breaker.cooldownSec * 1000;
@@ -238,10 +281,10 @@ export function recordFailure(
   }
   const counts = countsAsFailure(o.kind, o.status);
   const failures = counts ? (s?.failures ?? 0) + 1 : (s?.failures ?? 0);
-  const latencies =
-    o.kind === "timeout" && o.latencyMs !== undefined
-      ? [...(s?.latencies ?? []), Math.max(0, Math.round(o.latencyMs))]
-      : (s?.latencies ?? []);
+  const ring =
+    o.kind === "timeout" && o.latencyMs !== undefined && o.sample !== false
+      ? addSample(s, o.latencyMs, o.budgetMs)
+      : ringOf(s);
   let state: string;
   let retryAt: number | null;
   if (counts && (o.halfOpen || failures >= cfg.breaker.failures)) {
@@ -251,7 +294,7 @@ export function recordFailure(
     // A non-breaker error (invalid answer, 4xx) on the trial call: the provider is reachable.
     state = "closed";
     retryAt = null;
-  } else if (isSlow(latencies, o.budgetMs)) {
+  } else if (isSlow(ring)) {
     state = "slow";
     retryAt = o.now + cooldownMs;
   } else {
@@ -264,14 +307,56 @@ export function recordFailure(
     retryAt,
     lastErrorAt: o.now,
     lastErrorClass: errorClass,
-    latencies,
+    ...ring,
     ...day,
     calls,
   });
 }
 
-function isSlow(latencies: readonly number[], budgetMs: number): boolean {
-  if (latencies.length < SLOW_MIN_SAMPLES) return false;
-  const p = p95(latencies.slice(-50));
-  return p !== undefined && p > budgetMs;
+/** The store's write transaction when it has one (SQLite: BEGIN IMMEDIATE), else `fn` as is. */
+function atomically<T>(store: AdjudicatorStore, fn: () => T): T {
+  return store.atomically ? store.atomically(fn) : fn();
+}
+
+/** The latency ring and its per-sample budgets, kept the same length (0 = budget unknown). */
+interface Ring {
+  latencies: number[];
+  latencyBudgets: number[];
+}
+
+/** The stored ring with its budgets aligned to it (older rows have fewer or no budgets). */
+function ringOf(s: AdjudicatorProviderState | undefined): Ring {
+  const latencies = [...(s?.latencies ?? [])];
+  const all = s?.latencyBudgets ?? [];
+  const known = all.slice(Math.max(0, all.length - latencies.length));
+  const pad = Math.max(0, latencies.length - known.length);
+  return { latencies, latencyBudgets: [...new Array<number>(pad).fill(0), ...known] };
+}
+
+function addSample(
+  s: AdjudicatorProviderState | undefined,
+  latencyMs: number,
+  budgetMs: number,
+): Ring {
+  const r = ringOf(s);
+  r.latencies.push(Math.max(0, Math.round(latencyMs)));
+  r.latencyBudgets.push(Math.max(0, Math.round(budgetMs)));
+  return r;
+}
+
+/**
+ * p95 of latency / budget over the last 50 samples with a known budget is above 1. Samples
+ * without one (written before budgets were stored) are ignored rather than guessed.
+ */
+export function isSlow(ring: Ring): boolean {
+  const ratios: number[] = [];
+  const from = Math.max(0, ring.latencies.length - 50);
+  for (let i = from; i < ring.latencies.length; i++) {
+    const budget = ring.latencyBudgets[i] ?? 0;
+    const latency = ring.latencies[i];
+    if (budget > 0 && latency !== undefined) ratios.push(latency / budget);
+  }
+  if (ratios.length < SLOW_MIN_SAMPLES) return false;
+  const p = p95(ratios);
+  return p !== undefined && p > 1;
 }

@@ -577,7 +577,8 @@ function warmUp(
     v: 1,
     projectRoot: ctx.root,
     request,
-    cacheKey: cacheKeyFor(request, r),
+    // The same key the child computes (no hints or catalogues: just the config's ladder and weights).
+    cacheKey: cacheKeyFor(request, r, { config: cfg }),
     config: cfg,
     context: "hook",
     budgetMs: WARMUP_BUDGET_MS,

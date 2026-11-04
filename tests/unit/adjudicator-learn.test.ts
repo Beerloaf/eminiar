@@ -2,15 +2,21 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { adjudicate } from "../../src/adjudicator/engine.js";
+import { complexityBucket, topIntent } from "../../src/adjudicator/heuristic.js";
 import {
   AGENT_IDLE_MS,
   applyFeedback,
+  applyFeedbackResult,
   biasFor,
   biasFromRows,
+  bucketsOf,
   computeBias,
   DEFAULT_LEARNING,
   decayFactor,
   FINAL_AFTER_MS,
+  feedbackOf,
+  matchDispatches,
   posterior,
   reconcile,
   recordSignal,
@@ -25,6 +31,8 @@ import {
   savingsReport,
   tierOf,
 } from "../../src/adjudicator/savings.js";
+import type { AdjudicatorProvider } from "../../src/adjudicator/types.js";
+import { ConfigSchema } from "../../src/config.js";
 import { SqliteAdapter } from "../../src/storage/sqlite/adapter.js";
 import type { AdjudicationInput, ApiCallInput, ApiCallRow } from "../../src/storage/types.js";
 import { costOfCall, resolvePrice } from "../../src/usage/pricing.js";
@@ -287,8 +295,9 @@ describe("reconcile: best-effort agent linking", () => {
       call({ agent_id: "early", sidechain: 1, ts: ts + 30_000, model: "claude-sonnet-5-5" }),
       call({ agent_id: "before", sidechain: 1, ts: ts - 1000 }),
     ]);
-    const a = row({ ts });
-    const b = row({ ts: ts + 1 });
+    // Both windows hold "early": the tier each dispatch asked for settles which one it is.
+    const a = row({ ts, modelRequested: "sonnet" });
+    const b = row({ ts: ts + 1, modelRequested: "haiku" });
     const res = reconcile(db, { now: NOW });
     expect(res.linked).toBe(1);
     expect(db.adjudicator.get(a)).toMatchObject({
@@ -304,6 +313,137 @@ describe("reconcile: best-effort agent linking", () => {
     // Once the linked agent is idle, the row closes with outcome n/a.
     reconcile(db, { now: ts + 30_000 + AGENT_IDLE_MS + MIN });
     expect(db.adjudicator.get(a)).toMatchObject({ outcome: "n/a", final: true });
+  });
+
+  /** Two Agent dispatches from one assistant message: rows 3 ms apart, agents in parallel. */
+  function parallel(
+    first: { model: string; tier?: string; at: number },
+    second: { model: string; tier?: string; at: number },
+    action: "applied" | "advised" = "applied",
+  ) {
+    const t0 = NOW - 60 * MIN;
+    db.apiCallsUpsert([
+      call({ ts: t0 - 5000 }),
+      call({ agent_id: "ag-1", sidechain: 1, model: first.model, ts: t0 + first.at }),
+      call({ agent_id: "ag-1", sidechain: 1, model: first.model, ts: t0 + first.at + 2000 }),
+      call({ agent_id: "ag-2", sidechain: 1, model: second.model, ts: t0 + second.at }),
+      call({ agent_id: "ag-2", sidechain: 1, model: second.model, ts: t0 + second.at + 2000 }),
+    ]);
+    const common = { action, baselineModel: "claude-opus-5-5" } as const;
+    const r1 = row({
+      ...common,
+      ts: t0,
+      tier: first.tier ?? null,
+      modelFinal: action === "applied" ? (first.tier ?? null) : null,
+      modelRequested: action === "advised" ? (first.tier ?? null) : null,
+    });
+    const r2 = row({
+      ...common,
+      ts: t0 + 3,
+      tier: second.tier ?? null,
+      modelFinal: action === "applied" ? (second.tier ?? null) : null,
+      modelRequested: action === "advised" ? (second.tier ?? null) : null,
+    });
+    return { r1, r2 };
+  }
+
+  it("links parallel dispatches by the tier each asked for, not by who started first (probe p6)", () => {
+    // ag-2 (opus) makes its first call before ag-1 (haiku); the haiku row must still get ag-1.
+    const { r1, r2 } = parallel(
+      { model: "claude-haiku-4-5", tier: "haiku", at: 1400 },
+      { model: "claude-opus-5-5", tier: "opus", at: 900 },
+    );
+    expect(reconcile(db, { now: NOW }).linked).toBe(2);
+    expect(db.adjudicator.get(r1)).toMatchObject({ agentId: "ag-1", outcomeSource: "link" });
+    expect(db.adjudicator.get(r1)?.actualModel).toContain("haiku");
+    expect(db.adjudicator.get(r1)?.savingsUsd).toBeCloseTo(2 * (OPUS - HAIKU), 10);
+    expect(db.adjudicator.get(r2)).toMatchObject({ agentId: "ag-2" });
+    expect(db.adjudicator.get(r2)?.actualModel).toContain("opus");
+    expect(db.adjudicator.summary()).toMatchObject({ applyIneffective: 0, applyChecked: 2 });
+  });
+
+  it("leaves parallel dispatches of the same tier unlinked rather than guess", () => {
+    const { r1, r2 } = parallel(
+      { model: "claude-haiku-4-5", tier: "haiku", at: 1400 },
+      { model: "claude-haiku-4-5", tier: "haiku", at: 900 },
+    );
+    expect(reconcile(db, { now: NOW }).linked).toBe(0);
+    for (const id of [r1, r2])
+      expect(db.adjudicator.get(id)).toMatchObject({ agentId: null, actualModel: null });
+    expect(db.adjudicator.summary()).toMatchObject({ applyIneffective: 0, applyChecked: 0 });
+    // Still unlinked at 24 h: the rows close as n/a without a guessed agent.
+    reconcile(db, { now: NOW - 60 * MIN + FINAL_AFTER_MS + MIN });
+    expect(db.adjudicator.get(r1)).toMatchObject({ agentId: null, final: true, outcome: "n/a" });
+  });
+
+  it("leaves dispatches without a requested tier unlinked when several share a window", () => {
+    const { r1, r2 } = parallel(
+      { model: "claude-haiku-4-5", at: 1400 },
+      { model: "claude-opus-5-5", at: 900 },
+      "advised",
+    );
+    expect(reconcile(db, { now: NOW }).linked).toBe(0);
+    expect(db.adjudicator.get(r1)?.agentId ?? null).toBeNull();
+    expect(db.adjudicator.get(r2)?.agentId ?? null).toBeNull();
+  });
+
+  it("still links an apply that did not take effect once the other dispatch is settled", () => {
+    // Applied haiku, but the agent ran sonnet; the opus row's agent is unambiguous, which
+    // leaves one row and one agent: a genuine "apply did not take effect".
+    const { r1, r2 } = parallel(
+      { model: "claude-sonnet-5-5", tier: "haiku", at: 1400 },
+      { model: "claude-opus-5-5", tier: "opus", at: 900 },
+    );
+    expect(reconcile(db, { now: NOW }).linked).toBe(2);
+    expect(db.adjudicator.get(r1)?.agentId).toBe("ag-1");
+    expect(db.adjudicator.get(r2)?.agentId).toBe("ag-2");
+    expect(db.adjudicator.summary()).toMatchObject({ applyIneffective: 1, applyChecked: 2 });
+  });
+
+  it("waits while ingestion has not reached the end of the link window", () => {
+    const ts = NOW - 5 * MIN;
+    db.apiCallsUpsert([call({ agent_id: "x", sidechain: 1, ts: ts + 1000 })]);
+    const id = row({ ts });
+    expect(reconcile(db, { now: NOW }).linked).toBe(0);
+    db.apiCallsUpsert([call({ ts: ts + 2 * MIN })]);
+    expect(reconcile(db, { now: NOW + 1000 }).linked).toBe(1);
+    expect(db.adjudicator.get(id)?.agentId).toBe("x");
+  });
+});
+
+describe("matchDispatches", () => {
+  const W = 60_000;
+  const r = (id: number, ts: number, want?: string, settled = true) => ({ id, ts, want, settled });
+  const a = (id: string, first: number, tier?: string) => ({ id, first, tier });
+
+  it("pairs a lone row and agent, whatever their tiers", () => {
+    expect([...matchDispatches([r(1, 0, "haiku")], [a("x", 10, "opus")], W)]).toEqual([[1, "x"]]);
+  });
+
+  it("pairs by requested tier across a component and peels what is left", () => {
+    const m = matchDispatches(
+      [r(1, 0, "haiku"), r(2, 3, "opus"), r(3, 5, "sonnet")],
+      [a("o", 900, "opus"), a("h", 1400, "haiku"), a("s2", 1500, "opus")],
+      W,
+    );
+    // haiku→h is unique; opus has two candidates (o, s2), so rows 2 and 3 stay unpaired.
+    expect([...m]).toEqual([[1, "h"]]);
+  });
+
+  it("does not pair when a rival row could own the agent", () => {
+    // Row 2 asked for nothing in particular: it could have started the haiku agent.
+    expect(matchDispatches([r(1, 0, "haiku"), r(2, 3)], [a("h", 10, "haiku")], W).size).toBe(0);
+  });
+
+  it("skips a component with an unsettled row and ignores agents outside every window", () => {
+    expect(matchDispatches([r(1, 0, "haiku", false)], [a("h", 10, "haiku")], W).size).toBe(0);
+    expect(matchDispatches([r(1, 0)], [a("x", -1), a("y", W + 1)], W).size).toBe(0);
+    // Separate components are decided independently.
+    const m = matchDispatches([r(1, 0), r(2, 10 * W)], [a("x", 5), a("y", 10 * W + 5)], W);
+    expect([...m].sort()).toEqual([
+      [1, "x"],
+      [2, "y"],
+    ]);
   });
 });
 
@@ -509,6 +649,35 @@ describe("savingsReport", () => {
     expect(s.netUsd).toBeCloseTo(rep.netUsd, 10);
   });
 
+  it("counts each swarm task once: its agent row, else its plan row (probe p11)", () => {
+    // Three tasks, each with a plan row and an applied agent row, one haiku worker each.
+    for (const i of [1, 2, 3]) {
+      const t = swarmTask("done", `A${i}`);
+      db.apiCallsUpsert([
+        call({ agent_id: `A${i}`, sidechain: 1, model: "claude-haiku-4-5" }),
+        call({ agent_id: `A${i}`, sidechain: 1, model: "claude-haiku-4-5", ts: NOW - 4 * MIN }),
+      ]);
+      row({ surface: "plan", runId: "R1", taskId: t, action: "advised", ts: NOW - 12 * MIN });
+      row({ runId: "R1", taskId: t, action: "applied", modelFinal: "haiku", agentId: `A${i}` });
+    }
+    // A fourth task only planned (no Agent dispatch row): its plan row stands in for it.
+    const t4 = swarmTask("done", "A4");
+    db.apiCallsUpsert([call({ agent_id: "A4", sidechain: 1, model: "claude-sonnet-5-5" })]);
+    row({ surface: "plan", runId: "R1", taskId: t4, tier: "haiku", ts: NOW - 12 * MIN });
+    reconcile(db, { now: NOW });
+    // Both rows of a dispatched task carry the worker's model; only one is counted.
+    expect(
+      db.adjudicator.list({ surface: "plan" }).rows.filter((r) => r.actualModel?.includes("haiku")),
+    ).toHaveLength(3);
+    const rep = savingsReport(db);
+    expect(rep.matrix).toEqual([
+      { suggested: "haiku", actual: "haiku", n: 3 },
+      { suggested: "haiku", actual: "sonnet", n: 1 },
+    ]);
+    expect(rep.tokensPerSuccessByTier.haiku).toMatchObject({ tasks: 3, tokens: 9000 });
+    expect(rep.tokensPerSuccessByTier.sonnet).toMatchObject({ tasks: 1, tokens: 1500 });
+  });
+
   it("says so when no usage is recorded", () => {
     row({ surface: "mcp" });
     const rep = savingsReport(db);
@@ -631,7 +800,7 @@ describe("feedback", () => {
 
     expect(applyFeedback(db, good, "good", { learning: L, now: NOW })).toMatchObject({
       outcome: "success",
-      outcomeSource: "feedback",
+      outcomeSource: "feedback:good",
       outcomeTs: NOW,
       final: true,
     });
@@ -661,5 +830,207 @@ describe("feedback", () => {
       "success",
     );
     expect(db.adjudicator.biasAll()).toEqual([]);
+  });
+});
+
+describe("bias bucket: taught and looked up on the heuristic complexity (task #40)", () => {
+  it("bucketsOf prefers scores.heuristicComplexity and falls back to the row complexity", () => {
+    const intents = { features: { intents: { implement: 1 } } };
+    const withHeuristic = JSON.stringify({ ...intents, heuristicComplexity: 1.74 });
+    expect(bucketsOf({ complexity: 2.74, scores: withHeuristic }).tier).toBe("2");
+    expect(bucketsOf({ complexity: 2.74, scores: JSON.stringify(intents) }).tier).toBe("3");
+    expect(bucketsOf({ complexity: 2.74, scores: "not json" }).tier).toBe("3");
+    expect(bucketsOf({ complexity: null, scores: null }).tier).toBeUndefined();
+  });
+
+  it("a provider that moves complexity across a bucket: feedback lands where the next lookup reads", async () => {
+    const cfg = ConfigSchema.parse({
+      adjudicator: {
+        enabled: true,
+        provider: "openai-compatible",
+        openai: { preset: "ollama" },
+        learning: { minSamples: 0 },
+      },
+    }).adjudicator;
+    const provider: AdjudicatorProvider = {
+      id: "openai-compatible",
+      remote: false,
+      dims: ["complexity", "tier"],
+      async adjudicate(reqs) {
+        return {
+          answers: reqs.map((r) => ({ key: r.key, complexity: { value: 3.5, confidence: 0.95 } })),
+          usage: { inTok: 1, outTok: 1, costUsd: 0 },
+          latencyMs: 5,
+          model: "m",
+        };
+      },
+      async probe() {
+        return { ok: true, latencyMs: 1, detail: "" };
+      },
+    };
+    const text = "add a --json flag to the status command and update its test";
+    let heuristic = Number.NaN;
+    const [a] = await adjudicate([{ key: "a", surface: "mcp", text }], {
+      config: cfg,
+      store: db.adjudicator,
+      provider,
+      context: "server",
+      bias: (_req, f, h) => {
+        heuristic = h.complexity;
+        return biasFor(db, cfg.learning, { complexity: h.complexity, intent: topIntent(f) });
+      },
+    });
+    expect(a?.verdict.source).toBe("blend");
+    // The provider pushed the blended complexity into another bucket than the heuristic's.
+    expect(complexityBucket(a?.verdict.complexity as number)).not.toBe(complexityBucket(heuristic));
+    expect(a?.verdict.heuristicComplexity).toBe(heuristic);
+    const id = a?.rowId as number;
+    const stored = db.adjudicator.get(id);
+    expect(stored && bucketsOf(stored).tier).toBe(String(complexityBucket(heuristic)));
+
+    for (let i = 0; i < 6; i++) applyFeedback(db, id, "too_small", { learning: cfg.learning });
+    const taught = db.adjudicator.biasAll().filter((r) => r.dimension === "tier");
+    expect(taught.map((r) => r.bucket)).toEqual([String(complexityBucket(heuristic))]);
+    const looked = biasFor(db, cfg.learning, { complexity: heuristic, intent: "none" });
+    expect(looked[`tier:${a?.verdict.tier.choice}`]).toBeLessThan(0);
+  });
+});
+
+describe("feedback is idempotent per decision (task #39)", () => {
+  const L = { ...DEFAULT_LEARNING, minSamples: 0 };
+  const opt = (dim: string, option: string) =>
+    db.adjudicator.biasAll().find((b) => b.dimension === dim && b.option === option);
+
+  it("the same feedback six times teaches once (probe p3: n stayed 5.8, bias hit −0.30)", () => {
+    const id = row({ surface: "mcp", tier: "sonnet", complexity: 1.74 });
+    const first = applyFeedbackResult(db, id, "too_small", { learning: L, now: NOW });
+    expect(first?.learned).toBe(1);
+    const bias = db.adjudicator.biasAll();
+    for (let i = 1; i < 6; i++)
+      expect(applyFeedbackResult(db, id, "too_small", { learning: L, now: NOW + i })?.learned).toBe(
+        0,
+      );
+    expect(db.adjudicator.biasAll()).toEqual(bias);
+    expect(opt("tier", "sonnet")).toMatchObject({ n: 1, s: 0, f: 1 });
+    // The first feedback's time is kept.
+    expect(db.adjudicator.get(id)).toMatchObject({
+      outcomeSource: "feedback:too_small",
+      outcomeTs: NOW,
+    });
+  });
+
+  it("a different feedback replaces the earlier one's lesson instead of adding to it", () => {
+    const id = row({ surface: "mcp", tier: "sonnet", role: "reviewer" });
+    const tiers = ["haiku", "sonnet", "opus"];
+    applyFeedback(db, id, "good", { learning: L, tiers });
+    expect(opt("tier", "sonnet")).toMatchObject({ n: 1, s: 1, f: 0 });
+    expect(opt("role", "reviewer")).toMatchObject({ n: 1, s: 1 });
+
+    // good → too_small: the tier success is relabelled a failure, the role success retracted.
+    applyFeedback(db, id, "too_small", { learning: L, tiers });
+    expect(opt("tier", "sonnet")).toMatchObject({ n: 1, s: 0, f: 1 });
+    expect(opt("role", "reviewer")).toMatchObject({ n: 0, s: 0, f: 0, bias: 0 });
+
+    // too_small → too_big: sonnet back to a success, plus one success for haiku.
+    applyFeedback(db, id, "too_big", { learning: L, tiers });
+    expect(opt("tier", "sonnet")).toMatchObject({ n: 1, s: 1, f: 0 });
+    expect(opt("tier", "haiku")).toMatchObject({ n: 1, s: 1 });
+
+    // too_big → good: the lower-tier success goes, the role success comes back.
+    applyFeedback(db, id, "good", { learning: L, tiers });
+    expect(opt("tier", "sonnet")).toMatchObject({ n: 1, s: 1, f: 0 });
+    expect(opt("tier", "haiku")).toMatchObject({ n: 0, s: 0 });
+    expect(opt("role", "reviewer")).toMatchObject({ n: 1, s: 1 });
+    expect(db.adjudicator.get(id)?.outcomeSource).toBe("feedback:good");
+  });
+
+  it("does not re-teach a row reconcile already learned from; a disagreement relabels it", () => {
+    const t = swarmTask("done");
+    db.apiCallsUpsert([call({ agent_id: "A1", sidechain: 1, model: "claude-haiku-4-5" })]);
+    const id = row({ runId: "R1", taskId: t, action: "applied", role: "reviewer" });
+    expect(reconcile(db, { now: NOW, learning: L }).learned).toBe(2);
+    expect(db.adjudicator.get(id)).toMatchObject({ outcome: "success", outcomeSource: "swarm" });
+    const bias = db.adjudicator.biasAll();
+
+    // Agreeing feedback changes nothing (the role that ran, coder, is the one taught).
+    expect(applyFeedbackResult(db, id, "good", { learning: L })?.learned).toBe(0);
+    expect(db.adjudicator.biasAll()).toEqual(bias);
+    expect(opt("role", "reviewer")).toBeUndefined();
+
+    // Disagreeing feedback flips the tier signal (n unchanged) and retracts the role success.
+    applyFeedback(db, id, "too_small", { learning: L });
+    expect(opt("tier", "haiku")).toMatchObject({ n: 1, s: 0, f: 1 });
+    expect(opt("role", "coder")).toMatchObject({ n: 0, s: 0 });
+    // Repeating it, or reconciling again, adds nothing.
+    applyFeedback(db, id, "too_small", { learning: L });
+    reconcile(db, { now: NOW + MIN, learning: L });
+    expect(opt("tier", "haiku")).toMatchObject({ n: 1, s: 0, f: 1 });
+  });
+
+  it("a redo relabel turns the attempt's taught success into a failure, n unchanged", () => {
+    const t = swarmTask("done", "A0");
+    db.apiCallsUpsert([
+      call({ agent_id: "A0", sidechain: 1, model: "claude-haiku-4-5", ts: NOW - 25 * MIN }),
+    ]);
+    const first = row({ runId: "R1", taskId: t, ts: NOW - 30 * MIN, action: "applied" });
+    reconcile(db, { now: NOW, learning: L });
+    expect(db.adjudicator.get(first)).toMatchObject({ outcome: "success", final: true });
+    expect(opt("tier", "haiku")).toMatchObject({ n: 1, s: 1, f: 0 });
+
+    // The task is dispatched again (a sonnet worker): the first attempt did not hold.
+    db.swarm.workerUpsert({
+      run_id: "R1",
+      agent_id: "A2",
+      agent_type: "swarm-feature-coder",
+      role: "coder",
+      session_id: "S",
+      task_id: t,
+    });
+    db.apiCallsUpsert([
+      call({ agent_id: "A2", sidechain: 1, model: "claude-sonnet-5-5", ts: NOW - 3 * MIN }),
+    ]);
+    row({ runId: "R1", taskId: t, ts: NOW - 4 * MIN, action: "applied" });
+    reconcile(db, { now: NOW + 10 * MIN, learning: L });
+    expect(db.adjudicator.get(first)).toMatchObject({ outcome: "failure", outcomeSource: "redo" });
+    expect(opt("tier", "haiku")).toMatchObject({ n: 1, s: 0, f: 1 });
+    expect(opt("tier", "sonnet")).toMatchObject({ n: 1, s: 1 });
+
+    // Feedback on the relabelled attempt replaces the redo lesson, it does not add one.
+    applyFeedback(db, first, "good", { learning: L });
+    expect(opt("tier", "haiku")).toMatchObject({ n: 1, s: 1, f: 0 });
+  });
+
+  it("explicit feedback is not overwritten by a later redo relabel", () => {
+    const t = swarmTask("done", "A0");
+    db.apiCallsUpsert([
+      call({ agent_id: "A0", sidechain: 1, model: "claude-haiku-4-5", ts: NOW - 25 * MIN }),
+    ]);
+    const first = row({ runId: "R1", taskId: t, ts: NOW - 30 * MIN, action: "applied" });
+    reconcile(db, { now: NOW, learning: L });
+    applyFeedback(db, first, "good", { learning: L });
+    db.swarm.workerUpsert({
+      run_id: "R1",
+      agent_id: "A2",
+      agent_type: "x",
+      role: "coder",
+      session_id: "S",
+      task_id: t,
+    });
+    db.apiCallsUpsert([call({ agent_id: "A2", sidechain: 1, ts: NOW - 3 * MIN })]);
+    row({ runId: "R1", taskId: t, ts: NOW - 4 * MIN, action: "applied" });
+    reconcile(db, { now: NOW + 10 * MIN, learning: L });
+    expect(db.adjudicator.get(first)).toMatchObject({
+      outcome: "success",
+      outcomeSource: "feedback:good",
+    });
+    expect(opt("tier", "haiku")).toMatchObject({ n: 1, s: 1, f: 0 });
+  });
+
+  it('reads a legacy bare "feedback" label by its outcome', () => {
+    expect(feedbackOf({ outcome: "failure", outcomeSource: "feedback" })).toBe("too_small");
+    expect(feedbackOf({ outcome: "success", outcomeSource: "feedback" })).toBe("good");
+    expect(feedbackOf({ outcome: "success", outcomeSource: "feedback:too_big" })).toBe("too_big");
+    expect(feedbackOf({ outcome: "success", outcomeSource: "swarm" })).toBeUndefined();
+    expect(feedbackOf({ outcome: "success", outcomeSource: "feedback:bogus" })).toBeUndefined();
   });
 });

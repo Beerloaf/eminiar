@@ -320,6 +320,7 @@ export class SqliteAdjudicatorStore implements AdjudicatorStore {
       lastErrorAt: r.last_error_at == null ? null : Number(r.last_error_at),
       lastErrorClass: (r.last_error_class as string | null) ?? null,
       latencies: parseLatencies(r.latencies),
+      latencyBudgets: parseLatencies(r.latency_budgets),
       spendDay: (r.spend_day as string | null) ?? null,
       spendUsd: Number(r.spend_usd ?? 0),
       calls: Number(r.calls ?? 0),
@@ -340,6 +341,7 @@ export class SqliteAdjudicatorStore implements AdjudicatorStore {
       lastErrorAt: null,
       lastErrorClass: null,
       latencies: [],
+      latencyBudgets: [],
       spendDay: null,
       spendUsd: 0,
       calls: 0,
@@ -350,14 +352,19 @@ export class SqliteAdjudicatorStore implements AdjudicatorStore {
       if (v !== undefined) (next as unknown as Record<string, unknown>)[k] = v;
     }
     next.latencies = next.latencies.slice(-LATENCY_RING);
+    // Never longer than the ring it annotates (the two are aligned at the end).
+    const budgets = next.latencyBudgets ?? [];
+    next.latencyBudgets = budgets.slice(Math.max(0, budgets.length - next.latencies.length));
     this.prep(
       `INSERT INTO adjudicator_provider_state (provider, state, failures, retry_at, last_ok_at,
-         last_error_at, last_error_class, latencies, spend_day, spend_usd, calls, auth_fingerprint)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         last_error_at, last_error_class, latencies, latency_budgets, spend_day, spend_usd, calls,
+         auth_fingerprint)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(provider) DO UPDATE SET state = excluded.state, failures = excluded.failures,
          retry_at = excluded.retry_at, last_ok_at = excluded.last_ok_at,
          last_error_at = excluded.last_error_at, last_error_class = excluded.last_error_class,
-         latencies = excluded.latencies, spend_day = excluded.spend_day,
+         latencies = excluded.latencies, latency_budgets = excluded.latency_budgets,
+         spend_day = excluded.spend_day,
          spend_usd = excluded.spend_usd, calls = excluded.calls,
          auth_fingerprint = excluded.auth_fingerprint`,
     ).run(
@@ -369,12 +376,20 @@ export class SqliteAdjudicatorStore implements AdjudicatorStore {
       next.lastErrorAt,
       next.lastErrorClass,
       JSON.stringify(next.latencies),
+      JSON.stringify(next.latencyBudgets),
       next.spendDay,
       next.spendUsd,
       next.calls,
       next.authFingerprint,
     );
     return next;
+  }
+
+  atomically<T>(fn: () => T): T {
+    // Heal before BEGIN so the DDL never runs inside the caller's transaction.
+    this.heal();
+    if (this.db.inTransaction) return fn();
+    return this.db.transaction(fn).immediate();
   }
 
   // --- bias -------------------------------------------------------------------------

@@ -9,7 +9,7 @@ import { z } from "zod";
 import { resolveAdjudicator } from "../adjudicator/config.js";
 import { adjudicate } from "../adjudicator/engine.js";
 import { complexityBucket } from "../adjudicator/heuristic.js";
-import { applyFeedback, type Feedback, reconcile } from "../adjudicator/learn.js";
+import { applyFeedbackResult, type Feedback, reconcile } from "../adjudicator/learn.js";
 import type { EmbeddingFactory } from "../adjudicator/providers/embedding.js";
 import { head } from "../adjudicator/redact.js";
 import { type SavingsReportOptions, savingsReport } from "../adjudicator/savings.js";
@@ -373,14 +373,20 @@ export async function runAdjudicate(
       if (!cfg?.enabled) return text(OFF);
       if (args.id === undefined || !args.outcome)
         return errorResult('feedback needs id and outcome: "good", "too_small" or "too_big"');
-      const row = applyFeedback(db(), args.id, args.outcome as Feedback, {
+      const fb = applyFeedbackResult(db(), args.id, args.outcome as Feedback, {
         config: ctx.config,
         ...(deps.now ? { now: deps.now() } : {}),
       });
-      if (!row) return errorResult(`no adjudicator decision ${args.id}`);
+      if (!fb) return errorResult(`no adjudicator decision ${args.id}`);
+      const { row } = fb;
       const note = args.note?.trim() ? head(args.note, NOTE_MAX) : undefined;
       if (note) db().adjudicator.update(row.id, { feedbackNote: note });
-      const learned = cfg.learning.enabled ? "; the learned bias was updated" : "";
+      // Feedback replaces the decision's earlier lesson, so repeating it changes nothing.
+      const learned = !cfg.learning.enabled
+        ? ""
+        : fb.learned > 0
+          ? "; the learned bias was updated"
+          : "; the learned bias already reflects this";
       return text(
         `Feedback ${args.outcome} on decision ${row.id} (${row.tier ?? "–"}${row.role ? `, ${row.role}` : ""}): outcome ${row.outcome}, final${learned}.${
           note ? ` Note: ${clip(note, 200)}` : ""

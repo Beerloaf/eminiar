@@ -563,6 +563,7 @@ CREATE TABLE IF NOT EXISTS adjudicator_provider_state (
   last_error_at INTEGER,
   last_error_class TEXT,
   latencies TEXT,
+  latency_budgets TEXT,
   spend_day TEXT,
   spend_usd REAL NOT NULL DEFAULT 0,
   calls INTEGER NOT NULL DEFAULT 0,
@@ -596,6 +597,7 @@ export const ADJUDICATOR_LATE_COLUMNS: ReadonlyArray<
   ["adjudicator_provider_state", "calls", "INTEGER NOT NULL DEFAULT 0"],
   ["adjudicator_provider_state", "auth_fingerprint", "TEXT"],
   ["adjudications", "feedback_note", "TEXT"],
+  ["adjudicator_provider_state", "latency_budgets", "TEXT"],
 ];
 
 /**

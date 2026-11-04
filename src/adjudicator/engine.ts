@@ -8,8 +8,9 @@
  * back within budget + a few ms. Persistence and cache failures (DB busy, v8 not migrated) are
  * swallowed: the verdict is still returned, just not stored.
  *
- * Cache: keyed by sha256(SCORER_VERSION | configured provider | model | surface | text), so the
- * hooks pick up verdicts the server's embedding provider wrote. Only provider-blended verdicts
+ * Cache: keyed by sha256(SCORER_VERSION | configured provider | model | surface | inputs | text),
+ * where inputs are the hints, tool/role catalogues, tier ladder and weights (cacheKeyFor), so
+ * the hooks pick up verdicts the server's embedding provider wrote for the same request. Only provider-blended verdicts
  * are cached (the heuristic is cheaper than a lookup). A null entry is the `pending` marker of a
  * running async job; it dedupes jobs for PENDING_TTL_MS.
  *
@@ -105,9 +106,17 @@ export interface EngineOptions {
   random?: (() => number) | undefined;
 }
 
+/**
+ * A verdict as the engine returns it. `heuristicComplexity` is the heuristic's complexity before
+ * any provider blend: the learned-bias bucket is keyed by it both when bias is looked up (only
+ * the heuristic is known then) and when it is taught (learn.bucketsOf reads it from the row's
+ * scores JSON), so feedback lands in the bucket the same request reads.
+ */
+export type EngineVerdict = Verdict & { heuristicComplexity?: number };
+
 export interface Adjudication {
   request: AdjudicationRequest;
-  verdict: Verdict;
+  verdict: EngineVerdict;
   cacheKey: string;
   features: Features;
   /** The adjudications row, when one was inserted. */
@@ -132,20 +141,68 @@ export function surfaceBudget(cfg: AdjudicatorConfig, surface: Surface, local = 
   }
 }
 
-/** The cache key (§9): never the text itself. */
+/**
+ * Everything besides the text that changes a blended verdict: the request hints, the tool and
+ * role catalogues the heuristic scores over, and the configured tier ladder and weights. Two
+ * requests with the same text but different hints or catalogues must not share a cache entry.
+ */
+export interface CacheKeyContext {
+  config?: Pick<AdjudicatorConfig, "tiers" | "weights"> | undefined;
+  /** The registered tool ids (EngineOptions.tools); default TOOL_IDS. */
+  tools?: readonly string[] | undefined;
+  /** Role options used when the request has no hints.roles (EngineOptions.roles). */
+  roles?: ReadonlyArray<{ name: string; description?: string }> | undefined;
+}
+
+/** JSON with object keys sorted, so equal inputs always hash the same. */
+function stableJson(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(stableJson).join(",")}]`;
+  if (v && typeof v === "object") {
+    const o = v as Record<string, unknown>;
+    return `{${Object.keys(o)
+      .filter((k) => o[k] !== undefined)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${stableJson(o[k])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(v ?? null);
+}
+
+/** The cache key (§9): never the text itself, nor any other raw input (all go through sha256). */
 export function cacheKeyFor(
-  req: Pick<AdjudicationRequest, "surface" | "text">,
+  req: Pick<AdjudicationRequest, "surface" | "text" | "hints">,
   r: Pick<Resolved, "configured" | "model">,
+  ctx: CacheKeyContext = {},
 ): string {
   const text = normalize(req.text).toLowerCase().replace(/\s+/g, " ").slice(0, CACHE_KEY_CHARS);
+  const h = req.hints;
+  const roles = h?.roles ?? ctx.roles;
+  const inputs = stableJson({
+    files: h?.files,
+    deps: h?.deps,
+    role: h?.role,
+    // Order does not change the scores; descriptions do (the heuristic matches on them).
+    roles: roles
+      ?.map((x) => ({ name: x.name, description: x.description ?? "" }))
+      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)),
+    tools: ctx.tools ? [...ctx.tools].sort() : undefined,
+    // The ladder is ordered, so its order stays.
+    tiers: ctx.config?.tiers,
+    weights: ctx.config?.weights,
+  });
   return createHash("sha256")
-    .update([SCORER_VERSION, r.configured, r.model ?? "", req.surface, text].join("|"))
+    .update([SCORER_VERSION, r.configured, r.model ?? "", req.surface, inputs, text].join("|"))
     .digest("hex");
+}
+
+/** The tool catalogue the engine scores over for these options (prepare() and the cache key). */
+function toolsOf(opts: EngineOptions): readonly string[] | undefined {
+  return opts.tools ?? opts.deps?.tools;
 }
 
 /** The verdict columns of an adjudications row (insert, or the async job's update). */
 export function verdictColumns(
-  v: Verdict,
+  v: EngineVerdict,
   o: { features?: Features | undefined; providerModel?: string | undefined } = {},
 ): AdjudicationPatch {
   const u = v.usage;
@@ -159,6 +216,7 @@ export function verdictColumns(
     features: o.features,
     alpha: v.alpha,
     bias: v.bias,
+    heuristicComplexity: v.heuristicComplexity,
   };
   return {
     complexity: v.complexity,
@@ -239,7 +297,8 @@ export async function adjudicate(
       !!store && (cfg.enabled ? opts.persist !== false : enabled && opts.persist === true);
     const firstSurface = items[0]?.req.surface ?? "prompt";
     const budgetMs = Math.max(0, opts.budgetMs ?? surfaceBudget(cfg, firstSurface, r.local));
-    for (const it of items) it.cacheKey = cacheKeyFor(it.req, r);
+    const keyCtx: CacheKeyContext = { config: cfg, tools: toolsOf(opts), roles: opts.roles };
+    for (const it of items) it.cacheKey = cacheKeyFor(it.req, r, keyCtx);
 
     if (!enabled) {
       for (const it of items) it.verdict = heuristicVerdict(it, "heuristic", "heuristic", "n/a");
@@ -331,6 +390,9 @@ export async function adjudicate(
       remaining,
     );
     const providerLatencyMs = now() - callStart;
+    // Warm-up and test/probe calls (surface "test": cold model loads, CLI test, try-it) say
+    // nothing about the latency of real work, so they stay out of the slow guard.
+    const sample = !misses.some((it) => it.req.surface === "test");
 
     if (!outcome.ok) {
       const kind = outcome.kind;
@@ -346,6 +408,7 @@ export async function adjudicate(
               budgetMs,
               halfOpen,
               keyFingerprint: keyFp,
+              sample,
             }),
           log,
         );
@@ -366,6 +429,7 @@ export async function adjudicate(
             latencyMs: res.latencyMs || providerLatencyMs,
             costUsd: res.usage.costUsd,
             budgetMs,
+            sample,
           }),
         log,
       );
@@ -419,7 +483,11 @@ export async function adjudicate(
     }
     return items.map((it) => ({
       request: it.req,
-      verdict: { ...(it.verdict as Verdict), latencyMs: now() - start },
+      verdict: {
+        ...(it.verdict as Verdict),
+        latencyMs: now() - start,
+        heuristicComplexity: it.h.complexity,
+      },
       cacheKey: it.cacheKey,
       features: it.features,
     }));
@@ -441,7 +509,7 @@ function prepare(req: AdjudicationRequest, index: number, opts: EngineOptions): 
   const cfg = opts.config;
   const features = extractFeatures(req.text, req.hints);
   const catalogue: Catalogue = { tiers: cfg.tiers };
-  const tools = opts.tools ?? opts.deps?.tools;
+  const tools = toolsOf(opts);
   if (tools) catalogue.tools = tools;
   const roles = req.hints?.roles ?? opts.roles;
   if (roles?.length) catalogue.roles = roles;
@@ -493,7 +561,11 @@ function finish(
   const cfg = opts.config;
   const latencyMs = now() - start;
   return items.map((it) => {
-    const verdict = { ...(it.verdict as Verdict), latencyMs };
+    const verdict: EngineVerdict = {
+      ...(it.verdict as Verdict),
+      latencyMs,
+      heuristicComplexity: it.h.complexity,
+    };
     const out: Adjudication = {
       request: it.req,
       verdict,
@@ -607,7 +679,9 @@ function buildJob(
     budgetMs: 2 * budgetMs,
     bias: it.bias,
   };
-  if (opts.tools) job.tools = [...opts.tools];
+  // The child recomputes the cache key from these, so it must see the same catalogue.
+  const tools = toolsOf(opts);
+  if (tools) job.tools = [...tools];
   if (opts.roles) job.roles = opts.roles.map((r) => ({ ...r }));
   return job;
 }

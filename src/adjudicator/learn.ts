@@ -4,16 +4,18 @@
  * reconcile(db, {limit}) links non-final adjudication rows to what happened afterwards:
  * - plan / agent rows of a swarm task take the task's status as their outcome and the
  *   worker's api_calls as their tokens;
- * - agent rows without a swarm task are linked best-effort to the first sidechain agent that
- *   starts within 60 s of the dispatch (outcome_source "link");
+ * - agent rows without a swarm task are linked to the sidechain agent that starts within 60 s
+ *   of the dispatch (outcome_source "link"), jointly across parallel dispatches and only when
+ *   the evidence is unambiguous (matchDispatches);
  * - prompt rows take the session's main-thread calls up to the next prompt row.
  * It reprices those calls at the baseline model (savings.ts), credits savings only for
  * followed or applied dispatches, charges a redone failed attempt its full cost, and on the
- * row's transition to final updates the learned bias buckets. Final rows are never touched
- * again, so re-runs are idempotent.
+ * row's transition to final updates the learned bias buckets. Final rows are not re-scanned,
+ * so re-runs are idempotent; a final row holds at most one lesson, which a redo relabel or
+ * explicit feedback replaces rather than adds to (see "lessons" below).
  *
- * Learning keeps decayed counts per bucket (tier: complexity bucket × tier; role: top intent ×
- * role) and turns them into a bounded additive bias with a Beta(2,2) prior:
+ * Learning keeps decayed counts per bucket (tier: HEURISTIC complexity bucket × tier, the one
+ * lookup can know before a provider answers; role: top intent × role) and turns them into a bounded additive bias with a Beta(2,2) prior:
  *   bias = clamp((s+2)/(n+4) − 0.8 − costWeight·log2(costMedian / bucket median), ±maxBias)
  * applied only when n ≥ minSamples. biasFor() returns it keyed "tier:<option>" /
  * "role:<option>" for blend; learning.enabled=false gives {}.
@@ -252,15 +254,36 @@ function parsedFeatures(row: Pick<AdjudicationRow, "scores">): Features | undefi
   }
 }
 
-/** The (tier, role) buckets of a row: complexity bucket, and top intent ("none" without one). */
+/** scores.heuristicComplexity (engine.verdictColumns), when the row has it. */
+function heuristicComplexityOf(row: Pick<AdjudicationRow, "scores">): number | undefined {
+  if (!row.scores) return undefined;
+  try {
+    const s = JSON.parse(row.scores) as { heuristicComplexity?: unknown } | null;
+    const c = s && typeof s === "object" ? s.heuristicComplexity : undefined;
+    return typeof c === "number" && Number.isFinite(c) ? c : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The (tier, role) buckets of a row: complexity bucket, and top intent ("none" without one).
+ * The tier bucket uses the HEURISTIC complexity, the same one biasFor is looked up with (the
+ * provider has not answered at lookup time), so a provider that moves the blended complexity
+ * across a bucket boundary cannot teach a bucket the request never reads. Rows written before
+ * the heuristic complexity was stored fall back to the row's (blended) complexity.
+ */
 export function bucketsOf(row: Pick<AdjudicationRow, "complexity" | "scores">): {
   tier: string | undefined;
   role: string;
 } {
-  const tier =
-    typeof row.complexity === "number" && Number.isFinite(row.complexity)
-      ? String(complexityBucket(row.complexity))
-      : undefined;
+  const heuristic = heuristicComplexityOf(row);
+  const complexity =
+    heuristic ??
+    (typeof row.complexity === "number" && Number.isFinite(row.complexity)
+      ? row.complexity
+      : undefined);
+  const tier = complexity === undefined ? undefined : String(complexityBucket(complexity));
   const f = parsedFeatures(row);
   const intent = f?.intents && typeof f.intents === "object" ? topIntent(f) : undefined;
   return { tier, role: intent ?? "none" };
@@ -302,6 +325,95 @@ export interface ReconcileResult {
 
 const CREDITED = new Set(["applied", "followed"]);
 
+/** A non-swarm Agent dispatch row competing for a sidechain agent. */
+export interface DispatchCandidate {
+  id: number;
+  ts: number;
+  /** Tier the dispatch asked for (model_final, else model_requested); unknown = undefined. */
+  want?: string | undefined;
+  /** Ingestion has passed the row's link window, so every agent it could own is visible. */
+  settled: boolean;
+}
+
+/** A sidechain agent of the session: its first call and the tier it mostly ran on. */
+export interface AgentCandidate {
+  id: string;
+  first: number;
+  tier?: string | undefined;
+}
+
+/**
+ * Pair dispatch rows with the agents they started, linking only what the evidence settles.
+ * An agent can belong to a row when its first call falls in [row.ts, row.ts + 60 s]. Rows and
+ * agents that share candidates form a component; components with a row whose window is not
+ * yet ingested wait. In a component:
+ * - one row and one agent: they pair (nothing else could have started it);
+ * - otherwise a row pairs with an agent when that agent is the row's only candidate running
+ *   the tier it asked for, and every other row that could own the agent asked for a known,
+ *   different tier.
+ * Paired rows and agents are removed and the rest re-examined, so a row whose agent ran a
+ * different tier than asked (apply ineffective) is still linked once the others are settled.
+ * Anything else, e.g. two parallel dispatches of the same tier, stays unlinked: a guess would
+ * misreport savings and raise a false "apply did not take effect". Returns row id → agent id.
+ */
+export function matchDispatches(
+  rows: readonly DispatchCandidate[],
+  agents: readonly AgentCandidate[],
+  windowMs = LINK_WINDOW_MS,
+): Map<number, string> {
+  const out = new Map<number, string>();
+  let R = [...rows];
+  let A = [...agents];
+  const inWindow = (r: DispatchCandidate, a: AgentCandidate) =>
+    a.first >= r.ts && a.first <= r.ts + windowMs;
+  for (;;) {
+    const cand = new Map(R.map((r) => [r.id, A.filter((a) => inWindow(r, a))]));
+    const owners = new Map(A.map((a) => [a.id, R.filter((r) => inWindow(r, a))]));
+    const pairs: Array<[DispatchCandidate, AgentCandidate]> = [];
+    const seen = new Set<number>();
+    for (const start of R) {
+      if (seen.has(start.id)) continue;
+      // The component of `start`: rows and agents reachable through shared windows.
+      const rowsC: DispatchCandidate[] = [];
+      const agentsC = new Set<AgentCandidate>();
+      const queue = [start];
+      seen.add(start.id);
+      while (queue.length) {
+        const r = queue.pop() as DispatchCandidate;
+        rowsC.push(r);
+        for (const a of cand.get(r.id) ?? []) {
+          if (agentsC.has(a)) continue;
+          agentsC.add(a);
+          for (const o of owners.get(a.id) ?? [])
+            if (!seen.has(o.id)) {
+              seen.add(o.id);
+              queue.push(o);
+            }
+        }
+      }
+      if (!agentsC.size || rowsC.some((r) => !r.settled)) continue;
+      if (rowsC.length === 1 && agentsC.size === 1) {
+        pairs.push([rowsC[0] as DispatchCandidate, [...agentsC][0] as AgentCandidate]);
+        continue;
+      }
+      for (const r of rowsC) {
+        if (!r.want) continue;
+        const match = (cand.get(r.id) ?? []).filter((a) => a.tier === r.want);
+        if (match.length !== 1) continue;
+        const a = match[0] as AgentCandidate;
+        const rivals = (owners.get(a.id) ?? []).filter((o) => o !== r);
+        if (rivals.every((o) => o.want !== undefined && o.want !== a.tier)) pairs.push([r, a]);
+      }
+    }
+    if (!pairs.length) return out;
+    for (const [r, a] of pairs) out.set(r.id, a.id);
+    const pr = new Set(pairs.map(([r]) => r.id));
+    const pa = new Set(pairs.map(([, a]) => a.id));
+    R = R.filter((r) => !pr.has(r.id));
+    A = A.filter((a) => !pa.has(a.id));
+  }
+}
+
 class Reconciler {
   readonly result: ReconcileResult = {
     scanned: 0,
@@ -316,6 +428,8 @@ class Reconciler {
   private promptsBySession: Map<string, AdjudicationRow[]> | undefined;
   /** Agent ids already tied to an adjudication row. */
   private readonly taken = new Set<string>();
+  /** Row id → the agent linkAgents matched it to in this run. */
+  private readonly links = new Map<number, string>();
   private readonly latestCallTs: number | undefined;
 
   constructor(
@@ -370,6 +484,68 @@ class Reconciler {
       this.promptsBySession = m;
     }
     return this.promptsBySession.get(sessionId) ?? [];
+  }
+
+  /**
+   * Can every agent this row might own be visible? Yes once ingestion holds a call past the
+   * row's link window, or once the row is AGENT_IDLE_MS old (a session whose last agents
+   * finished inside the window has no later call; by then its transcripts are ingested).
+   */
+  private windowSeen(row: AdjudicationRow): boolean {
+    return (
+      this.latestCallTs === undefined ||
+      this.latestCallTs >= row.ts + LINK_WINDOW_MS ||
+      this.now - row.ts >= AGENT_IDLE_MS
+    );
+  }
+
+  /**
+   * Decide, once per run and jointly per session, which sidechain agent each unlinked
+   * non-swarm agent row dispatched (agentRow reads the result). Parallel Agent calls in one
+   * message are the common case, so rows are not linked greedily in order: every dispatch
+   * row of the session without an agent id competes (final, unsettled and swarm rows too),
+   * and matchDispatches links only what the evidence settles. Ambiguous rows stay unlinked.
+   */
+  linkAgents(targets: readonly AdjudicationRow[]): void {
+    const bySession = new Map<string, AdjudicationRow[]>();
+    for (const r of targets) {
+      if (r.agentId || !r.sessionId) continue;
+      const list = bySession.get(r.sessionId);
+      if (list) list.push(r);
+      else bySession.set(r.sessionId, [r]);
+    }
+    if (!bySession.size) return;
+    const minTs = Math.min(...targets.map((r) => r.ts));
+    const near = allRows(this.db, { surface: "agent", since: minTs - LINK_WINDOW_MS });
+    for (const [sessionId, mine] of bySession) {
+      const maxTs = Math.max(...mine.map((r) => r.ts));
+      const linkable = new Set(mine.map((r) => r.id));
+      const rows: DispatchCandidate[] = near
+        .filter((r) => r.sessionId === sessionId && !r.agentId && r.ts <= maxTs + LINK_WINDOW_MS)
+        .map((r) => ({
+          id: r.id,
+          ts: r.ts,
+          want: tierOf(r.modelFinal ?? r.modelRequested),
+          settled: this.windowSeen(r),
+        }));
+      const callsBy = new Map<string, ApiCallRow[]>();
+      for (const c of this.calls(sessionId)) {
+        if (!c.sidechain || !c.agent_id || this.taken.has(c.agent_id)) continue;
+        const list = callsBy.get(c.agent_id);
+        if (list) list.push(c);
+        else callsBy.set(c.agent_id, [c]);
+      }
+      const agents: AgentCandidate[] = [...callsBy].map(([id, cs]) => ({
+        id,
+        first: Math.min(...cs.map((c) => c.ts)),
+        tier: tierOf(dominantModel(cs)),
+      }));
+      for (const [rowId, agentId] of matchDispatches(rows, agents)) {
+        // A pair whose row is not in this run's batch still consumes the agent.
+        this.taken.add(agentId);
+        if (linkable.has(rowId)) this.links.set(rowId, agentId);
+      }
+    }
   }
 
   /** Seed `taken` with the agent ids already on agent / plan rows near these rows. */
@@ -487,9 +663,11 @@ class Reconciler {
       if (e.surface !== "agent" || e.id >= row.id || !e.final) continue;
       if (!CREDITED.has(e.action ?? "") || typeof e.actualCostUsd !== "number") continue;
       const patch: AdjudicationPatch = { savingsUsd: -e.actualCostUsd };
-      if (e.outcome !== "failure") {
-        // A later dispatch for the same task means this attempt did not hold. The bias
-        // already counted it at finalisation; only the outcome label and savings change.
+      // A later dispatch for the same task means this attempt did not hold: relabel it a
+      // failure, unless explicit feedback already labelled it (feedback wins over the guess).
+      const relabel = e.outcome !== "failure" && feedbackOf(e) === undefined;
+      const before = relabel ? reconcileLesson(this.db, e) : [];
+      if (relabel) {
         patch.outcome = "failure";
         patch.outcomeSource = "redo";
       }
@@ -499,6 +677,16 @@ class Reconciler {
         Object.assign(e, d);
         this.result.updated++;
       }
+      // The lesson follows the label: the success it taught at finalisation becomes a
+      // failure (relabelled, not added), so a final row always holds exactly one lesson.
+      if (relabel)
+        this.result.learned += replaceLesson(
+          this.db,
+          before,
+          reconcileLesson(this.db, e),
+          this.learning,
+          this.now,
+        );
     }
   }
 
@@ -589,22 +777,10 @@ class Reconciler {
     const all = sessionId ? this.calls(sessionId) : [];
     let agentId = row.agentId ?? undefined;
     let linkedNow = false;
-    if (!agentId && sessionId) {
-      const first = new Map<string, number>();
-      for (const c of all) {
-        if (!c.sidechain || !c.agent_id) continue;
-        const t = first.get(c.agent_id);
-        if (t === undefined || c.ts < t) first.set(c.agent_id, c.ts);
-      }
-      let best: [string, number] | undefined;
-      for (const [id, t] of first) {
-        if (this.taken.has(id) || t < row.ts || t > row.ts + LINK_WINDOW_MS) continue;
-        if (!best || t < best[1]) best = [id, t];
-      }
-      if (best) {
-        agentId = best[0];
+    if (!agentId) {
+      agentId = this.links.get(row.id);
+      if (agentId) {
         linkedNow = true;
-        this.taken.add(agentId);
         this.result.linked++;
       }
     }
@@ -704,11 +880,23 @@ export function reconcile(db: StorageAdapter, opts: ReconcileOptions = {}): Reco
   rec.result.scanned = rows.length;
 
   // Swarm rows first: they claim their agent ids before best-effort linking runs.
-  const ordered = [...rows.filter(isSwarm), ...rows.filter((r) => !isSwarm(r))];
-  for (const row of ordered) {
+  const swarm = rows.filter(isSwarm);
+  const rest = rows.filter((r) => !isSwarm(r));
+  for (const row of swarm) {
     try {
-      if (isSwarm(row)) rec.swarmRow(row);
-      else if (row.surface === "agent") rec.agentRow(row);
+      rec.swarmRow(row);
+    } catch {
+      // Never let one row (or a locked DB) break reconcile for the rest.
+    }
+  }
+  try {
+    rec.linkAgents(rest.filter((r) => r.surface === "agent"));
+  } catch {
+    // Linking is best-effort; unlinked rows simply wait for the next run.
+  }
+  for (const row of rest) {
+    try {
+      if (row.surface === "agent") rec.agentRow(row);
       else if (row.surface === "prompt") rec.promptRow(row, minTs);
       else rec.otherRow(row);
     } catch {
@@ -716,6 +904,189 @@ export function reconcile(db: StorageAdapter, opts: ReconcileOptions = {}): Reco
     }
   }
   return rec.result;
+}
+
+// --- lessons -------------------------------------------------------------------------
+//
+// A final row holds at most ONE lesson in the bias buckets: the signals reconcile taught at
+// finalisation, or the signals of the latest feedback on it. Both are derived from the row's
+// label (outcome + outcome_source), so a later label REPLACES the earlier lesson (a signal
+// whose success flips is relabelled in place, one no longer taught is retracted, a new one is
+// recorded) instead of adding to it. Repeated feedback is therefore idempotent, and feedback
+// on a row reconcile already learned from never counts it twice.
+
+/** outcome_source of a feedback label: "feedback:<kind>". */
+export function feedbackSource(feedback: Feedback): string {
+  return `feedback:${feedback}`;
+}
+
+/** The feedback a row was labelled with; a bare legacy "feedback" maps by its outcome. */
+export function feedbackOf(
+  row: Pick<AdjudicationRow, "outcome" | "outcomeSource">,
+): Feedback | undefined {
+  const src = row.outcomeSource ?? "";
+  if (src.startsWith("feedback:")) {
+    const k = src.slice("feedback:".length);
+    return Object.hasOwn(FEEDBACK_OUTCOME, k) ? (k as Feedback) : undefined;
+  }
+  if (src === "feedback")
+    return row.outcome === "failure" ? "too_small" : row.outcome === "success" ? "good" : undefined;
+  return undefined;
+}
+
+/** The role a swarm row's work ran as: the task's role, else its worker's. */
+function ranAsRole(db: StorageAdapter, row: AdjudicationRow): string | undefined {
+  if (!row.runId || typeof row.taskId !== "number") return undefined;
+  const task = db.swarm.taskGet(row.taskId);
+  if (task && task.run_id === row.runId && task.role) return task.role;
+  if (!row.agentId) return undefined;
+  return db.swarm.workers(row.runId).find((w) => w.agent_id === row.agentId)?.role ?? undefined;
+}
+
+const signalKey = (s: BiasSignal) => `${s.dimension}\u0000${s.bucket}\u0000${s.option}`;
+
+/**
+ * The signals reconcile taught a final swarm row at finalisation (Reconciler.swarmRow): agent
+ * rows, and plan rows no agent row tracked by then; success / failure only; the tier that ran
+ * and the task's (or worker's) role. Empty for every other row.
+ */
+export function reconcileLesson(db: StorageAdapter, row: AdjudicationRow): BiasSignal[] {
+  if (!row.final || (row.outcomeSource !== "swarm" && row.outcomeSource !== "redo")) return [];
+  if (row.outcome !== "success" && row.outcome !== "failure") return [];
+  if (!row.runId || typeof row.taskId !== "number") return [];
+  if (row.surface === "plan") {
+    const cutoff = row.outcomeTs ?? Number.POSITIVE_INFINITY;
+    const tracked = db.adjudicator
+      .forTask(row.runId, row.taskId)
+      .some((s) => s.surface === "agent" && s.ts <= cutoff);
+    if (tracked) return [];
+  } else if (row.surface !== "agent") return [];
+  const success = row.outcome === "success";
+  const b = bucketsOf(row);
+  const out: BiasSignal[] = [];
+  const tier = tierOf(row.actualModel);
+  if (tier && b.tier !== undefined)
+    out.push({
+      dimension: "tier",
+      bucket: b.tier,
+      option: tier,
+      success,
+      costUsd: row.actualCostUsd,
+    });
+  const role = ranAsRole(db, row);
+  if (role)
+    out.push({
+      dimension: "role",
+      bucket: b.role,
+      option: role,
+      success,
+      costUsd: row.actualCostUsd,
+    });
+  return out;
+}
+
+/**
+ * The signals one feedback teaches: good = success for the tier and role; too_small = failure
+ * for the tier; too_big = success for the tier plus one for the next-lower tier. The tier is
+ * the one that actually ran when known, else the applied / requested / advised tier; the role
+ * is the one the work ran as, else the advised role.
+ */
+export function feedbackLesson(
+  db: StorageAdapter,
+  row: AdjudicationRow,
+  feedback: Feedback,
+  ladder: readonly string[] = TIERS,
+): BiasSignal[] {
+  const b = bucketsOf(row);
+  const success = FEEDBACK_OUTCOME[feedback] === "success";
+  const cost = row.actualCostUsd;
+  const out: BiasSignal[] = [];
+  const tier =
+    tierOf(row.actualModel) ??
+    tierOf(row.modelFinal) ??
+    tierOf(row.modelRequested) ??
+    tierOf(row.tier) ??
+    undefined;
+  if (tier && b.tier !== undefined) {
+    out.push({ dimension: "tier", bucket: b.tier, option: tier, success, costUsd: cost });
+    if (feedback === "too_big") {
+      const at = ladder.indexOf(tier);
+      const lower = at > 0 ? ladder[at - 1] : undefined;
+      if (lower) out.push({ dimension: "tier", bucket: b.tier, option: lower, success: true });
+    }
+  }
+  if (feedback === "good") {
+    const role = ranAsRole(db, row) ?? row.role ?? undefined;
+    if (role)
+      out.push({ dimension: "role", bucket: b.role, option: role, success: true, costUsd: cost });
+  }
+  return out;
+}
+
+/**
+ * Move one bucket option's counts by (dn, ds, df) without decay, clamped to 0 ≤ s, f ≤ n, and
+ * recompute the bucket's biases. No-op (false) when the option has no row or learning is off.
+ * Undecayed: the signal being replaced has decayed a little since it was counted, so this
+ * slightly over-corrects, which the clamps bound.
+ */
+function adjustSignal(
+  db: StorageAdapter,
+  sig: BiasSignal,
+  dn: number,
+  ds: number,
+  df: number,
+  learning: LearningConfig,
+  now: number,
+): boolean {
+  if (!learning.enabled) return false;
+  const inBucket = db.adjudicator
+    .biasAll()
+    .filter((r) => r.dimension === sig.dimension && r.bucket === sig.bucket);
+  const target = inBucket.find((r) => r.option === sig.option);
+  if (!target) return false;
+  target.n = Math.max(0, target.n + dn);
+  target.s = clamp(target.s + ds, 0, target.n);
+  target.f = clamp(target.f + df, 0, target.n);
+  target.updatedAt = now;
+  const med = bucketMedianOf(inBucket);
+  for (const r of inBucket) {
+    const bias = computeBias(r, med, learning);
+    if (r !== target && bias === r.bias) continue;
+    r.bias = bias;
+    db.adjudicator.biasUpsert({ ...r, updatedAt: r === target ? now : r.updatedAt });
+  }
+  return true;
+}
+
+/**
+ * Replace a row's lesson `before` with `after`: a signal in both with the same success stays;
+ * one whose success flipped is relabelled (n unchanged); one only in `before` is retracted;
+ * one only in `after` is recorded. Returns how many bucket options changed.
+ */
+export function replaceLesson(
+  db: StorageAdapter,
+  before: readonly BiasSignal[],
+  after: readonly BiasSignal[],
+  learning: LearningConfig,
+  now = Date.now(),
+): number {
+  if (!learning.enabled) return 0;
+  const prev = new Map(before.map((s) => [signalKey(s), s]));
+  let changed = 0;
+  for (const s of after) {
+    const k = signalKey(s);
+    const p = prev.get(k);
+    prev.delete(k);
+    if (p === undefined) {
+      recordSignal(db, s, learning, now);
+      changed++;
+    } else if (p.success !== s.success) {
+      if (adjustSignal(db, s, 0, s.success ? 1 : -1, s.success ? -1 : 1, learning, now)) changed++;
+    }
+  }
+  for (const p of prev.values())
+    if (adjustSignal(db, p, -1, p.success ? -1 : 0, p.success ? 0 : -1, learning, now)) changed++;
+  return changed;
 }
 
 // --- feedback ------------------------------------------------------------------------
@@ -736,68 +1107,52 @@ export interface FeedbackOptions {
   tiers?: readonly string[] | undefined;
 }
 
+export interface FeedbackResult {
+  row: AdjudicationRow;
+  /** Bucket options the feedback changed; 0 when the bias already held this lesson. */
+  learned: number;
+}
+
 /**
- * Explicit feedback on one decision: sets the outcome (outcome_source "feedback", final) and
- * teaches the bias. good = success for the tier (and role); too_small = failure for the tier;
- * too_big = success for the tier plus one success for the next-lower tier. The tier is the
- * one that actually ran when known, else the applied / requested / advised tier. Returns the
- * updated row, or undefined for an unknown id.
+ * Explicit feedback on one decision: labels the outcome (outcome_source "feedback:<kind>",
+ * final) and makes the row's lesson the feedback's (feedbackLesson), replacing what the row
+ * taught before — an earlier feedback, or reconcile's lesson at finalisation — rather than
+ * adding to it. Sending the same feedback again changes nothing. Undefined for an unknown id.
  */
+export function applyFeedbackResult(
+  db: StorageAdapter,
+  id: number,
+  feedback: Feedback,
+  opts: FeedbackOptions = {},
+): FeedbackResult | undefined {
+  const row = db.adjudicator.get(id);
+  if (!row) return undefined;
+  const now = opts.now ?? Date.now();
+  const learning = learningOf(opts.learning, opts.config);
+  const ladder = opts.tiers ?? opts.config?.adjudicator?.tiers ?? TIERS;
+  const prior = feedbackOf(row);
+  // What the row taught so far: its last feedback (always final), or reconcile's lesson.
+  const before = prior ? feedbackLesson(db, row, prior, ladder) : reconcileLesson(db, row);
+  const after = feedbackLesson(db, row, feedback, ladder);
+  const same = prior === feedback;
+  db.adjudicator.update(id, {
+    outcome: FEEDBACK_OUTCOME[feedback],
+    outcomeSource: feedbackSource(feedback),
+    // Repeated identical feedback keeps the time it was first given.
+    outcomeTs: same && row.outcomeTs != null ? row.outcomeTs : now,
+    final: true,
+  });
+  const learned = replaceLesson(db, before, after, learning, now);
+  const updated = db.adjudicator.get(id);
+  return updated ? { row: updated, learned } : undefined;
+}
+
+/** applyFeedbackResult, returning only the updated row. */
 export function applyFeedback(
   db: StorageAdapter,
   id: number,
   feedback: Feedback,
   opts: FeedbackOptions = {},
 ): AdjudicationRow | undefined {
-  const row = db.adjudicator.get(id);
-  if (!row) return undefined;
-  const now = opts.now ?? Date.now();
-  const learning = learningOf(opts.learning, opts.config);
-  const outcome = FEEDBACK_OUTCOME[feedback];
-  db.adjudicator.update(id, { outcome, outcomeSource: "feedback", outcomeTs: now, final: true });
-
-  if (learning.enabled) {
-    const b = bucketsOf(row);
-    const tier =
-      tierOf(row.actualModel) ??
-      tierOf(row.modelFinal) ??
-      tierOf(row.modelRequested) ??
-      tierOf(row.tier) ??
-      undefined;
-    const cost = row.actualCostUsd;
-    if (tier && b.tier !== undefined) {
-      recordSignal(
-        db,
-        {
-          dimension: "tier",
-          bucket: b.tier,
-          option: tier,
-          success: outcome === "success",
-          costUsd: cost,
-        },
-        learning,
-        now,
-      );
-      if (feedback === "too_big") {
-        const ladder = opts.tiers ?? opts.config?.adjudicator?.tiers ?? TIERS;
-        const at = ladder.indexOf(tier);
-        const lower = at > 0 ? ladder[at - 1] : undefined;
-        if (lower)
-          recordSignal(
-            db,
-            { dimension: "tier", bucket: b.tier, option: lower, success: true },
-            learning,
-            now,
-          );
-      }
-    }
-    if (feedback === "good" && row.role)
-      recordSignal(
-        db,
-        { dimension: "role", bucket: b.role, option: row.role, success: true, costUsd: cost },
-        learning,
-        now,
-      );
-  }
-  return db.adjudicator.get(id);
+  return applyFeedbackResult(db, id, feedback, opts)?.row;
 }

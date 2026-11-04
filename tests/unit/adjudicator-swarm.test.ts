@@ -444,10 +444,19 @@ describe("em_swarm plan advice and em_adjudicate", () => {
     );
     expect(db.adjudicator.get(id)).toMatchObject({
       outcome: "failure",
-      outcomeSource: "feedback",
+      outcomeSource: "feedback:too_small",
       final: true,
     });
     expect(db.adjudicator.biasAll().some((b) => b.dimension === "tier")).toBe(true);
+    // Review #30 / task #39: re-sending the same feedback (a retried tool call) is idempotent.
+    const bias = db.adjudicator.biasAll();
+    for (let i = 0; i < 5; i++) {
+      const again = await runAdjudicate({ action: "feedback", id, outcome: "too_small" }, ctx, {
+        db,
+      });
+      expect(again.content[0]!.text).toContain("the learned bias already reflects this");
+    }
+    expect(db.adjudicator.biasAll()).toEqual(bias);
     expect((await runAdjudicate({ action: "feedback", id }, ctx, { db })).isError).toBe(true);
     expect(
       (await runAdjudicate({ action: "feedback", id: 999999, outcome: "good" }, ctx, { db }))

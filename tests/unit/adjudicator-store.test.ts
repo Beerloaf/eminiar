@@ -181,6 +181,7 @@ describe("pre-release v8 databases (task #26)", () => {
       "adjudicator_provider_state.calls",
       "adjudicator_provider_state.auth_fingerprint",
       "adjudications.feedback_note",
+      "adjudicator_provider_state.latency_budgets",
     ]);
     expect(healAdjudicatorColumns(raw)).toEqual([]);
     raw.close();
@@ -388,6 +389,14 @@ describe("SqliteAdjudicatorStore", () => {
     expect(st.latencies).toHaveLength(50);
     expect(st.latencies[0]).toBe(10);
     expect(st.latencies[49]).toBe(59);
+    // Per-sample budgets round-trip and are never longer than the ring (aligned at the end).
+    const withBudgets = s.saveProviderState("typesafe", {
+      latencies: [1, 2],
+      latencyBudgets: [800, 800, 3000],
+    });
+    expect(withBudgets.latencyBudgets).toEqual([800, 3000]);
+    expect(s.providerState("typesafe")?.latencyBudgets).toEqual([800, 3000]);
+    s.saveProviderState("typesafe", { latencies: Array.from({ length: 60 }, (_, i) => i) });
     // Daily calls and the auth lockout round-trip.
     s.saveProviderState("typesafe", {
       state: "auth_failed",

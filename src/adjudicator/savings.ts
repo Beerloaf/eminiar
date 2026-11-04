@@ -228,7 +228,7 @@ export function allRows(
 // --- summary -------------------------------------------------------------------------
 
 export interface TierTokens {
-  /** Successful agent dispatches whose actual model is this tier. */
+  /** Successful tasks whose actual model is this tier: agent rows, or plan rows of tasks without one. */
   tasks: number;
   tokens: number;
   costUsd: number;
@@ -252,7 +252,10 @@ export interface SavingsReport {
   /** realisedUsd − spendUsd. */
   netUsd: number;
   tokensPerSuccessByTier: Partial<Record<Tier, TierTokens>>;
-  /** Suggested tier × the tier (or model) that actually ran, agent and plan rows. */
+  /**
+   * Suggested tier × the tier (or model) that actually ran: one count per agent dispatch, plus
+   * plan rows of swarm tasks no agent row tracks (each task counted once).
+   */
   matrix: Array<{ suggested: string; actual: string; n: number }>;
   assumptions: string[];
 }
@@ -263,6 +266,8 @@ export interface SavingsReportOptions {
 }
 
 const CREDITED = new Set(["applied", "followed"]);
+
+const taskKey = (r: Pick<AdjudicationRow, "runId" | "taskId">) => `${r.runId}#${r.taskId}`;
 
 /**
  * Realised, potential, spend and net for rows since `since`. Run reconcile first so the
@@ -279,6 +284,17 @@ export function savingsReport(db: StorageAdapter, opts: SavingsReportOptions = {
   let spendUsd = 0;
   const byTier: Partial<Record<Tier, TierTokens>> = {};
   const matrix = new Map<string, { suggested: string; actual: string; n: number }>();
+  // A swarm task has a plan row and, once dispatched, an agent row; reconcile gives both the
+  // worker's calls. Count the task once: by its agent row(s), by the plan row only when no
+  // agent row tracks the task (the rule reconcile teaches by). Agent rows follow their plan
+  // row, so a plan row inside `since` has its agent rows inside it too.
+  const dispatched = new Set(
+    rows
+      .filter((r) => r.surface === "agent" && r.runId && typeof r.taskId === "number")
+      .map(taskKey),
+  );
+  const counts = (r: AdjudicationRow) =>
+    r.surface === "agent" || (r.surface === "plan" && !dispatched.has(taskKey(r)));
 
   for (const r of rows) {
     if (typeof r.costUsd === "number") spendUsd += r.costUsd;
@@ -287,14 +303,14 @@ export function savingsReport(db: StorageAdapter, opts: SavingsReportOptions = {
       if (r.savingsUsd < 0 && r.outcome === "failure") redoPenaltyUsd += r.savingsUsd;
       if (CREDITED.has(r.action ?? "")) creditedRows++;
     }
-    if ((r.surface === "agent" || r.surface === "plan") && r.tier && r.actualModel) {
+    if (counts(r) && r.tier && r.actualModel) {
       const actual = tierOf(r.actualModel) ?? r.actualModel;
       const k = `${r.tier}\u0000${actual}`;
       const m = matrix.get(k);
       if (m) m.n++;
       else matrix.set(k, { suggested: r.tier, actual, n: 1 });
     }
-    if (r.surface === "agent" && r.outcome === "success") {
+    if (counts(r) && r.outcome === "success") {
       const t = tierOf(r.actualModel);
       if (t && typeof r.actualTokens === "number") {
         const e = byTier[t] ?? { tasks: 0, tokens: 0, costUsd: 0, tokensPerTask: null };

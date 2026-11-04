@@ -501,6 +501,12 @@ export interface AdjudicatorProviderState {
   lastErrorClass: string | null;
   /** The last ≤ 50 provider latencies in ms, oldest first. */
   latencies: number[];
+  /**
+   * The budget in ms each latency was measured against, index-aligned with the END of
+   * `latencies` (a shorter array means the oldest samples predate it; 0 = unknown). The slow
+   * guard judges latency / budget, so surfaces with different budgets can share one ring.
+   */
+  latencyBudgets?: number[];
   /** UTC day (YYYY-MM-DD) that `spendUsd` and `calls` belong to. */
   spendDay: string | null;
   spendUsd: number;
@@ -591,6 +597,13 @@ export interface AdjudicatorStore {
     provider: string,
     patch: Partial<Omit<AdjudicatorProviderState, "provider">>,
   ): AdjudicatorProviderState;
+  /**
+   * Run `fn` as one write transaction that takes the write lock up front (SQLite BEGIN
+   * IMMEDIATE), so a read-modify-write of the provider state (half-open claim, spend and call
+   * counters) cannot interleave with another hook process. Nested calls join the outer one.
+   * Optional: a store without it (a test double, the try-it wrapper) runs `fn` directly.
+   */
+  atomically?<T>(fn: () => T): T;
 
   biasAll(): AdjudicatorBiasRow[];
   biasUpsert(row: Omit<AdjudicatorBiasRow, "updatedAt"> & { updatedAt?: number | null }): void;

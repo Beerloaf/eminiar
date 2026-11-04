@@ -1,7 +1,9 @@
+import { execFile } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   type AsyncJob,
@@ -19,6 +21,7 @@ import {
   keyFingerprint,
   p95,
   recordFailure,
+  recordSuccess,
   SLOW_MIN_SAMPLES,
   utcDay,
 } from "../../src/adjudicator/breaker.js";
@@ -302,6 +305,99 @@ describe("pipeline", () => {
     );
     expect(k).not.toContain("fix");
   });
+
+  it("the cache key covers hints, catalogues, tiers and weights; role order does not matter (task #37)", () => {
+    const r = { configured: "typesafe" as const, model: "jev-1.14.0" };
+    const cfg = adj();
+    const roles = [
+      { name: "coder", description: "implements" },
+      { name: "tester", description: "writes tests" },
+    ];
+    const text = "Refactor the session store";
+    const base0 = { surface: "plan" as const, text, hints: { roles, files: 0, deps: 0 } };
+    const k = cacheKeyFor(base0, r, { config: cfg });
+    const differs = [
+      cacheKeyFor({ ...base0, hints: { ...base0.hints, files: 14 } }, r, { config: cfg }),
+      cacheKeyFor({ ...base0, hints: { ...base0.hints, deps: 5 } }, r, { config: cfg }),
+      cacheKeyFor({ ...base0, hints: { ...base0.hints, role: "tester" } }, r, { config: cfg }),
+      cacheKeyFor({ ...base0, hints: { ...base0.hints, roles: roles.slice(0, 1) } }, r, {
+        config: cfg,
+      }),
+      cacheKeyFor(
+        { ...base0, hints: { ...base0.hints, roles: [roles[0]!, { name: "tester" }] } },
+        r,
+        { config: cfg },
+      ),
+      cacheKeyFor(base0, r, { config: cfg, tools: ["em_execute", "em_search"] }),
+      cacheKeyFor(base0, r, { config: adj({ tiers: ["haiku", "opus"] }) }),
+      cacheKeyFor(base0, r, {
+        config: adj({ weights: { tierCenters: { haiku: 0.6, sonnet: 2.2, opus: 3.4 } } }),
+      }),
+    ];
+    for (const d of differs) expect(d).not.toBe(k);
+    expect(new Set(differs).size).toBe(differs.length);
+    // Same inputs in another order hash the same; the key never carries the raw inputs.
+    expect(
+      cacheKeyFor({ ...base0, hints: { deps: 0, files: 0, roles: [...roles].reverse() } }, r, {
+        config: cfg,
+      }),
+    ).toBe(k);
+    expect(cacheKeyFor(base0, r, { config: cfg, tools: ["em_search", "em_execute"] })).toBe(
+      differs[5],
+    );
+    // Without hints.roles, the engine's role list is part of the key.
+    const noHints = { surface: "plan" as const, text };
+    expect(cacheKeyFor(noHints, r, { config: cfg, roles })).not.toBe(
+      cacheKeyFor(noHints, r, { config: cfg }),
+    );
+    expect(k).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("same text, different hints: the second request misses the cache and scores its own hints", async () => {
+    const cfg = adj();
+    const store = openStore();
+    const p = ok();
+    const text = "Refactor the session store\nMove the store behind the adapter interface";
+    const a = await adjudicateOne(
+      { key: "#1", surface: "plan", text, hints: { files: 0, deps: 0, role: "tester" } },
+      { ...base(cfg, { store }), provider: p },
+    );
+    const b = await adjudicateOne(
+      { key: "#2", surface: "plan", text, hints: { files: 14, deps: 5, role: "reviewer" } },
+      { ...base(cfg, { store }), provider: p },
+    );
+    expect(a.verdict.source).toBe("blend");
+    expect(b.verdict.source).toBe("blend");
+    expect(b.cacheKey).not.toBe(a.cacheKey);
+    expect(p.calls).toHaveLength(2);
+    // The same request again is a hit.
+    const again = await adjudicateOne(
+      { key: "#3", surface: "plan", text, hints: { deps: 5, files: 14, role: "reviewer" } },
+      { ...base(cfg, { store }), provider: p },
+    );
+    expect(again.verdict.source).toBe("cache");
+    expect(again.cacheKey).toBe(b.cacheKey);
+  });
+
+  it("an async job carries the tool catalogue from deps.tools, so the child computes the hook's key", async () => {
+    const cfg = adj();
+    const jobs: AsyncJob[] = [];
+    const tools = ["em_search", "em_execute"];
+    const [a] = await adjudicate([req("k1")], {
+      ...base(cfg),
+      provider: ok(),
+      call: "async",
+      deps: { tools },
+      spawn: (j) => {
+        jobs.push(j);
+        return true;
+      },
+    });
+    expect(jobs[0]?.tools).toEqual(tools);
+    expect(a?.cacheKey).toBe(
+      cacheKeyFor(req("k1"), resolved(cfg), { config: jobs[0]?.config, tools: jobs[0]?.tools }),
+    );
+  });
 });
 
 describe("never throws, never waits past the budget", () => {
@@ -478,6 +574,105 @@ describe("slow guard and daily cap", () => {
     const st = openStore().providerState("typesafe");
     expect(st?.state).toBe("closed");
     expect(st?.latencies).toEqual([40]);
+    expect(st?.latencyBudgets).toHaveLength(1);
+  });
+
+  it("each sample is judged against its own budget: a slow plan batch never makes fast agent calls slow (task #36)", () => {
+    const store = openStore();
+    const cfg = adj();
+    // 19 plan batches at 1500 ms under a 3000 ms budget, then fast agent calls under 800 ms.
+    for (let i = 0; i < SLOW_MIN_SAMPLES - 1; i++)
+      recordSuccess(store, "typesafe", cfg, {
+        now: T0,
+        latencyMs: 1500,
+        costUsd: 0,
+        budgetMs: 3000,
+      });
+    for (let i = 0; i < 5; i++) {
+      const st = recordSuccess(store, "typesafe", cfg, {
+        now: T0,
+        latencyMs: 150,
+        costUsd: 0,
+        budgetMs: 800,
+      });
+      expect(st.state).toBe("closed");
+    }
+    const st = store.providerState("typesafe");
+    expect(st?.latencies).toHaveLength(SLOW_MIN_SAMPLES + 4);
+    expect(st?.latencyBudgets?.slice(-2)).toEqual([800, 800]);
+    expect(gate(store, "typesafe", cfg, { now: T0 + 1, remote: true }).allow).toBe(true);
+  });
+
+  it("the slow guard needs SLOW_MIN_SAMPLES samples: a few outliers cannot trip it", () => {
+    const store = openStore();
+    const cfg = adj();
+    for (let i = 0; i < SLOW_MIN_SAMPLES - 1; i++)
+      expect(
+        recordSuccess(store, "typesafe", cfg, {
+          now: T0,
+          latencyMs: 5000,
+          costUsd: 0,
+          budgetMs: 800,
+        }).state,
+      ).toBe("closed");
+    expect(
+      recordSuccess(store, "typesafe", cfg, { now: T0, latencyMs: 5000, costUsd: 0, budgetMs: 800 })
+        .state,
+    ).toBe("slow");
+    // One outlier among 20 fast samples does not decide (p95 is not the max at n = 20).
+    const other = "openai-compatible";
+    recordSuccess(store, other, cfg, { now: T0, latencyMs: 9000, costUsd: 0, budgetMs: 800 });
+    for (let i = 0; i < SLOW_MIN_SAMPLES; i++)
+      recordSuccess(store, other, cfg, { now: T0, latencyMs: 100, costUsd: 0, budgetMs: 800 });
+    expect(store.providerState(other)?.state).toBe("closed");
+  });
+
+  it("legacy samples without a stored budget are ignored, not judged against today's budget", () => {
+    const store = openStore();
+    const cfg = adj();
+    store.saveProviderState("typesafe", { latencies: Array.from({ length: 40 }, () => 4000) });
+    const st = recordSuccess(store, "typesafe", cfg, {
+      now: T0,
+      latencyMs: 100,
+      costUsd: 0,
+      budgetMs: 800,
+    });
+    expect(st.state).toBe("closed");
+    expect(st.latencyBudgets).toHaveLength(41);
+    expect(st.latencyBudgets?.[0]).toBe(0);
+  });
+
+  it("warm-up and test calls (surface test) stay out of the latency ring; real calls are sampled", async () => {
+    const cfg = adj();
+    let now = T0;
+    const clock = () => now;
+    const coldLoad: Fake = fake(async (reqs) => {
+      now += 4000;
+      return {
+        answers: reqs.map((r) => opusAnswer(r.key)),
+        usage: { inTok: 10, outTok: 5, costUsd: 0 },
+        latencyMs: 4000,
+        model: "jev-1.14.0",
+      };
+    });
+    const warm = await adjudicateOne(req("warmup", "warm up", "test"), {
+      ...base(cfg),
+      provider: coldLoad,
+      now: clock,
+      budgetMs: 10_000,
+    });
+    expect(warm.verdict.source).toBe("blend");
+    let st = openStore().providerState("typesafe");
+    expect(st?.latencies).toEqual([]);
+    expect(st?.calls).toBe(1);
+    await adjudicateOne(req("p1", "explain the session cache flow"), {
+      ...base(cfg),
+      provider: ok({ latencyMs: 150 }),
+      now: clock,
+    });
+    st = openStore().providerState("typesafe");
+    expect(st?.latencies).toEqual([150]);
+    expect(st?.latencyBudgets).toEqual([surfaceBudget(cfg, "prompt")]);
   });
 
   it("stops a remote provider at budget.dailyUsd; a new UTC day resets it", async () => {
@@ -758,6 +953,98 @@ describe("slow guard and daily cap", () => {
     expect(p95([])).toBeUndefined();
     expect(p95([5])).toBe(5);
     expect(p95(Array.from({ length: 20 }, (_, i) => i + 1))).toBe(19);
+  });
+});
+
+describe("breaker and counters are atomic across processes (task #38)", () => {
+  const ROOT = resolve(fileURLToPath(new URL("../..", import.meta.url)));
+  const TSX = join(ROOT, "node_modules", ".bin", process.platform === "win32" ? "tsx.cmd" : "tsx");
+  /** One hook process: waits for the start line, claims the gate, then records N successes. */
+  const CHILD = `
+const [root, dbPath, startAt, n] = process.argv.slice(2);
+// Never fall back to a relative path (String(undefined) would create ./undefined in the cwd).
+if (!root || !dbPath || !dbPath.startsWith("/") || !startAt || !n) {
+  process.stdout.write("ERR bad arguments: " + JSON.stringify(process.argv.slice(2)));
+  process.exit(2);
+}
+const { SqliteAdapter } = await import(root + "/src/storage/sqlite/adapter.ts");
+const { gate, recordSuccess } = await import(root + "/src/adjudicator/breaker.ts");
+const { adjudicatorDefaults } = await import(root + "/src/config.ts");
+const db = new SqliteAdapter(dbPath, { vectors: false });
+const cfg = adjudicatorDefaults();
+db.adjudicator.providerState("typesafe");
+while (Date.now() < Number(startAt)) {}
+const g = gate(db.adjudicator, "typesafe", cfg, { now: Date.now(), remote: true });
+for (let i = 0; i < Number(n); i++)
+  recordSuccess(db.adjudicator, "counter", cfg, { now: Date.now(), latencyMs: 1, costUsd: 0.001, budgetMs: 60000 });
+db.close();
+process.stdout.write(JSON.stringify({ allow: g.allow, halfOpen: g.allow ? g.halfOpen : false }));
+`;
+
+  it("10 processes at once: one half-open trial call, no lost spend or call increments", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "em-adj-race-"));
+    const child = join(dir, "child.mts");
+    writeFileSync(child, CHILD);
+    const seed = openStore();
+    seed.saveProviderState("typesafe", { state: "open", failures: 2, retryAt: Date.now() - 1000 });
+    const PROCS = 10;
+    const N = 20;
+    const startAt = Date.now() + 3000;
+    // The children get an explicit absolute DB path and run in the temp dir, never the repo root.
+    expect(isAbsolute(dbPath)).toBe(true);
+    const stray = [join(ROOT, "undefined"), join(dir, "undefined")];
+    const outs = await Promise.all(
+      Array.from(
+        { length: PROCS },
+        () =>
+          new Promise<string>((done) => {
+            execFile(
+              TSX,
+              [child, ROOT, dbPath, String(startAt), String(N)],
+              { cwd: dir },
+              (err, out, errOut) => done(err ? `ERR ${out}${errOut || err.message}` : out),
+            );
+          }),
+      ),
+    );
+    for (const f of stray) expect(existsSync(f), f).toBe(false);
+    const results = outs.map((o) => {
+      expect(o.startsWith("{"), o.slice(0, 300)).toBe(true);
+      return JSON.parse(o) as { allow: boolean; halfOpen: boolean };
+    });
+    expect(results.filter((r) => r.halfOpen)).toHaveLength(1);
+    expect(results.filter((r) => r.allow)).toHaveLength(1);
+    expect(seed.providerState("typesafe")?.state).toBe("half_open");
+    const counter = seed.providerState("counter");
+    expect(counter?.calls).toBe(PROCS * N);
+    expect(counter?.spendUsd).toBeCloseTo(PROCS * N * 0.001, 9);
+  }, 60_000);
+
+  it("atomically() joins an outer transaction and rolls back on a throw", () => {
+    const store = openStore();
+    expect(store.atomically).toBeTypeOf("function");
+    const atomically = store.atomically?.bind(store) as <T>(fn: () => T) => T;
+    expect(() =>
+      atomically(() => {
+        store.saveProviderState("p", { calls: 5 });
+        atomically(() => store.saveProviderState("p", { calls: 6 }));
+        throw new Error("abort");
+      }),
+    ).toThrow("abort");
+    expect(store.providerState("p")).toBeUndefined();
+    expect(atomically(() => store.saveProviderState("p", { calls: 7 }).calls)).toBe(7);
+  });
+
+  it("a store without atomically() still works (try-it wrapper, test doubles)", () => {
+    const real = openStore();
+    const plain: AdjudicatorStore = {
+      ...({} as AdjudicatorStore),
+      providerState: (p) => real.providerState(p),
+      saveProviderState: (p, patch) => real.saveProviderState(p, patch),
+    };
+    real.saveProviderState("typesafe", { state: "open", retryAt: T0 - 1 });
+    const g = gate(plain, "typesafe", adj(), { now: T0, remote: true });
+    expect(g.allow && g.halfOpen).toBe(true);
   });
 });
 
