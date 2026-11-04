@@ -514,14 +514,68 @@ function envOverrides(): Record<string, unknown> {
 }
 
 /**
- * The project layer is committed and shared, but consent to send text to a remote provider is
- * personal: drop `adjudicator.remoteConsent` from it before merging.
+ * The adjudicator keys a committed <root>/eminiar.config.json may set (docs/design/adjudicator.md
+ * §5 "Trust boundary"). A project file comes with any cloned repo, so it must never decide where
+ * text or keys go, which key is sent, how much text leaves the machine, or how much is spent:
+ * provider, typesafe, openai (preset, baseUrl, model, price), keyEnv, remoteConsent, privacy,
+ * budget, timeouts and breaker come only from ~/.eminiar/config.json and EMINIAR_* env. What is
+ * left only turns the adjudicator on and tunes how verdicts are scored and used locally.
+ */
+export const PROJECT_ADJUDICATOR_KEYS: readonly string[] = [
+  "enabled",
+  "mode",
+  "surfaces",
+  "promptMode",
+  "minPromptChars",
+  "tiers",
+  "weights",
+  "apply",
+  "advice",
+  "embedding",
+  "learning",
+  "cache",
+];
+
+/** The adjudicator keys of a raw project file that projectLayer drops, sorted. */
+export function droppedProjectAdjudicatorKeys(raw: Record<string, unknown>): string[] {
+  const adj = raw.adjudicator;
+  if (!isPlainObject(adj)) return [];
+  return Object.keys(adj)
+    .filter((k) => !PROJECT_ADJUDICATOR_KEYS.includes(k))
+    .sort();
+}
+
+/**
+ * One line for doctor/status when <root>/eminiar.config.json sets adjudicator keys that only the
+ * personal config may set; undefined when it sets none.
+ */
+export function projectAdjudicatorWarning(projectRoot: string): string | undefined {
+  const file = join(projectRoot, "eminiar.config.json");
+  if (!existsSync(file)) return undefined;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(file, "utf8"));
+  } catch {
+    return undefined; // loadConfig already reports a malformed file
+  }
+  if (!isPlainObject(raw)) return undefined;
+  const dropped = droppedProjectAdjudicatorKeys(raw);
+  if (!dropped.length) return undefined;
+  return `eminiar.config.json sets adjudicator.${dropped.join(", adjudicator.")}: ignored, only ~/.eminiar/config.json may set ${dropped.length === 1 ? "it" : "them"}`;
+}
+
+/**
+ * The project layer with its adjudicator section cut down to PROJECT_ADJUDICATOR_KEYS. A section
+ * holding a key-like field stays whole instead, so the schema's secret check still refuses it
+ * (the whole config falls back to defaults, the adjudicator off) rather than dropping it quietly.
  */
 function projectLayer(raw: Record<string, unknown>): Record<string, unknown> {
   const adj = raw.adjudicator;
-  if (!isPlainObject(adj) || !("remoteConsent" in adj)) return raw;
-  const { remoteConsent: _personal, ...rest } = adj;
-  return { ...raw, adjudicator: rest };
+  if (!isPlainObject(adj)) return raw;
+  if (findSecretFields(adj).length) return raw;
+  const kept: Record<string, unknown> = {};
+  for (const k of PROJECT_ADJUDICATOR_KEYS) if (k in adj) kept[k] = adj[k];
+  return { ...raw, adjudicator: kept };
 }
 
 /**

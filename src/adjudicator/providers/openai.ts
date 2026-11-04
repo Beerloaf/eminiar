@@ -1,8 +1,7 @@
 import { z } from "zod";
 import type { AdjudicatorConfig } from "../../config.js";
-import type { Resolved } from "../config.js";
+import { keyFor, type Resolved } from "../config.js";
 import { buildCatalogue, buildItems, type Catalogue, openaiSchema, rubric } from "../prompt.js";
-import { resolveKey } from "../secrets.js";
 import type {
   AdjudicationRequest,
   AdjudicatorProvider,
@@ -92,11 +91,8 @@ export function createOpenAIProvider(
 
   const key = (): string | undefined => {
     if (!r.keyId) return undefined;
-    const k = resolveKey(r.keyId, {
-      keyEnv: r.keyEnv,
-      providerEnv: r.providerEnv,
-      env: deps.env,
-    }).key;
+    // A loopback server gets only a key stored for it in the key file, never an env secret.
+    const k = keyFor(r, deps.env)?.key;
     // Local servers usually take no key; a remote one cannot work without it.
     if (!k && r.remote) throw new ProviderError("no_key", `no key for ${r.keyId}`);
     return k;

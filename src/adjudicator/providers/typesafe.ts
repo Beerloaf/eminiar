@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { AdjudicatorConfig } from "../../config.js";
-import type { Resolved } from "../config.js";
+import { keyFor, type Resolved } from "../config.js";
 import {
   buildCatalogue,
   buildItems,
@@ -10,7 +10,6 @@ import {
   jevState,
   type StateItem,
 } from "../prompt.js";
-import { resolveKey } from "../secrets.js";
 import type {
   AdjudicationRequest,
   AdjudicatorProvider,
@@ -85,11 +84,8 @@ export function createTypesafeProvider(
   const model = pinJevModel(r.model);
   const askTool = (cfg.weights.features.toolProvider ?? 0) > 0;
   const key = (): string => {
-    const k = resolveKey(r.keyId ?? "typesafe", {
-      keyEnv: r.keyEnv,
-      providerEnv: r.providerEnv,
-      env: deps.env,
-    }).key;
+    // A loopback baseUrl gets only a key stored in the key file, never an env secret.
+    const k = keyFor({ ...r, keyId: r.keyId ?? "typesafe" }, deps.env)?.key;
     if (!k) throw new ProviderError("no_key", "no key for typesafe");
     return k;
   };

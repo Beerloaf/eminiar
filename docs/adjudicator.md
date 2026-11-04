@@ -89,8 +89,17 @@ server starts, so run **`/mcp reconnect`** (or restart Claude Code) after enabli
 
 `enable --project` writes only `adjudicator.enabled: true` to the committed
 `eminiar.config.json`. The provider, the keys and the consent stay personal, in
-`~/.eminiar/config.json` and `~/.eminiar/adjudicator.key`. A project file cannot grant consent:
-`adjudicator.remoteConsent` is dropped from the project layer.
+`~/.eminiar/config.json` and `~/.eminiar/adjudicator.key`.
+
+A project file comes with every clone of the repo, so eminiar trusts it only for settings that
+cannot send your text or keys anywhere. In `eminiar.config.json` the adjudicator section may set
+`enabled`, `mode`, `surfaces`, `promptMode`, `minPromptChars`, `tiers`, `weights`, `apply`,
+`advice`, `embedding`, `learning` and `cache`. Everything else is ignored there: `provider`,
+`typesafe`, `openai` (preset, base URL, model, price), `keyEnv`, `remoteConsent`, `privacy`,
+`budget`, `timeouts` and `breaker` are read only from `~/.eminiar/config.json` and the
+`EMINIAR_ADJUDICATOR*` variables. `eminiar doctor` and `adjudicator status` name any key a project
+file sets that was ignored. A repo that turns the adjudicator on for someone with no personal
+setup gets the heuristic, which never leaves the machine.
 
 ## Providers and privacy
 
@@ -189,6 +198,11 @@ eminiar looks for a key in this order:
 2. the provider's own variable: `TYPESAFE_API_KEY`, `GROQ_API_KEY` or `CEREBRAS_API_KEY`
 3. `EMINIAR_ADJUDICATOR_KEY`
 4. the key file
+
+`keyEnv` counts only in `~/.eminiar/config.json`. A local provider (one whose URL is
+`localhost`, `127.x.x.x` or `::1`) never gets a key from an environment variable, not even
+`keyEnv` or `EMINIAR_ADJUDICATOR_KEY`: if your local server needs a token, store it with
+`eminiar adjudicator key set` for that preset.
 
 `eminiar adjudicator key status` shows where each key comes from, masked as `****abcd`.
 `key clear [provider]` removes one key, or the whole file.
@@ -397,6 +411,7 @@ provider, the one that actually runs, and why they differ.
 | `em_adjudicate` is missing | The MCP server registered its tools before you enabled it: `/mcp reconnect`. Or it is off: check `status` for which layer decides (`env EMINIAR_ADJUDICATOR`, project file, global file) |
 | "the heuristic runs until: no key for typesafe" | `eminiar adjudicator key set typesafe` |
 | "… sends redacted prompt text to …: run `eminiar adjudicator enable --accept-remote`" | Consent is missing. Consent in a project file is ignored on purpose |
+| "eminiar.config.json sets adjudicator.… : ignored" | The project file set a provider, URL, key, cap or timeout. Those are personal: move them to `~/.eminiar/config.json` (`eminiar adjudicator provider …`) |
 | "the key file is readable by others and was ignored" | `chmod 600 ~/.eminiar/adjudicator.key` |
 | "API key rejected (HTTP 401)" | The key is wrong or revoked. Store a new one with `key set`; the lockout lifts as soon as the key changes |
 | "the custom preset needs openai.baseUrl and openai.model" | Set both: `eminiar adjudicator provider openai-compatible --preset custom --base-url … --model …` |

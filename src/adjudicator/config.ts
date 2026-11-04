@@ -1,7 +1,7 @@
 import type { AdjudicatorConfig, Config } from "../config.js";
 import type { AdjudicatorProviderState } from "../storage/types.js";
 import { authLockout, keyFingerprint } from "./breaker.js";
-import { type KeyId, type KeySource, mask, resolveKey } from "./secrets.js";
+import { type KeyId, type KeyResolution, type KeySource, mask, resolveKey } from "./secrets.js";
 import type { ProviderId } from "./types.js";
 
 /**
@@ -198,7 +198,12 @@ export function resolveAdjudicator(
   const context = opts.context ?? "hook";
   const t = target(a);
   const key = t.keyId
-    ? resolveKey(t.keyId, { keyEnv: a.keyEnv, providerEnv: t.providerEnv, env: opts.env })
+    ? resolveKey(t.keyId, {
+        keyEnv: a.keyEnv,
+        providerEnv: t.providerEnv,
+        env: opts.env,
+        fileOnly: !t.remote,
+      })
     : undefined;
 
   const r: Resolved = {
@@ -250,16 +255,33 @@ export function resolveAdjudicator(
 }
 
 /**
+ * The key a provider sends to `r`, looked up at send time. A local (loopback) target gets only
+ * a key stored in the key file for its id: never one from keyEnv, the provider's env var or
+ * EMINIAR_ADJUDICATOR_KEY, so a port on this machine cannot collect an env secret.
+ */
+export function keyFor(
+  r: Pick<Resolved, "keyId" | "keyEnv" | "providerEnv" | "configuredRemote">,
+  env?: NodeJS.ProcessEnv,
+): KeyResolution | undefined {
+  if (!r.keyId) return undefined;
+  return resolveKey(r.keyId, {
+    keyEnv: r.keyEnv,
+    providerEnv: r.providerEnv,
+    env,
+    fileOnly: !r.configuredRemote,
+  });
+}
+
+/**
  * keyFingerprint() of the key the effective provider would send; null when it uses no key or
  * none is set. Never the key itself.
  */
 export function currentKeyFingerprint(
-  r: Pick<Resolved, "keyId" | "keyEnv" | "providerEnv">,
+  r: Pick<Resolved, "keyId" | "keyEnv" | "providerEnv" | "configuredRemote">,
   env?: NodeJS.ProcessEnv,
 ): string | null {
-  if (!r.keyId) return null;
-  const k = resolveKey(r.keyId, { keyEnv: r.keyEnv, providerEnv: r.providerEnv, env });
-  return k.key ? keyFingerprint(k.key) : null;
+  const k = keyFor(r, env);
+  return k?.key ? keyFingerprint(k.key) : null;
 }
 
 /**

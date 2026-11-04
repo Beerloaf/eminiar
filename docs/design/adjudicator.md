@@ -82,7 +82,7 @@ It can be blended with one provider:
 
 - The heuristic, embedding and localhost providers keep all data on the machine.
 - Remote providers need explicit consent. `--yes` never implies it, and a committed project file
-  cannot grant it.
+  cannot grant it, nor choose the provider, its URL, the key or the caps (§5 "Trust boundary").
 - Remote providers also need a key, which lives only in `~/.eminiar/adjudicator.key` or an env
   var.
 - We store hashes, scores and an 80-char redacted head of the input. We never store prompts or
@@ -236,14 +236,37 @@ Rules:
   - `EMINIAR_ADJUDICATOR_PROVIDER`
   - `EMINIAR_ADJUDICATOR_MODE`
   - `EMINIAR_ADJUDICATOR_REMOTE=1` → `remoteConsent`
-- **(b)** `loadConfig` deletes `adjudicator.remoteConsent` from the project layer
-  (`<root>/eminiar.config.json`) before merging. Teams commit that file, and consent is personal.
+- **(b)** `loadConfig` cuts the project layer's adjudicator section down to an allowlist before
+  merging (see "Trust boundary" below). Teams commit that file, and consent is personal.
 - **(c)** A `superRefine` rejects any key inside `adjudicator` that matches
   `/(api_?key|token|secret|password)/i`, except `keyEnv`. The error tells the user to run
   `eminiar adjudicator key set`.
 - **(d)** `install.ts` freezes `ConfigSchema.parse({})` into `~/.eminiar/config.json`, so every
   default above has to be safe to freeze. Optional fields stay undefined.
 - **(e)** Run `scripts/gen-schema.ts` and commit the regenerated `eminiar.config.schema.json`.
+
+### Trust boundary: what the project file may set
+
+`<root>/eminiar.config.json` comes with any cloned repo, so it is untrusted input. It must never
+decide where adjudicator text or keys go, which key is sent, how much text leaves the machine or
+how much is spent. Security review #31 showed the old rule (strip only `remoteConsent`) let a
+project file set `openai.baseUrl` and send the user's Groq key and prompts to any host, or name
+`keyEnv: "AWS_SECRET_ACCESS_KEY"` and send that.
+
+- `PROJECT_ADJUDICATOR_KEYS` in `src/config.ts` is the allowlist: `enabled`, `mode`, `surfaces`,
+  `promptMode`, `minPromptChars`, `tiers`, `weights`, `apply`, `advice`, `embedding`,
+  `learning`, `cache`. These turn the feature on and tune how verdicts are scored and used. None
+  changes the host, the key or the caps: `surfaces.tools` only adds a local hint, and
+  `promptMode` only changes when the consented provider is called.
+- Everything else (`provider`, `typesafe`, `openai` with its preset, baseUrl, model and price,
+  `keyEnv`, `remoteConsent`, `privacy`, `budget`, `timeouts`, `breaker`) comes only from
+  `~/.eminiar/config.json` and `EMINIAR_*` env. `projectLayer()` drops it before the merge.
+- `projectAdjudicatorWarning(root)` returns one line naming the dropped keys, for doctor and
+  `adjudicator status`.
+- A project section holding a key-like field stays whole, so the secret check (c) still rejects
+  the config instead of dropping the key quietly.
+- A cloned repo can therefore turn the adjudicator on, but with no personal config only the
+  heuristic runs.
 
 ### PRESETS (`config.ts`)
 
@@ -284,6 +307,12 @@ Resolution order:
 2. the provider's own env var (`TYPESAFE_API_KEY`, `GROQ_API_KEY`, `CEREBRAS_API_KEY`)
 3. `EMINIAR_ADJUDICATOR_KEY`
 4. the key file
+
+A local (loopback) target skips steps 1 to 3: it gets only a key stored in the key file for its
+own id (`openai:llamacpp`, ...), never an env var. Otherwise any process listening on a local
+port could collect `$GITHUB_TOKEN` through `keyEnv`, or the generic key. `keyFor(r)` in
+`config.ts` is the one place providers and the auth-lockout fingerprint get the key from.
+`keyEnv` is read only from the personal config (the project layer drops it).
 
 If the file's mode has any `0o077` bits set, we refuse to read it, and doctor fails with a
 `chmod 600` hint.
@@ -764,7 +793,8 @@ Every savings figure is shown with its assumptions:
 | Jev alias moves | the version is pinned; re-run eval before bumping `typesafe.model` |
 | Cursor client | skipped on every surface |
 | many prompts in parallel sessions | the cache plus the pending marker dedupe; the breaker is shared through SQLite |
-| a team's config turns the feature on | only heuristic or local providers can run: consent never comes from the project file, and keys live only per user |
+| a team's config turns the feature on | it can set `enabled` and the behaviour knobs only; the provider, URL, key, consent and caps come from the user's own config, so without one only the heuristic runs |
+| a cloned repo's config names a host or `keyEnv` | dropped by the project allowlist; doctor/status name the ignored keys |
 
 ## 15. MCP surface: a new tool `em_adjudicate`, registered only when enabled
 
@@ -1026,7 +1056,8 @@ Deps: none
 Accept:
 
 - the types from §4 and the schema and defaults from §5 (enabled false); `parse({})` round-trips
-- env overrides work; the project layer cannot set `remoteConsent`; the refine rejects key-like
+- env overrides work; the project layer cannot set `remoteConsent` (later: anything outside
+  `PROJECT_ADJUDICATOR_KEYS`, #32); the refine rejects key-like
   fields
 - `PRESETS` and `isLoopback`; `resolveAdjudicator` returns the effective provider plus a degraded
   reason for no_key, no_consent and hook_context

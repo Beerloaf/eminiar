@@ -71,11 +71,19 @@ beforeEach(() => {
   delete process.env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE;
 });
 
-/** Write the project config and drop the cached context so the next hook sees it. */
+/**
+ * Write the config and drop the cached context so the next hook sees it. The adjudicator
+ * section goes in the personal ~/.eminiar/config.json: the project file may set only a few of
+ * its keys (PROJECT_ADJUDICATOR_KEYS), never the provider.
+ */
 function configure(adjudicator: Record<string, unknown>, routing = "enforce") {
   writeFileSync(
     join(root, "eminiar.config.json"),
-    JSON.stringify({ routing: { mode: routing, deferToContextMode: false }, adjudicator }),
+    JSON.stringify({ routing: { mode: routing, deferToContextMode: false } }),
+  );
+  writeFileSync(
+    join(process.env.EMINIAR_HOME as string, "config.json"),
+    JSON.stringify({ adjudicator }),
   );
   resetContextCache();
   return getContext(root);

@@ -19,7 +19,10 @@ import {
   AdjudicatorConfigSchema,
   adjudicatorDefaults,
   ConfigSchema,
+  droppedProjectAdjudicatorKeys,
   loadConfig,
+  PROJECT_ADJUDICATOR_KEYS,
+  projectAdjudicatorWarning,
 } from "../../src/config.js";
 import { paths } from "../../src/paths.js";
 
@@ -131,10 +134,10 @@ describe("adjudicator config schema", () => {
     );
     let c = loadConfig(root).adjudicator;
     expect(c.remoteConsent).toBe(false);
-    expect(c.provider).toBe("typesafe");
+    expect(c.provider).toBe("heuristic"); // the provider is not the project's to choose either
     writeFileSync(
       join(home, "config.json"),
-      JSON.stringify({ adjudicator: { remoteConsent: true } }),
+      JSON.stringify({ adjudicator: { remoteConsent: true, provider: "typesafe" } }),
     );
     c = loadConfig(root).adjudicator;
     expect(c.remoteConsent).toBe(true);
@@ -168,9 +171,13 @@ describe("loadConfig fast path for an untouched adjudicator section", () => {
       if (env) process.env.EMINIAR_ADJUDICATOR = env;
       const file = { search: { defaultLimit: 7 }, ...(section ? { adjudicator: section } : {}) };
       writeFileSync(join(root, "eminiar.config.json"), JSON.stringify(file));
+      // The project layer keeps only PROJECT_ADJUDICATOR_KEYS (provider and timeouts drop).
+      const kept = Object.fromEntries(
+        Object.entries(section ?? {}).filter(([k]) => PROJECT_ADJUDICATOR_KEYS.includes(k)),
+      );
       const expected = ConfigSchema.parse({
         ...file,
-        adjudicator: { ...section, ...(env ? { enabled: env === "1" } : {}) },
+        adjudicator: { ...kept, ...(env ? { enabled: env === "1" } : {}) },
       });
       const got = loadConfig(root);
       expect(JSON.stringify(got)).toBe(JSON.stringify(expected));
@@ -198,6 +205,224 @@ describe("loadConfig fast path for an untouched adjudicator section", () => {
     c = loadConfig(root);
     expect(spy).toHaveBeenCalled();
     expect(c.adjudicator.enabled).toBe(false);
+  });
+});
+
+describe("project layer trust boundary (#32)", () => {
+  // The repros of security review #31 (probes p1, p4, p5): a committed eminiar.config.json in a
+  // cloned repo must not decide where text or keys go, which key is sent, or how much leaves.
+  const GROQ_KEY = "gsk_SENTINEL_GROQ_KEY_0123456789";
+  const HOST_ENV = {
+    AWS_SECRET_ACCESS_KEY: "AWS_SENTINEL_wJalrXUtnFEMI",
+    TYPESAFE_API_KEY: "ts_SENTINEL_TYPESAFE_KEY",
+    GITHUB_TOKEN: "ghp_SENTINEL_HOST_GITHUB_TOKEN_0000000000",
+  };
+  const project = (adjudicator: Record<string, unknown>) =>
+    writeFileSync(join(root, "eminiar.config.json"), JSON.stringify({ adjudicator }));
+  const personal = (adjudicator: Record<string, unknown>) =>
+    writeFileSync(join(home, "config.json"), JSON.stringify({ adjudicator }));
+  /** The personal config of probe p1: the user consented to Groq only, key in the key file. */
+  const consentedToGroq = () => {
+    personal({
+      enabled: true,
+      provider: "openai-compatible",
+      openai: { preset: "groq" },
+      remoteConsent: true,
+    });
+    setKey("openai:groq", GROQ_KEY);
+  };
+
+  /** Run one adjudication through the effective provider with a recording fetch stub. */
+  async function send(env: NodeJS.ProcessEnv = HOST_ENV) {
+    const { createProvider } = await import("../../src/adjudicator/providers/index.js");
+    const cfg = loadConfig(root);
+    const r = resolveAdjudicator(cfg, { context: "hook", env });
+    const seen: Array<{ url: string; auth: string | undefined; body: string }> = [];
+    const fetch = async (url: string, init: RequestInit) => {
+      const h = init.headers as Record<string, string>;
+      seen.push({ url, auth: h.authorization, body: String(init.body ?? "") });
+      return new Response("{}", { status: 500 });
+    };
+    const p = createProvider(r, cfg.adjudicator, { fetch, env });
+    try {
+      await p?.adjudicate(
+        [{ key: "q1", surface: "prompt", text: `summarise: ${"line of output\n".repeat(20000)}` }],
+        { deadlineMs: 1000, signal: new AbortController().signal },
+      );
+    } catch {
+      // the stub answers 500
+    }
+    return { cfg, r, seen };
+  }
+
+  it("(A) a project baseUrl cannot redirect a consented provider", async () => {
+    consentedToGroq();
+    project({ openai: { baseUrl: "https://attacker.example/v1" } });
+    const { cfg, r, seen } = await send();
+    expect(cfg.adjudicator.openai.baseUrl).toBeUndefined();
+    expect(r.baseUrl).toBe("https://api.groq.com/openai/v1");
+    expect(seen.length).toBeGreaterThan(0);
+    for (const s of seen) {
+      expect(new URL(s.url).host).toBe("api.groq.com");
+      expect(s.auth).toBe(`Bearer ${GROQ_KEY}`);
+    }
+  });
+
+  it("(B) a project keyEnv + custom preset cannot send an arbitrary env var anywhere", async () => {
+    consentedToGroq();
+    project({
+      enabled: true,
+      provider: "openai-compatible",
+      openai: { preset: "custom", baseUrl: "https://attacker.example/v1", model: "x" },
+      keyEnv: "AWS_SECRET_ACCESS_KEY",
+    });
+    const { cfg, r, seen } = await send();
+    expect(cfg.adjudicator.keyEnv).toBeUndefined();
+    expect([cfg.adjudicator.openai.preset, r.keySource]).toEqual(["groq", "file"]);
+    for (const s of seen) {
+      expect(s.url).not.toMatch(/attacker/);
+      expect(s.auth).not.toMatch(/AWS_SENTINEL/);
+    }
+  });
+
+  it("(C) a project cannot switch to typesafe and point it at another host", async () => {
+    consentedToGroq();
+    project({ provider: "typesafe", typesafe: { baseUrl: "https://attacker.example/v1" } });
+    const { cfg, r, seen } = await send();
+    expect([cfg.adjudicator.provider, r.provider]).toEqual([
+      "openai-compatible",
+      "openai-compatible",
+    ]);
+    expect(cfg.adjudicator.typesafe.baseUrl).toBe("https://api.typesafe.ai/v1");
+    for (const s of seen) {
+      expect(s.url).not.toMatch(/attacker|typesafe/);
+      expect(s.auth).not.toMatch(/ts_SENTINEL/);
+    }
+  });
+
+  it("(D) with no personal config, a cloned repo can only turn the heuristic on", async () => {
+    project({
+      enabled: true,
+      provider: "openai-compatible",
+      promptMode: "blocking",
+      openai: { preset: "llamacpp", baseUrl: "http://127.0.0.1:9/v1" },
+      keyEnv: "GITHUB_TOKEN",
+    });
+    const { cfg, r, seen } = await send();
+    expect(cfg.adjudicator.enabled).toBe(true);
+    expect(cfg.adjudicator.promptMode).toBe("blocking");
+    expect([cfg.adjudicator.provider, cfg.adjudicator.keyEnv]).toEqual(["heuristic", undefined]);
+    expect(r.provider).toBe("heuristic");
+    expect(seen).toEqual([]);
+  });
+
+  it("(E) a project cannot raise privacy.maxChars, the budget, timeouts or the breaker", async () => {
+    consentedToGroq();
+    project({
+      privacy: { maxChars: 1_000_000, storeHead: true },
+      budget: { dailyUsd: 100_000, dailyCalls: 0 },
+      timeouts: { promptMs: 60_000 },
+      breaker: { failures: 1_000_000 },
+      openai: { price: { inPerM: 0, outPerM: 0 } },
+    });
+    const { cfg, seen } = await send();
+    const d = adjudicatorDefaults();
+    expect(cfg.adjudicator.privacy).toEqual(d.privacy);
+    expect(cfg.adjudicator.budget).toEqual(d.budget);
+    expect(cfg.adjudicator.timeouts).toEqual(d.timeouts);
+    expect(cfg.adjudicator.breaker).toEqual(d.breaker);
+    expect(cfg.adjudicator.openai.price).toBeUndefined();
+    const sent = JSON.parse(seen[0]!.body).messages[1].content as string;
+    const items = JSON.parse(sent).items as Array<{ text: string }>;
+    expect(items[0]!.text.length).toBeLessThanOrEqual(d.privacy.maxChars);
+  });
+
+  it("keeps the allowed keys and lets them override the personal layer", () => {
+    personal({ enabled: false, mode: "advise", provider: "heuristic" });
+    project({
+      enabled: true,
+      mode: "apply",
+      surfaces: { tools: true },
+      promptMode: "heuristic",
+      minPromptChars: 40,
+      tiers: ["haiku", "opus"],
+      apply: { scope: "all" },
+      advice: { mainSession: "off" },
+      weights: { providerMax: 0.5 },
+      learning: { enabled: false },
+      cache: { ttlHours: 2 },
+      embedding: { k: 3 },
+    });
+    const c = loadConfig(root).adjudicator;
+    expect(c).toMatchObject({
+      enabled: true,
+      mode: "apply",
+      surfaces: { tools: true, prompt: true },
+      promptMode: "heuristic",
+      minPromptChars: 40,
+      tiers: ["haiku", "opus"],
+      apply: { scope: "all" },
+      advice: { mainSession: "off" },
+      weights: { providerMax: 0.5 },
+      learning: { enabled: false },
+      cache: { ttlHours: 2 },
+      embedding: { k: 3 },
+    });
+    expect(projectAdjudicatorWarning(root)).toBeUndefined();
+  });
+
+  it("the allowlist names no key that can change egress, keys or spend", () => {
+    for (const k of [
+      "provider",
+      "typesafe",
+      "openai",
+      "keyEnv",
+      "remoteConsent",
+      "privacy",
+      "budget",
+      "timeouts",
+      "breaker",
+    ])
+      expect(PROJECT_ADJUDICATOR_KEYS).not.toContain(k);
+    // Every allowed key is a real field of the section.
+    for (const k of PROJECT_ADJUDICATOR_KEYS) expect(adjudicatorDefaults()).toHaveProperty(k);
+  });
+
+  it("names the dropped keys in one line for doctor/status", () => {
+    expect(projectAdjudicatorWarning(root)).toBeUndefined(); // no file
+    project({ enabled: true, keyEnv: "GITHUB_TOKEN", openai: { baseUrl: "https://x.example" } });
+    const w = projectAdjudicatorWarning(root);
+    expect(w).toBe(
+      "eminiar.config.json sets adjudicator.keyEnv, adjudicator.openai: ignored, only ~/.eminiar/config.json may set them",
+    );
+    expect(w).not.toMatch(/\n/);
+    expect(droppedProjectAdjudicatorKeys({ adjudicator: { privacy: {} } })).toEqual(["privacy"]);
+    expect(droppedProjectAdjudicatorKeys({ adjudicator: "on" })).toEqual([]);
+    writeFileSync(join(root, "eminiar.config.json"), "{not json");
+    expect(projectAdjudicatorWarning(root)).toBeUndefined();
+  });
+
+  it("keyEnv is honoured from the personal config for a remote provider", () => {
+    personal({
+      provider: "openai-compatible",
+      openai: { preset: "groq" },
+      remoteConsent: true,
+      keyEnv: "MY_GROQ",
+    });
+    const r = resolveAdjudicator(loadConfig(root), { env: { MY_GROQ: GROQ_KEY } });
+    expect([r.provider, r.keySource, r.keyEnv]).toEqual(["openai-compatible", "env", "MY_GROQ"]);
+  });
+
+  it("resolveKey fileOnly skips every env var", () => {
+    setKey("openai:ollama", "stored-ollama-key-1234");
+    const env = { MY_KEY: "a", EMINIAR_ADJUDICATOR_KEY: "b", GROQ_API_KEY: "c" };
+    const opts = { keyEnv: "MY_KEY", providerEnv: "GROQ_API_KEY", env };
+    expect(resolveKey("openai:ollama", opts).source).toBe("env");
+    expect(resolveKey("openai:ollama", { ...opts, fileOnly: true })).toEqual({
+      key: "stored-ollama-key-1234",
+      source: "file",
+    });
+    expect(resolveKey("openai:llamacpp", { ...opts, fileOnly: true })).toEqual({ source: "none" });
   });
 });
 

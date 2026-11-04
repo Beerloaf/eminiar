@@ -90,6 +90,8 @@ function load(): Cached {
 /**
  * Resolution order: the env var named by keyEnv, the provider's own env var
  * (TYPESAFE_API_KEY, GROQ_API_KEY, ...), EMINIAR_ADJUDICATOR_KEY, then the key file.
+ * `fileOnly` skips every env var: a local (loopback) provider only ever gets a key the user
+ * stored for exactly that provider id, never one from the environment (§6).
  */
 export function resolveKey(
   id: KeyId,
@@ -97,10 +99,12 @@ export function resolveKey(
     keyEnv?: string | undefined;
     providerEnv?: string | undefined;
     env?: NodeJS.ProcessEnv | undefined;
+    fileOnly?: boolean | undefined;
   } = {},
 ): KeyResolution {
   const env = opts.env ?? process.env;
-  for (const name of [opts.keyEnv, opts.providerEnv, GENERIC_KEY_ENV]) {
+  const names = opts.fileOnly ? [] : [opts.keyEnv, opts.providerEnv, GENERIC_KEY_ENV];
+  for (const name of names) {
     const v = name ? env[name]?.trim() : undefined;
     if (name && v) return { key: v, source: "env", envName: name };
   }

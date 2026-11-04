@@ -767,6 +767,102 @@ describe("openai-compatible provider", () => {
 
 // ---------------------------------------------------------------------------------------------
 
+describe("no env key for a loopback provider (#32)", () => {
+  /** Every env var a key could come from, all set to secrets that must never reach a local port. */
+  const HOST_ENV = {
+    GITHUB_TOKEN: "ghp_SENTINEL_HOST_GITHUB_TOKEN_0000000000",
+    EMINIAR_ADJUDICATOR_KEY: "SENTINEL_GENERIC_ADJ_KEY_0000",
+    GROQ_API_KEY: "gsk_SENTINEL_GROQ_0000000000",
+    TYPESAFE_API_KEY: "ts_SENTINEL_TYPESAFE_000000",
+  };
+
+  it("a local preset at 127.0.0.1 gets no key from keyEnv, the generic or a provider env var", async () => {
+    const { cfg, r } = openai(
+      {
+        remoteConsent: false,
+        keyEnv: "GITHUB_TOKEN",
+        openai: { preset: "llamacpp", baseUrl: "http://127.0.0.1:9/v1" },
+      },
+      HOST_ENV,
+    );
+    expect([r.provider, r.local, r.keySource]).toEqual(["openai-compatible", true, "none"]);
+    const f = mockFetch(completion([item("i0")]));
+    await createOpenAIProvider(r, cfg, { fetch: f, env: HOST_ENV }).adjudicate(reqs(1), {
+      signal: signal(),
+      deadlineMs: 600,
+    });
+    expect(f.calls[0]?.url).toBe("http://127.0.0.1:9/v1/chat/completions");
+    expect(headerOf(f.calls[0], "authorization")).toBeUndefined();
+    expect(JSON.stringify(f.calls[0]?.init)).not.toMatch(/SENTINEL/);
+  });
+
+  it("the same holds for a custom preset on localhost, even with a hand-made Resolved", async () => {
+    const { cfg, r } = openai(
+      {
+        remoteConsent: false,
+        openai: { preset: "custom", baseUrl: "http://localhost:1/v1", model: "m" },
+      },
+      HOST_ENV,
+    );
+    expect(r.local).toBe(true);
+    // keyEnv/providerEnv on the Resolved do not matter: the target is local.
+    const forged: Resolved = { ...r, keyEnv: "GITHUB_TOKEN", providerEnv: "GROQ_API_KEY" };
+    const f = mockFetch(completion([item("i0")]));
+    await createOpenAIProvider(forged, cfg, { fetch: f, env: HOST_ENV }).adjudicate(reqs(1), {
+      signal: signal(),
+      deadlineMs: 600,
+    });
+    expect(headerOf(f.calls[0], "authorization")).toBeUndefined();
+  });
+
+  it("a key the user stored for that local provider id is still sent", async () => {
+    const { setKey } = await import("../../src/adjudicator/secrets.js");
+    setKey("openai:lmstudio", "lm-studio-own-token-1234");
+    const { cfg, r } = openai({ remoteConsent: false, openai: { preset: "lmstudio" } }, HOST_ENV);
+    expect(r.keySource).toBe("file");
+    const f = mockFetch(completion([item("i0")]));
+    await createOpenAIProvider(r, cfg, { fetch: f, env: HOST_ENV }).adjudicate(reqs(1), {
+      signal: signal(),
+      deadlineMs: 600,
+    });
+    expect(headerOf(f.calls[0], "authorization")).toBe("Bearer lm-studio-own-token-1234");
+  });
+
+  it("typesafe on a loopback baseUrl ignores TYPESAFE_API_KEY and keyEnv", async () => {
+    const { cfg, r } = typesafe(
+      {
+        remoteConsent: false,
+        keyEnv: "GITHUB_TOKEN",
+        typesafe: { baseUrl: "http://127.0.0.1:9/v1" },
+      },
+      HOST_ENV,
+    );
+    expect([r.provider, r.degraded]).toEqual(["heuristic", "no_key"]);
+    const f = mockFetch(json({}));
+    const p = createTypesafeProvider({ ...r, provider: "typesafe", remote: false }, cfg, {
+      fetch: f,
+      env: HOST_ENV,
+    });
+    expect((await caught(p.adjudicate(reqs(1), { signal: signal(), deadlineMs: 600 }))).kind).toBe(
+      "no_key",
+    );
+    expect(f.calls).toHaveLength(0);
+  });
+
+  it("a remote provider still reads keyEnv from the user config", async () => {
+    const { cfg, r } = openai({ keyEnv: "MY_GROQ" }, { MY_GROQ: SENTINEL });
+    expect(r.keySource).toBe("env");
+    const f = mockFetch(completion([item("i0")]));
+    await createOpenAIProvider(r, cfg, { fetch: f, env: { MY_GROQ: SENTINEL } }).adjudicate(
+      reqs(1),
+      { signal: signal(), deadlineMs: 2000 },
+    );
+    expect(headerOf(f.calls[0], "authorization")).toBe(`Bearer ${SENTINEL}`);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+
 describe("provider registry", () => {
   const stub = (id: "embedding"): AdjudicatorProvider => ({
     id,
