@@ -6,7 +6,9 @@ import {
   ev,
   withPriority,
 } from "../capture/classify.js";
+import { featuresWanted } from "../config.js";
 import { getContext } from "../context.js";
+import type { RecallRerank } from "../decisions/types.js";
 import { indexContent } from "../index/indexer.js";
 import { recallForError, recallForText, recordShown } from "../session/recall.js";
 import { globalDb } from "../stats/global.js";
@@ -114,9 +116,23 @@ export const userPromptSubmit: HookHandler = async (input) => {
   const ctx = getContext(input.cwd);
   const { recall } = ctx.config;
   const parts: string[] = [];
+  // Jev features (off by default; loaded only when one is on): the recall reranker and any
+  // advice note that arrived late. Hooks make no network call here.
+  let jevSeams: { prompt?: RecallRerank; error?: RecallRerank } = {};
+  if (featuresWanted(ctx.config.adjudicator)) {
+    try {
+      const jev = await import("../decisions/hooks.js");
+      jevSeams = await jev.decisionPromptSeams(ctx, db, sessionId);
+      const late = jev.decisionDrainNotes(db, sessionId);
+      if (late) parts.push(late);
+    } catch {
+      // Jev is optional
+    }
+  }
   if (recall.onPrompt) {
     try {
       const r = await recallForText(db, input.prompt, {
+        rerank: jevSeams.prompt,
         maxMemories: recall.maxMemories,
         maxDocs: recall.maxDocs,
         sessionId,
@@ -219,6 +235,17 @@ export const postToolUse: HookHandler = async (input) => {
       }
     }
   }
+  // Jev advice notes (off by default): a note queued by an earlier call is delivered once.
+  if (featuresWanted(getContext(input.cwd).config.adjudicator)) {
+    try {
+      const { decisionDrainNotes } = await import("../decisions/hooks.js");
+      const note = decisionDrainNotes(db, sessionId);
+      if (note)
+        return { hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: note } };
+    } catch {
+      // Jev is optional
+    }
+  }
   return undefined;
 };
 
@@ -230,10 +257,21 @@ export const postToolUseFailure: HookHandler = async (input) => {
   const { db, root, sessionId } = open(input);
   // Look the error up before it is persisted, so it does not find itself.
   let recalled: string | undefined;
-  const { recall } = getContext(input.cwd).config;
+  const errCtx = getContext(input.cwd);
+  const { recall } = errCtx.config;
   if (recall.onError && input.error) {
     try {
+      let rerank: RecallRerank | undefined;
+      if (featuresWanted(errCtx.config.adjudicator)) {
+        try {
+          const { decisionPromptSeams } = await import("../decisions/hooks.js");
+          rerank = (await decisionPromptSeams(errCtx, db, sessionId)).error;
+        } catch {
+          // Jev is optional
+        }
+      }
       const r = await recallForError(db, input.error, {
+        rerank,
         sessionId,
         maxMemories: Math.min(2, recall.maxMemories),
         repeatAfter: recall.repeatAfter,

@@ -629,6 +629,50 @@ CREATE TABLE IF NOT EXISTS adjudicator_exchanges (
 CREATE INDEX IF NOT EXISTS adjudicator_exchanges_ts ON adjudicator_exchanges(ts);
 `,
   },
+  {
+    // Decision features (docs/design/jev-integration-options.md): one row per provider call or
+    // shadow decision, and a cache of answers. New tables only, so no heal is needed. Never
+    // stores prompt, memory, diff or output text: ids, labels, numbers and template notes only.
+    version: 10,
+    sql: `
+CREATE TABLE IF NOT EXISTS decision_calls (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  feature TEXT NOT NULL,
+  context TEXT NOT NULL,
+  session_id TEXT,
+  subject TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  status TEXT NOT NULL,
+  items INTEGER NOT NULL DEFAULT 0,
+  baseline TEXT NOT NULL DEFAULT 'null',
+  provider TEXT,
+  answers TEXT,
+  decision TEXT,
+  changed INTEGER NOT NULL DEFAULT 0,
+  applied INTEGER NOT NULL DEFAULT 0,
+  latency_ms INTEGER,
+  tokens_in INTEGER,
+  cost_usd REAL,
+  model TEXT,
+  exchange_id INTEGER,
+  note TEXT,
+  note_session TEXT,
+  delivered_at INTEGER,
+  feedback TEXT
+);
+CREATE INDEX IF NOT EXISTS decision_calls_feature_ts ON decision_calls(feature, ts);
+CREATE INDEX IF NOT EXISTS decision_calls_subject ON decision_calls(feature, subject, ts);
+CREATE INDEX IF NOT EXISTS decision_calls_outbox ON decision_calls(note_session, delivered_at) WHERE note IS NOT NULL;
+CREATE TABLE IF NOT EXISTS decision_cache (
+  key TEXT PRIMARY KEY,
+  feature TEXT NOT NULL,
+  answers TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS decision_cache_created ON decision_cache(created_at);
+`,
+  },
 ];
 
 /**

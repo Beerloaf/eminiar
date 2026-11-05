@@ -37,6 +37,85 @@ function findSecretFields(v: unknown, path: (string | number)[] = []): (string |
  * hook process ~1 ms to construct and ~1.5 ms to parse for the first time, and the adjudicator
  * is off by default. loadConfig skips it entirely while it is untouched (adjudicatorDefaults).
  */
+/** The default commit-advice exclusions: lock files, minified output and anything key-shaped. */
+export const COMMIT_EXCLUDE = [
+  "**/*.lock",
+  "**/package-lock.json",
+  "**/*.min.*",
+  "**/.env*",
+  "**/*.pem",
+  "**/*.key",
+  "**/*.p12",
+  "**/id_rsa*",
+  "**/secrets/**",
+];
+
+/**
+ * One decision feature (docs/design/jev-integration-options.md): an object, or true/false as shorthand
+ * for {enabled}. Shadow (record only, change nothing) is on by default.
+ */
+const decisionFeature = <T extends z.ZodRawShape>(maxCallsPerDay: number, shape: T) =>
+  z
+    .preprocess(
+      (v) => (typeof v === "boolean" ? { enabled: v } : v),
+      z.object({
+        enabled: z.boolean().default(false),
+        shadow: z.boolean().default(true),
+        maxCallsPerDay: z.number().int().nonnegative().default(maxCallsPerDay),
+        ...shape,
+      }),
+    )
+    .prefault({});
+
+const prob = (d: number) => z.number().min(0).max(1).default(d);
+const ms = (d: number) => z.number().int().positive().default(d);
+
+/**
+ * The provider-generic decision features (adjudicator.features.*): they run on whichever provider
+ * the adjudicator is configured with. Personal config only: "features" and "featureConsent" are
+ * deliberately not in PROJECT_ADJUDICATOR_KEYS. EMINIAR_ADJUDICATOR_FEATURES=0 withdraws every
+ * feature; no env var grants one.
+ */
+const buildFeaturesObject = () =>
+  z
+    .object({
+      recall: decisionFeature(500, {
+        dropBelow: prob(0.25),
+        mcpMs: ms(1200),
+        jobMs: ms(2500),
+        maxChars: ms(600),
+      }),
+      memory: decisionFeature(100, {
+        minProb: prob(0.6),
+        k: ms(5),
+        mcpMs: ms(1500),
+        maxChars: ms(1500),
+      }),
+      commit: decisionFeature(100, {
+        minProb: prob(0.7),
+        jobMs: ms(4000),
+        maxChars: ms(4000),
+        exclude: z
+          .array(z.string().max(256))
+          .max(64)
+          .default([...COMMIT_EXCLUDE]),
+      }),
+      compaction: decisionFeature(50, {
+        output: z.boolean().default(false),
+        minKeep: prob(0.3),
+        jobMs: ms(4000),
+        mcpMs: ms(800),
+        maxChars: ms(400),
+      }),
+      swarm: decisionFeature(300, {
+        flagAbove: prob(0.7),
+        bgMs: ms(3000),
+        maxChars: ms(600),
+      }),
+      docs: decisionFeature(20, { minScore: prob(0.5), mcpMs: ms(3000) }),
+    })
+    .prefault({});
+
 const buildAdjudicatorObject = () =>
   z.object({
     /** Off by default; EMINIAR_ADJUDICATOR=0 is the kill switch. */
@@ -198,6 +277,9 @@ const buildAdjudicatorObject = () =>
         captureExchanges: z.boolean().default(false),
       })
       .prefault({}),
+    features: buildFeaturesObject(),
+    /** "<dataClass>@<origin>" lines written by `eminiar adjudicator features on`; personal config only. */
+    featureConsent: z.array(z.string().max(512)).max(32).default([]),
   });
 
 /**
@@ -229,6 +311,57 @@ export type AdjudicatorConfig = z.infer<ReturnType<typeof buildAdjudicatorObject
  * What AdjudicatorConfigSchema.parse({}) returns, without building the schema. A unit test
  * (tests/unit/adjudicator-config.test.ts) pins the two equal: change both together.
  */
+function featureDefaults(): AdjudicatorConfig["features"] {
+  const f = { enabled: false, shadow: true };
+  return {
+    recall: {
+      ...f,
+      maxCallsPerDay: 500,
+      dropBelow: 0.25,
+      mcpMs: 1200,
+      jobMs: 2500,
+      maxChars: 600,
+    },
+    memory: { ...f, maxCallsPerDay: 100, minProb: 0.6, k: 5, mcpMs: 1500, maxChars: 1500 },
+    commit: {
+      ...f,
+      maxCallsPerDay: 100,
+      minProb: 0.7,
+      jobMs: 4000,
+      maxChars: 4000,
+      exclude: [...COMMIT_EXCLUDE],
+    },
+    compaction: {
+      ...f,
+      maxCallsPerDay: 50,
+      output: false,
+      minKeep: 0.3,
+      jobMs: 4000,
+      mcpMs: 800,
+      maxChars: 400,
+    },
+    swarm: { ...f, maxCallsPerDay: 300, flagAbove: 0.7, bgMs: 3000, maxChars: 600 },
+    docs: { ...f, maxCallsPerDay: 20, minScore: 0.5, mcpMs: 3000 },
+  };
+}
+
+/**
+ * Is any decision feature switched on? A pure property walk, so a hook can decide whether to import
+ * src/decisions at all: with every feature off, no hook loads a decisions module.
+ */
+export function featuresWanted(cfg: AdjudicatorConfig): boolean {
+  if (!cfg.enabled) return false;
+  const f = cfg.features;
+  return (
+    f.recall.enabled ||
+    f.memory.enabled ||
+    f.commit.enabled ||
+    f.compaction.enabled ||
+    f.swarm.enabled ||
+    f.docs.enabled
+  );
+}
+
 export function adjudicatorDefaults(): AdjudicatorConfig {
   return {
     enabled: false,
@@ -264,6 +397,8 @@ export function adjudicatorDefaults(): AdjudicatorConfig {
     breaker: { failures: 2, cooldownSec: 120 },
     budget: { dailyUsd: 0.5, dailyCalls: 2000 },
     privacy: { maxChars: 2000, storeHead: true, captureExchanges: false },
+    features: featureDefaults(),
+    featureConsent: [],
   };
 }
 

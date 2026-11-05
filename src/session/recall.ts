@@ -1,3 +1,4 @@
+import type { RecallRerank } from "../decisions/types.js";
 import { fileId, fileOf } from "../graph/ids.js";
 import { DEPENDENCY_KINDS } from "../graph/metrics.js";
 import { type FileRisk, readFileRisk } from "../history/model.js";
@@ -120,6 +121,11 @@ export interface RecallOptions {
   /** Collect a trace of every candidate (for recording and --explain). */
   trace?: boolean | undefined;
   path?: RecallPath | undefined;
+  /**
+   * Jev reranker (src/decisions/features/recall.ts); the type is here so the hooks can pass the seam.
+   * Returns the keys to show in order, or undefined to keep the term-matched result.
+   */
+  rerank?: RecallRerank | undefined;
 }
 
 export interface RecallResult {
@@ -682,7 +688,13 @@ function resolutionAfter(
 export async function recallForError(
   db: StorageAdapter,
   error: string,
-  opts: { sessionId?: string | undefined; maxMemories?: number; repeatAfter?: number } = {},
+  opts: {
+    sessionId?: string | undefined;
+    maxMemories?: number;
+    repeatAfter?: number;
+    /** See RecallOptions.rerank. */
+    rerank?: RecallRerank | undefined;
+  } = {},
 ): Promise<RecallResult> {
   const terms = promptTerms(error.slice(0, 600)).filter((t) => !ERROR_FILLER.has(t));
   if (terms.length < 3) return { text: "", keys: [] };

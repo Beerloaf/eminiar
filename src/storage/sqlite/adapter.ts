@@ -44,6 +44,7 @@ import type {
   VocabTerm,
 } from "../types.js";
 import { SqliteAdjudicatorStore } from "./adjudicator.js";
+import { SqliteDecisionStore } from "./decisions.js";
 import { migrations, vecTableSql } from "./schema.js";
 import { SqliteSwarmStore } from "./swarm.js";
 
@@ -124,6 +125,7 @@ export class SqliteAdapter implements StorageAdapter {
   readonly vectors: boolean;
   readonly swarm: SqliteSwarmStore;
   readonly adjudicator: SqliteAdjudicatorStore;
+  readonly decisions: SqliteDecisionStore;
   private readonly stmts = new Map<string, Database.Statement<unknown[], unknown>>();
 
   /**
@@ -150,6 +152,7 @@ export class SqliteAdapter implements StorageAdapter {
     // Statements are prepared lazily, so the tables only need to exist by the first call.
     this.swarm = new SqliteSwarmStore(this.db);
     this.adjudicator = new SqliteAdjudicatorStore(this.db);
+    this.decisions = new SqliteDecisionStore(this.db);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("synchronous = NORMAL");
     this.db.pragma("foreign_keys = ON");
@@ -1654,7 +1657,10 @@ export class SqliteAdapter implements StorageAdapter {
           "DELETE FROM api_calls; DELETE FROM tool_uses; DELETE FROM context_events; DELETE FROM transcript_files; DELETE FROM statusline_snapshots;",
         );
       }
-      if (scope === "adjudicator" || scope === "all") this.adjudicator.purge();
+      if (scope === "adjudicator" || scope === "all") {
+        this.adjudicator.purge();
+        this.decisions.purge();
+      }
       if (scope === "memories" || scope === "all") {
         this.db.exec("DELETE FROM memories;");
         // The index and graph scopes clear their own tables; a memories-only purge must

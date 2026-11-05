@@ -1,3 +1,4 @@
+import type { DecisionStore } from "../decisions/types.js";
 import type { SwarmStore } from "../swarm/types.js";
 import type {
   AdjudicatorStore,
@@ -55,6 +56,8 @@ export interface StorageAdapter {
   readonly swarm: SwarmStore;
   /** Adjudicator decisions, verdict cache, provider breakers and learned bias; see src/adjudicator. */
   readonly adjudicator: AdjudicatorStore;
+  /** Jev feature calls, answer cache and advice outbox; see src/jev. */
+  readonly decisions: DecisionStore;
 
   // --- documents & chunks -------------------------------------------------
   /** Insert a document with its chunks. Same uri+hash → returns the existing id with created=false. */
