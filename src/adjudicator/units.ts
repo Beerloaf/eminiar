@@ -21,8 +21,8 @@
  *    keeps "Fix X"); the first unit always stays.
  * 3. At most UNIT_MAX units are scored, each with the shared scorer (extractFeatures +
  *    scoreHeuristic, with the request's hints); past the cap the remaining statements are joined
- *    into the last unit, so none is lost, and that unit is scored as its statements (joined they
- *    would add up again), in at most UNIT_MAX runs. The highest complexity wins: the complexity,
+ *    into the last unit, so none is lost, and that unit is scored as its statements, each alone
+ *    (joined they would add up again, or dilute a hard one). The highest complexity wins: the complexity,
  *    its reasons, the tier table and the effort are that unit's. A tie goes to the riskier unit,
  *    then to the earlier one, so reordering the statements changes nothing.
  * 4. Role and tool are votes summed over the units (each unit's raw scores, read back from its
@@ -38,8 +38,8 @@
  * scores, so a caller can present the effort as informational. `roleConfidence` is the summed
  * role table's confidence, for gating a "role suggested" note.
  *
- * Pure and synchronous, no I/O: one whole-text feature pass plus at most UNIT_MAX unit scorings,
- * 2 × UNIT_MAX − 1 on a brief past the cap.
+ * Pure and synchronous, no I/O: one whole-text feature pass plus one scoring per unit, and one
+ * per statement of the last unit on a brief past the cap (bounded by UNIT_CHARS).
  */
 
 import { extractFeatures, type FeatureExtras } from "./features.js";
@@ -74,14 +74,14 @@ export const UNIT_CHARS = 4000;
 /** A whole-text complexity above this before the 0..4 clamp is `saturated`. */
 export const SATURATED_AT = 4;
 /** Part of the cache key of unit-scored verdicts (engine.cacheKeyFor): bump when this changes. */
-export const UNITS_VERSION = "2";
+export const UNITS_VERSION = "3";
 
 /** How a brief was scored; on the engine's Adjudication and in the row's scores JSON (`units`). */
 export interface BriefUnits {
   /**
    * Scorings, the first line first, boilerplate excluded: one per unit, at most UNIT_MAX; when
-   * the brief is capped its last unit counts as the statements (or runs, at most UNIT_MAX) it
-   * was scored as, so up to 2 × UNIT_MAX − 1.
+   * the brief is capped its last unit counts as the statements it was scored as, each alone, so
+   * UNIT_MAX − 1 + skipped + 1.
    */
   scored: number;
   /** Boilerplate statements and clauses left out (routine checks, hand-in protocol). */
@@ -247,15 +247,70 @@ const PROTOCOL: readonly RegExp[] = [
 ];
 
 /**
- * Work carried by a step that opens on a check or report verb (review #109 F2): "Run the build
- * under Node 18 and fix the ESM import errors", "Make sure the build passes on Windows by
- * rewriting the path handling", "Check that CI is green after migrating the database layer",
- * "Report which endpoints leak personal data and patch each of them". The PROTOCOL patterns are
- * anchored on the lead verb, so without this the whole statement, work and all, was left out. A
- * routine follow-up ("and fix any failures", "and fix them") is still a hand-in step.
+ * Work carried by a step that opens on a check or report verb (review #109 F2, pre-PR review F2):
+ * "Run the build under Node 18 and fix the ESM import errors", "Make sure the build passes on
+ * Windows by replacing the path handling", "Verify CI is green after converting the monorepo to
+ * ESM", "Report which endpoints leak personal data and add authorization checks to each". The
+ * PROTOCOL patterns are anchored on the lead verb, so without this the whole statement, work and
+ * all, was left out.
+ *
+ * A tail is ", and" + a work verb in its base form ("and changes" is a noun: "Copilot rounds and
+ * changes"), or " by" / " after" + any gerund but a check or hand-in one ("by running npm test"). It is work unless it is a routine
+ * follow-up: a repair verb whose routine object ENDS the clause ("and fix any failures", "and fix
+ * them", "and fix the failing tests"; not "and fix the failing auth flow in the gateway"), a verb
+ * with no object ("and fix"), or an object that is the hand-in ("and add the counts to your
+ * update").
  */
-const WORK_TAIL =
-  /(?:,?\s+and|\s+by|\s+after)\s+(?:then\s+)?(?:fix(?:es|ing)?|patch(?:es|ing)?|redesign(?:s|ing)?|rewrit(?:e|es|ing)|refactor(?:s|ing)?|migrat(?:e|es|ing)|implement(?:s|ing)?|repair(?:s|ing)?|resolv(?:e|es|ing)|debug(?:s|ging)?|investigat(?:e|es|ing)|diagnos(?:e|es|ing)|port(?:s|ing)?|find(?:s|ing)?)\b(?!\s+(?:(?:any|all|the|every|each|those|these)\s+)?(?:(?:type|lint|test|tsc|build|ci|new|remaining|resulting|reported)\s+)?(?:failures?|failing\b|errors?|issues?|problems?|regressions?|breakages?|findings?|what\b|them\b|it\b|those\b|these\b|anything\b|everything\b|out\b))/;
+const TAIL_LEAD = /(,?\s+and|\s+by|\s+after)\s+(?:then\s+)?([a-z][a-z-]*)\b/g;
+/** Work verbs in the base form, for a tail after "and" ("and add …"). */
+const WORK_VERBS = new Set(
+  (
+    "fix patch redesign rewrite refactor migrate implement reimplement repair resolve debug " +
+    "investigate diagnose port find add update upgrade downgrade convert replace remove " +
+    "delete rename move extract split merge introduce create write change modify wire " +
+    "integrate harden optimize optimise restructure rework swap adopt bump configure enable " +
+    "disable extend document deprecate encrypt sanitize secure address correct design"
+  ).split(" "),
+);
+/** Repair verbs: their routine object ("any failures", "them") makes the tail a hand-in step. */
+const REPAIR_VERB = new Set(
+  (
+    "fix fixing patch patching repair repairing resolve resolving debug debugging investigate " +
+    "investigating diagnose diagnosing find finding address addressing correct correcting"
+  ).split(" "),
+);
+/** Gerunds that are a check or the hand-in, not work ("by running npm test", "after reporting"). */
+const NON_WORK_GERUND =
+  /^(?:re-?running|running|executing|checking|re-?checking|verifying|confirming|ensuring|testing|re-?testing|linting|building|re-?building|type-?checking|reporting|posting|committing|pushing|claiming|closing|finishing|completing|marking|following|using|doing|making|keeping|passing|reading|looking|reviewing|editing|starting|getting|having|being|calling|invoking|merging|rebasing|pulling|fetching|installing|saving|switching)$/;
+/** Words ending in -ing that are not gerunds. */
+const NOT_GERUND = /thing$|^(?:string|during|pending|morning|evening|ceiling|nothing|spring)$/;
+/**
+ * A routine object that ends the clause: "any failures", "the failing tests", "them", "the type
+ * errors". Only the routine qualifiers may sit before the noun: a specific object ("the ESM
+ * import errors", "the flaky concurrency failures") is real work and must not match.
+ */
+const ROUTINE_OBJECT =
+  /^(?:\s+(?:up|out))?(?:\s+(?:any|all|the|every|each|those|these|its|their|your|whatever|remaining|new|resulting|reported|other))*(?:\s+(?:type|types|lint|linter|typecheck|tsc|eslint|compile|compiler|compilation|build|ci|test|unit|vitest|jest|failing|failed|broken|outstanding)){0,3}\s+(?:failures?|failing|fails|errors?|issues?|problems?|regressions?|breakages?|findings?|warnings?|complaints?|tests?|specs?|checks?|them|it|those|these|that|anything|everything|what(?:ever)?\s+\S+(?:\s+\S+)?)(?:\s+(?:if any|as needed|as necessary|you find|found|reported|first|again|too|along the way|before (?:reporting|you report|finishing|you finish|handing in|you hand in|you are done|you're done|moving on)|(?:that|which|it|they|the \w+) (?:\S+\s?){1,3}))?\s*[.!]?$/;
+/** The object is the hand-in ("add the counts to your update", "update the task via em_swarm"). */
+const HANDIN_OBJECT =
+  /\b(?:em_swarm|em_remember|blackboard)\b|\b(?:to|in|into|on|under)\s+(?:the\s+|your\s+)?(?:task\s+)?(?:update|result|results|report|final (?:message|report|answer)|reply|summary|hand-?off)\s*[.!]?$/;
+
+function workTail(clause: string): boolean {
+  for (const m of clause.matchAll(TAIL_LEAD)) {
+    const verb = m[2] as string;
+    // After "and" a base form ("and add …"); after "by" / "after" only a gerund ("by replacing").
+    const gerund =
+      /^\w{3,}ing$/.test(verb) && !NON_WORK_GERUND.test(verb) && !NOT_GERUND.test(verb);
+    const work = (m[1] as string).endsWith("and") ? WORK_VERBS.has(verb) : gerund;
+    if (!work) continue;
+    const rest = clause.slice((m.index ?? 0) + m[0].length);
+    if (!/[\p{L}\p{N}]/u.test(rest)) continue; // no object: "and fix"
+    if (HANDIN_OBJECT.test(rest)) continue;
+    if (REPAIR_VERB.has(verb) && ROUTINE_OBJECT.test(rest)) continue;
+    return true;
+  }
+  return false;
+}
 
 function boilerplateClause(clause: string): boolean {
   const lead = clause
@@ -267,7 +322,7 @@ function boilerplateClause(clause: string): boolean {
   if (!c || c.length > CLAUSE_MAX) return false;
   if (CHECKS_ONLY.test(c)) return true;
   // A clause that opens on a code identifier ("`claim` → `claimTask` …") names code, not a step.
-  return !lead.startsWith("`") && PROTOCOL.some((re) => re.test(c)) && !WORK_TAIL.test(c);
+  return !lead.startsWith("`") && PROTOCOL.some((re) => re.test(c)) && !workTail(c);
 }
 
 /**
@@ -336,15 +391,6 @@ export function splitUnits(text: string): {
   return { units, dropped, skipped: tail.length - 1, tail };
 }
 
-/** `items` in at most `n` runs, in order: each alone when they fit, else joined runs. */
-function runsOf(items: readonly string[], n: number): string[] {
-  if (items.length <= n) return [...items];
-  const size = Math.ceil(items.length / n);
-  const out: string[] = [];
-  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size).join("\n"));
-  return out;
-}
-
 // --- scoring ---------------------------------------------------------------------------------
 
 const EPS = 1e-9;
@@ -381,11 +427,13 @@ export function scoreUnits(
     risks.push(f.risk);
     return scoreHeuristic(f, weights, catalogue);
   };
-  // The last unit of a capped brief is scored as its statements, not as the joined text: joined
-  // statements add up the way a whole text does (14 of the 35 capped real dispatch prompts went
-  // sonnet → opus that way), and a small edit among them pulls a hard one down (edit_small
-  // weighs negative). Alone while they fit in UNIT_MAX runs, so the work stays bounded.
-  const scoredParts = tail.length ? [...parts.slice(0, -1), ...runsOf(tail, UNIT_MAX)] : parts;
+  // The last unit of a capped brief is scored as its statements, each alone, not as the joined
+  // text or joined runs of it: joined statements add up the way a whole text does (14 of the 35
+  // capped real dispatch prompts went sonnet → opus that way), and a small edit among them pulls
+  // a hard one down (edit_small weighs negative: "Migrate the auth tokens to the new encrypted
+  // store." scored opus alone, sonnet in a run of renames; pre-PR review F3). The work stays
+  // bounded: statements come from the first UNIT_CHARS characters only.
+  const scoredParts = tail.length ? [...parts.slice(0, -1), ...tail] : parts;
   const sets = scoredParts.map(score);
   const win = hardest(sets, risks);
   const top = sets[win] as ScoreSet;

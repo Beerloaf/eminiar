@@ -121,7 +121,7 @@ eminiar merges four layers. A later layer overrides an earlier one.
 
 | Key | Default | Description |
 |---|---|---|
-| `manifest` | `".eminiar/docs.json"` | The documentation sources manifest |
+| `manifest` | `".eminiar/docs.json"` | The documentation sources manifest, relative to the project root (see below) |
 | `ttlHours` | `168` (7 days) | Page cache lifetime |
 | `crawl.depth` | `1` | Link depth for dependency docs |
 | `crawl.maxPages` | `8` | Pages per dependency source |
@@ -132,6 +132,24 @@ eminiar merges four layers. A later layer overrides an earlier one.
 | `discover.includeDev` | `false` | Include dev dependencies in discovery |
 | `discover.subprojects` | `true` | Scan one level of sub-projects |
 | `catalog` | `[]` | Extra catalogue entries, each with a `tier`: `service`, `infra` or `library` |
+
+`docs.manifest` must be a path inside the project: an absolute path, a drive letter, a `..`
+segment or a control character (a newline, NUL) is refused by the schema, and a project
+`eminiar.config.json` or a personal config that sets one is ignored for that key only (a stderr
+note says so; the next layer's or the default value applies, and the rest of both files stays). Because
+`em_docs add` / `remove` rewrite this file, a write is also refused when:
+
+- the path, or the folder it is in, resolves outside the project through a symlink;
+- the manifest itself is a symlink, even to a file inside the project (writes replace only a
+  regular file; reads still follow a symlink that stays inside the project);
+- it is not a manifest this version can rewrite without losing data: `version` other than `1`,
+  top-level keys other than `version` and `sources`, a `sources` that is not an array, or an
+  entry that is not valid (bad name, duplicate, unknown kind);
+- it could not be read (too large, not a regular file, not JSON, a merge conflict).
+
+The refusal names the file and the reason; fix or move the file, then retry. Hooks and other
+readers never fail on it: an unreadable or outside manifest reads as empty. Writes go to a temp
+file in the same folder that is renamed over the manifest, keeping its file mode.
 
 ### `usage`
 

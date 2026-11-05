@@ -123,7 +123,7 @@ function active(cfg: AdjudicatorConfig, input: Pick<HookInput, "client">): boole
  */
 function docsLibraries(ctx: ProjectContext): string[] | undefined {
   const names = new Set<string>();
-  for (const src of readManifestAt(manifestPath(ctx)).sources) {
+  for (const src of readManifestAt(manifestPath(ctx), ctx.root).sources) {
     names.add(src.name.toLowerCase());
     const pkg = /^(?:npm|pypi|go|crates?):(.+)$/.exec(String(src.provider ?? ""))?.[1];
     if (pkg) names.add(pkg.toLowerCase());

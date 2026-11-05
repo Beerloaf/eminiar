@@ -260,7 +260,8 @@
       "properties": {
         "manifest": {
           "default": ".eminiar/docs.json",
-          "type": "string"
+          "type": "string",
+          "pattern": "^(?![/\\\\])(?![A-Za-z]:)(?!(?:[\\s\\S]*[/\\\\])?\\.\\.[. ]*(?:[/\\\\]|$))[^\\p{Cc}]+$"
         },
         "ttlHours": {
           "default": 168,

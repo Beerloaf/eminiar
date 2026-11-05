@@ -8,6 +8,16 @@ import { paths } from "./paths.js";
 export const RoutingMode = z.enum(["off", "annotate", "enforce", "auto"]);
 export type RoutingMode = z.infer<typeof RoutingMode>;
 
+/**
+ * A relative path that stays inside the folder it is joined to: not empty, no leading `/` or
+ * `\`, no drive letter, no `..` segment (either separator), no control character (`\p{Cc}`: NUL, newline,
+ * ...). Lexical only: symlinks are checked where the path is used (src/docs/manifest.ts). The
+ * `..` lookahead reads `[\s\S]` so a line break could never hide a segment from it, and it also
+ * refuses `.. ` / `...` segments, which Windows trims to `..` (trailing dots and spaces).
+ */
+export const PROJECT_RELATIVE_PATH_RE =
+  /^(?![/\\])(?![A-Za-z]:)(?!(?:[\s\S]*[/\\])?\.\.[. ]*(?:[/\\]|$))[^\p{Cc}]+$/u;
+
 /** Field names that look like they hold a credential; only `keyEnv` (an env var NAME) is allowed. */
 const SECRET_FIELD = /(api_?key|token|secret|password)/i;
 
@@ -384,8 +394,14 @@ const BaseConfigSchema = z.object({
     .prefault({}),
   docs: z
     .object({
-      /** Project-relative manifest of documentation sources (`em_docs`); commit it. */
-      manifest: z.string().default(".eminiar/docs.json"),
+      /**
+       * Project-relative manifest of documentation sources (`em_docs`); commit it. Absolute
+       * paths and `..` segments are refused: em_docs rewrites this file.
+       */
+      manifest: z
+        .string()
+        .regex(PROJECT_RELATIVE_PATH_RE, "must be a path inside the project (no leading / or ..)")
+        .default(".eminiar/docs.json"),
       /** How long fetched documentation pages stay cached before a sync refetches them. */
       ttlHours: z
         .number()
@@ -844,6 +860,28 @@ function projectLayer(raw: Record<string, unknown>): Record<string, unknown> {
 }
 
 /**
+ * A config layer without a docs.manifest that could leave the project (absolute, `..`, not a
+ * string): em_docs rewrites that file, so a cloned repo must not aim it at ../settings.json, and a
+ * bad personal value must not cost the rest of the personal config. Only that key is dropped, so
+ * the next layer's or the default value applies and everything else stays. `source` names the
+ * file in the stderr note. The real guard stays at write time (src/docs/manifest.ts).
+ */
+function withoutUnsafeDocsManifest(
+  raw: Record<string, unknown>,
+  source: string,
+): Record<string, unknown> {
+  const docs = raw.docs;
+  if (!isPlainObject(docs) || !Object.hasOwn(docs, "manifest")) return raw;
+  const m = docs.manifest;
+  if (typeof m === "string" && PROJECT_RELATIVE_PATH_RE.test(m)) return raw;
+  process.stderr.write(
+    `eminiar: ignoring docs.manifest ${JSON.stringify(m)} in ${source}: it must be a path inside the project\n`,
+  );
+  const { manifest: _dropped, ...rest } = ownJson(docs) as Record<string, unknown>;
+  return { ...(ownJson(raw) as Record<string, unknown>), docs: rest };
+}
+
+/**
  * The personal layer: paths().configFile as it is, unless it sets adjudicator keys outside
  * PROJECT_ADJUDICATOR_KEYS from a location the project could have put there
  * (personalConfigTrusted, task #54); then it gets the project layer's cut.
@@ -851,8 +889,11 @@ function projectLayer(raw: Record<string, unknown>): Record<string, unknown> {
 function personalLayer(projectRoot: string): Record<string, unknown> {
   const file = paths().configFile;
   const raw = readJson(file);
-  if (!droppedProjectAdjudicatorKeys(raw).length) return raw;
-  return personalConfigTrusted(projectRoot, file) ? raw : projectLayer(raw);
+  const layer =
+    !droppedProjectAdjudicatorKeys(raw).length || personalConfigTrusted(projectRoot, file)
+      ? raw
+      : projectLayer(raw);
+  return withoutUnsafeDocsManifest(layer, file);
 }
 
 /**
@@ -863,7 +904,10 @@ export function loadConfig(projectRoot: string): Config {
   const merged = deepMerge(
     deepMerge(
       personalLayer(projectRoot),
-      projectLayer(readJson(join(projectRoot, "eminiar.config.json"))),
+      withoutUnsafeDocsManifest(
+        projectLayer(readJson(join(projectRoot, "eminiar.config.json"))),
+        "eminiar.config.json",
+      ),
     ),
     envOverrides(),
   );

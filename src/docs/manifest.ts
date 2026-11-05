@@ -1,4 +1,6 @@
+import { randomBytes } from "node:crypto";
 import {
+  chmodSync,
   closeSync,
   constants,
   fstatSync,
@@ -6,10 +8,13 @@ import {
   mkdirSync,
   openSync,
   readSync,
+  realpathSync,
+  renameSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import type { ProjectContext } from "../context.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 
@@ -90,8 +95,9 @@ function empty(): DocsManifest {
   return { version: 1, sources: [] };
 }
 
-function normalize(raw: unknown): DocsManifest {
-  if (!raw || typeof raw !== "object") return empty();
+/** A manifest as read, and how many `sources` entries it held that were not kept. */
+function normalize(raw: unknown): { manifest: DocsManifest; dropped: number } {
+  if (!raw || typeof raw !== "object") return { manifest: empty(), dropped: 0 };
   const sources = Array.isArray((raw as DocsManifest).sources) ? (raw as DocsManifest).sources : [];
   const out: DocSource[] = [];
   const seen = new Set<string>();
@@ -107,7 +113,25 @@ function normalize(raw: unknown): DocsManifest {
       addedAt: typeof s.addedAt === "string" ? s.addedAt : new Date(0).toISOString(),
     });
   }
-  return { version: 1, sources: out };
+  return { manifest: { version: 1, sources: out }, dropped: sources.length - out.length };
+}
+
+/**
+ * Why a write would lose part of a parsed manifest, or undefined: a version other than 1 (a
+ * newer eminiar's format), top-level keys other than version and sources, a `sources` that is
+ * not an array, or entries normalize() did not keep (bad name, duplicate, unknown kind).
+ */
+function lossyReason(raw: Record<string, unknown>, dropped: number): string | undefined {
+  if (raw.version !== 1)
+    return raw.version === undefined
+      ? "it has no version (this eminiar writes version 1)"
+      : `it has version ${JSON.stringify(raw.version)}, and this eminiar only writes version 1`;
+  const extra = Object.keys(raw).filter((k) => k !== "version" && k !== "sources");
+  if (extra.length) return `it has keys this eminiar does not know (${extra.sort().join(", ")})`;
+  if (Object.hasOwn(raw, "sources") && !Array.isArray(raw.sources))
+    return "its sources is not an array";
+  if (dropped) return `${dropped} of its sources ${dropped === 1 ? "is" : "are"} not valid entries`;
+  return undefined;
 }
 
 /**
@@ -122,6 +146,17 @@ export type ManifestProbe =
   | { state: "missing" }
   | { state: "ok"; manifest: DocsManifest }
   | { state: "refused"; reason: string };
+
+/** Options for probeManifestAt. */
+export interface ManifestProbeOptions {
+  /** The project root the manifest must stay inside, also after resolving symlinks. */
+  root?: string | undefined;
+  /**
+   * Probe for a write: a symlink is refused (even one inside the project), and so is a manifest
+   * a write would reduce (lossyReason).
+   */
+  write?: boolean | undefined;
+}
 
 /**
  * Thrown by every manifest write when a file is present but was not read: writing would replace
@@ -140,12 +175,74 @@ export class ManifestRefusedError extends Error {
   }
 }
 
+/** `child` is `parent` or below it (both already absolute and resolved the same way). */
+function within(child: string, parent: string): boolean {
+  const rel = relative(parent, child);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
+/**
+ * Why `file` is not a manifest location inside `root`, or undefined. Lexically it must be below
+ * the root; its nearest existing parent folder must resolve (realpath) inside the resolved root,
+ * so a committed `.eminiar` symlink cannot lead out; and the file itself, when it is a symlink,
+ * is refused for a write and must resolve inside the root for a read.
+ */
+function locationProblem(file: string, root: string, write: boolean): string | undefined {
+  if (file === root || !within(file, root)) return "it is outside the project";
+  let realRoot: string;
+  try {
+    realRoot = realpathSync.native(root);
+  } catch (err) {
+    return `the project root could not be resolved (${(err as NodeJS.ErrnoException).code ?? (err as Error).message})`;
+  }
+  try {
+    let dir = dirname(file);
+    // The nearest entry that exists (lstat: a dangling folder symlink stops the walk and then
+    // fails realpath below, rather than being created through).
+    while (!lstatSync(dir, { throwIfNoEntry: false }) && within(dirname(dir), root) && dir !== root)
+      dir = dirname(dir);
+    if (!within(realpathSync.native(dir), realRoot))
+      return "its folder resolves outside the project (a symlink)";
+    const lst = lstatSync(file, { throwIfNoEntry: false });
+    if (lst?.isSymbolicLink()) {
+      if (write) {
+        let dangling = false;
+        try {
+          dangling = !statSync(file, { throwIfNoEntry: false });
+        } catch {
+          // a loop or unreadable target: still a symlink, refused below
+        }
+        return dangling
+          ? "it is a symlink to a missing file"
+          : "it is a symlink, and writes replace only a regular file";
+      }
+      let target: string;
+      try {
+        target = realpathSync.native(file);
+      } catch {
+        // Dangling or a loop: probeManifestAt reports it.
+        return undefined;
+      }
+      if (!within(target, realRoot)) return "it is a symlink to a file outside the project";
+    }
+    return undefined;
+  } catch (err) {
+    return `its location could not be resolved (${(err as NodeJS.ErrnoException).code ?? (err as Error).message})`;
+  }
+}
+
 /**
  * Look at a manifest file without trusting it: a regular file of at most MANIFEST_MAX_BYTES
  * holding a JSON object is `ok`; no entry is `missing`; anything else (too large, a directory,
- * a device, a FIFO, a dangling symlink, unreadable, not JSON) is `refused`.
+ * a device, a FIFO, a dangling symlink, unreadable, not JSON) is `refused`. With `root`, a path
+ * that leaves the project (lexically or through a symlink) is `refused` too; with `write`, so are
+ * a symlink and a manifest a write would reduce (another version, unknown keys, dropped entries).
  */
-export function probeManifestAt(file: string): ManifestProbe {
+export function probeManifestAt(file: string, opts: ManifestProbeOptions = {}): ManifestProbe {
+  if (opts.root !== undefined) {
+    const problem = locationProblem(file, opts.root, opts.write === true);
+    if (problem) return { state: "refused", reason: problem };
+  }
   let fd: number | undefined;
   try {
     // statSync follows symlinks; checking first keeps a FIFO or device from ever being opened.
@@ -179,7 +276,12 @@ export function probeManifestAt(file: string): ManifestProbe {
     }
     if (!raw || typeof raw !== "object" || Array.isArray(raw))
       return { state: "refused", reason: "it is not a JSON object" };
-    return { state: "ok", manifest: normalize(raw) };
+    const { manifest, dropped } = normalize(raw);
+    if (opts.write) {
+      const lossy = lossyReason(raw as Record<string, unknown>, dropped);
+      if (lossy) return { state: "refused", reason: lossy };
+    }
+    return { state: "ok", manifest };
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     // Removed between the stat and the open: nothing is there to lose.
@@ -202,40 +304,62 @@ function tooLarge(size: number): string {
 
 /**
  * Read a manifest file; a missing, malformed or oversized file, or a path that is not a
- * regular file (a directory, a device, a FIFO, also through a symlink), reads as empty.
- * For readers only (hooks fail open): a write must use readManifestForWrite.
+ * regular file (a directory, a device, a FIFO, also through a symlink), reads as empty, and so
+ * does one outside `root` when it is given. For readers only (hooks fail open): a write must
+ * use readManifestForWrite.
  */
-export function readManifestAt(file: string): DocsManifest {
-  const p = probeManifestAt(file);
+export function readManifestAt(file: string, root?: string): DocsManifest {
+  const p = probeManifestAt(file, { root });
   return p.state === "ok" ? p.manifest : empty();
 }
 
 export function readManifest(ctx: ProjectContext): DocsManifest {
-  return readManifestAt(manifestPath(ctx));
+  return readManifestAt(manifestPath(ctx), ctx.root);
 }
 
 /**
- * Read the manifest to change it: a missing one is empty, a present one that was not read
- * throws ManifestRefusedError instead of reading as empty.
+ * Read the manifest to change it: a missing one is empty, a present one that was not read, or
+ * that a write would reduce, or one outside the project or behind a symlink, throws
+ * ManifestRefusedError instead of reading as empty.
  */
 export function readManifestForWrite(ctx: ProjectContext): DocsManifest {
   const file = manifestPath(ctx);
-  const p = probeManifestAt(file);
+  const p = probeManifestAt(file, { root: ctx.root, write: true });
   if (p.state === "refused") throw new ManifestRefusedError(file, p.reason);
   return p.state === "ok" ? p.manifest : empty();
 }
 
-/** Write the manifest; throws ManifestRefusedError rather than replace a file it could not read. */
+/**
+ * Write the manifest; throws ManifestRefusedError rather than replace a file it could not read,
+ * leave the project, or write through a symlink. The text goes to a new temp file in the same
+ * folder, renamed over the manifest, so nothing is written through whatever is at the path.
+ */
 export function writeManifest(ctx: ProjectContext, m: DocsManifest): string {
   const file = manifestPath(ctx);
-  const p = probeManifestAt(file);
+  const opts = { root: ctx.root, write: true };
+  const p = probeManifestAt(file, opts);
   if (p.state === "refused") throw new ManifestRefusedError(file, p.reason);
-  mkdirSync(dirname(file), { recursive: true });
+  const dir = dirname(file);
+  mkdirSync(dir, { recursive: true });
+  // The folders just made are real ones; check the location again in case the tree moved.
+  const again = locationProblem(file, ctx.root, true);
+  if (again) throw new ManifestRefusedError(file, again);
   const sorted = {
     version: 1 as const,
     sources: [...m.sources].sort((a, b) => a.name.localeCompare(b.name)),
   };
-  writeFileSync(file, `${JSON.stringify(sorted, null, 2)}\n`);
+  const mode = p.state === "ok" ? statSync(file, { throwIfNoEntry: false })?.mode : undefined;
+  const tmp = join(dir, `.${basename(file)}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`);
+  try {
+    // wx: fails if anything (a planted symlink included) already has the temp name.
+    writeFileSync(tmp, `${JSON.stringify(sorted, null, 2)}\n`, { flag: "wx" });
+    if (mode !== undefined) chmodSync(tmp, mode & 0o7777);
+    // rename replaces the directory entry; it never follows a symlink at `file`.
+    renameSync(tmp, file);
+  } catch (err) {
+    rmSync(tmp, { force: true });
+    throw err;
+  }
   return file;
 }
 

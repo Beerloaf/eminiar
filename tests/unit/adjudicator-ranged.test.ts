@@ -965,6 +965,8 @@ describe("onPreAgent: ranged swarm agents (#104)", () => {
       input?: Record<string, unknown>;
       env?: NodeJS.ProcessEnv;
       routing?: boolean;
+      /** The role actually dispatched, when it is not the planned one (mesh topology). */
+      agentRole?: string;
     } = {},
   ) {
     const ctx: ProjectContext = getContext(p.root);
@@ -1003,7 +1005,7 @@ describe("onPreAgent: ranged swarm agents (#104)", () => {
       role,
       scores: plan.scores ?? JSON.stringify({ role: { confidence: 0.9 } }),
     });
-    const agentType = `swarm-rng-${role}`;
+    const agentType = `swarm-rng-${opts.agentRole ?? role}`;
     const input: HookInput = {
       session_id: `S-${run.id}`,
       cwd: p.root,
@@ -1634,6 +1636,26 @@ swarms:
       // the move up costs more than the fallback: a negative saving, still credited
       expect(row.savingsUsd).toBeCloseTo(base - ran, 12);
       expect(row.savingsUsd!).toBeLessThan(0);
+    });
+
+    it("advise mode: the dispatch row's own pick wins over the plan row's when the dispatched role differs (F4)", async () => {
+      // planned for the tester (haiku..sonnet): verdict opus, pick sonnet. The coordinator dispatches
+      // the coder (haiku..opus) instead, so the Agent note names opus and the coordinator passes it.
+      const p = project();
+      const d = await dispatch(
+        p,
+        {
+          role: "tester",
+          tier: "opus",
+          scores: JSON.stringify({ role: { confidence: 0.9 }, [ADVISED_PICK_FIELD]: "sonnet" }),
+        },
+        { adjudicator: { mode: "advise" }, agentRole: "coder", input: { model: "opus" } },
+      );
+      expect(d.row).toMatchObject({ action: "advised", modelRequested: "opus" });
+      expect(d.row.parentId).not.toBeNull();
+      expect(advisedPick(d.row)).toBe("opus");
+      const { row } = settle(p, d.row, "claude-opus-4-5");
+      expect(row.action).toBe("followed");
     });
 
     it("advise mode: a pick the apply ceiling clamped is followed (#126)", async () => {

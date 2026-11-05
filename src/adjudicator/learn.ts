@@ -638,14 +638,16 @@ class Reconciler {
     // A dispatch whose advice named no model (a kept pin, FORCE, a fork: savings.ts keptModel)
     // has nothing to follow: no follow, no credit. The advice is the tier the line or note named
     // (savings.ts advisedPick: the verdict clamped to the apply bounds, and to the role's range
-    // for a ranged dispatch); a row written without it compares the raw verdict tier.
+    // for a ranged dispatch). The dispatch row's own pick comes first: it is what the Agent note
+    // named for the agent actually dispatched, whose range can differ from the planned role's; a
+    // row written without it falls back to the plan row's pick, then the raw verdict tier.
     const deferred = keptModel(row) !== undefined;
     let action = row.action ?? null;
     if (action === "advised" && row.modelRequested && !deferred) {
       const parent = row.parentId ? this.db.adjudicator.get(row.parentId) : undefined;
       const advice =
-        (parent ? advisedPick(parent) : undefined) ??
         advisedPick(row) ??
+        (parent ? advisedPick(parent) : undefined) ??
         parent?.tier ??
         row.tier ??
         undefined;

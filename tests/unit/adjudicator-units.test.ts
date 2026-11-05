@@ -160,6 +160,24 @@ describe("boilerplate", () => {
     "Run the tests and fix any failures.",
     "Run npm test and fix them.",
     "Make sure lint passes and fix any type errors.",
+    // a routine object ends the clause, or the object is the hand-in (pre-PR review F2)
+    "Run the tests and fix the failing tests.",
+    "Run the tests and fix whatever breaks.",
+    "Run npm test, and fix any failures before reporting.",
+    "Run the build and fix the type errors.",
+    "Run the linter and fix any lint errors.",
+    "Run the tests and fix the failing unit tests.",
+    "Run the tests and fix the broken tests.",
+    "Run the tests and fix any errors you find.",
+    "Run the linter and fix what it reports.",
+    "Run the build, and fix",
+    "Verify by running npm test.",
+    "Run the tests after making the change.",
+    "Verify CI is green after merging the PR.",
+    "Report the counts and add them to your update.",
+    "Report back and update the task with em_swarm.",
+    // a third-person form after "and" is a noun, not a step
+    "Return: PR number and URL, final head SHA, CI status, Copilot rounds and changes, test results, and a 3–4 line plain summary suitable for a Slack review request.",
   ])("leaves out %j", (s) => {
     expect(isBoilerplate(s)).toBe(true);
   });
@@ -190,6 +208,19 @@ describe("boilerplate", () => {
     "Check that the CI build is green on all three platforms after migrating the database layer.",
     "Report which endpoints leak personal data and patch each of them.",
     "Run the load test against the staging cluster and find the cause of the p99 latency regression.",
+    // any work verb or gerund, and an object that does not end on a routine noun (pre-PR review F2)
+    "Run the tests and fix the failing auth flow in the payment gateway",
+    "Run the build and fix the errors in the distributed transaction coordinator",
+    "Make sure the build passes on Windows by replacing the path handling across the codebase",
+    "Verify CI is green after converting the whole monorepo to ESM",
+    "Run the tests after upgrading the ORM to v5 across all services",
+    "Report which endpoints leak personal data and add authorization checks to each",
+    "Check that the build passes after splitting the monolith into packages.",
+    // free words before the routine noun name a specific object, so they are work (pre-PR review round 2)
+    "Run the build under Node 18 and fix the ESM import errors.",
+    "Run the test suite and fix the flaky concurrency failures.",
+    "Run the tests and fix the auth failures.",
+    "Run the build and fix the webpack config errors.",
   ])("keeps %j", (s) => {
     expect(isBoilerplate(s)).toBe(false);
   });
@@ -426,17 +457,35 @@ describe("scoreUnits", () => {
     expect(capped([design, ...renames]).set.complexity).toBe(whole(design).complexity);
   });
 
-  it("bounds the work on a very long tail: at most UNIT_MAX runs of it are scored", () => {
-    const filler = Array.from({ length: UNIT_MAX - 2 }, (_, i) => `Step ${i} adds a field.`);
-    const tail = [
-      "Design the new cache.",
-      ...Array.from({ length: 3 * UNIT_MAX }, (_, i) => `Item ${i} renames a flag.`),
-    ];
-    const u = unitSet(["Add the field", ...filler, ...tail].join("\n"));
-    expect(u.units.skipped).toBe(tail.length - 1);
-    expect(u.units.scored).toBeLessThanOrEqual(2 * UNIT_MAX - 1);
-    expect(u.units.winner).toBe(UNIT_MAX - 1);
-    expect(u.set.tier.choice).toBe(whole("Design the new cache.").tier.choice);
+  it("scores every statement of a very long tail alone: a hard one is never diluted (pre-PR review F3)", () => {
+    const filler = Array.from({ length: UNIT_MAX - 2 }, (_, i) => `Update f${i}.`);
+    for (const hard of [
+      "Migrate the auth tokens to the new encrypted store.",
+      "Implement retry with backoff in the HTTP client.",
+    ])
+      for (const n of [45, 80, 120, 200]) {
+        const tail = [hard, ...Array.from({ length: n }, (_, i) => `Rename x${i}.`)];
+        const text = ["Small cleanups", ...filler, ...tail].join("\n");
+        expect(text.length).toBeLessThanOrEqual(UNIT_CHARS);
+        const u = unitSet(text);
+        const alone = unitSet(`Small cleanups\n${hard}`);
+        expect(u.units).toMatchObject({
+          skipped: tail.length - 1,
+          scored: UNIT_MAX - 1 + tail.length,
+        });
+        expect(u.units.winner).toBe(UNIT_MAX - 1);
+        expect(u.set.complexity).toBe(alone.set.complexity);
+        expect(u.set.tier.choice).toBe(alone.set.tier.choice);
+      }
+  });
+
+  it("bounds the work on a tail by UNIT_CHARS: every statement scored alone, still fast", () => {
+    const tiny = Array.from({ length: 2000 }, (_, i) => `a${i}.`).join("\n");
+    const t0 = performance.now();
+    const u = unitSet(tiny);
+    expect(performance.now() - t0).toBeLessThan(500);
+    expect(u.units.scored).toBe(statements(tiny).length);
+    expect(u.units.scored).toBeLessThan(UNIT_CHARS / 3);
   });
 
   it("keeps a check-verb statement that carries the work, and its tier (review #109 F2)", () => {
@@ -446,6 +495,16 @@ describe("scoreUnits", () => {
     expect(u.units).toMatchObject({ scored: 2, dropped: 0, winner: 1 });
     expect(u.set.tier.choice).toBe("opus");
     expect(u.set.complexity).toBe(whole(work).complexity);
+    // pre-PR review F2: the tail verb need not be on a fixed list, and a qualifier after "the
+    // failing" no longer reads the object as routine
+    for (const step of [
+      "Make sure the build passes on Windows by replacing the path handling across the codebase.",
+      "Run the tests and fix the failing auth flow in the payment gateway.",
+    ]) {
+      const v = unitSet(`Windows support\n${step}`);
+      expect(v.units).toMatchObject({ scored: 2, dropped: 0, winner: 1 });
+      expect(v.set.complexity).toBe(whole(step).complexity);
+    }
   });
 
   it("never rates a brief below its hardest statement alone, whatever surrounds it", () => {

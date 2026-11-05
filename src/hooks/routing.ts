@@ -141,7 +141,8 @@ export interface SuggestExtra {
 /** Registered documentation sources (default manifest location; cheap, cached by the OS). */
 function docsSources(root: string): DocSource[] {
   try {
-    return readManifestAt(join(root, ".eminiar", "docs.json")).sources;
+    // `root` keeps a committed docs.json symlink that points outside the project unread.
+    return readManifestAt(join(root, ".eminiar", "docs.json"), root).sources;
   } catch {
     return [];
   }
