@@ -1,0 +1,10 @@
+---
+name: adjudicator/jev-blend-tuning
+kind: decision
+tags: [adjudicator, jev, typesafe, eval, tuning]
+related: [file:src/adjudicator/blend.ts, file:src/adjudicator/eval.ts, file:src/adjudicator/providers/typesafe.ts, file:docs/adjudicator.md]
+created: 2026-11-05T11:31:15.344Z
+updated: 2026-11-05T11:31:15.344Z
+---
+
+Jev blend tuning (2026-11-05, branch feature/adjudicator, jev-1.14.0): keep the default blend weights (providerMax 0.7, lowConfidence 0.55) and the current table-mix tier rule. Measured with the official CLI eval: heuristic tier 37/40, 50/60, 47/60 (134/160); Jev blended 35/40, 51/60, 57/60 (143/160). Verdict yes on both held-out sets (blind held-out-2 +16.7 pp), no on built-in (the heuristic's in-sample set). Blind set over-tier 16.7% → 1.7%, under-tier 5.0% → 3.3%; opus recall 20/20 → 18/20 (Jev calls 'review this PR for security issues and race conditions' and 'implement oauth2 PKCE login flow…' sonnet while the heuristic is 0.99 sure of opus). Method: recorded Jev's raw answers once per set through runEval with a recording provider wrapper, then replayed scoreHeuristic+blend offline (exact match to the CLI). Jev is not deterministic: 3/160 tier argmax flips and up to 0.11 prob drift between two passes, so ±1 item per set is noise. Rejected after testing on both passes: (1) sweep providerMax 0.5–0.8 × lowConfidence 0.5–0.6 — flat, best 145 vs 144; (2) damping tier alpha by heuristic confidence — no help because the heuristic is equally confident (0.93–0.94) on its wrong calls; (3) 3-way mix heuristic/Jev/complexity-derived tier — peak 148 but worst-over-neighbours only 145 and falls to 132 at lowConfidence 0.6 (overfit); (4) guard keeping a heuristic opus call at confidence ≥ 0.95 — restores opus 20/20 but 142/160, and under×2+over cost ties (23 vs 23). 9 of the 16 remaining misses are items where heuristic and Jev agree on the wrong tier (mostly small tasks labelled haiku that both call sonnet), so the ceiling for blend tuning is ~151/160. Next lever is better features/labels or a bigger eval set, not blend weights.

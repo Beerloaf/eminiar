@@ -572,14 +572,36 @@ within one step on the 0–4 scale):
 
 What this says:
 
-- The **heuristic** is the number to trust, and the blind held-out set is the honest one: about
+- The **heuristic** is the offline baseline, and the blind held-out set is the honest one: about
   78% exact tier against 45% for always guessing the most common tier. Its errors lean towards
   a larger model (16.7% over-tier against 5.0% under-tier on the blind set), as designed.
 - The **embedding** provider barely adds anything over the heuristic. The blend is equal or one
   item worse on tier, and gains or loses a few points on complexity ±1. The eval verdict was "no"
   on all three sets. Use it if you like, but expect the heuristic's results.
-- **Jev and the OpenAI-compatible providers are unmeasured.** The harness supports them, but no
-  run with a key has been recorded. Measure them on your own key before relying on them:
+- **Jev** (`typesafe`, pinned `jev-1.14.0`) was measured on 2026-11-05 with the default
+  weights. Its blend is the first provider that beats the heuristic overall:
+
+  | Set | Heuristic, tier | Jev blended, tier | Jev blended, complexity ±1 | Verdict |
+  |---|---|---|---|---|
+  | Built-in, 40 | 92.5% (37/40) | 87.5% (35/40) | 97.5% | no (−5.0 pp tier) |
+  | Held-out, 60 | 83.3% (50/60) | 85.0% (51/60) | 98.3% | yes |
+  | Held-out 2, 60 (blind) | 78.3% (47/60) | 95.0% (57/60) | 98.3% | yes (+16.7 pp tier) |
+
+  Over all 160 items that is 143 against 134. The blend removes most of the heuristic's
+  over-tiering: on the blind set, over-tier falls from 16.7% to 1.7% and under-tier goes from
+  5.0% to 3.3%. The built-in loss is on the set the heuristic was tuned on. The
+  cost is that opus recall drops from 20/20 to 18/20: Jev calls a security review and an OAuth
+  flow sonnet while the heuristic is sure of opus. Jev's answers drift a little between runs
+  (3 of 160 top choices flipped between two passes), so expect ±1 item per set. A sweep over
+  `providerMax`, `lowConfidence` and several alternative tier rules (a guard that keeps a
+  confident heuristic opus call, a 3-way mix with a complexity-derived tier) found nothing
+  that beats the defaults robustly, so the defaults stay. About half of the remaining misses
+  are items where the heuristic and Jev agree on the wrong tier. A cost of $0.02 per 1000
+  items and p50 ~340 ms per batch of 10 make it practical for plans and prompts, not for the
+  PreToolUse hot path.
+- **The OpenAI-compatible providers are unmeasured.** The harness supports them, but no run
+  with a key has been recorded. Measure them, or re-measure Jev, on your own key before relying
+  on them:
 
 ```sh
 eminiar adjudicator eval --providers typesafe            # or --provider groq, --provider ollama, …
