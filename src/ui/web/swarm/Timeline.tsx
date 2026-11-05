@@ -29,7 +29,7 @@ const dominant = (s: SwarmSegment): string => {
 };
 
 /** Two clicks: "release", then "confirm release" within a few seconds. */
-function ReleaseButton({
+export function ReleaseButton({
   agent,
   onRelease,
 }: {

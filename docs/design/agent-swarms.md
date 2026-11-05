@@ -260,6 +260,13 @@ API: `GET /api/swarm`, `GET /api/swarm/run?id=`, `GET /api/swarm/events?id=&afte
 existing loopback-origin and JSON content-type checks. The view polls every 2 s while a run
 is active and the tab is visible.
 
+The tab was later split into **Runs** (`#/swarm`, the monitor above) and **Configure**
+(`#/swarm/config`), a visual editor for the swarm file with `GET /api/swarm/config`,
+`GET /api/swarm/templates`, `POST /api/swarm/config/validate` and `POST /api/swarm/config/save`.
+Saves are project-contained, refuse symlinks, check a base hash (409 on conflict) and write
+atomically; anchors, merge keys, `x-*` keys and role hooks stay raw-YAML only. See
+[dashboard.md](../dashboard.md#configure).
+
 ## CLI
 
 `eminiar swarm init [--force] | validate | sync [--dry-run] [--force] | list | status [run] | runs | release | watch`.

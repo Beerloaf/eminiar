@@ -8,6 +8,7 @@ import type {
   SwarmTopology,
   SwarmWorkerStatus,
 } from "../api.js";
+import type { Tone } from "../ds.js";
 
 /**
  * Glyph + word for every state: colour is never the only cue.
@@ -35,6 +36,20 @@ export type StateWord =
 
 /** CSS class of a state (colour) — always rendered next to its glyph and word. */
 export const stateClass = (s: StateWord): string => `sw-s-${s}`;
+
+/** Design-system tone of a state (ds Badge / Pill / Card), matching the sw-s-* colours. */
+export const STATE_TONE: Record<StateWord, Tone> = {
+  pending: "muted",
+  idle: "muted",
+  running: "accent",
+  active: "accent",
+  blocked: "warn",
+  done: "ok",
+  failed: "bad",
+  cancelled: "muted",
+  stale: "warn",
+  coordinator: "purple",
+};
 
 export const TOPOLOGY_GLYPH: Record<SwarmTopology, string> = {
   hierarchical: "⋔",

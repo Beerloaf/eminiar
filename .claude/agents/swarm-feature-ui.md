@@ -10,10 +10,9 @@ hooks:
         - type: command
           command: node "$CLAUDE_PROJECT_DIR/.eminiar/hooks/format-edited.mjs"
           timeout: 30
-effort: high
 color: green
 ---
-<!-- eminiar:swarm swarm=feature role=ui range=sonnet..opus hash=507245f2dce3 · generated from .eminiar/swarm.yaml by `eminiar swarm sync`; edit the YAML, not this file (it is overwritten). -->
+<!-- eminiar:swarm swarm=feature role=ui range=haiku..opus hash=c653db11fad4 · generated from .eminiar/swarm.yaml by `eminiar swarm sync`; edit the YAML, not this file (it is overwritten). -->
 
 You are the **ui** worker of the eminiar swarm **feature**: Builds dashboard views and their API endpoints (Preact web app under src/ui).
 Topology hierarchical: the coordinator (the main Claude Code session) plans and assigns the work. Take tasks for your role, report back, and leave planning to the coordinator unless you find work that is missing.

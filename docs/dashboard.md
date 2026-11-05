@@ -150,21 +150,35 @@ Claude Code subagents from `.eminiar/swarm.yaml`. Every state is written as a gl
 so colour is never the only cue: ○ pending or idle, ● running or active, ◆ blocked, ✓ done,
 ✗ failed, ◌ stale (running but silent for 30 minutes), ★ the coordinator (your main session).
 
-- **Left rail.** The configured swarms: topology, description, and role chips in a colour per
-  role. Each chip shows the state of its generated agent file (in sync, missing, stale, or a
-  conflict with a hand-written file of the same name). Validation errors are listed with their
-  line numbers. **Sync agent files** rewrites `.claude/agents/swarm-*.md`. Below that are the
-  runs, each with its status, goal, age and task progress. Click a run to open it
-  (`#/swarm?run=<id>`). With no run selected, the newest active run opens.
-- **Stat tiles.** Workers running (out of `max_agents`), tasks done out of total, tool calls,
-  errors and elapsed time.
-- **Topology canvas.** The coordinator hub with one node per worker, showing role, short agent
-  id, status and task. Hierarchical swarms draw as a tree from the hub, mesh as a ring with peer
+The tab has two pages, switched in the sub-nav at the top. **Runs** (`#/swarm`) is the live
+monitor described below. **Configure** (`#/swarm/config`) is the [configuration studio](#configure),
+a visual editor for `.eminiar/swarm.yaml`. On Configure, the sub-nav shows a count of the swarm
+file's issues. Beside the sub-nav sit the file path and a file-state badge: not opted in, file
+invalid, disabled, agent files out of date, or enabled and in sync. The state is re-read every
+15 seconds.
+
+- **Run header.** A band with the run's goal, a state pill, the swarm and its topology, and a
+  **Finish run** button while the run is active. Two rings show tasks done (as a percentage) and
+  workers running against the `max_agents` limit. A stat row follows: a task bar (done, active,
+  and failed or blocked), tool calls with a per-minute sparkline, the error rate (the share of
+  tool calls that failed), and a live elapsed counter. The finish form closes an active run as
+  done, failed or cancelled, with an optional summary. It can also write the outcome as a project
+  memory.
+- **Topology.** The coordinator hub with one node per worker, showing role, short agent id,
+  status and task. Hierarchical swarms draw as a tree from the hub, mesh as a ring with peer
   links, and pipeline as left-to-right stage lanes. A role with no worker yet shows as an idle
-  ghost node. Motion means data. A running worker pulses. Each tool call flashes its node: blue
-  for reads, amber for writes, purple for commands. An edge lights up for ten seconds after a
-  claim, post or report. Click a worker to filter the activity feed to it. With
-  `prefers-reduced-motion`, the pulses and flashes are drawn as static rings.
+  ghost node. Motion means data. A running worker glows. Each tool call flashes its node: blue
+  for reads, amber for writes, purple for commands. A comet travels along an edge for ten seconds
+  after a claim, post or report. Click a worker to open it and filter the activity feed to it.
+  With `prefers-reduced-motion`, the glow, comets and flashes are drawn as static rings. The
+  topology and the Workers panel are stacked, and sit side by side only when the area is at least
+  1500 px wide.
+- **Workers.** One card per worker with its task, last tool, call and error counts and a
+  heartbeat (time since its last event). A running worker silent for a while gets a **quiet**
+  badge, and a stale one also gets **Release**, which returns its task to pending. Finished
+  workers are folded after the newest few. Click a card to open a drawer with the role's model
+  or model range, tools and scope, the tasks the worker held, its spawn prompt, and its last 50
+  events.
 - **Task board.** Pending, active, done, and failed or blocked columns. Each card shows the
   task id, role, holder, file count and dependencies. Hovering a card shows the result. A card
   closed from a worker's final message, because the worker never reported, carries an
@@ -176,16 +190,22 @@ so colour is never the only cue: ○ pending or idle, ● running or active, ◆
   per kind. You can filter by role or kind (tool calls, tasks, blackboard, workers, run, errors).
 - **Blackboard.** The shared notes with key, author, version and age. Click a note to read its
   value.
-- **Finish run.** An inline form closes an active run as done, failed or cancelled, with an
-  optional summary. It can also write the outcome as a project memory.
+- **Left rail.** A **Swarms** card lists the configured swarms: topology, role count, slots
+  against `max_agents`, and role chips in a colour per role. A badge shows how many agent files
+  need a sync. Click a swarm, or the **Configure** link, to edit it. **Sync agent files**
+  rewrites `.claude/agents/swarm-*.md`. Below the card are the runs, each with its status, goal,
+  age and task progress, filtered by all, active, done or failed (which includes cancelled). Click
+  a run to open it (`#/swarm?run=<id>`). With no run selected, the newest active run opens.
 
 While a run is active and the tab is visible, new events are polled every 2 seconds and the
 snapshot every 5. Otherwise the run list refreshes every 15 seconds.
 
-Without a swarm file, the tab explains the feature. It shows the starter file read-only, with a
-**Create .eminiar/swarm.yaml** button, and the commands `eminiar swarm init` and
-`/eminiar:em-swarm <swarm> <goal>`. An invalid file shows its errors. A file with
-`enabled: false` is shown read-only.
+With no runs yet, the page says so and shows the command to start one
+(`/eminiar:em-swarm <swarm> <goal>`) with a preview of each swarm. Without a swarm file, the
+tab explains the feature, shows the starter file read-only, and offers a **Create
+.eminiar/swarm.yaml** button and the command `eminiar swarm init`. An invalid file lists its
+errors with their line numbers and a Configure link. A file with `enabled: false` shows "Swarms
+are disabled", because the hooks ignore the swarms until it is switched back on.
 
 API (JSON, loopback only):
 
@@ -196,9 +216,81 @@ API (JSON, loopback only):
 | `GET /api/swarm/events?id=&after=` | up to 200 events after an event id, oldest first |
 | `POST /api/swarm/init` | writes the starter file if none exists (409 otherwise) and syncs the agent files |
 | `POST /api/swarm/sync` | syncs the agent files with the swarm file |
+| `POST /api/swarm/release` | `{id, agent}`, returning a stale worker's task to pending |
 | `POST /api/swarm/finish` | `{id, status: done\|failed\|cancelled, summary?, remember?}`, closing the run as the coordinator |
 
 Run ids look like `20261028-a1b2c3`. Anything else is a 400, and an unknown run is a 404.
+
+#### Configure
+
+`#/swarm/config` edits the swarm file without hand-writing YAML. Deep-link parameters:
+`?swarm=<name>` picks a swarm, `&role=<name>` opens that role's drawer, and `&tab=settings`
+shows the file-level settings.
+
+- **Swarm editor.** Description, topology (a picker with a small preview), `max_agents`, stages
+  and instructions, with a live topology preview that warns when the roles' counts exceed
+  `max_agents`.
+- **Role cards and drawer.** Each role is a card. Its drawer edits the description, prompt,
+  tools, disallowed tools, skills, count, isolation, turn limit, effort, colour, scope, memory
+  tags, context and model policy.
+- **Model policy.** Each role is in one of three states. *Default* inherits the file's
+  `defaults.model_range`. *Pin* gives the role one fixed `model`, so the adjudicator never
+  changes it. *Range* sets the role's own floor and ceiling, and the adjudicator picks a model
+  inside that range per task. The control rejects a fallback model outside the range.
+- **Settings.** The file-level `enabled`, `sync`, `enforce`, `allowed_agents` and `defaults`.
+  Turning on `enforce` or `enabled: false` asks for confirmation first.
+- **Templates.** **＋ New swarm** opens a gallery (feature, review, research, bugfix, docs,
+  blank). With no file yet, an onboarding page offers **Start from the annotated starter**.
+- **Raw YAML.** **Raw YAML** switches to a text editor, and **Show YAML** / **Hide YAML** shows
+  the rendered file beside the form. Fields the form cannot edit safely (YAML anchors and
+  aliases, merge keys, `x-*` keys and every role's `hooks`) are read-only with an **Edit in
+  YAML** link.
+- **Save.** Changes are validated by the server as you type (after a 350 ms pause). **Save**
+  writes the file, **Save & sync** also rewrites `.claude/agents/swarm-*.md` (it reads **Sync
+  agent files** when nothing is dirty but the agent files are out of date), and **Revert**
+  drops the draft. Leaving with unsaved changes prompts. If the file changed on disk meanwhile,
+  a banner offers **Reload from disk** or **Keep mine**, which rebases your draft onto the
+  current file.
+- **Warnings.** Saving is allowed but warns when a rename or removal touches a role that an
+  active run uses, or when roles exceed `max_agents`.
+
+Config API:
+
+| Route | Returns |
+|---|---|
+| `GET /api/swarm/config` | state, file path, text and hash, parsed document, issues, warnings, locked paths, active runs, and the editor's choices and limits |
+| `GET /api/swarm/templates` | the starter templates with their roles and models |
+| `POST /api/swarm/config/validate` | `{doc\|text, renames?, baseHash}`: the rendered text, issues, warnings and changed lines. Never writes |
+| `POST /api/swarm/config/save` | `{doc\|text, renames?, baseHash, sync?}`: writes the file and returns the new hash, text and the sync result |
+
+Send exactly one of `doc` and `text`. `baseHash` is the SHA-256 of the file you started from,
+or `null` to create it. Status codes:
+
+| Status | Meaning |
+|---|---|
+| 400 | the body or the resulting file is invalid; `issues` lists each problem with its path |
+| 403 | the target location is refused (outside the project, or a symlink) |
+| 405 | the method is not allowed for the route |
+| 409 | the file changed on disk since `baseHash`, or you tried to create over an existing file; `current` holds the on-disk text and hash |
+| 422 | the edit touches a locked path, or the existing YAML does not parse in structured mode (use raw mode) |
+
+Write safety: the server writes only `.eminiar/swarm.yaml`, never a path from the client. The
+path must stay inside the project, with no symlink in the way. The file is re-read and compared
+with `baseHash` right before the write, then replaced atomically through a temp file and
+rename. The rendered text must pass the same validation as `eminiar swarm`, and `enforce` must
+read the same to the hook.
+
+The first structural save re-serialises the file. Comment text survives, but trailing comments
+can be re-aligned or move onto their own line, and comments on items inside a list that is
+replaced are lost. Editing a single scalar changes only that line.
+
+#### Design-system components
+
+The dashboard's shared building blocks live in `src/ui/web/ds.tsx`: `Hero`, `Stat` and
+`StatRow`, `Badge`, `Pill`, `Card`, `Gauge`, `Sparkline`, `SegBar`, `ColumnChart`, `Skeleton`,
+`Segmented`, `Drawer`, `Field`, `Stepper`, `ChipInput`, `Switch` and `EmptyState`. The Overview,
+Runs and Configure views use them, so tones, spacing and the glyph-plus-word state cues stay
+the same everywhere.
 
 ### Adjudicator
 

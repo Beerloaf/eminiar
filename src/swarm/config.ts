@@ -229,6 +229,8 @@ const RawFile = z.looseObject({
   swarms: z.record(z.string(), RawSwarm),
 });
 type RawFile = z.infer<typeof RawFile>;
+/** The file as a user may write it; edit.ts checks its draft type (doc-types.ts) against this. */
+export type SwarmFileRaw = z.input<typeof RawFile>;
 
 // --- helpers ----------------------------------------------------------------------------
 
