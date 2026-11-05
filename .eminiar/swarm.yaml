@@ -43,6 +43,7 @@ swarms:
       researcher:
         description: Investigates external options (providers, local model runtimes, APIs, latency/cost) and reports findings with sources.
         model: sonnet
+        model_range: { floor: haiku }    # sonnet fallback; adjudicator may drop to haiku
         effort: high
         color: cyan
         disallowed_tools: [Edit, Write, NotebookEdit]
@@ -77,6 +78,7 @@ swarms:
       coder:
         description: Implements one backend/CLI/hook task at a time with the smallest diff that works.
         model: opus
+        model_range: { floor: sonnet }   # opus fallback; adjudicator may drop to sonnet
         effort: high
         count: 4                 # at most four coders at once
         color: blue
@@ -99,6 +101,7 @@ swarms:
       ui:
         description: Builds dashboard views and their API endpoints (Preact web app under src/ui).
         model: opus
+        model_range: { floor: sonnet }   # opus fallback; adjudicator may drop to sonnet
         effort: high
         color: green
         scope: ["src/ui/**", "docs/dashboard.md"]
@@ -118,6 +121,7 @@ swarms:
       tester:
         description: Writes and runs tests that pin the new behaviour, its edge cases and failure paths.
         model: sonnet
+        model_range: { floor: haiku }    # sonnet fallback; adjudicator may drop to haiku
         effort: high
         count: 2
         color: yellow
