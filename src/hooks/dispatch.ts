@@ -1,16 +1,60 @@
 import { getContext } from "../context.js";
 import { failedText, rawEnforced, swarmGate } from "../swarm/hooks.js";
+import { budgetFor, clearBudget, startBudget } from "./budget.js";
 import { cursorDir, detectClient, fromCursor, toCursor } from "./cursor.js";
 import { handlers } from "./index.js";
 import { hookLog } from "./log.js";
-import type { HookInput, HookOutput } from "./types.js";
+import type { HookHandler, HookInput, HookOutput } from "./types.js";
+
+/** Set when the last `dispatch` answered at its deadline with the handler still running. */
+let late = false;
+
+/** Did the last `dispatch` give up on its handler? The process should then exit, not wait. */
+export function ranLate(): boolean {
+  return late;
+}
+
+/**
+ * Run a handler against the run's budget. A handler that has not answered by then loses:
+ * `timedOut` is set and the caller answers without it. The handler keeps running in the
+ * background; only a process exit ends it (src/hook.ts does that when `ranLate()`).
+ */
+async function runWithin(
+  handler: HookHandler,
+  input: HookInput,
+  ms: number,
+): Promise<{ out: HookOutput | undefined; timedOut: boolean }> {
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<"late">((resolve) => {
+    timer = setTimeout(() => resolve("late"), ms);
+  });
+  try {
+    const r = await Promise.race([handler(input), deadline]);
+    if (r === "late") {
+      late = true;
+      return { out: undefined, timedOut: true };
+    }
+    return { out: r, timedOut: false };
+  } finally {
+    clearTimeout(timer);
+    // A late handler keeps running: its budget stays spent, so it skips what is optional.
+    if (!late) clearBudget();
+  }
+}
 
 /**
  * One hook payload in, one JSON document out. The client dialect (Claude Code or Cursor)
  * is taken from `--client <name>` or detected from the payload. A hook must never block
- * the model: every failure path still returns a well-formed, permissive answer.
+ * the model: every failure path still returns a well-formed, permissive answer, and a run
+ * that outlasts its budget (src/hooks/budget.ts) is answered without the handler, before
+ * Claude Code's own timeout would discard the answer.
  */
-export async function dispatch(raw: string, argv: string[]): Promise<string> {
+export async function dispatch(
+  raw: string,
+  argv: string[],
+  opts: { budgetMs?: number } = {},
+): Promise<string> {
+  late = false;
   let parsed: Record<string, unknown>;
   try {
     parsed = raw.trim() ? (JSON.parse(raw) as Record<string, unknown>) : {};
@@ -23,14 +67,21 @@ export async function dispatch(raw: string, argv: string[]): Promise<string> {
   if (forced !== -1 && argv[forced + 1]) parsed.hook_event_name = argv[forced + 1];
   if (argv.includes("--selftest")) return JSON.stringify({ systemMessage: "eminiar hook ok" });
 
-  if (detectClient(parsed, argv) === "cursor") return runCursor(parsed);
+  if (detectClient(parsed, argv) === "cursor") return runCursor(parsed, opts.budgetMs);
 
   const input = parsed as unknown as HookInput;
   const handler = handlers[input.hook_event_name];
   if (!handler) return "{}";
+  const ms = opts.budgetMs ?? budgetFor(input.hook_event_name);
+  startBudget(ms);
   try {
-    const out = await handler(input);
-    return JSON.stringify(out ?? {});
+    const r = await runWithin(handler, input, ms);
+    if (r.timedOut) {
+      const err = new Error(`hook budget of ${ms} ms exceeded`);
+      hookLog("error", `${input.hook_event_name}: ${err.message}; answered without it`);
+      return failClosed(input, err) ?? "{}";
+    }
+    return JSON.stringify(r.out ?? {});
   } catch (err) {
     hookLog("error", `${input.hook_event_name}: ${(err as Error).stack ?? String(err)}`);
     return failClosed(input, err) ?? "{}";
@@ -74,14 +125,18 @@ function failClosed(input: HookInput, err: unknown): string | undefined {
   }
 }
 
-async function runCursor(parsed: Record<string, unknown>): Promise<string> {
+async function runCursor(parsed: Record<string, unknown>, budgetMs?: number): Promise<string> {
   const input = fromCursor(parsed);
   const event = input.hook_event_name;
   let out: HookOutput | undefined;
   const handler = handlers[event];
   if (handler) {
+    const ms = budgetMs ?? budgetFor(event);
+    startBudget(ms);
     try {
-      out = await handler(input);
+      const r = await runWithin(handler, input, ms);
+      if (r.timedOut) hookLog("error", `cursor ${event}: hook budget of ${ms} ms exceeded`);
+      out = r.out;
     } catch (err) {
       hookLog("error", `cursor ${event}: ${(err as Error).stack ?? String(err)}`);
     }

@@ -21,8 +21,13 @@ import {
 } from "../swarm/hooks.js";
 import { budgetWarnings } from "../usage/brief.js";
 import { ingestSession, ingestTranscript, usageEnabled } from "../usage/ingest.js";
+import { hasBudget } from "./budget.js";
 import { hookLog } from "./log.js";
 import type { HookHandler, HookInput } from "./types.js";
+
+/** What a stage of the prompt hook needs left of the run's budget to be worth starting. */
+const RECALL_NEEDS_MS = 600;
+const ADJUDICATOR_NEEDS_MS = 1500;
 
 /** Categories worth finding again with em_recall / em_search (source "session"). */
 const INDEXED = new Set([
@@ -106,15 +111,29 @@ export function ingestUsage(db: StorageAdapter, input: HookInput, sessionId: str
 
 export const userPromptSubmit: HookHandler = async (input) => {
   if (!input.prompt?.trim()) return undefined;
-  const { db, sessionId } = open(input);
-  db.sessionUpsert({ id: sessionId, last_prompt: clip(input.prompt, 600) });
-  persist(db, sessionId, withPriority(sessionId, classifyPrompt(input.prompt)));
+  const ctx = getContext(input.cwd);
+  const db = getStorage(ctx, { vectors: false });
+  const sessionId = input.session_id || "unknown";
+  // The session row and the prompt's events are bookkeeping: a database another process holds
+  // locked must not cost the prompt its recall. A reader is not blocked by a writer, so the
+  // reads below still run; the first locked write ends this block, since the next would only
+  // wait for the same lock again (src/hooks/budget.ts).
+  try {
+    db.sessionUpsert({
+      id: sessionId,
+      project_root: ctx.root,
+      transcript_path: input.transcript_path,
+      last_prompt: clip(input.prompt, 600),
+    });
+    persist(db, sessionId, withPriority(sessionId, classifyPrompt(input.prompt)));
+  } catch (err) {
+    hookLog("info", `UserPromptSubmit: prompt not recorded: ${(err as Error).message}`);
+  }
   // Hand Claude the memories and doc pages this prompt touches, so it does not have
   // to remember to ask em_recall / em_docs first.
-  const ctx = getContext(input.cwd);
   const { recall } = ctx.config;
   const parts: string[] = [];
-  if (recall.onPrompt) {
+  if (recall.onPrompt && hasBudget(RECALL_NEEDS_MS)) {
     try {
       const r = await recallForText(db, input.prompt, {
         maxMemories: recall.maxMemories,
@@ -124,17 +143,27 @@ export const userPromptSubmit: HookHandler = async (input) => {
         trace: true,
         path: "prompt",
       });
-      // Quiet decisions are recorded too: the hit rate is only measurable with both sides.
-      recordShown(db, sessionId, r.keys, { path: "prompt", trace: r.trace });
       if (r.text) parts.push(r.text);
+      // Quiet decisions are recorded too: the hit rate is only measurable with both sides.
+      // A statistic, written after the recall is in hand: a locked database loses the count,
+      // not the answer.
+      try {
+        recordShown(db, sessionId, r.keys, { path: "prompt", trace: r.trace });
+      } catch {
+        // statistics only
+      }
     } catch {
       // recall is best effort; never block a prompt on it
     }
   }
   // The adjudicator (off by default; loaded only when enabled): one advice line for Claude
-  // and, now and then, a main-session note for the user.
+  // and, now and then, a main-session note for the user. Skipped when the run is already late.
   let systemMessage: string | undefined;
-  if (ctx.config.adjudicator.enabled && input.client !== "cursor") {
+  if (
+    ctx.config.adjudicator.enabled &&
+    input.client !== "cursor" &&
+    hasBudget(ADJUDICATOR_NEEDS_MS)
+  ) {
     try {
       const { onPrompt } = await import("../adjudicator/hooks.js");
       const a = await onPrompt(ctx, db, input, sessionId);

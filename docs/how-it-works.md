@@ -59,6 +59,19 @@ equivalents are [below](#cursor)):
 Hooks are fast by design. They never run `git log` and never load the embedding model. Recall
 is a few FTS queries against the project database.
 
+Claude Code discards the output of a hook that outlasts its `timeout` in `hooks/hooks.json`, so
+every run also has a time budget below that timeout (3.5 s for the 5 s hooks, 8 s for
+`SessionStart`, `PostToolUse` and `SubagentStart`, 12 s for `PreCompact`). Two limits enforce it:
+
+- **Short lock wait.** Many processes share one project database (the main session, every
+  swarm worker, the indexer). A hook waits at most 250 ms for another process's write lock,
+  where the CLI and servers wait 2 s, because a handler's waits add up statement by statement.
+  A locked database costs the prompt hook its bookkeeping (the session row, the event log, the
+  recall statistics) and nothing else: readers are not blocked by a writer, so recall still runs.
+- **Deadline.** A run that has not answered by its budget answers `{}` (a denied swarm dispatch
+  stays denied when `enforce` is on) and the process exits. The prompt hook skips recall and the
+  adjudicator when too little budget is left for them.
+
 ### Agent swarms
 
 Swarms are opt-in: without `.eminiar/swarm.yaml` every swarm path below returns after one
