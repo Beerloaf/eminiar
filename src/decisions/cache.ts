@@ -11,11 +11,13 @@ export function questionHash(q: DecisionQuestionSpec): string {
 }
 
 /**
- * sha256 over feature | provider | model | questionVersion | question | context | item id | item text.
+ * sha256 over feature | mode | provider | model | questionVersion | question | context | item id | item text.
  * Context and item text are the REDACTED strings that would be sent, hashed, never stored.
  */
 export function decisionCacheKey(o: {
   feature: DecisionFeature;
+  /** Shadow and live never share an answer: a shadow answer must not act the moment it flips. */
+  mode: "shadow" | "live";
   provider: string;
   model: string;
   questionVersion: number;
@@ -28,6 +30,7 @@ export function decisionCacheKey(o: {
     .update(
       [
         o.feature,
+        o.mode,
         o.provider,
         o.model,
         String(o.questionVersion),

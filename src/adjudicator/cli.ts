@@ -232,20 +232,28 @@ const tilde = (p: string) => {
   return h && p.startsWith(h) ? `~${p.slice(h.length)}` : p;
 };
 
-/** Which layer decides `enabled`: env > project > global > default. */
+function enabledIn(file: string): boolean | undefined {
+  try {
+    const a = readRaw(file).adjudicator;
+    return isObj(a) && typeof a.enabled === "boolean" ? a.enabled : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Which layer decides `enabled`. A personal `false` wins for anything that can send text (it beats
+ * a project `true` and EMINIAR_ADJUDICATOR=1); only EMINIAR_ADJUDICATOR=0 is stronger or equal.
+ * Otherwise env > project > personal > default.
+ */
 export function enabledSource(root: string, env: NodeJS.ProcessEnv): string {
   const e = env.EMINIAR_ADJUDICATOR;
-  if (e === "0" || e === "1") return `env EMINIAR_ADJUDICATOR=${e}`;
-  const enabledIn = (file: string) => {
-    try {
-      const a = readRaw(file).adjudicator;
-      return isObj(a) && typeof a.enabled === "boolean";
-    } catch {
-      return false;
-    }
-  };
-  if (enabledIn(projectFile(root))) return "project eminiar.config.json";
-  if (enabledIn(paths().configFile)) return `global ${tilde(paths().configFile)}`;
+  if (e === "0") return "env EMINIAR_ADJUDICATOR=0";
+  const personal = enabledIn(paths().configFile);
+  if (personal === false) return `personal ${tilde(paths().configFile)} (enabled: false wins)`;
+  if (e === "1") return "env EMINIAR_ADJUDICATOR=1";
+  if (enabledIn(projectFile(root)) !== undefined) return "project eminiar.config.json";
+  if (personal !== undefined) return `global ${tilde(paths().configFile)}`;
   return "default";
 }
 
@@ -1453,6 +1461,10 @@ export async function adjudicatorCommand(
       if (values.project) {
         writeAdjudicatorPatch(projectFile(ctx.root), { enabled: true });
         io.out(`Wrote adjudicator.enabled: true to ${projectFile(ctx.root)} (commit it to share).`);
+        if (enabledIn(paths().configFile) === false)
+          io.out(
+            `It stays off for you: ${tilde(paths().configFile)} sets adjudicator.enabled: false, and a personal off wins over the project file for anything that sends text. Run \`eminiar adjudicator enable\` without --project to turn it on for yourself.`,
+          );
         const { enabled: _e, ...personal } = patch;
         if (Object.keys(personal).length) writeAdjudicatorPatch(paths().configFile, personal);
       } else writeAdjudicatorPatch(paths().configFile, patch);

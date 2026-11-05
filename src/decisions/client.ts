@@ -108,6 +108,7 @@ export function createDecisionClient(
   ) =>
     decisionCacheKey({
       feature,
+      mode: mode(),
       provider: providerId(),
       model: modelId(),
       questionVersion: input.questionVersion ?? 1,
@@ -259,6 +260,10 @@ export function createDecisionClient(
         const apply =
           !input.fillOnly &&
           mode() === "live" &&
+          // A partial batch (some items unanswered) never acts: the baseline stands for all of it.
+          // Every feature is batch-wise (a reordered list, a guide, a discovery set), so none is
+          // itemwise-safe; the answered items are still cached and recorded.
+          st !== "partial" &&
           DECISION_USABLE.includes(st) &&
           (decision?.changed ?? 0) > 0;
         const row: RowExtras = {

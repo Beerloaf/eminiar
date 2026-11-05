@@ -13,6 +13,14 @@ eminiar merges four layers. A later layer overrides an earlier one.
 | 3 | `<project>/eminiar.config.json` | Team settings. **Commit this file** |
 | 4 | `EMINIAR_*` environment variables | One-off overrides |
 
+One exception to "later wins": for anything that can send text, a **personal `false` wins**.
+`adjudicator.enabled: false` in `~/.eminiar/config.json` beats a project `enabled: true` and
+`EMINIAR_ADJUDICATOR=1`; personal `surfaces.<x>: false` beats a project `true`; personal
+`promptMode: "heuristic"` beats the project's `async`/`blocking`; a project `minPromptChars` below the
+personal one is raised to it. A project `false` or `EMINIAR_ADJUDICATOR=0` still turns it off, and a
+silent personal file lets a project turn it on. `eminiar adjudicator status` and `enable` name the
+deciding layer. See [Adjudicator](adjudicator.md#turn-it-on).
+
 `eminiar.config.schema.json` is the JSON Schema for every key. The file written by
 `eminiar install --team` already points to it, so your editor completes and checks the keys:
 
@@ -237,13 +245,13 @@ only:
 | `privacy.captureExchanges` | `false` | Keep the newest 100 requests sent to TypeSafe Jev and its answers, with timing, for the dashboard. They contain redacted prompt text, at most 65,536 characters per request or answer. Personal `~/.eminiar/config.json` only: `eminiar.config.json` cannot set it. See [Jev request capture](adjudicator.md#jev-request-capture) |
 | `features.<name>` | all off | One object per decision feature, `<name>` being `recall`, `memory`, `commit`, `compaction`, `swarm` or `docs`; `true`/`false` is shorthand for `{"enabled": …}`. Personal config only. Manage with `eminiar adjudicator features`. See [Features](adjudicator.md#features) |
 | `features.<name>.enabled` | `false` | Turn the feature on. It also needs the adjudicator on with a provider other than the heuristic, and for a remote provider the feature's data-class consent |
-| `features.<name>.shadow` | `true` | Record verdicts without acting on them. `false` lets the feature act |
+| `features.<name>.shadow` | `true` | Record verdicts without acting on them (the provider is still called, so a waiting surface can add up to its `mcpMs`/`bgMs` budget of latency). `false` lets the feature act; shadow answers are cached apart from live ones, so a flip never applies an old shadow answer |
 | `features.<name>.maxCallsPerDay` | per feature (recall 500, memory 100, commit 100, compaction 50, swarm 300, docs 20) | Daily call cap for this feature |
 | `features.<name>.maxChars` | per feature (recall 600, memory 1500, commit 4000, compaction 400, swarm 600) | Characters of redacted text per item sent to the provider. `docs` sends names only |
 | `features.recall` | `dropBelow` 0.25, `mcpMs` 1200, `jobMs` 2500 | Verdicts below `dropBelow` drop a recalled memory or doc page; deadlines for `em_recall` and the background job |
 | `features.memory` | `minProb` 0.6, `k` 5, `mcpMs` 1500 | Nearest memories compared on `em_remember`; the probability a duplicate or supersede note needs |
 | `features.commit` | `minProb` 0.7, `jobMs` 4000, `exclude` (globs) | Probability a pre-commit note needs; files matching `exclude` (lockfiles, secrets, binaries) are never sent |
-| `features.compaction` | `output` false, `minKeep` 0.3, `jobMs` 4000, `mcpMs` 800 | `output: true` also triages `em_execute` output sections; sections scored below `minKeep` go first |
+| `features.compaction` | `output` false, `minKeep` 0.3, `jobMs` 4000, `mcpMs` 800 | `output: true` also triages `em_execute` output sections; sections scored below `minKeep` are left out of the rewritten guide (and of the triaged output), not merely moved to the end; with an uncalibrated provider only the order changes |
 | `features.swarm` | `flagAbove` 0.7, `bgMs` 3000 | Probability a stalled, looping or needs-human flag needs |
 | `features.docs` | `minScore` 0.5, `mcpMs` 3000 | Dependencies scoring below this are not recommended by `em_docs discover` |
 | `featureConsent` | `[]` | `"<class>@<origin>"` lines (`memory`, `diffs`, `session`, `swarm`, `packages`) written by `features on` after you agree. Personal config only; at most 32 |

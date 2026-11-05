@@ -104,7 +104,9 @@ Hooks pick up the change on the next prompt. The `em_adjudicate` tool is registe
 server starts, so run **`/mcp reconnect`** (or restart Claude Code) after enabling or disabling.
 
 `enable --project` writes only `adjudicator.enabled: true` to the committed
-`eminiar.config.json`. The provider, the keys and the consent stay personal, in
+`eminiar.config.json`. A personal `enabled: false` in `~/.eminiar/config.json` wins over it (see
+below): the command says so and the adjudicator stays off for you until you run `enable` without
+`--project`. The provider, the keys and the consent stay personal, in
 `~/.eminiar/config.json` and `~/.eminiar/adjudicator.key`.
 
 A project file comes with every clone of the repo, so eminiar trusts it only for settings that
@@ -116,7 +118,12 @@ cannot send your text or keys anywhere. In `eminiar.config.json` the adjudicator
 `~/.eminiar/config.json` and the `EMINIAR_ADJUDICATOR*` variables. `eminiar doctor` (check
 "adjudicator project config"), `adjudicator status` (a `warning:` line, `projectIgnored` in
 `--json`) and the dashboard overview name any key a project file sets that was ignored, even
-while the adjudicator is off. A repo that turns the adjudicator on for someone with no personal
+while the adjudicator is off. **A personal "off" wins** for anything that can send text: your
+`adjudicator.enabled: false` beats a project `enabled: true` and `EMINIAR_ADJUDICATOR=1` (a repo's
+`.claude/settings.json` can set that variable); `surfaces.<x>: false` beats a project `true`;
+personal `promptMode: heuristic` beats `async`/`blocking`; a project `minPromptChars` below yours is
+raised to yours. `EMINIAR_ADJUDICATOR=0` and a project `false` still turn it off. `status` and
+`enable` name the layer that decides. A repo that turns the adjudicator on for someone with no personal
 setup gets the heuristic, which never leaves the machine. Keys named `__proto__`,
 `constructor` or `prototype` are dropped from every config file at any depth, so they cannot
 smuggle settings past this list.
@@ -581,6 +588,34 @@ same. `eminiar doctor` shows the features you turned on and fails when one is wa
 **Shadow mode** is the default for every feature. The feature asks the provider and records the
 verdict next to what eminiar did anyway, but changes nothing, so you can compare before it acts.
 Shadow output is identical to the feature being off. `shadow <name> off` makes it live.
+
+Shadow is not free: it still calls the provider, so a feature that waits for the answer (`em_recall`,
+`em_remember`, the compaction and `em_docs` paths) adds latency of up to its own per-surface budget
+(`mcpMs`, `bgMs`; the hooks and background jobs wait for nothing) and spends money and the daily
+cap exactly as live does.
+
+Shadow and live answers are cached separately (the mode is part of the cache key). Turning shadow
+off therefore never applies an answer shadow recorded earlier: the first live ask calls the
+provider again, and the 24 h cache then fills for live.
+
+**What a verdict can do.** A *calibrated* provider (Jev) gives real probabilities, so a verdict below
+the threshold can drop a recalled candidate or section. An *uncalibrated* provider (the embedding
+provider's similarity, an OpenAI-compatible model's own number or choice) only reorders and flags,
+and then only when it reaches 0.85; it is never trusted to drop. A batch the provider answered only
+in part (`partial`) is not acted on at all: the whole batch keeps the deterministic baseline, though
+the answers are cached and recorded.
+
+### Known limits
+
+- **Commit advice arrives late.** The detached job runs while the commit command does, so the note
+  reaches Claude with the next tool result or prompt, after the commit has already run. It is
+  advice for the next step, never a gate.
+- **Diff scrubbing sees only the staged hunk.** The block-scalar scrub (YAML `|` / `>` values) works
+  on `git diff -U0`, so a secret under a block header that is not itself in the staged hunk cannot
+  be recognised as part of a block scalar. Keep `commit.exclude` covering files that hold secrets.
+- **Recall verdicts are shared by search terms.** The hook, `em_recall` and later prompts reuse one
+  verdict whenever the extracted search terms and the candidates match, even if the prompt wording
+  differs. A verdict made for one prompt can therefore shape another with the same terms.
 
 ### Consent
 

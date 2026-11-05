@@ -334,7 +334,7 @@ to the whole tab.
   stored and the text is not sent back, but a provider call counts against the daily caps.
 - **Last eval.** The report saved by `eminiar adjudicator eval --save`.
 
-- **Features.** Shown whenever the adjudicator is on and any `adjudicator.features.*` entry is enabled, with any provider: one row per feature with its state (off, shadow, live, no consent), calls, cost, errors, unsupported (the provider cannot answer that question kind, so the deterministic path ran) and agreement (answered calls where the provider matched the deterministic baseline), plus the active provider. Counts only; nothing the feature asked about is stored.
+- **Features.** Shown whenever the adjudicator is on and any `adjudicator.features.*` entry is enabled, with any provider: one row per feature with its state (off, shadow, live, no consent, or waiting when enabled but blocked by the heuristic provider, a missing key or a kill switch; the CLI's `features` command uses live, shadow, waiting and off), calls, cost, errors, unsupported (the provider cannot answer that question kind, so the deterministic path ran) and agreement (answered calls where the provider matched the deterministic baseline), plus the active provider. Counts only; nothing the feature asked about is stored.
 
 Links: `#/adjudicator?range=7d` and `#/adjudicator?id=<decision id>` (opens the drawer).
 
