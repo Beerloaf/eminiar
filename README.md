@@ -17,11 +17,11 @@
 <br/>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/dashboard-explore-dark.webp">
-  <img alt="The eminiar dashboard: source explorer with file impact, dependents and linked memories" src="docs/images/dashboard-explore-light.webp" width="900">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/dashboard-swarm-dark.webp">
+  <img alt="The eminiar Swarms dashboard: progress rings, run stats and the live topology of a swarm run" src="docs/images/dashboard-swarm-light.webp" width="900">
 </picture>
 
-<sub>The local dashboard: source, file impact and the memories linked to the file.</sub>
+<sub>The Swarms dashboard: progress rings, run stats and the live topology of a run.</sub>
 
 </div>
 
@@ -88,6 +88,11 @@ Recall matches a memory when the prompt names it, one of its tags, a file it men
 symbol from that file. A memory can come back later in a long session. To see why a memory did
 or did not appear, run `eminiar recall --explain "<prompt>"`.
 
+| | |
+|:---:|:---:|
+| [<img alt="Memory: the list of memories by kind, and one decision with its tags, linked files and text" src="docs/images/dashboard-memory-dark.webp" width="430">](docs/dashboard.md#memory) | [<img alt="Memory graph: memories linked to the files, tags and topics they are about" src="docs/images/dashboard-memory-graph-dark.webp" width="430">](docs/dashboard.md#memory) |
+| **Memory:** read and edit every memory | **Memory graph:** what each memory is about |
+
 ### 🕸️ Code knowledge graph — a map before an edit
 
 tree-sitter parses TypeScript, JavaScript, Python, Go and PHP into files, symbols, imports, calls,
@@ -100,6 +105,11 @@ Memories and documentation share the same graph. Each memory links to the files 
 mentions, and each doc source links to the code that uses it. One graph answers *"what do we
 know about this file?"*
 
+| | |
+|:---:|:---:|
+| [<img alt="Galaxy: the knowledge graph of files and symbols around a file, by imports, calls and references" src="docs/images/dashboard-galaxy-dark.webp" width="430">](docs/dashboard.md#galaxy) | [<img alt="Explore: the source of a file with its impact, dependents and linked memories" src="docs/images/dashboard-explore-dark.webp" width="430">](docs/dashboard.md#explore) |
+| **Galaxy:** the knowledge graph | **Explore:** source, impact and linked memories |
+
 ### 📜 Git history, read for Claude
 
 `em_history` classifies every commit (feat, fix, refactor, perf …). It traces each fix back to
@@ -110,11 +120,18 @@ The history graph connects branches to their commits, commits to the files they 
 those files to the memories and docs about them. Merged and deleted branches keep their commits.
 A fix points at the commit it repairs.
 
+| | |
+|:---:|:---:|
+| [<img alt="History: commits classified by kind, with the branch graph" src="docs/images/dashboard-history-dark.webp" width="430">](docs/dashboard.md#history) | [<img alt="History graph: branches, their commits, and the files, memories and docs they touched" src="docs/images/dashboard-history-graph-dark.webp" width="430">](docs/dashboard.md#history) |
+| **History:** classified commits and fix tracing | **History graph:** branches to files and memories |
+
 ### 📚 Documentation knowledge base
 
 `em_docs` finds your local docs (READMEs, ADRs, OpenAPI, Postman) and the libraries, services
 and third-party APIs your code calls. It indexes their documentation locally. OpenAPI specs are
 split into one section per endpoint, so a lookup returns the exact operation.
+
+[<img alt="Docs: discovered local docs, catalog libraries and registry packages, ready to index" src="docs/images/dashboard-docs-dark.webp" width="640">](docs/dashboard.md#docs)
 
 ### 💸 Usage insights — what each session really costs
 
@@ -124,6 +141,8 @@ and per-session breakdowns, 5-hour billing blocks with burn rate, the context ti
 session with its compactions, which tools fill the context, insights with recommendations, and
 what eminiar's own tools saved in dollars. Everything stays local; cost is an estimate at list
 price ([details](docs/usage.md)).
+
+[<img alt="Usage: cost per day by model, cache hit rate, burn rate and session scores" src="docs/images/dashboard-usage-dark.webp" width="640">](docs/dashboard.md#usage)
 
 ### 🐝 Agent swarms (opt-in)
 
@@ -155,19 +174,10 @@ off: `eminiar adjudicator enable` ([details](docs/adjudicator.md)).
 ### 📊 Local dashboard
 
 `eminiar ui` opens a local web app with token savings, usage and cost, a source explorer with
-impact analysis, a graph "galaxy", an architecture map, a history explorer with a history
-graph, a memory editor with a memory graph, and a docs manager.
+impact analysis, a graph "galaxy", a history explorer with a history graph, a memory editor with a
+memory graph, a docs manager, and a swarm monitor with a configuration studio.
 
-| | |
-|:---:|:---:|
-| [<img alt="Galaxy: the knowledge graph around a file" src="docs/images/dashboard-galaxy-dark.webp" width="430">](docs/dashboard.md#galaxy) | [<img alt="Usage: cost per day by model, cache hit rate, burn rate and session scores" src="docs/images/dashboard-usage-dark.webp" width="430">](docs/dashboard.md#usage) |
-| **Galaxy:** the knowledge graph | **Usage:** cost, cache and burn rate |
-| [<img alt="History graph: branches, their commits, and the files, memories and docs they touched" src="docs/images/dashboard-history-graph-dark.webp" width="430">](docs/dashboard.md#history) | [<img alt="Memory graph: memories linked to the files, tags and topics they are about" src="docs/images/dashboard-memory-graph-dark.webp" width="430">](docs/dashboard.md#memory) |
-| **History graph:** branches to files and memories | **Memory graph:** what each memory is about |
-| [<img alt="History: commits classified by kind, with the branch graph" src="docs/images/dashboard-history-dark.webp" width="430">](docs/dashboard.md#history) | [<img alt="Hotspots: fan-in, churn and complexity per file" src="docs/images/dashboard-hotspots-dark.webp" width="430">](docs/dashboard.md#architecture) |
-| **History:** classified commits and fix tracing | **Hotspots:** where change is risky |
-| [<img alt="Swarm run: progress rings, task and worker counts, and the live topology of a run" src="docs/images/dashboard-swarm-light.webp" width="430">](docs/dashboard.md#swarms) | [<img alt="Swarm configuration studio: the role drawer with model, effort and isolation" src="docs/images/dashboard-swarm-config-role-dark.webp" width="430">](docs/dashboard.md#configure) |
-| **Swarm run:** live monitor (light theme) | **Role drawer:** model policy, effort, isolation |
+[<img alt="Overview: tokens kept out of context, savings per session, project and lifetime, the active swarm run and savings by tool" src="docs/images/dashboard-overview-dark.webp" width="640">](docs/dashboard.md#overview)
 
 ## What Claude sees
 
