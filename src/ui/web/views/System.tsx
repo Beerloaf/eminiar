@@ -1,7 +1,8 @@
 import type { JSX } from "preact";
 import { useState } from "preact/hooks";
 import { api, type IndexRun, post } from "../api.js";
-import { ErrorBox, KV, Spinner, SubTabs, toast, useAsync } from "../components.js";
+import { ErrorBox, KV, Spinner, toast, useAsync } from "../components.js";
+import { Badge, Card, EmptyState, Hero, Segmented, Skeleton } from "../ds.js";
 import { ago, cls } from "../util.js";
 
 interface Check {
@@ -16,7 +17,7 @@ function Doctor(): JSX.Element {
   const bad = (q.data ?? []).filter((c) => !c.ok).length;
   return (
     <>
-      <div class="row" style={{ marginBottom: 10 }}>
+      <div class="sy-bar">
         <button type="button" class="primary" onClick={() => q.reload()}>
           Re-run
         </button>
@@ -29,40 +30,44 @@ function Doctor(): JSX.Element {
         >
           Run with --fix
         </button>
-        <span class="muted small">
-          {q.loading ? (
-            <Spinner />
-          ) : q.data ? (
-            bad ? (
-              <span class="bad">
-                {bad} problem{bad > 1 ? "s" : ""}
-              </span>
-            ) : (
-              <span class="ok">all checks pass</span>
-            )
+        {q.loading ? (
+          <Spinner />
+        ) : q.data ? (
+          bad ? (
+            <Badge tone="bad" dot>
+              {bad} problem{bad > 1 ? "s" : ""}
+            </Badge>
           ) : (
-            ""
-          )}
-        </span>
+            <Badge tone="ok" dot>
+              all checks pass
+            </Badge>
+          )
+        ) : null}
       </div>
       {q.error ? (
         <ErrorBox error={q.error} />
+      ) : !q.data ? (
+        <Card>
+          <Skeleton h={14} />
+        </Card>
       ) : (
-        <div class="card flush">
-          <table>
-            <tbody>
-              {(q.data ?? []).map((c) => (
-                <tr>
-                  <td class={cls(c.ok ? "ok" : "bad")} style={{ width: 24 }}>
-                    {c.ok ? "✓" : "✗"}
-                  </td>
-                  <td class="nowrap">{c.name}</td>
-                  <td class="break">{c.detail}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <Card flush title="Checks" right={`${q.data.length - bad}/${q.data.length} pass`}>
+          <div class="ds-table-wrap">
+            <table>
+              <tbody>
+                {q.data.map((c) => (
+                  <tr>
+                    <td class={cls(c.ok ? "ok" : "bad")} style={{ width: 24 }}>
+                      {c.ok ? "✓" : "✗"}
+                    </td>
+                    <td class="nowrap">{c.name}</td>
+                    <td class="break">{c.detail}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
       )}
     </>
   );
@@ -120,10 +125,9 @@ function Actions({ onChanged }: { onChanged: () => void }): JSX.Element {
   );
   return (
     <>
-      <div class="actions">
-        <div class="card">
-          <h3>reindex</h3>
-          <p>
+      <div class="sy-actions">
+        <Card title="Reindex">
+          <p class="sy-desc">
             Rebuild the code graph, git signals, metrics, docs, memories or embeddings. Incremental
             unless full.
           </p>
@@ -143,25 +147,24 @@ function Actions({ onChanged }: { onChanged: () => void }): JSX.Element {
             </label>
             <B label={`reindex ${scope}`} body={{ action: "reindex", scope, full }} />
           </div>
-        </div>
-        <div class="card">
-          <h3>index a path</h3>
-          <p>
+        </Card>
+        <Card title="Index a path">
+          <p class="sy-desc">
             Index files or a directory into search (markdown by default; pass globs for other
             files).
           </p>
-          <div class="row">
+          <div class="row sy-index">
             <input
               type="text"
-              class="grow"
+              class="sy-index-path"
               placeholder="docs/ or README.md"
               value={path}
               onInput={(e) => setPath((e.target as HTMLInputElement).value)}
             />
             <input
               type="text"
+              class="sy-index-globs"
               placeholder="globs, comma separated"
-              style={{ maxWidth: 200 }}
               value={glob}
               onInput={(e) => setGlob((e.target as HTMLInputElement).value)}
             />
@@ -174,30 +177,29 @@ function Actions({ onChanged }: { onChanged: () => void }): JSX.Element {
               Index
             </button>
           </div>
-        </div>
-        <div class="card">
-          <h3>embeddings</h3>
-          <p>
+        </Card>
+        <Card title="Embeddings">
+          <p class="sy-desc">
             Embed every chunk that still has no vector. Loads the model on first use.{" "}
             {stats.data ? <span class="muted">({stats.data.index.embeddings})</span> : null}
           </p>
           <div class="row">
             <B label="embed pending" body={{ action: "embed" }} />
           </div>
-        </div>
-        <div class="card">
-          <h3>memories</h3>
-          <p>
+        </Card>
+        <Card title="Memories">
+          <p class="sy-desc">
             Re-import memory files edited, added or removed by hand under{" "}
             <code>{stats.data?.memoriesDir ?? ".eminiar/memories"}</code>.
           </p>
           <div class="row">
             <B label="reconcile" body={{ action: "reconcile" }} />
           </div>
-        </div>
-        <div class="card">
-          <h3>purge</h3>
-          <p>Permanently delete project data. Memory files stay on disk and are re-imported.</p>
+        </Card>
+        <Card title="Purge">
+          <p class="sy-desc">
+            Permanently delete project data. Memory files stay on disk and are re-imported.
+          </p>
           <div class="row">
             <select
               value={pscope}
@@ -227,9 +229,8 @@ function Actions({ onChanged }: { onChanged: () => void }): JSX.Element {
             </button>
             <B label="empty fetch cache" body={{ action: "purge-fetch-cache" }} cls="" />
           </div>
-        </div>
-        <div class="card">
-          <h3>server</h3>
+        </Card>
+        <Card title="Server">
           {stats.data ? (
             <KV
               rows={[
@@ -241,17 +242,18 @@ function Actions({ onChanged }: { onChanged: () => void }): JSX.Element {
           ) : (
             <Spinner />
           )}
-        </div>
+        </Card>
       </div>
-      <div class="card">
-        <h3>
-          action log{" "}
-          <button type="button" class="sm right" onClick={() => setLog([])}>
+      <Card
+        title="Action log"
+        right={
+          <button type="button" class="sm" onClick={() => setLog([])}>
             clear
           </button>
-        </h3>
+        }
+      >
         <pre class="log">{log.length ? log.join("\n\n") : "ready."}</pre>
-      </div>
+      </Card>
     </>
   );
 }
@@ -261,67 +263,83 @@ function Runs(): JSX.Element {
   if (q.error) return <ErrorBox error={q.error} />;
   if (!q.data) return <Spinner />;
   return (
-    <div class="card flush">
-      <table>
-        <thead>
-          <tr>
-            <th>started</th>
-            <th>scope</th>
-            <th class="num">scanned</th>
-            <th class="num">indexed</th>
-            <th class="num">unchanged</th>
-            <th class="num">skipped</th>
-            <th class="num">removed</th>
-            <th class="num">errors</th>
-            <th class="num">ms</th>
-            <th>git</th>
-            <th>detail</th>
-          </tr>
-        </thead>
-        <tbody>
-          {q.data.length ? (
-            q.data.map((r) => (
-              <tr>
-                <td class="muted nowrap" title={new Date(r.started_at).toLocaleString()}>
-                  {ago(r.started_at)}
-                </td>
-                <td>{r.scope}</td>
-                <td class="num">{r.scanned}</td>
-                <td class="num">{r.indexed}</td>
-                <td class="num">{r.unchanged}</td>
-                <td class="num">{r.skipped}</td>
-                <td class="num">{r.removed}</td>
-                <td class={cls("num", r.errors > 0 && "bad")}>{r.errors}</td>
-                <td class="num">{r.finished_at ? r.finished_at - r.started_at : "…"}</td>
-                <td class="muted small">{r.head_sha?.slice(0, 7) ?? ""}</td>
-                <td class="muted small break">{r.detail ?? ""}</td>
-              </tr>
-            ))
-          ) : (
+    <Card flush title="Index runs" right={q.data.length}>
+      <div class="ds-table-wrap">
+        <table>
+          <thead>
             <tr>
-              <td colSpan={11} class="muted">
-                no runs logged yet
-              </td>
+              <th>started</th>
+              <th>scope</th>
+              <th class="num">scanned</th>
+              <th class="num">indexed</th>
+              <th class="num">unchanged</th>
+              <th class="num">skipped</th>
+              <th class="num">removed</th>
+              <th class="num">errors</th>
+              <th class="num">ms</th>
+              <th>git</th>
+              <th>detail</th>
             </tr>
-          )}
-        </tbody>
-      </table>
-    </div>
+          </thead>
+          <tbody>
+            {q.data.length ? (
+              q.data.map((r) => (
+                <tr>
+                  <td class="muted nowrap" title={new Date(r.started_at).toLocaleString()}>
+                    {ago(r.started_at)}
+                  </td>
+                  <td>{r.scope}</td>
+                  <td class="num">{r.scanned}</td>
+                  <td class="num">{r.indexed}</td>
+                  <td class="num">{r.unchanged}</td>
+                  <td class="num">{r.skipped}</td>
+                  <td class="num">{r.removed}</td>
+                  <td class={cls("num", r.errors > 0 && "bad")}>{r.errors}</td>
+                  <td class="num">{r.finished_at ? r.finished_at - r.started_at : "…"}</td>
+                  <td class="muted small">{r.head_sha?.slice(0, 7) ?? ""}</td>
+                  <td class="muted small break">{r.detail ?? ""}</td>
+                </tr>
+              ))
+            ) : (
+              <tr>
+                <td colSpan={11}>
+                  <EmptyState compact icon="○" title="No runs logged yet" />
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </Card>
   );
 }
+
+const TAB_SUB = {
+  actions: "Rebuild indexes, embed, reconcile memories and purge project data.",
+  doctor: "Check that eminiar's runtime dependencies and storage are healthy.",
+  runs: "Every indexing pass, newest first.",
+} as const;
 
 export function System({ onChanged }: { onChanged: () => void }): JSX.Element {
   const [tab, setTab] = useState<"actions" | "doctor" | "runs">("actions");
   return (
-    <div class="page">
-      <SubTabs
-        tabs={[
-          ["actions", "Actions"],
-          ["doctor", "Doctor"],
-          ["runs", "Index runs"],
-        ]}
-        value={tab}
-        onChange={setTab}
+    <div class="page ds-page">
+      <Hero
+        eyebrow="System"
+        title="Maintenance"
+        sub={TAB_SUB[tab]}
+        aside={
+          <Segmented<"actions" | "doctor" | "runs">
+            label="system section"
+            options={[
+              { id: "actions", label: "Actions" },
+              { id: "doctor", label: "Doctor" },
+              { id: "runs", label: "Index runs" },
+            ]}
+            value={tab}
+            onChange={setTab}
+          />
+        }
       />
       {tab === "actions" && <Actions onChanged={onChanged} />}
       {tab === "doctor" && <Doctor />}

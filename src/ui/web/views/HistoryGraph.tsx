@@ -1,7 +1,8 @@
 import type { JSX } from "preact";
 import { useEffect, useMemo, useState } from "preact/hooks";
 import { api, type HistoryGraphNodeUi, type HistoryKnowledgeUi } from "../api.js";
-import { Empty, KindTag, Spinner, Tag, toast } from "../components.js";
+import { KindTag, Spinner, Tag, toast } from "../components.js";
+import { EmptyState, Skeleton } from "../ds.js";
 import { EdgeList } from "../graph/EdgeList.js";
 import { EdgeGlyph, Glyph } from "../graph/Glyph.js";
 import { GraphCanvas } from "../graph/GraphCanvas.js";
@@ -121,10 +122,15 @@ export function HistoryGraph({ focus }: { focus?: string | undefined }): JSX.Ele
   const focusOn = (id: string) => navigate("history", { tab: "graph", focus: id });
   const focused = data?.focus ? byId.get(data.focus) : undefined;
 
-  if (data && !data.git) return <Empty>{data.error ?? "Not a git repository."}</Empty>;
+  if (data && !data.git)
+    return (
+      <EmptyState icon="⎇" title="No git history">
+        {data.error ?? "Not a git repository."}
+      </EmptyState>
+    );
 
   return (
-    <div class="kgalaxy hgraph">
+    <div class="kgalaxy hgraph ds-card flush">
       <div class="gtoolbar">
         {focus ? (
           <span class="row tight">
@@ -238,9 +244,11 @@ export function HistoryGraph({ focus }: { focus?: string | undefined }): JSX.Ele
       >
         <div style={{ minWidth: 0, minHeight: 0 }}>
           {!shown ? (
-            <Empty>
-              <Spinner />
-            </Empty>
+            <div class="hist-graph-loading" role="status" aria-busy="true">
+              <Skeleton h={14} />
+              <Skeleton w="70%" h={14} />
+              <Skeleton h={120} />
+            </div>
           ) : shown.nodes.length ? (
             <GraphCanvas
               nodes={shown.nodes}
@@ -255,9 +263,9 @@ export function HistoryGraph({ focus }: { focus?: string | undefined }): JSX.Ele
               labelOf={historyLabelOf}
             />
           ) : nodes.length ? (
-            <Empty>Nothing left after these filters.</Empty>
+            <EmptyState compact title="Nothing left after these filters." />
           ) : (
-            <Empty>No commits to draw.</Empty>
+            <EmptyState compact title="No commits to draw." />
           )}
         </div>
         {sel && (

@@ -18,7 +18,19 @@ import {
   api,
   post,
 } from "../api.js";
-import { Empty, ErrorBox, KV, Spinner, SubTabs, Tag, useAsync } from "../components.js";
+import { ErrorBox, KV, Spinner, Tag, useAsync } from "../components.js";
+import {
+  Badge,
+  Card,
+  EmptyState,
+  GradientText,
+  Hero,
+  Pill,
+  Segmented,
+  Skeleton,
+  Stat,
+  StatRow,
+} from "../ds.js";
 import { useWidth } from "../history/charts.js";
 import { navigate } from "../router.js";
 import { ago, cls, fmt } from "../util.js";
@@ -262,11 +274,11 @@ function MatrixHeat({
   const outside = keptModelLabel(kept);
   if (!g.total)
     return (
-      <Empty>
+      <EmptyState compact icon="▦" title="No dispatches to compare">
         {outside
-          ? `no dispatch ran on a model the advice chose (${outside})`
-          : "no agent or plan dispatches with a known model yet"}
-      </Empty>
+          ? `No dispatch ran on a model the advice chose (${outside}).`
+          : "No agent or plan dispatches with a known model yet."}
+      </EmptyState>
     );
   return (
     <>
@@ -973,13 +985,11 @@ function CallLog({
   );
   const p = page.data;
   return (
-    <div class="card adj-log">
-      <h3>
-        call log
-        <span class="right muted small">
-          {p ? pageLabel(p.offset, p.rows.length, p.total) : ""}
-        </span>
-      </h3>
+    <Card
+      class="adj-log"
+      title="Call log"
+      right={p ? pageLabel(p.offset, p.rows.length, p.total) : ""}
+    >
       <div class="row adj-filters">
         {sel(
           "surface",
@@ -1001,11 +1011,11 @@ function CallLog({
       ) : !p ? (
         <Spinner />
       ) : !p.rows.length ? (
-        <Empty>
+        <EmptyState compact icon="▁" title="No decisions">
           {p.total || f.surface || f.provider || f.outcome
-            ? "no decisions match these filters"
-            : "no decisions in this range"}
-        </Empty>
+            ? "None match these filters."
+            : "Nothing was recorded in this range."}
+        </EmptyState>
       ) : (
         <div class="adj-scroll">
           <table class="adj-calls">
@@ -1057,7 +1067,7 @@ function CallLog({
           </button>
         </div>
       ) : null}
-    </div>
+    </Card>
   );
 }
 
@@ -1165,16 +1175,16 @@ function HealthCard({ ov }: { ov: HealthOverview }): JSX.Element {
   const others = ov.health.filter((h) => !h.configured);
   const ignored = ignoredKeysOf(ov.projectIgnored);
   return (
-    <div class="card">
-      <h3>
-        provider
-        <span class="right">
+    <Card
+      title="Provider"
+      right={
+        <>
           {ov.projectIgnored ? (
-            <ToneTag tone="warn" title={ov.projectIgnored}>
+            <Badge tone="warn" title={ov.projectIgnored}>
               project config ignored: {ignored.length ? ignored.join(", ") : "some keys"}
-            </ToneTag>
-          ) : null}{" "}
-          <ToneTag
+            </Badge>
+          ) : null}
+          <Badge
             tone={ov.mode === "apply" ? "accent" : "muted"}
             title={
               ov.mode === "apply"
@@ -1183,9 +1193,10 @@ function HealthCard({ ov }: { ov: HealthOverview }): JSX.Element {
             }
           >
             {ov.mode} mode
-          </ToneTag>
-        </span>
-      </h3>
+          </Badge>
+        </>
+      }
+    >
       <KV
         rows={[
           [
@@ -1271,7 +1282,7 @@ function HealthCard({ ov }: { ov: HealthOverview }): JSX.Element {
           ))}
         </details>
       ) : null}
-    </div>
+    </Card>
   );
 }
 
@@ -1346,15 +1357,16 @@ function SavingsPanel({ s }: { s: AdjSavings }): JSX.Element {
     ["net", s.netUsd, "realised − spend", s.netUsd >= 0 ? "ok" : "bad"],
   ];
   return (
-    <div class="card">
-      <h3>
-        savings
-        {gap ? (
-          <span class="right warn small" title={gap.help}>
+    <Card
+      title="Savings"
+      right={
+        gap ? (
+          <Badge tone="warn" title={gap.help}>
             {gap.label}
-          </span>
-        ) : null}
-      </h3>
+          </Badge>
+        ) : undefined
+      }
+    >
       <div class="adj-figs">
         {figures.map(([k, v, sub, tone]) => (
           <div>
@@ -1395,20 +1407,19 @@ function SavingsPanel({ s }: { s: AdjSavings }): JSX.Element {
         smaller tiers can need more turns: if haiku needs far more tokens per task than sonnet, the
         savings above overstate.
       </div>
-    </div>
+    </Card>
   );
 }
 
 function Assumptions({ list }: { list: string[] }): JSX.Element {
   return (
-    <div class="card adj-assume" id="adj-assumptions">
-      <h3>how savings are computed</h3>
-      <ul class="reasons">
+    <Card class="adj-assume ds-block" title="How savings are computed">
+      <ul class="reasons" id="adj-assumptions">
         {list.map((a) => (
           <li>{a}</li>
         ))}
       </ul>
-    </div>
+    </Card>
   );
 }
 
@@ -1438,11 +1449,7 @@ function TryIt({ ov }: { ov: AdjOverview | undefined }): JSX.Element {
   };
   const v = res?.verdict;
   return (
-    <div class="card adj-try">
-      <h3>
-        try it
-        <span class="right muted small">nothing is stored · the text is not sent back</span>
-      </h3>
+    <Card class="adj-try" title="Try it" right="nothing is stored · the text is not sent back">
       <textarea
         rows={4}
         maxLength={20000}
@@ -1508,7 +1515,7 @@ function TryIt({ ov }: { ov: AdjOverview | undefined }): JSX.Element {
           <ScoreTableView title="agent role" table={v.role} alpha={v.alpha?.role ?? 0} />
         </div>
       ) : null}
-    </div>
+    </Card>
   );
 }
 
@@ -1519,18 +1526,17 @@ function EvalCard(): JSX.Element {
   const facts = evalFacts(report);
   const verdict = facts.find(([k]) => k === "verdict");
   return (
-    <div class="card">
-      <h3>last eval</h3>
+    <Card title="Last eval">
       {e.error ? (
         <ErrorBox error={e.error} />
       ) : !e.data ? (
         <Spinner />
       ) : !report ? (
-        <Empty>
-          no eval yet: run <Code>eminiar adjudicator eval</Code> to compare the heuristic and your
-          provider on the labelled set
+        <EmptyState compact icon="○" title="No eval yet">
+          Run <Code>eminiar adjudicator eval</Code> to compare the heuristic and your provider on
+          the labelled set.
           {e.data.error ? <div class="bad small">{e.data.error}</div> : null}
-        </Empty>
+        </EmptyState>
       ) : (
         <>
           {verdict ? (
@@ -1563,14 +1569,40 @@ function EvalCard(): JSX.Element {
           ) : null}
         </>
       )}
+    </Card>
+  );
+}
+
+function AdjSkeleton(): JSX.Element {
+  return (
+    <div class="page ds-page adj-page" aria-busy="true">
+      <section class="ds-hero">
+        <div class="ds-hero-main ds-skel-stack">
+          <Skeleton w={140} h={12} />
+          <Skeleton w="60%" h={30} />
+          <Skeleton w="40%" h={14} />
+        </div>
+      </section>
+      <div class="ds-stats">
+        {[0, 1, 2, 3, 4, 5].map(() => (
+          <div class="ds-stat">
+            <Skeleton w={70} h={10} />
+            <Skeleton w={90} h={26} />
+            <Skeleton w="80%" h={10} />
+          </div>
+        ))}
+      </div>
+      <div class="ds-grid main-side">
+        <Skeleton h={260} class="adj-skel-card" />
+        <Skeleton h={260} class="adj-skel-card" />
+      </div>
     </div>
   );
 }
 
 function DisabledIntro(): JSX.Element {
   return (
-    <div class="card adj-intro">
-      <h3>adjudicator is off</h3>
+    <Card class="adj-intro ds-block" title="Adjudicator is off">
       <p>
         The adjudicator scores each request's complexity and suggests the eminiar tool, the Claude
         model size (haiku, sonnet, opus) and the swarm role that fit it, so small work goes to small
@@ -1601,7 +1633,7 @@ function DisabledIntro(): JSX.Element {
           then /mcp reconnect. This page updates without restarting the server.
         </span>
       </div>
-    </div>
+    </Card>
   );
 }
 
@@ -1625,17 +1657,12 @@ export function Adjudicator({ params }: { params: Record<string, string> }): JSX
 
   if (ov.error)
     return (
-      <div class="page">
+      <div class="page ds-page adj-page">
         <ErrorBox error={ov.error} />
       </div>
     );
   const o = ov.data;
-  if (!o)
-    return (
-      <div class="page">
-        <Spinner />
-      </div>
-    );
+  if (!o) return <AdjSkeleton />;
   const s = o.summary;
   const hasData = s.total > 0;
   const statusCounts = Object.entries(s.byProviderStatus).filter(
@@ -1701,98 +1728,124 @@ export function Adjudicator({ params }: { params: Record<string, string> }): JSX
   ];
 
   return (
-    <div class="page adj-page">
-      <div class="row" style={{ marginBottom: 10 }}>
-        <SubTabs tabs={RANGES} value={range} onChange={(r) => go({ range: r })} />
-        <span class="spacer" />
-        <span class="muted small">
-          {o.enabled ? (
+    <div class="page ds-page adj-page">
+      <Hero
+        eyebrow={
+          <>
+            <span>Adjudicator</span>
+            {o.enabled ? (
+              <Pill tone="ok" title="the adjudicator is enabled">
+                on
+              </Pill>
+            ) : (
+              <Pill tone="muted" title="the adjudicator is disabled">
+                off
+              </Pill>
+            )}
+          </>
+        }
+        title={
+          hasData ? (
             <>
-              <i class="dot fresh" />
-              on · {o.mode} · {o.provider.effective}
+              <GradientText>{fmt(s.total)} decisions</GradientText> in {range}
             </>
           ) : (
-            <>
-              <i class="dot" />
-              off
-            </>
-          )}
-          {"reconcile" in o && o.reconcile && "error" in o.reconcile ? (
-            <span class="warn"> · reconcile failed: {o.reconcile.error}</span>
-          ) : null}
-          {o.chartsCut ? <span class="warn"> · charts drawn from the newest 20k rows</span> : null}
-        </span>
-        <button
-          type="button"
-          class="ghost sm"
-          onClick={() => setTick((t) => t + 1)}
-          disabled={ov.loading}
-        >
-          {ov.loading ? "…" : "↻ refresh"}
-        </button>
-      </div>
+            "No decisions in this range"
+          )
+        }
+        sub={
+          o.enabled
+            ? "Complexity, tool, model tier and role advice for each request, with the cost and savings it brings."
+            : hasData
+              ? "Showing decisions recorded while it was on."
+              : "Turn it on to see routing advice for each request."
+        }
+        meta={
+          <>
+            {o.enabled ? (
+              <>
+                <Badge tone={o.mode === "apply" ? "accent" : "muted"} title="advise or apply">
+                  {o.mode} mode
+                </Badge>
+                <Badge tone="purple" title="the provider in use">
+                  {o.provider.effective}
+                </Badge>
+              </>
+            ) : null}
+            {"reconcile" in o && o.reconcile && "error" in o.reconcile ? (
+              <Badge tone="warn">reconcile failed: {o.reconcile.error}</Badge>
+            ) : null}
+            {o.chartsCut ? <Badge tone="warn">charts drawn from the newest 20k rows</Badge> : null}
+          </>
+        }
+        aside={
+          <div class="adj-hero-actions">
+            <Segmented<Range>
+              label="time range"
+              options={RANGES.map(([id, label]) => ({ id: id as Range, label }))}
+              value={range}
+              onChange={(r) => go({ range: r })}
+            />
+            <button
+              type="button"
+              class="ghost sm"
+              onClick={() => setTick((t) => t + 1)}
+              disabled={ov.loading}
+            >
+              {ov.loading ? "…" : "↻ refresh"}
+            </button>
+          </div>
+        }
+      />
 
       {!o.enabled ? <DisabledIntro /> : null}
-      {!o.enabled && hasData ? (
-        <div class="muted small" style={{ margin: "-4px 0 10px" }}>
-          showing decisions recorded while it was on
-        </div>
-      ) : null}
 
       {o.enabled || hasData ? (
         <>
-          <div class="grid adj-kpis">
+          <StatRow>
             {kpis.map(([h, v, sub, title]) => (
-              <div class="card" title={title}>
-                <h3>{h}</h3>
-                <div class="big">{v}</div>
-                <div class="sub">{sub}</div>
-              </div>
+              <Stat label={h} value={v} sub={sub} title={title} />
             ))}
-          </div>
+          </StatRow>
           {showHow ? <Assumptions list={sav.data?.assumptions ?? []} /> : null}
           {jevActive(o) ? (
             <JevImpact range={range} tick={tick} ov={o} onOpen={(n) => go({ id: n })} />
           ) : null}
 
-          <div class="grid wide">
-            <div class="card">
-              <h3>
-                decisions per day
-                <span class="right usage-legend">
+          <div class="ds-grid main-side">
+            <Card
+              title="Decisions per day"
+              right={
+                <span class="usage-legend">
                   {SOURCES.map((k) => (
                     <Swatch color={SOURCE_COLORS[k]} label={k} title={SOURCE_HELP[k]} />
                   ))}
                 </span>
-              </h3>
+              }
+            >
               {o.charts.perDay.length ? (
                 <DayChart rows={o.charts.perDay} />
               ) : (
-                <Empty>
+                <EmptyState compact icon="▁" title="No decisions yet">
                   {o.enabled
-                    ? "no decisions yet: they appear as you prompt and dispatch agents"
-                    : "no decisions in this range"}
-                </Empty>
+                    ? "They appear as you prompt and dispatch agents."
+                    : "Nothing was recorded in this range."}
+                </EmptyState>
               )}
               <div class="muted small">UTC days</div>
-            </div>
+            </Card>
             <HealthCard ov={o} />
           </div>
 
-          <div class="grid two">
-            <div class="card">
-              <h3>
-                complexity
-                <span class="right muted small">0 trivial → 4 very complex</span>
-              </h3>
+          <div class="ds-grid cols-2">
+            <Card title="Complexity" right="0 trivial → 4 very complex">
               {hasData ? (
                 <ComplexityHistogram counts={o.charts.complexity} />
               ) : (
-                <Empty>no decisions yet</Empty>
+                <EmptyState compact icon="▁" title="No decisions yet" />
               )}
-            </div>
-            <div class="card">
-              <h3>suggested tier × model that ran</h3>
+            </Card>
+            <Card title="Suggested tier × model that ran">
               {sav.error ? (
                 <ErrorBox error={sav.error} />
               ) : !sav.data ? (
@@ -1800,31 +1853,31 @@ export function Adjudicator({ params }: { params: Record<string, string> }): JSX
               ) : (
                 <MatrixHeat matrix={sav.data.matrix} kept={sav.data.keptModel} />
               )}
-            </div>
+            </Card>
           </div>
 
           <CallLog ov={o} since={range} tick={tick} selected={id} onOpen={(n) => go({ id: n })} />
 
-          <div class="grid two">
+          <div class="ds-grid cols-2">
             {sav.error ? (
-              <div class="card">
+              <Card title="Savings">
                 <ErrorBox error={sav.error} />
-              </div>
+              </Card>
             ) : sav.data ? (
               <SavingsPanel s={sav.data} />
             ) : (
-              <div class="card">
-                <Spinner />
-              </div>
+              <Card title="Savings">
+                <Skeleton h={120} />
+              </Card>
             )}
             <TryIt ov={o} />
           </div>
-          <div class="grid">
+          <div class="ds-grid">
             <EvalCard />
           </div>
         </>
       ) : (
-        <div class="grid two">
+        <div class="ds-grid cols-2">
           <TryIt ov={o} />
           <EvalCard />
         </div>

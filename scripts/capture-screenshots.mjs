@@ -51,7 +51,7 @@ const SHOTS = [
     schemes: ["dark"],
     actions: [click("+1"), click("fit view")],
   },
-  { name: "hotspots", hash: "#/architecture?tab=hotspots", schemes: ["dark"] },
+  { name: "hotspots", hash: "#/galaxy?tab=hotspots", schemes: ["dark"] },
   { name: "history", hash: "#/history?tab=timeline", schemes: ["dark"] },
   { name: "history-risk", hash: "#/history?tab=risk", schemes: ["dark"] },
   { name: "history-graph", hash: "#/history?tab=graph", schemes: ["dark"] },

@@ -7,7 +7,8 @@ import {
   fetchJevExchange,
   fetchJevExchanges,
 } from "../api.js";
-import { Empty, ErrorBox, Spinner, toast, useAsync } from "../components.js";
+import { ErrorBox, Spinner, toast, useAsync } from "../components.js";
+import { Badge, Card, EmptyState, Skeleton } from "../ds.js";
 import { cls } from "../util.js";
 import type { Tone } from "./adjudicator-helpers.js";
 import {
@@ -35,7 +36,7 @@ const isoTime = (ts: number): string => new Date(ts).toISOString();
 
 function ResultPill({ x }: { x: Pick<AdjExchangeSummary, "outcome" | "status"> }): JSX.Element {
   const tone: Tone = resultTone(x.outcome);
-  return <span class={cls("tag", `adj-t-${tone}`)}>{resultLabel(x)}</span>;
+  return <Badge tone={tone}>{resultLabel(x)}</Badge>;
 }
 
 /** A thin bar of how much of the deadline the request used; red when it timed out. */
@@ -147,7 +148,7 @@ function Rows({
 /** The timing bar: segments in the order the time was spent, with a deadline marker. */
 function TimingBar({ x }: { x: AdjExchangeDetail }): JSX.Element {
   const t = timeline(x);
-  if (!t.segments.length) return <Empty>no timing was recorded</Empty>;
+  if (!t.segments.length) return <EmptyState compact icon="▁" title="No timing recorded" />;
   return (
     <>
       <div class="xchg-bar" role="img" aria-label="request timing">
@@ -353,7 +354,9 @@ function ExchangeDrawer({
               }}
             />
           ) : (
-            <Empty>Request capture is off or Jev is not the provider, so nothing is shown.</Empty>
+            <EmptyState compact icon="○" title="Nothing to show">
+              Request capture is off or Jev is not the provider.
+            </EmptyState>
           )}
         </div>
       </aside>
@@ -380,25 +383,23 @@ export function JevExchanges({
   if (state === "hidden") return null;
   const list = r.data?.active && r.data.capture ? r.data : null;
   const keep = r.data?.active ? r.data.keep : DEFAULT_KEEP;
-  const head = (
-    <h3>
-      Jev requests
-      <span class="right muted small">
-        newest {keep} kept · capture {state === "off" ? "off" : state === "loading" ? "…" : "on"}
-      </span>
-    </h3>
-  );
+  const right = `newest ${keep} kept · capture ${state === "off" ? "off" : state === "loading" ? "…" : "on"}`;
   let body: JSX.Element;
   if (r.error) body = <ErrorBox error={r.error} />;
-  else if (state === "loading") body = <Spinner />;
+  else if (state === "loading") body = <Skeleton h={120} />;
   else if (state === "off") {
     const t = captureOffText();
     body = (
-      <Empty>
+      <EmptyState compact icon="○" title="Request capture is off">
         {t.before} <code class="adj-cmd">{t.command}</code>. {t.after}
-      </Empty>
+      </EmptyState>
     );
-  } else if (state === "empty") body = <Empty>{CAPTURE_EMPTY_TEXT}</Empty>;
+  } else if (state === "empty")
+    body = (
+      <EmptyState compact icon="▸" title="No requests captured yet">
+        {CAPTURE_EMPTY_TEXT}
+      </EmptyState>
+    );
   else
     body = (
       <>
@@ -419,12 +420,11 @@ export function JevExchanges({
       </>
     );
   return (
-    <section class="card jev-xchg">
-      {head}
+    <Card class="jev-xchg ds-block" title="Jev requests" right={right}>
       {body}
       {open !== null ? (
         <ExchangeDrawer id={open} onClose={() => setOpen(null)} onOpen={onOpen} />
       ) : null}
-    </section>
+    </Card>
   );
 }

@@ -1,9 +1,10 @@
-import type { ComponentChildren, JSX } from "preact";
+import type { JSX } from "preact";
 import { useState } from "preact/hooks";
 import { type AdjJevImpact, type AdjOverview, fetchJevImpact } from "../api.js";
-import { Empty, ErrorBox, Spinner, useAsync } from "../components.js";
+import { ErrorBox, useAsync } from "../components.js";
+import { Badge, Card, EmptyState, Skeleton, Stat, StatRow } from "../ds.js";
 import { cls } from "../util.js";
-import { DEGRADED_HELP, heat, type Tone } from "./adjudicator-helpers.js";
+import { DEGRADED_HELP, heat } from "./adjudicator-helpers.js";
 import { JevExchanges } from "./JevExchanges.js";
 import {
   complexityLine,
@@ -21,24 +22,10 @@ import {
   verdictTone,
 } from "./jev-helpers.js";
 
-const Pill = ({
-  tone,
-  children,
-  title,
-}: {
-  tone: Tone;
-  children: ComponentChildren;
-  title?: string;
-}): JSX.Element => (
-  <span class={cls("tag", `adj-t-${tone}`)} title={title}>
-    {children}
-  </span>
-);
-
 /** heuristic tier (rows) × tier with Jev (columns); outlined cells are agreement. */
 function TierGrid({ t }: { t: AdjJevImpact["influence"]["tier"] }): JSX.Element {
   const g = transitionGrid(t.transitions);
-  if (!g.total) return <Empty>no compared decisions yet</Empty>;
+  if (!g.total) return <EmptyState compact icon="▦" title="No compared decisions yet" />;
   return (
     <>
       <div class="adj-scroll">
@@ -129,7 +116,7 @@ function Agreement({ r }: { r: AdjJevImpact }): JSX.Element {
           </table>
         </div>
       ) : (
-        <Empty>no compared decisions yet</Empty>
+        <EmptyState compact icon="▦" title="No compared decisions yet" />
       )}
       <ul class="jev-lines">
         <li>
@@ -184,10 +171,9 @@ function Evidence({ r, onOpen }: { r: AdjJevImpact; onOpen: (id: number) => void
   const e = r.outcomes.evidence;
   if (!e.rows.length)
     return (
-      <Empty>
-        no labelled outcomes on decisions Jev changed yet: feedback through em_adjudicate and
-        finished swarm tasks add them
-      </Empty>
+      <EmptyState compact icon="○" title="No labelled outcomes yet">
+        Feedback through em_adjudicate and finished swarm tasks add them to decisions Jev changed.
+      </EmptyState>
     );
   return (
     <>
@@ -197,7 +183,7 @@ function Evidence({ r, onOpen }: { r: AdjJevImpact; onOpen: (id: number) => void
       <ul class="jev-evidence">
         {e.rows.map((row) => (
           <li>
-            <Pill tone={evidenceTone(row.kind)}>{row.kind}</Pill>
+            <Badge tone={evidenceTone(row.kind)}>{row.kind}</Badge>
             <button type="button" class="adj-link" onClick={() => onOpen(row.id)}>
               #{row.id}
             </button>
@@ -227,33 +213,31 @@ function Panel({
   // The server answered {active:false}: the config changed since the overview loaded.
   if (j.data && !j.data.active) return null;
   const r = j.data?.active ? j.data : undefined;
-  const head = (
-    <h3>
-      Jev impact
-      <span class="right muted small">TypeSafe Jev blended onto the heuristic · {range}</span>
-    </h3>
-  );
+  const cardProps = {
+    class: "jev-impact ds-block",
+    title: "Jev impact",
+    right: `TypeSafe Jev blended onto the heuristic · ${range}`,
+  };
   if (j.error)
     return (
-      <section class="card jev-impact">
-        {head}
+      <Card {...cardProps}>
         <ErrorBox error={j.error} />
-      </section>
+      </Card>
     );
   if (!r)
     return (
-      <section class="card jev-impact">
-        {head}
-        <Spinner />
-      </section>
+      <Card {...cardProps}>
+        <Skeleton h={160} />
+      </Card>
     );
   if (!r.sample.rows)
     return (
-      <section class="card jev-impact">
-        {head}
+      <Card {...cardProps}>
         {r.provider.degraded ? <Degraded why={r.provider.degraded} /> : null}
-        <Empty>no Jev decisions in this range yet</Empty>
-      </section>
+        <EmptyState compact icon="▸" title="No Jev decisions in this range yet">
+          Decisions blended with Jev appear here as the adjudicator runs.
+        </EmptyState>
+      </Card>
     );
 
   const v = r.verdict;
@@ -263,11 +247,10 @@ function Panel({
     ? v.warnings.filter((w) => !w.startsWith("Jev is configured but degraded"))
     : v.warnings;
   return (
-    <section class="card jev-impact">
-      {head}
+    <Card {...cardProps}>
       {r.provider.degraded ? <Degraded why={r.provider.degraded} /> : null}
       <div class="jev-verdict">
-        <Pill tone={tone}>{v.label}</Pill>
+        <Badge tone={tone}>{v.label}</Badge>
         <span class="jev-why-line">{verdictLine(v)}</span>
         <button type="button" class="adj-link" aria-expanded={how} onClick={() => setHow(!how)}>
           how is this decided?
@@ -291,38 +274,30 @@ function Panel({
         </ul>
       ) : null}
 
-      <div class="grid adj-kpis">
+      <StatRow>
         {kpiRows(r, r.provider.health?.state).map((k) => (
-          <div class="card" title={k.help}>
-            <h3>{k.title}</h3>
-            <div class="big">{k.value}</div>
-            <div class="sub">{k.sub}</div>
-          </div>
+          <Stat label={k.title} value={k.value} sub={k.sub} title={k.help} />
         ))}
-      </div>
+      </StatRow>
 
-      <div class="grid two">
-        <div class="card">
-          <h3>heuristic → final tier</h3>
+      <div class="ds-grid cols-2">
+        <Card title="Heuristic → final tier">
           <TierGrid t={r.influence.tier} />
-        </div>
-        <div class="card">
-          <h3>agreement</h3>
+        </Card>
+        <Card title="Agreement">
           <Agreement r={r} />
-        </div>
+        </Card>
       </div>
-      <div class="grid two">
-        <div class="card">
-          <h3>outcomes: changed vs unchanged</h3>
+      <div class="ds-grid cols-2">
+        <Card title="Outcomes: changed vs unchanged">
           <Outcomes r={r} />
-        </div>
-        <div class="card">
-          <h3>evidence</h3>
+        </Card>
+        <Card title="Evidence">
           <Evidence r={r} onOpen={onOpen} />
-        </div>
+        </Card>
       </div>
       <div class="muted small jev-foot">{footerFacts(r).join(" · ")}</div>
-    </section>
+    </Card>
   );
 }
 

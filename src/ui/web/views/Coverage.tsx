@@ -1,9 +1,20 @@
 import type { JSX } from "preact";
 import { useMemo, useState } from "preact/hooks";
 import { api, post } from "../api.js";
-import { Empty, ErrorBox, KV, Spinner, Tag, toast, useAsync, useSort } from "../components.js";
+import { ErrorBox, KV, Spinner, toast, useAsync, useSort } from "../components.js";
+import {
+  Badge,
+  Card,
+  EmptyState,
+  GradientText,
+  Hero,
+  Skeleton,
+  Stat,
+  StatRow,
+  type Tone,
+} from "../ds.js";
 import { navigate } from "../router.js";
-import { ago, cls, fmt } from "../util.js";
+import { ago, fmt } from "../util.js";
 
 interface CoverageFile {
   path: string;
@@ -39,6 +50,13 @@ interface Coverage {
   files: CoverageFile[];
 }
 
+const STATUS_TONE: Record<string, Tone> = {
+  indexed: "ok",
+  partial: "warn",
+  skipped: "bad",
+  unsupported: "muted",
+};
+
 export function Coverage(): JSX.Element {
   const q = useAsync(() => api<Coverage>("/api/coverage"), []);
   const [status, setStatus] = useState("");
@@ -67,74 +85,107 @@ export function Coverage(): JSX.Element {
   };
   if (q.error)
     return (
-      <div class="page">
-        <ErrorBox error={q.error} />
+      <div class="page ds-page">
+        <ErrorBox error={q.error} onRetry={q.reload} />
       </div>
     );
   const d = q.data;
   if (!d)
     return (
-      <div class="page">
-        <Spinner />
+      <div class="page ds-page" role="status" aria-busy="true">
+        <Hero title={<Skeleton w="min(320px, 70%)" h={34} />} sub={<Skeleton w={220} h={14} />} />
+        <StatRow>
+          {[0, 1, 2, 3].map((k) => (
+            <div class="ds-stat" key={k}>
+              <Skeleton w={80} h={11} />
+              <Skeleton w={100} h={28} />
+              <Skeleton w={130} h={11} />
+            </div>
+          ))}
+        </StatRow>
+        <Skeleton h={120} />
       </div>
     );
   const b = d.summary.byStatus;
   const total = Object.values(b).reduce((a, n) => a + n, 0);
   const fresh = d.freshness.headMatches && !d.freshness.dirty.length && !d.freshness.queued;
+  const freshLabel = fresh
+    ? "fresh"
+    : d.freshness.dirty.length || d.freshness.queued
+      ? "stale"
+      : "git behind";
   const cards: Array<[string, number, string]> = [
     ["indexed", b.indexed ?? 0, "parsed into the graph and search"],
     ["partial", b.partial ?? 0, "indexed, syntax errors recovered"],
     ["skipped", b.skipped ?? 0, "too large or parser error"],
     ["unsupported", b.unsupported ?? 0, "matched by globs, no parser"],
   ];
+  const gaps = (b.partial ?? 0) + (b.skipped ?? 0) + (b.unsupported ?? 0);
   return (
-    <div class="page">
-      <div class="grid">
-        {cards.map(([k, n, sub]) => (
-          <div
-            class={cls("card")}
-            style={{ cursor: "pointer" }}
-            onClick={() => setStatus(status === k ? "" : k)}
-          >
-            <h3>
-              {k}
-              {status === k ? <span class="right">filtering</span> : null}
-            </h3>
-            <div
-              class={cls(
-                "big",
-                k === "skipped" && n > 0 && "bad",
-                k === "partial" && n > 0 && "warn",
-              )}
+    <div class="page ds-page cv-page">
+      <Hero
+        eyebrow="Index coverage"
+        title={
+          total ? (
+            <>
+              <GradientText>{fmt(b.indexed ?? 0)}</GradientText> of {fmt(total)} files indexed
+            </>
+          ) : (
+            "No files scanned yet"
+          )
+        }
+        sub={
+          total
+            ? gaps
+              ? `${fmt(gaps)} file${gaps === 1 ? "" : "s"} partly or not indexed. Pick a status below to filter the list.`
+              : "Every matched file is in the graph and search index."
+            : "Run a code reindex and the coverage report shows up here."
+        }
+        meta={
+          <Badge tone={fresh ? "ok" : "warn"} dot>
+            {freshLabel}
+          </Badge>
+        }
+        aside={
+          <>
+            <button
+              type="button"
+              disabled={!!busy}
+              onClick={() => run("code", { action: "reindex", scope: "code" })}
             >
-              {n}
-            </div>
-            <div class="sub">{sub}</div>
-          </div>
+              {busy === "code" ? <Spinner /> : "Reindex code"}
+            </button>
+            <button
+              type="button"
+              disabled={!!busy}
+              onClick={() => run("full", { action: "reindex", scope: "code", full: true })}
+            >
+              {busy === "full" ? <Spinner /> : "Full reindex"}
+            </button>
+          </>
+        }
+      />
+      <StatRow>
+        {cards.map(([k, n, sub]) => (
+          <Stat
+            label={k}
+            value={n}
+            tone={k === "skipped" && n > 0 ? "bad" : k === "partial" && n > 0 ? "warn" : undefined}
+            sub={status === k ? `${sub} · filtering` : sub}
+            title={status === k ? `show all files` : `show only ${k} files`}
+            onClick={() => setStatus(status === k ? "" : k)}
+          />
         ))}
-        <div class="card">
-          <h3>freshness</h3>
-          <div class={cls("big", fresh ? "ok" : "warn")}>
-            {fresh
-              ? "fresh"
-              : d.freshness.dirty.length || d.freshness.queued
-                ? "stale"
-                : "git behind"}
-          </div>
-          <div class="sub">
-            {d.freshness.dirty.length} changed · {d.freshness.queued} queued
-          </div>
-        </div>
-      </div>
-      <div class="grid wide">
-        <div class="card">
-          <h3>
-            files{" "}
-            <span class="right">
-              {sorted.length} of {total}
-            </span>
-          </h3>
-          <div class="row" style={{ marginBottom: 8 }}>
+        <Stat
+          label="freshness"
+          value={freshLabel}
+          tone={fresh ? "ok" : "warn"}
+          sub={`${d.freshness.dirty.length} changed · ${d.freshness.queued} queued`}
+        />
+      </StatRow>
+      <div class="ds-grid main-side">
+        <Card flush title="Files" right={`${sorted.length} of ${total}`}>
+          <div class="row cv-filter">
             <input
               type="search"
               class="grow"
@@ -151,22 +202,8 @@ export function Coverage(): JSX.Element {
                 <option value={s}>{s}</option>
               ))}
             </select>
-            <button
-              type="button"
-              disabled={!!busy}
-              onClick={() => run("code", { action: "reindex", scope: "code" })}
-            >
-              {busy === "code" ? <Spinner /> : "Reindex code"}
-            </button>
-            <button
-              type="button"
-              disabled={!!busy}
-              onClick={() => run("full", { action: "reindex", scope: "code", full: true })}
-            >
-              {busy === "full" ? <Spinner /> : "Full reindex"}
-            </button>
           </div>
-          <div class="list" style={{ maxHeight: 560 }}>
+          <div class="ds-table-wrap cv-files">
             <table>
               <thead>
                 <tr>
@@ -187,17 +224,7 @@ export function Coverage(): JSX.Element {
                         <a onClick={() => navigate("explore", { file: r.path })}>{r.path}</a>
                       </td>
                       <td>
-                        <Tag
-                          class={
-                            r.status === "indexed"
-                              ? "s-accepted"
-                              : r.status === "partial"
-                                ? "s-proposed"
-                                : "risk-high"
-                          }
-                        >
-                          {r.status}
-                        </Tag>
+                        <Badge tone={STATUS_TONE[r.status] ?? "muted"}>{r.status}</Badge>
                       </td>
                       <td class="muted small">
                         {r.reason ?? ""}
@@ -212,7 +239,11 @@ export function Coverage(): JSX.Element {
                           class="sm"
                           disabled={!!busy}
                           onClick={() =>
-                            run(r.path, { action: "reindex", scope: "code", paths: [r.path] })
+                            run(r.path, {
+                              action: "reindex",
+                              scope: "code",
+                              paths: [r.path],
+                            })
                           }
                         >
                           {busy === r.path ? <Spinner /> : "reindex"}
@@ -223,17 +254,24 @@ export function Coverage(): JSX.Element {
                 ) : (
                   <tr>
                     <td colSpan={7}>
-                      <Empty>no files match</Empty>
+                      <EmptyState
+                        compact
+                        icon="∅"
+                        title={total ? "No files match" : "No files yet"}
+                      >
+                        {total
+                          ? "Change the filter or status to see more files."
+                          : "Nothing has been scanned. Run a code reindex."}
+                      </EmptyState>
                     </td>
                   </tr>
                 )}
               </tbody>
             </table>
           </div>
-        </div>
-        <div class="stack">
-          <div class="card">
-            <h3>index state</h3>
+        </Card>
+        <div class="cv-side">
+          <Card title="Index state">
             <KV
               rows={[
                 ["HEAD", d.freshness.head?.slice(0, 10) ?? "no git"],
@@ -253,11 +291,10 @@ export function Coverage(): JSX.Element {
                 ],
               ]}
             />
-          </div>
+          </Card>
           {d.freshness.dirty.length ? (
-            <div class="card">
-              <h3>changed since indexed · {d.freshness.dirty.length}</h3>
-              <div class="list" style={{ maxHeight: 200 }}>
+            <Card title="Changed since indexed" right={d.freshness.dirty.length}>
+              <div class="list cv-dirty">
                 {d.freshness.dirty.map((p) => (
                   <div class="item" onClick={() => navigate("explore", { file: p })}>
                     <div class="p">{p}</div>
@@ -270,30 +307,34 @@ export function Coverage(): JSX.Element {
                 style={{ marginTop: 6 }}
                 disabled={!!busy}
                 onClick={() =>
-                  run("dirty", { action: "reindex", scope: "code", paths: d.freshness.dirty })
+                  run("dirty", {
+                    action: "reindex",
+                    scope: "code",
+                    paths: d.freshness.dirty,
+                  })
                 }
               >
                 {busy === "dirty" ? <Spinner /> : "Reindex changed files"}
               </button>
-            </div>
+            </Card>
           ) : null}
           {d.summary.reasons.length ? (
-            <div class="card">
-              <h3>why files are not fully indexed</h3>
-              <table>
-                <tbody>
-                  {d.summary.reasons.map((r) => (
-                    <tr class="click" onClick={() => setText(r.reason)}>
-                      <td>{r.reason}</td>
-                      <td class="num">{r.n}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+            <Card flush title="Why files are not fully indexed">
+              <div class="ds-table-wrap">
+                <table>
+                  <tbody>
+                    {d.summary.reasons.map((r) => (
+                      <tr class="click" onClick={() => setText(r.reason)}>
+                        <td>{r.reason}</td>
+                        <td class="num">{r.n}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
           ) : null}
-          <div class="card">
-            <h3>scope</h3>
+          <Card title="Scope">
             <div class="small">
               <div class="muted">include</div>
               <div class="mono break">{(d.scan?.include ?? []).join("  ") || "(defaults)"}</div>
@@ -306,7 +347,7 @@ export function Coverage(): JSX.Element {
                 coverage result means no recorded gap, not proof of completeness.
               </div>
             </div>
-          </div>
+          </Card>
         </div>
       </div>
     </div>

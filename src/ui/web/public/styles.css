@@ -1165,77 +1165,6 @@ svg.glyph {
   max-width: 180px;
 }
 
-/* --- treemap --- */
-.treemap {
-  position: relative;
-  width: 100%;
-  height: 520px;
-  background: var(--card);
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  overflow: hidden;
-}
-.treemap .cell {
-  position: absolute;
-  overflow: hidden;
-  border: 1px solid var(--card);
-  font-size: 11px;
-  cursor: pointer;
-  padding: 2px 4px;
-  color: #fff;
-  text-shadow: 0 0 2px rgba(0, 0, 0, 0.6);
-}
-.treemap .cell.dir {
-  background: transparent !important;
-  border: 1px solid var(--line);
-  color: var(--fg);
-  text-shadow: none;
-  padding: 0;
-}
-.treemap .cell.dir > .lbl {
-  font-size: 11px;
-  padding: 2px 5px;
-  color: var(--muted);
-  background: var(--card);
-  display: inline-block;
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.treemap .cell:hover {
-  outline: 2px solid var(--accent);
-  z-index: 2;
-}
-.treemap .cell.sel {
-  outline: 2px solid var(--fg);
-  z-index: 2;
-}
-
-/* --- behavior tree --- */
-.btree {
-  font-size: 12.5px;
-}
-.btree .bnode {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 3px 6px;
-  border-radius: 6px;
-  cursor: pointer;
-}
-.btree .bnode:hover {
-  background: var(--hover);
-}
-.btree .bnode.sel {
-  background: var(--accent-soft);
-}
-.btree .kids {
-  margin-left: 18px;
-  border-left: 1px dashed var(--line);
-  padding-left: 6px;
-}
-
 /* --- history explorer ------------------------------------------------------------- */
 .hist-stats {
   display: grid;
@@ -6231,7 +6160,7 @@ table.adj-eval {
 .jev-impact {
   margin-bottom: 14px;
 }
-.jev-impact > .grid {
+.jev-impact > .ds-grid {
   margin-top: 12px;
 }
 .jev-impact .grid .card {
@@ -6454,4 +6383,444 @@ table.adj-eval {
 .adj-drawer-body .adj-h .right {
   overflow-wrap: anywhere;
   text-align: right;
+}
+
+/* --- Memory and Docs views (mem-page, docs-page): only these two views use these rules --- */
+.mem-page .ds-segmented,
+.docs-page .ds-segmented {
+  margin-bottom: var(--space-3);
+}
+.docs-log {
+  margin-top: var(--space-3);
+}
+
+/* --- History and History graph (ds alignment, task #249) ------------------------------ */
+.hist-page .hist-nav {
+  margin-bottom: var(--space-4);
+  overflow-x: auto;
+}
+.hist-page .ds-card {
+  margin-bottom: var(--space-3);
+}
+.hist-page .ds-card.flush {
+  margin-bottom: var(--space-3);
+}
+.hist-page .stack > .ds-card {
+  margin-bottom: 0;
+}
+.hist-page .grid.wide {
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+.hist-page .ds-card .hist-h3 {
+  font-size: 13.5px;
+  font-weight: 650;
+  color: var(--fg);
+  text-transform: none;
+  letter-spacing: -0.005em;
+  margin: 0;
+}
+.hist-page .ds-card h3.hist-subject {
+  font-size: 15px;
+  font-weight: 650;
+  color: var(--fg);
+  text-transform: none;
+  letter-spacing: -0.01em;
+  margin: var(--space-2) 0 var(--space-1);
+}
+.hist-page .ds-card-head h3 .break,
+.hist-page .ds-card-head h3 {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.hist-page .ds-card.muted {
+  color: var(--muted);
+}
+.hist-page .hist-kind {
+  background: var(--hover);
+  border: 1px solid var(--line);
+}
+.hist-page .kgalaxy.hgraph.ds-card {
+  padding: 0;
+  margin-bottom: 0;
+  height: calc(100vh - 360px);
+}
+.hist-graph-loading {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-4);
+}
+
+/* --- workspace views: Explore, Galaxy, Knowledge galaxy, Coverage (ds alignment) ---
+   Full-bleed canvases keep their split/toolbar layout; only the chrome (toolbars, panel
+   heads, chips, empty and loading states) takes the ds tokens. Scoped to .ws / .cv-* so the
+   shared .panel / .gtoolbar rules keep serving the other pages. */
+.ws-explore,
+.ws-galaxy {
+  height: 100%;
+}
+.ws-galaxy {
+  display: flex;
+  flex-direction: column;
+}
+.ws-body {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+}
+.ws .gtoolbar,
+.ws .crumbs {
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface-2);
+}
+.ws .panel {
+  background: var(--card);
+}
+.ws .panel .head {
+  padding: 10px var(--space-3);
+  font-size: 12.5px;
+  font-weight: 650;
+  letter-spacing: -0.005em;
+  text-transform: none;
+  color: var(--fg);
+  gap: var(--space-2);
+}
+.ws .panel .head a {
+  font-weight: 500;
+}
+.ws .panel .section {
+  padding: var(--space-3);
+}
+.ws .panel .section h4 {
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: var(--space-2);
+}
+.ws button.chip {
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 0 10px;
+  line-height: 22px;
+}
+.ws button.chip.on {
+  color: var(--ink-accent);
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+.ws .ds-segmented button {
+  font-size: 12px;
+  padding: 2px 10px;
+}
+.ws .ds-empty {
+  margin: var(--space-4);
+}
+.ws .ds-empty.compact {
+  margin: var(--space-3);
+}
+.ws-skel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-4);
+}
+.ws .tag.kind {
+  font-weight: 600;
+}
+.kgalaxy.ws {
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+}
+.cv-page .ds-hero-aside {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  align-items: center;
+}
+.cv-filter {
+  padding: var(--space-3) var(--space-4);
+  flex-wrap: wrap;
+}
+.cv-files {
+  max-height: 560px;
+  overflow: auto;
+}
+.cv-side {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+}
+.cv-dirty {
+  max-height: 200px;
+}
+
+/* --- Usage, Sessions and System aligned to the design system (us-*, ss-*, sy-*; task #251) ---
+   Only what the ds-* components do not cover. Colours come from tokens, so all themes work. */
+.us-hero-unit {
+  font-size: 0.5em;
+  font-weight: 500;
+  color: var(--muted);
+}
+.us-big {
+  font-size: 24px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+.us-savings {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 24px;
+  margin-bottom: var(--space-3);
+}
+.us-page .ds-card-head .usage-legend {
+  justify-content: flex-end;
+}
+.ss-split {
+  grid-template-columns: minmax(280px, 1fr) minmax(0, 2fr);
+  align-items: start;
+}
+.ss-list {
+  max-height: 70vh;
+  overflow-y: auto;
+}
+.ss-item {
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+}
+.ss-item:last-child {
+  border-bottom: 0;
+}
+.ss-item:hover {
+  background: var(--surface-2);
+}
+.ss-item.sel {
+  background: var(--surface-2);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.ss-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.ss-item-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+.ss-ago {
+  margin-left: auto;
+}
+.ss-prompt {
+  margin: 3px 0;
+  overflow-wrap: anywhere;
+}
+.ss-skel,
+.ss-pad {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-4);
+}
+.ss-filters {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+.sy-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+.sy-actions {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr));
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+.sy-desc {
+  margin: 0 0 var(--space-3);
+  color: var(--muted);
+  font-size: 12.5px;
+}
+.sy-actions .row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+@media (max-width: 760px) {
+  .ss-split {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* --- adjudicator, Jev impact and Jev requests on the design system (adj-ds) --------------
+   These three views use ds-* components; this section holds only what they add on top. */
+.adj-page .ds-block {
+  margin-bottom: var(--space-4);
+}
+.adj-page .ds-block > .ds-grid {
+  margin-top: var(--space-3);
+}
+.adj-page .ds-block .ds-grid .ds-card,
+.adj-page .ds-block .ds-stats .ds-stat {
+  min-width: 0;
+}
+.adj-page .ds-stat-sub {
+  overflow-wrap: anywhere;
+}
+.adj-page .ds-stats {
+  margin-bottom: var(--space-4);
+}
+.adj-hero-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+.adj-page .ds-card.adj-log,
+.adj-page .ds-card.adj-try {
+  margin-bottom: var(--space-4);
+}
+.ds-skeleton.adj-skel-card {
+  border-radius: var(--radius-lg);
+}
+
+/* --- treemap --- */
+.treemap {
+  position: relative;
+  width: 100%;
+  height: 520px;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.treemap .cell {
+  position: absolute;
+  overflow: hidden;
+  border: 1px solid var(--card);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 2px 4px;
+  color: #fff;
+  text-shadow: 0 0 2px rgba(0, 0, 0, 0.6);
+}
+.treemap .cell.dir {
+  background: transparent !important;
+  border: 1px solid var(--line);
+  color: var(--fg);
+  text-shadow: none;
+  padding: 0;
+}
+.treemap .cell.dir > .lbl {
+  font-size: 11px;
+  padding: 2px 5px;
+  color: var(--muted);
+  background: var(--card);
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.treemap .cell:hover {
+  outline: 2px solid var(--accent);
+  z-index: 2;
+}
+.treemap .cell.sel {
+  outline: 2px solid var(--fg);
+  z-index: 2;
+}
+
+/* --- behavior tree --- */
+.btree {
+  font-size: 12.5px;
+}
+.btree .bnode {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.btree .bnode:hover {
+  background: var(--hover);
+}
+.btree .bnode.sel {
+  background: var(--accent-soft);
+}
+.btree .kids {
+  margin-left: 18px;
+  border-left: 1px dashed var(--line);
+  padding-left: 6px;
+}
+
+/* --- Galaxy tabs: the former Architecture panels live under the Galaxy tab bar --- */
+.gtabs {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-2);
+  overflow-x: auto;
+}
+.gt-page {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+.ds-card.gt-canvas {
+  height: 560px;
+  overflow: hidden;
+}
+.ws-graph-pane {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Memory toolbar: the filter keeps a usable width and wraps onto its own line on phones. */
+.mem-toolbar .mem-filter {
+  flex: 1 1 200px;
+  min-width: 160px;
+}
+@media (max-width: 520px) {
+  .mem-toolbar .mem-filter {
+    flex-basis: 100%;
+    order: -1;
+  }
+}
+
+.hist-page .hist-kind.neutral {
+  color: var(--ink-muted, var(--fg));
+}
+
+/* System > Index a path: keep the path input readable, wrap the rest. */
+.sy-index-path {
+  flex: 2 1 180px;
+  min-width: 160px;
+}
+.sy-index-globs {
+  flex: 1 1 160px;
+  min-width: 0;
+  max-width: 240px;
+}
+@media (max-width: 520px) {
+  .sy-index-globs {
+    max-width: none;
+  }
 }

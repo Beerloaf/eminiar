@@ -18,25 +18,22 @@ import {
   post,
   type SearchHitUi,
 } from "../api.js";
-import { Empty, ErrorBox, KV, Spinner, SubTabs, toast, useAsync } from "../components.js";
+import { ErrorBox, KV, Spinner, toast, useAsync } from "../components.js";
+import { Badge, Card, EmptyState, Hero, Segmented, type Tone } from "../ds.js";
 import { navigate } from "../router.js";
 import { ago, cls, day, fmt } from "../util.js";
 import { KnowledgeGalaxy } from "./KnowledgeGalaxy.js";
 
-const KIND_COLORS: Record<string, string> = { url: "#2563eb", path: "#16a34a" };
-const CONF_COLORS: Record<string, string> = {
-  catalog: "#16a34a",
-  probe: "#2563eb",
-  registry: "#d97706",
-  unknown: "#6b7280",
+const KIND_TONES: Record<string, Tone> = { url: "accent", path: "ok" };
+const CONF_TONES: Record<string, Tone> = {
+  catalog: "ok",
+  probe: "accent",
+  registry: "warn",
+  unknown: "muted",
 };
 
 function KindTag({ kind }: { kind: string }): JSX.Element {
-  return (
-    <span class="tag kind" style={{ color: KIND_COLORS[kind] ?? "#6b7280" }}>
-      {kind}
-    </span>
-  );
+  return <Badge tone={KIND_TONES[kind] ?? "muted"}>{kind}</Badge>;
 }
 
 function Links({ urls }: { urls: string[] }): JSX.Element {
@@ -164,7 +161,9 @@ function SourceDetail({
           </tbody>
         </table>
       ) : (
-        <Empty>nothing indexed yet — run sync</Empty>
+        <EmptyState compact icon="○" title="Nothing indexed yet">
+          Run sync to index this source.
+        </EmptyState>
       )}
     </div>
   );
@@ -238,8 +237,7 @@ function AddForm({ onDone }: { onDone: (r: DocsAddResult) => void }): JSX.Elemen
     }
   };
   return (
-    <div class="card">
-      <h3>add a source</h3>
+    <Card title="Add a source">
       <div class="grid" style={{ gridTemplateColumns: "1fr 2fr 1fr", gap: 8 }}>
         <div class="field">
           <label>name (optional)</label>
@@ -321,7 +319,7 @@ function AddForm({ onDone }: { onDone: (r: DocsAddResult) => void }): JSX.Elemen
           {busy ? <Spinner /> : "Add & index"}
         </button>
       </div>
-    </div>
+    </Card>
   );
 }
 
@@ -543,12 +541,12 @@ function Sources({
         class="grid wide"
         style={{ gridTemplateColumns: "minmax(280px,1fr) minmax(0,2fr)", alignItems: "start" }}
       >
-        <div class="card flush">
+        <Card flush>
           <div class="list">
             {!d ? (
-              <Empty>
+              <EmptyState compact icon="…" title="Loading sources">
                 <Spinner />
-              </Empty>
+              </EmptyState>
             ) : rows.length ? (
               groups.map((g) => (
                 <>
@@ -584,15 +582,17 @@ function Sources({
                 </>
               ))
             ) : (
-              <Empty>
-                {d.sources.length
-                  ? "no sources match"
-                  : "No documentation sources yet. Use Discover, or add a url, path or provider."}
-              </Empty>
+              <EmptyState
+                compact
+                icon="○"
+                title={d.sources.length ? "No sources match" : "No documentation sources yet"}
+              >
+                {d.sources.length ? null : "Use Discover, or add a url, path or provider."}
+              </EmptyState>
             )}
           </div>
-        </div>
-        <div class="card">
+        </Card>
+        <Card>
           {current ? (
             <SourceDetail
               s={current}
@@ -601,9 +601,11 @@ function Sources({
               onRemove={() => remove(current.name)}
             />
           ) : (
-            <Empty>Select a source to see its pages and sync state.</Empty>
+            <EmptyState compact icon="◇" title="Select a source">
+              to see its pages and sync state.
+            </EmptyState>
           )}
-        </div>
+        </Card>
       </div>
     </>
   );
@@ -736,9 +738,7 @@ function Discover({
     return (
       <div class="card flush" style={{ marginBottom: 12 }}>
         <h3 style={{ padding: "10px 12px 0" }}>
-          <span class="tag kind" style={{ color: CONF_COLORS[conf] }}>
-            {conf}
-          </span>{" "}
+          <Badge tone={CONF_TONES[conf] ?? "muted"}>{conf}</Badge>{" "}
           {conf === "catalog"
             ? "libraries, services and infrastructure"
             : conf === "probe"
@@ -840,12 +840,12 @@ function Discover({
       </div>
       {q.error ? <ErrorBox error={q.error} /> : null}
       {!ran ? (
-        <Empty>
+        <EmptyState compact icon="⌕" title="Discover documentation">
           Scans the project (and one level of sub-projects) for READMEs, docs folders, ADRs, API
           specs, agent instructions and env references, plus the npm / PyPI / Go packages, env var
           prefixes, container images, infrastructure files and outbound API calls — and maps each to
           its documentation. Nothing is fetched until you add.
-        </Empty>
+        </EmptyState>
       ) : !d ? (
         <Spinner />
       ) : (
@@ -934,10 +934,10 @@ function DocsSearch({ sources }: { sources: string[] }): JSX.Element {
       </div>
       {r.error ? <ErrorBox error={r.error} /> : null}
       {!run ? (
-        <Empty>
+        <EmptyState compact icon="⌕" title="Search the documentation">
           Searches only the documentation sources (source docs:*). Claude uses the same index
           through em_docs lookup.
-        </Empty>
+        </EmptyState>
       ) : !r.data ? (
         <Spinner />
       ) : r.data.hits.length ? (
@@ -979,7 +979,7 @@ function DocsSearch({ sources }: { sources: string[] }): JSX.Element {
           ))}
         </div>
       ) : (
-        <Empty>no matches</Empty>
+        <EmptyState compact icon="○" title="No matches" />
       )}
     </>
   );
@@ -998,13 +998,20 @@ export function Docs({ params }: { params: Record<string, string> }): JSX.Elemen
     if (params.tab) setTab(params.tab);
   }, [params.tab]);
   return (
-    <div class="page">
-      <SubTabs
-        tabs={[
-          ["sources", "Sources"],
-          ["discover", "Discover"],
-          ["search", "Search"],
-          ["graph", "Graph"],
+    <div class="page ds-page docs-page">
+      <Hero
+        eyebrow="Documentation"
+        title="Documentation knowledge base"
+        sub="Local docs and the libraries, services and APIs the project depends on, indexed for em_docs lookup."
+        meta={list.data ? <Badge tone="accent">{list.data.sources.length} sources</Badge> : null}
+      />
+      <Segmented
+        label="Documentation views"
+        options={[
+          { id: "sources", label: "Sources" },
+          { id: "discover", label: "Discover" },
+          { id: "search", label: "Search" },
+          { id: "graph", label: "Graph" },
         ]}
         value={tab}
         onChange={(t) => {
@@ -1017,15 +1024,17 @@ export function Docs({ params }: { params: Record<string, string> }): JSX.Elemen
       {tab === "search" && <DocsSearch sources={(list.data?.sources ?? []).map((s) => s.name)} />}
       {tab === "graph" && <KnowledgeGalaxy scope="docs" focus={params.focus} />}
       {log.length ? (
-        <div class="card" style={{ marginTop: 12 }}>
-          <h3>
-            sync log{" "}
-            <button type="button" class="sm right" onClick={() => setLog([])}>
+        <Card
+          class="docs-log"
+          title="Sync log"
+          right={
+            <button type="button" class="sm" onClick={() => setLog([])}>
               clear
             </button>
-          </h3>
+          }
+        >
           <pre class="log">{log.join("\n\n")}</pre>
-        </div>
+        </Card>
       ) : null}
     </div>
   );

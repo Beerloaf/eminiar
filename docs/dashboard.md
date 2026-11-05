@@ -58,19 +58,27 @@ A source explorer for the project.
 
 ![Galaxy: the knowledge graph two layers around a file](images/dashboard-galaxy-dark.webp)
 
-The knowledge graph on a canvas. Search for a node, choose the direction and edge kinds, expand
-one layer at a time, find a path between two nodes, or switch to a folder hierarchy. Back and
-forward buttons step through your exploration.
+The code graph and the project's architecture, in one page with seven tabs. The tab is in the
+URL (`#/galaxy?tab=<id>`), and the page reopens on the last tab you used.
 
-### Architecture
+- **Galaxy** (`tab=galaxy`). The knowledge graph on a canvas, force-directed. Search for a node,
+  choose the direction and edge kinds, expand one layer at a time, or find a path between two
+  nodes. Back and forward buttons step through your exploration. A link with `node=` opens this
+  tab (`#/galaxy?node=file:src/server.ts`).
+- **Hierarchy** (`tab=hierarchy`). The same graph and controls, laid out in layers.
+- **Folder map** (`tab=map`). A treemap of the folders, sized by lines of code (or evenly) and
+  coloured by language or by heat.
+- **Routes** (`tab=routes`). The HTTP routes found in the code, with their handlers.
+- **Hotspots** (`tab=hotspots`). The files and functions that attract change: fan-in, commits in
+  the last 90 days, complexity and the hotspot score.
+- **Structure** (`tab=structure`). Module clusters and their import cycles.
+- **Behavior** (`tab=behavior`). A tree of the calls that one operation can make.
 
-![Architecture, Hotspots tab: fan-in, recent commits and complexity per file](images/dashboard-hotspots-dark.webp)
+![Galaxy, Hotspots tab: fan-in, recent commits and complexity per file](images/dashboard-hotspots-dark.webp)
 
-- Folder treemap, sized by code size or coloured by heat.
-- Routes with their handlers.
-- Hotspot table (shown above).
-- Clusters with their import cycles.
-- A behaviour tree of the calls that an operation can make.
+The five tabs after Hierarchy were once a separate Architecture page. Old `#/architecture`
+links still work: they open Galaxy on the same tab (`#/architecture?tab=hotspots` →
+`#/galaxy?tab=hotspots`), and the old overview, or no tab, opens the Folder map.
 
 ### History
 

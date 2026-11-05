@@ -14,7 +14,18 @@ import {
   type HistoryOverview,
   type RiskUi,
 } from "../api.js";
-import { Bar, Empty, ErrorBox, Spinner, SubTabs, Tag, useAsync, useSort } from "../components.js";
+import { Bar, ErrorBox, Spinner, useAsync, useSort } from "../components.js";
+import {
+  Badge,
+  Card,
+  EmptyState,
+  Hero,
+  Segmented,
+  Skeleton,
+  Stat,
+  StatRow,
+  type Tone,
+} from "../ds.js";
 import {
   ActivityChart,
   bucketColor,
@@ -35,7 +46,10 @@ type Tab = "timeline" | "branches" | "files" | "graph" | "risk";
 
 function KindTagH({ kind, bucket }: { kind: string; bucket: Bucket }): JSX.Element {
   return (
-    <span class="tag kind" style={{ color: bucketColor(bucket) }}>
+    <span
+      class={cls("ds-badge hist-kind", bucket === "other" && "neutral")}
+      style={bucket === "other" ? undefined : { color: bucketColor(bucket) }}
+    >
       {kind}
     </span>
   );
@@ -119,24 +133,20 @@ function RiskBar({ value }: { value: number }): JSX.Element {
   );
 }
 
-function Stat({
-  v,
-  k,
-  sub,
-}: {
-  v: ComponentChildren;
-  k: string;
-  sub?: ComponentChildren;
-}): JSX.Element {
-  return (
-    <div class="stat">
-      <div class="v">
-        {v}
-        {sub ? <small>{sub}</small> : null}
-      </div>
-      <div class="k">{k}</div>
-    </div>
-  );
+const TAG_TONE: Record<string, Tone> = {
+  "risk-high": "bad",
+  "risk-medium": "warn",
+  "risk-low": "ok",
+  "s-accepted": "ok",
+};
+
+/** A small status/label chip: the history views' `Tag`, drawn with the ds Badge. */
+function Tag({ children, class: c }: { children: ComponentChildren; class?: string }): JSX.Element {
+  return <Badge tone={c ? TAG_TONE[c] : undefined}>{children}</Badge>;
+}
+
+function Empty({ children }: { children: ComponentChildren }): JSX.Element {
+  return <EmptyState compact title={children} />;
 }
 
 /** Rows of commits; `lanes` adds the DAG column on the left. */
@@ -260,7 +270,7 @@ function CommitDetail({
   const maxLines = Math.max(1, ...d.files.map((f) => f.added + f.deleted));
   return (
     <div class="stack">
-      <div class="card">
+      <Card>
         <div class="row tight" style={{ flexWrap: "wrap" }}>
           <KindTagH kind={c.kind} bucket={c.bucket} />
           {c.scope ? <Tag>{c.scope}</Tag> : null}
@@ -275,7 +285,7 @@ function CommitDetail({
             {c.sha.slice(0, 12)}
           </span>
         </div>
-        <h3 style={{ marginTop: 6 }}>{c.subject}</h3>
+        <h3 class="hist-subject">{c.subject}</h3>
         <div class="muted small">
           {c.author} &lt;{c.email}&gt; · {new Date(c.at).toLocaleString()} ({ago(c.at)})
           {c.merge
@@ -314,10 +324,9 @@ function CommitDetail({
             </span>
           ) : null}
         </div>
-      </div>
+      </Card>
       {d.blamedBy.length || d.origins.length || d.revertedBy ? (
-        <div class="card">
-          <h3>what history says</h3>
+        <Card title="what history says">
           {d.origins.length ? (
             <>
               <div class="muted small" style={{ marginBottom: 4 }}>
@@ -365,12 +374,12 @@ function CommitDetail({
               </div>
             </>
           ) : null}
-        </div>
+        </Card>
       ) : null}
       {diff !== false ? (
-        <div class="card">
+        <Card>
           <div class="row" style={{ marginBottom: 6 }}>
-            <h3 style={{ margin: 0 }}>diff{diff ? ` · ${diff}` : ""}</h3>
+            <h3 class="hist-h3">diff{diff ? ` · ${diff}` : ""}</h3>
             {diff ? (
               <button type="button" class="sm ghost" onClick={() => setDiff(null)}>
                 whole commit
@@ -378,16 +387,13 @@ function CommitDetail({
             ) : null}
           </div>
           <DiffView sha={c.sha} path={diff ?? undefined} />
-        </div>
+        </Card>
       ) : null}
       {d.files.length ? (
-        <div class="card">
-          <h3>
-            files · {d.files.length}
-            <span class="muted small" style={{ fontWeight: 400, marginLeft: 8 }}>
-              symbols are listed when the file has not changed since this commit
-            </span>
-          </h3>
+        <Card
+          title={`files · ${d.files.length}`}
+          sub="symbols are listed when the file has not changed since this commit"
+        >
           <div class="cfiles">
             {d.files.map((f) => (
               <div class="cfile">
@@ -436,7 +442,7 @@ function CommitDetail({
               </div>
             ))}
           </div>
-        </div>
+        </Card>
       ) : null}
     </div>
   );
@@ -502,7 +508,7 @@ function Timeline({
       style={{ alignItems: "start", gridTemplateColumns: "minmax(0, 1.4fr) minmax(320px, 1fr)" }}
     >
       <div class="stack">
-        <div class="card">
+        <Card>
           <div class="row" style={{ marginBottom: 6, flexWrap: "wrap" }}>
             <KindLegend
               counts={bucketCounts}
@@ -528,8 +534,8 @@ function Timeline({
             </span>
           </div>
           <ActivityChart weeks={ov.weeks} range={range} onRange={setRange} hidden={hidden} />
-        </div>
-        <div class="card">
+        </Card>
+        <Card>
           <div class="row" style={{ flexWrap: "wrap", marginBottom: 8 }}>
             <input
               type="search"
@@ -595,23 +601,21 @@ function Timeline({
               ) : null}
             </>
           )}
-        </div>
+        </Card>
       </div>
       <div class="stack">
         {selected ? (
           <CommitDetail sha={selected} onSelect={onSelect} />
         ) : (
           <>
-            <div class="card">
-              <h3>worth knowing</h3>
+            <Card title="worth knowing">
               {ov.notable.length ? (
                 <CommitList commits={ov.notable} selected={null} onSelect={onSelect} />
               ) : (
                 <div class="muted small">No commit stands out in hindsight.</div>
               )}
-            </div>
-            <div class="card">
-              <h3>people</h3>
+            </Card>
+            <Card title="people">
               <table>
                 <tbody>
                   {ov.authors.slice(0, 8).map((a) => (
@@ -629,10 +633,9 @@ function Timeline({
                   ))}
                 </tbody>
               </table>
-            </div>
+            </Card>
             {ov.tags.length ? (
-              <div class="card">
-                <h3>releases</h3>
+              <Card title="releases">
                 <div class="row tight" style={{ flexWrap: "wrap" }}>
                   {ov.tags.slice(0, 20).map((t) => (
                     <a onClick={() => onSelect(t.sha)} title={day(t.at)}>
@@ -640,7 +643,7 @@ function Timeline({
                     </a>
                   ))}
                 </div>
-              </div>
+              </Card>
             ) : null}
           </>
         )}
@@ -685,13 +688,10 @@ function Branches({
       class="grid wide"
       style={{ alignItems: "start", gridTemplateColumns: "minmax(0, 1fr) minmax(360px, 1fr)" }}
     >
-      <div class="card">
-        <h3>
-          commit graph{" "}
-          <span class="muted small">
-            · latest {graph.data?.commits.length ?? ""} across all branches
-          </span>
-        </h3>
+      <Card
+        title="commit graph"
+        sub={`latest ${graph.data?.commits.length ?? ""} across all branches`}
+      >
         {graph.error ? (
           <ErrorBox error={graph.error} />
         ) : !graph.data ? (
@@ -707,11 +707,11 @@ function Branches({
             lanes={lanes}
           />
         )}
-      </div>
+      </Card>
       <div class="stack">
-        <div class="card">
+        <Card>
           <div class="row" style={{ marginBottom: 6 }}>
-            <h3 style={{ margin: 0 }}>branches · {rows.length}</h3>
+            <h3 class="hist-h3">branches · {rows.length}</h3>
             <span class="spacer" />
             <button
               type="button"
@@ -770,10 +770,9 @@ function Branches({
               ))}
             </tbody>
           </table>
-        </div>
+        </Card>
         {sel ? (
-          <div class="card">
-            <h3>{sel}</h3>
+          <Card title={<span class="break">{sel}</span>}>
             {detail.error ? (
               <ErrorBox error={detail.error} />
             ) : !detail.data ? (
@@ -789,12 +788,12 @@ function Branches({
                 }}
               />
             )}
-          </div>
+          </Card>
         ) : (
-          <div class="card muted small">
+          <Card class="muted small">
             Select a branch to see the commits only it has, the files they touch, and how bug-prone
             those files have been.
-          </div>
+          </Card>
         )}
       </div>
     </div>
@@ -910,9 +909,9 @@ function Files({
       style={{ alignItems: "start", gridTemplateColumns: "minmax(0, 1fr) minmax(360px, 1fr)" }}
     >
       <div class="stack">
-        <div class="card">
+        <Card>
           <div class="row" style={{ marginBottom: 6 }}>
-            <h3 style={{ margin: 0 }}>churn vs fix share</h3>
+            <h3 class="hist-h3">churn vs fix share</h3>
             <input
               type="text"
               placeholder="folder prefix, e.g. src/graph/"
@@ -930,8 +929,8 @@ function Files({
           ) : (
             <Spinner />
           )}
-        </div>
-        <div class="card flush">
+        </Card>
+        <Card flush>
           <table>
             <thead>
               <tr>
@@ -962,7 +961,7 @@ function Files({
               ))}
             </tbody>
           </table>
-        </div>
+        </Card>
       </div>
       <div class="stack">
         {sel ? (
@@ -975,10 +974,10 @@ function Files({
             }}
           />
         ) : (
-          <div class="card muted small">
+          <Card class="muted small">
             Pick a file to read its story: who changed it, what broke afterwards, and which fixes
             restored behaviour worth a test.
-          </div>
+          </Card>
         )}
       </div>
     </div>
@@ -1001,8 +1000,7 @@ function FileDetail({
   const f = d.file;
   return (
     <>
-      <div class="card">
-        <h3 class="break">{path}</h3>
+      <Card title={<span class="break">{path}</span>}>
         {f ? (
           <>
             <div class="row small" style={{ flexWrap: "wrap" }}>
@@ -1056,10 +1054,9 @@ function FileDetail({
         ) : (
           <div class="muted small">No commits in the loaded window touch this file.</div>
         )}
-      </div>
+      </Card>
       {d.origins.length ? (
-        <div class="card">
-          <h3>changes that later needed fixing</h3>
+        <Card title="changes that later needed fixing">
           <div class="chain">
             {d.origins.map((o) => (
               <div class="step origin">
@@ -1081,12 +1078,11 @@ function FileDetail({
               </div>
             ))}
           </div>
-        </div>
+        </Card>
       ) : null}
-      <div class="card">
-        <h3>timeline · {d.commits.length}</h3>
+      <Card title={`timeline · ${d.commits.length}`}>
         <CommitList commits={d.commits} selected={selected} onSelect={onSelect} />
-      </div>
+      </Card>
     </>
   );
 }
@@ -1120,9 +1116,9 @@ function Risk({
   return (
     <div class="grid wide" style={{ alignItems: "start" }}>
       <div class="stack">
-        <div class="card">
+        <Card>
           <div class="row" style={{ marginBottom: 6 }}>
-            <h3 style={{ margin: 0 }}>
+            <h3 class="hist-h3">
               {paths.trim() ? "history risk for these paths" : "working tree exposure"}
             </h3>
             <input
@@ -1205,9 +1201,8 @@ function Risk({
               </tbody>
             </table>
           )}
-        </div>
-        <div class="card">
-          <h3>bug-prone files</h3>
+        </Card>
+        <Card title="bug-prone files">
           {ov.risky.length ? (
             <table>
               <tbody>
@@ -1228,11 +1223,10 @@ function Risk({
           ) : (
             <div class="muted small">No file shows a fix pattern yet.</div>
           )}
-        </div>
+        </Card>
       </div>
       <div class="stack">
-        <div class="card">
-          <h3>lessons from this history</h3>
+        <Card title="lessons from this history">
           {ov.lessons.length ? (
             ov.lessons.map((l) => <Lesson text={l} />)
           ) : (
@@ -1243,9 +1237,8 @@ function Risk({
               {ov.stats.tracePending} fixes still to trace; reload to continue.
             </div>
           ) : null}
-        </div>
-        <div class="card">
-          <h3>changes that later needed fixing</h3>
+        </Card>
+        <Card title="changes that later needed fixing">
           <div class="muted small" style={{ marginBottom: 6 }}>
             A fix removed lines these commits wrote. The pattern, not the blame, is the lesson: what
             kind of change tends to break here?
@@ -1260,7 +1253,7 @@ function Risk({
           ) : (
             <Spinner />
           )}
-        </div>
+        </Card>
       </div>
     </div>
   );
@@ -1297,68 +1290,100 @@ export function History({ params }: { params: Record<string, string> }): JSX.Ele
   };
   if (ov.error)
     return (
-      <div class="page">
+      <div class="page ds-page hist-page">
         <ErrorBox error={ov.error} />
       </div>
     );
   if (!ov.data)
     return (
-      <div class="page">
-        <Spinner />
+      <div class="page ds-page hist-page" role="status" aria-busy="true">
+        <section class="ds-hero">
+          <div class="ds-hero-main">
+            <Skeleton w={120} h={12} />
+            <Skeleton w="min(360px, 70%)" h={34} />
+          </div>
+        </section>
+        <StatRow>
+          {[0, 1, 2, 3].map(() => (
+            <div class="ds-stat">
+              <Skeleton w={90} h={11} />
+              <Skeleton w={80} h={28} />
+            </div>
+          ))}
+        </StatRow>
       </div>
     );
   const d = ov.data;
   if (!d.git)
     return (
-      <div class="page">
-        <Empty>
+      <div class="page ds-page hist-page">
+        <EmptyState icon="⎇" title="No git history">
           {d.error ?? "Not a git repository."} The history explorer reads `git log`; initialise a
           repository and commit to use it.
-        </Empty>
+        </EmptyState>
       </div>
     );
   const s = d.stats;
   const trend = s.prior30 ? Math.round(((s.last30 - s.prior30) / s.prior30) * 100) : null;
   return (
-    <div class="page">
-      <div class="hist-stats">
-        <Stat v={s.commits} k="commits" sub={`${s.onHead} on HEAD`} />
+    <div class="page ds-page hist-page">
+      <Hero
+        eyebrow="History"
+        title="Project history"
+        sub={
+          <>
+            {d.branch ?? "detached"} @ {d.head.slice(0, 7)} · built {ago(d.builtAt)}
+          </>
+        }
+        meta={
+          <>
+            <Badge tone="accent">{fmt(s.commits)} commits</Badge>
+            <Badge tone={s.unmerged ? "warn" : "ok"}>
+              {s.unmerged ? `${s.unmerged} unmerged` : "all merged"}
+            </Badge>
+            <a
+              class="ds-link"
+              onClick={() => api("/api/history", { refresh: 1 }).then(() => ov.reload())}
+            >
+              rebuild
+            </a>
+          </>
+        }
+      />
+      <StatRow>
+        <Stat label="commits" value={s.commits} sub={`${s.onHead} on HEAD`} />
         <Stat
-          v={s.last30}
-          k="last 30 days"
+          label="last 30 days"
+          value={s.last30}
           sub={
             trend === null
               ? `${s.prior30} in the 30 before`
               : `${trend >= 0 ? "+" : ""}${trend}% vs prior 30`
           }
+          tone={trend === null ? undefined : trend >= 0 ? "ok" : "warn"}
         />
         <Stat
-          v={s.fixes}
-          k="fixes"
-          sub={`${Math.round((s.fixes / Math.max(1, s.commits - s.merges)) * 100)}%`}
+          label="fixes"
+          value={s.fixes}
+          sub={`${Math.round((s.fixes / Math.max(1, s.commits - s.merges)) * 100)}% · ${s.linksTraced} origins traced${s.tracePending ? `, ${s.tracePending} pending` : ""}`}
         />
         <Stat
-          v={s.linksTraced}
-          k="traced fix origins"
-          sub={s.tracePending ? `${s.tracePending} pending` : `${s.fixesTraced} fixes`}
+          label="branches"
+          value={s.branches}
+          sub={`${s.unmerged ? `${s.unmerged} unmerged` : "all merged"} · ${s.tags} tags`}
         />
-        <Stat
-          v={s.branches}
-          k="branches"
-          sub={s.unmerged ? `${s.unmerged} unmerged` : "all merged"}
-        />
-        <Stat v={s.authors} k="authors" sub={`${s.files} files`} />
-        <Stat v={s.tags} k="tags" sub={d.tags[0]?.name ?? ""} />
-        <Stat v={s.workingTree} k="working tree" sub={d.branch ?? "detached"} />
-      </div>
-      <div class="row" style={{ marginBottom: 8 }}>
-        <SubTabs
-          tabs={[
-            ["timeline", "Timeline"],
-            ["branches", "Branches"],
-            ["files", "Files"],
-            ["graph", "Graph"],
-            ["risk", "Risk & lessons"],
+        <Stat label="authors" value={s.authors} sub={`${s.files} files`} />
+        <Stat label="working tree" value={s.workingTree} sub={d.branch ?? "detached"} />
+      </StatRow>
+      <div class="hist-nav">
+        <Segmented<Tab>
+          label="History view"
+          options={[
+            { id: "timeline", label: "Timeline" },
+            { id: "branches", label: "Branches" },
+            { id: "files", label: "Files" },
+            { id: "graph", label: "Graph" },
+            { id: "risk", label: "Risk & lessons" },
           ]}
           value={tab}
           onChange={(t) => {
@@ -1366,11 +1391,6 @@ export function History({ params }: { params: Record<string, string> }): JSX.Ele
             navigate("history", { tab: t, sha: sel ?? undefined });
           }}
         />
-        <span class="spacer" />
-        <span class="muted small">
-          {d.branch ?? "detached"} @ {d.head.slice(0, 7)} · built {ago(d.builtAt)}{" "}
-          <a onClick={() => api("/api/history", { refresh: 1 }).then(() => ov.reload())}>rebuild</a>
-        </span>
       </div>
       {tab === "timeline" && <Timeline ov={d} params={params} selected={sel} onSelect={setSel} />}
       {tab === "branches" && <Branches ov={d} params={params} onSelectCommit={pick} />}
