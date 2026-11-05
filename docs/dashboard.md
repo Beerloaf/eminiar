@@ -200,6 +200,151 @@ API (JSON, loopback only):
 
 Run ids look like `20261028-a1b2c3`. Anything else is a 400, and an unknown run is a 404.
 
+### Adjudicator
+
+What the opt-in [adjudicator](adjudicator.md) decided, whether its advice was followed, and what
+it saved. The config is read again on every request, so `eminiar adjudicator enable` shows up
+without restarting the dashboard. The range switch (7d, 30d, 90d, all; default 30 days) applies
+to the whole tab.
+
+- **Off.** While the adjudicator is off, the tab explains what it does, its privacy model and
+  `eminiar adjudicator enable`, and offers the try-it box (heuristic only) and the last eval
+  report. Decisions recorded while it was on are still shown.
+- **Tiles.** Decisions by surface; advice followed, with the apply and respect rates; the
+  fallback rate with the provider statuses behind it; provider latency p50 and p95, and end to
+  end; the adjudicator's own spend; net savings, with a **how is this computed?** link that
+  lists the assumptions.
+- **Decisions per day**, stacked by where the verdict came from: heuristic, blend, cache or
+  fallback (UTC days).
+- **Provider card.** Configured and effective provider and why they differ, mode, key source
+  (`env`, `file` or `none`; never the key), consent, apply effectiveness ("n of m"), and per
+  provider the breaker state, retry time, last error class, p50/p95 latency and today's spend
+  against the daily cap. A rejected key shows as "API key rejected".
+- **Complexity** histogram (0 trivial to 4 very complex) and a **suggested tier × model that
+  ran** heatmap for dispatches and plan tasks.
+- **Call log.** Paged, filterable by surface, provider and outcome. Each row shows the stored
+  80-character redacted head of the input. Click a row to open the decision drawer: the
+  features, the tier, tool and role tables as bars split into heuristic, provider and learned
+  parts with their reasons, the complexity terms, the blend weights and bias, the provider
+  status, latency and tokens, and the outcome with the actual model, tokens and savings.
+- **Savings.** Realised, potential, spend and net, the assumptions, and tokens per successful
+  task by tier.
+- **Try it.** Paste a prompt or task to score it. The provider is used only when the
+  adjudicator is on, you tick the box, and the provider has its consent and key. Nothing is
+  stored and the text is not sent back, but a provider call counts against the daily caps.
+- **Last eval.** The report saved by `eminiar adjudicator eval --save`.
+
+Links: `#/adjudicator?range=7d` and `#/adjudicator?id=<decision id>` (opens the drawer).
+
+API (JSON, loopback only). The GETs that read decisions first link new outcomes
+(reconcile, up to 500 rows). No payload contains a key or a masked key. Input text beyond the
+stored 80-character head appears only in the two Jev request routes, and only when you turned on
+[Jev request capture](adjudicator.md#jev-request-capture).
+
+| Route | Returns |
+|---|---|
+| `GET /api/adjudicator?since=` | on/off, mode, the sanitised config, configured and effective provider, key source, consent, provider health, apply effectiveness, the summary, the fallback rate and the chart data (default `since=30d`) |
+| `GET /api/adjudicator/decisions?since&surface&provider&outcome&limit&offset` | decision rows without score tables (`limit` 1–500, default 50) |
+| `GET /api/adjudicator/decision?id=` | one decision with its parsed score tables |
+| `GET /api/adjudicator/savings?since=` | realised, potential, spend, net, assumptions, tokens per successful task by tier, the tier matrix |
+| `GET /api/adjudicator/eval` | the last saved eval report, or `null` |
+| `GET /api/adjudicator/jev?since=&surface=` | the Jev impact report (only when the adjudicator is on with the `typesafe` provider; otherwise `{active:false, reason}` without reading the database; `surface` is `prompt`, `agent`, `plan`, `mcp` or `tool`; like the other tab reads it first settles pending outcomes, at most 500 rows, and carries on if that fails; the result is in `reconcile`) |
+| `GET /api/adjudicator/jev/exchanges?limit=&row=` | the newest captured Jev requests without bodies: time, result, timing, items, tokens, decision ids (`limit` 1–100, default 100; `row` = only those that served that decision). `{active:false}` as for `/jev`, and `{capture:false}` when capture is off; neither reads the database |
+| `GET /api/adjudicator/jev/exchange?id=` | one captured request with the request and response bodies (redacted) and its error |
+| `POST /api/adjudicator/test` | `{text (1–20000 chars), useProvider?}`: a verdict that is never stored |
+
+#### Jev impact
+
+Inside the Adjudicator tab, under the tiles, when the adjudicator is **on** and its provider is
+`typesafe` (TypeSafe Jev). With any other provider, or the adjudicator off, the section is not
+rendered at all and the tab makes no `/api/adjudicator/jev` request. (A tab that was already open
+when you turned Jev off can still send one request on its next refresh; the server answers
+`{active:false}` without reading the database, and the section goes away.) If Jev is configured but
+cannot be called (no key, no consent), the section stays and shows a banner saying every
+decision falls back to the heuristic. It uses the tab's range switch and refresh button.
+
+It answers "is Jev changing what the heuristic would have chosen, and did that help?" from rows
+the adjudicator already records, with nothing re-scored and no prompt text read. Each load first
+settles pending outcomes like the other tab reads, which writes outcomes and updates the learned
+bias; the response carries that result in `reconcile`, so a failed settle is visible.
+
+- **Verdict**, with its sample size and the rule behind it (**how is this decided?**):
+  *helping* when the 90% lower bound of help ÷ (help + hurt), over dispatches Jev changed, is
+  above 50%; *hindering* when the upper bound is below 50%. It says **not enough data** and why
+  below 10 labelled outcomes, below 30 compared plan or agent decisions that Jev answered inline
+  (prompts and cache hits are not counted), when the labelled outcomes come from fewer than 3
+  different swarm runs or sessions, or when the evidence is split.
+  Warnings (Jev failing often, a degraded provider, blending that created near-ties, negative
+  net, an open breaker, deferred async prompts, mixed brief eras, missing usage data) are shown
+  in amber and never change the label.
+- **Tiles.** Share of decisions where Jev changed the tier (up and down, uncertain and deferred
+  counts); share of dispatches whose effective model changed; Jev calls with failure rate, p50
+  and breaker; Jev spend with cost per call and the wait it adds at p50; net from Jev's changes
+  (list prices, minus Jev's spend).
+- **Heuristic → final tier.** A grid of the heuristic's tier against the tier with Jev; the
+  outlined diagonal is agreement. The heuristic's pick is reconstructed from the stored blend
+  table, so near-ties are left out as uncertain. Below it: how often the heuristic overruled
+  Jev, and tiers rounded up for low confidence only because of blending.
+- **Agreement.** Per surface, then role, tool (tools move only through Jev's needs-plan boost),
+  effort and complexity.
+- **Outcomes: changed vs unchanged.** Dispatches where Jev changed the effective model against
+  those where it did not: advice followed, success rate (over success + failure), and feedback
+  counts.
+- **Evidence.** The newest labelled outcomes on dispatches Jev changed, as help, hurt or
+  neutral, with the move and why. Click an id to open the decision drawer. Only dispatches that
+  ran the tier Jev advised count: a downgrade that finished is help and one that failed is hurt;
+  an upgrade counts only through your feedback (`em_adjudicate`), because finishing on the bigger
+  model does not show the smaller one would have failed. Left out, and why:
+  - Dispatches that ignored the advice or passed no model; their feedback is left out too,
+    because it judges the model that ran, not Jev's.
+  - Outcomes that are not final yet.
+  - Dispatches where today's apply bounds, or the defaults (haiku to opus), would clamp the
+    heuristic's tier: the dispatch-time bounds are not stored, so it cannot be told whether Jev or
+    the bound set the model. Known limitation: a dispatch that ran under a narrower ceiling that
+    has since been removed can still be read as changed.
+  - Uncertain near-ties.
+- **Footer.** Provider and inline latency, deferred and timed-out calls, provider models and
+  how many briefs were scored per statement.
+
+Async prompt rows (the heuristic's advice was shown first, Jev's answer arrived later) count
+only as "would have changed", never as outcomes.
+
+#### Jev requests
+
+Below the impact panel (and shown even when it has no decisions), a **Jev requests** table lists
+the newest 100 requests sent to Jev, when [capture](adjudicator.md#jev-request-capture) is on. It
+does not follow the range switch. Newest first, one row per HTTP request:
+
+| Column | Shows |
+|---|---|
+| time | how long ago (hover for the exact time); click to open the request |
+| surface | `prompt`, `agent`, `plan` or `mcp` |
+| result | `200`, `timeout`, `429 rate limited`, `http 5xx` or `invalid` |
+| duration | the total time, with a thin bar against the deadline (red when it timed out) |
+| wait | the wait before sending, plus `job +Xms` when a background job queued first |
+| tries | attempts, with `↻ 120 ms` when a retry waited |
+| items | prompts or briefs in the request |
+| tokens | in / out |
+| decisions | the decisions the request served; click one to open its drawer |
+
+Above the table a notice always says what it holds: "Contains your redacted prompt text: each row
+is the exact request sent to api.typesafe.ai (redacted, up to privacy.maxChars characters per
+item) and Jev's answer, stored in this project's local database. Only the newest 100 are kept."
+It ends with the command that deletes them, `eminiar adjudicator exchanges purge --yes`.
+
+Click a row for the drawer (Esc closes it). **Timing** is one bar of the time in order: job wait
+(background prompts only), wait before send, to first byte, body read and retry wait, with a
+marker at the deadline, then a list of the send time, waits, attempts, deadline, engine budget,
+whether it timed out and the HTTP status. **Request** and **Response** show the target, model,
+the body's length in characters and the body as formatted JSON (raw text if it was cut at 65,536
+characters), each with a Copy button; the response also shows tokens, cost and any error. All of it is shown as text, never as HTML.
+
+With capture off the section says so and how to turn it on (`eminiar adjudicator exchanges on`,
+a personal setting that a project's `eminiar.config.json` cannot set). With capture on and
+nothing stored yet it says "Capture is on. No request has gone to Jev since. Prompt scoring runs
+in the background, so a request appears when that job finishes." Like the impact panel, it is
+not rendered, and nothing is fetched, unless the adjudicator is on with the `typesafe` provider.
+
 ## Deep links
 
 Views have hash routes, so you can bookmark or share a link to a view:

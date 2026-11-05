@@ -3,16 +3,24 @@
 // (dist/server.js) over real stdio, the way Claude Code drives it.
 //
 //   npm run build && node scripts/bench-hotpath.mjs [--runs 40] [--json]
+//       [--only hooks|server] [--hook-runs 60] [--base <repo dir of a baseline build>] [--assert]
 //
 // Measures: cold start to first tools/list reply, round-trip latency for a tiny
 // em_execute, em_batch_execute with 8 small commands, and em_execute on a large
 // (≈400 KB) output with an intent. Uses a throwaway EMINIAR_HOME and project so
 // nothing you have indexed is touched.
+//
+// The hook cases (bin/em-hook, a real process per call, one scratch EMINIAR_HOME each) measure what
+// the adjudicator costs a hook: UserPromptSubmit and PreToolUse(Bash) with the adjudicator OFF
+// (the default) against a baseline build when --base points at one (a checkout of the commit before
+// the adjudicator, built with `npx tsup`, node_modules linked in), interleaved run by run; and an
+// enabled heuristic UserPromptSubmit / Agent call. Budgets (--assert exits 1 when one is broken):
+// disabled <= 1 ms p50 over the baseline; enabled heuristic UserPromptSubmit <= 150 ms p95.
 
 import { spawn } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -20,6 +28,13 @@ const SERVER = join(here, "..", "dist", "server.js");
 const args = process.argv.slice(2);
 const RUNS = Number(args[args.indexOf("--runs") + 1]) || 40;
 const JSON_OUT = args.includes("--json");
+const arg = (name) => (args.includes(name) ? args[args.indexOf(name) + 1] : undefined);
+const ONLY = arg("--only");
+const HOOK_RUNS = Number(arg("--hook-runs")) || 60;
+const BASE = arg("--base");
+const ASSERT = args.includes("--assert");
+const DO_SERVER = ONLY !== "hooks";
+const DO_HOOKS = ONLY !== "server";
 
 const home = mkdtempSync(join(tmpdir(), "em-bench-home-"));
 const root = mkdtempSync(join(tmpdir(), "em-bench-root-"));
@@ -107,6 +122,7 @@ async function timed(fn) {
 
 const results = {};
 
+if (DO_SERVER) {
 // --- cold start: spawn → initialize → tools/list -------------------------------
 {
   const xs = [];
@@ -198,12 +214,89 @@ await c.call("em_batch_execute", { commands: [{ label: "a", command: "echo warm"
 }
 
 c.close();
+}
 rmSync(home, { recursive: true, force: true });
 rmSync(root, { recursive: true, force: true });
 
+// --- hooks: a real process per call, the adjudicator off vs a baseline build, and on -----------
+const checks = [];
+if (DO_HOOKS) {
+  const pkgRoot = join(here, "..");
+  /** A scratch HOME + project for one variant, so no variant sees another's state. */
+  const variant = (name, repo, config, globalConfig) => {
+    const h = mkdtempSync(join(tmpdir(), `em-bench-hook-home-${name}-`));
+    const r = mkdtempSync(join(tmpdir(), `em-bench-hook-root-${name}-`));
+    writeFileSync(join(r, "package.json"), "{}");
+    mkdirSync(join(r, ".git"));
+    writeFileSync(join(r, "eminiar.config.json"), JSON.stringify({ embeddings: { enabled: false }, graph: { include: [] }, ...config }));
+    if (globalConfig) writeFileSync(join(h, "config.json"), JSON.stringify(globalConfig));
+    const env = { ...process.env, EMINIAR_HOME: h, EMINIAR_PROJECT_ROOT: r, CLAUDE_PROJECT_DIR: r, EMINIAR_EMBEDDINGS: "0" };
+    for (const k of Object.keys(env)) if (/^(EMINIAR_ADJUDICATOR|TYPESAFE_|CLAUDE_CODE_)/.test(k)) delete env[k];
+    return { name, shim: join(repo, "bin", "em-hook"), env, cwd: r, home: h, root: r, cleanup: () => { rmSync(h, { recursive: true, force: true }); rmSync(r, { recursive: true, force: true }); } };
+  };
+  const payloads = {
+    prompt: (v) => ({ session_id: "bench", cwd: v.root, hook_event_name: "UserPromptSubmit", prompt: "Refactor the whole payment module across the repo and add tests for the new flow" }),
+    bash: (v) => ({ session_id: "bench", cwd: v.root, hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "git status" } }),
+    agent: (v) => ({ session_id: "bench", cwd: v.root, hook_event_name: "PreToolUse", tool_name: "Agent", tool_input: { description: "find the parser", prompt: "Find where the config parser is defined and list its callers." } }),
+  };
+  const once = (v, payload) =>
+    new Promise((resolve, reject) => {
+      const t = now();
+      const p = spawn("sh", [v.shim], { env: v.env, cwd: v.cwd, stdio: ["pipe", "pipe", "pipe"] });
+      let out = "";
+      p.stdout.on("data", (d) => { out += d; });
+      p.stderr.on("data", () => {});
+      p.on("error", reject);
+      p.on("close", (code) => {
+        const ms = now() - t;
+        if (code !== 0) return reject(new Error(`${v.name}: hook exited ${code}`));
+        try { JSON.parse(out || "{}"); } catch { return reject(new Error(`${v.name}: hook stdout is not JSON: ${out.slice(0, 120)}`)); }
+        resolve(ms);
+      });
+      p.stdin.end(JSON.stringify(payload));
+    });
+  /** Interleaved: every round runs each variant once, alternating who goes first. */
+  async function race(vs, kind, runs) {
+    const xs = Object.fromEntries(vs.map((v) => [v.name, []]));
+    for (let i = 0; i < 5; i++) for (const v of vs) await once(v, payloads[kind](v)); // warm
+    for (let i = 0; i < runs; i++) {
+      const order = i % 2 ? [...vs].reverse() : vs;
+      for (const v of order) xs[v.name].push(await once(v, payloads[kind](v)));
+    }
+    return Object.fromEntries(Object.entries(xs).map(([k, v]) => [k, stats(v)]));
+  }
+  const enabledHeuristic = { adjudicator: { enabled: true, provider: "heuristic", promptMode: "heuristic" } };
+  const cur = variant("current", pkgRoot, {});
+  const base = BASE ? variant("base", resolve(BASE), {}) : null;
+  const on = variant("enabled", pkgRoot, enabledHeuristic);
+  try {
+    for (const kind of ["prompt", "bash"]) {
+      const r = await race(base ? [base, cur] : [cur], kind, HOOK_RUNS);
+      results[`hook.${kind}.disabled`] = r.current;
+      if (base) {
+        results[`hook.${kind}.base`] = r.base;
+        const d50 = r.current.p50 - r.base.p50;
+        checks.push({ name: `hook ${kind}: adjudicator off, p50 over baseline`, value: d50, budget: 1.0, unit: "ms", ok: d50 <= 1.0 });
+      }
+    }
+    for (const kind of ["prompt", "agent"]) {
+      const r = await race([on], kind, HOOK_RUNS);
+      results[`hook.${kind}.enabledHeuristic`] = r.enabled;
+      if (kind === "prompt") checks.push({ name: "hook prompt: enabled heuristic, p95 incl. process", value: r.enabled.p95, budget: 150, unit: "ms", ok: r.enabled.p95 <= 150 });
+    }
+  } finally {
+    cur.cleanup();
+    base?.cleanup();
+    on.cleanup();
+  }
+}
+
 if (JSON_OUT) {
-  console.log(JSON.stringify(results, null, 2));
+  console.log(JSON.stringify({ results, checks }, null, 2));
 } else {
   const w = Math.max(...Object.keys(results).map((k) => k.length));
   for (const [k, v] of Object.entries(results)) console.log(`${k.padEnd(w)}  ${fmt(v)}`);
+  for (const c of checks) console.log(`${c.ok ? "PASS" : "FAIL"}  ${c.name}: ${c.value.toFixed(2)} ${c.unit} (budget ${c.budget} ${c.unit})`);
+  if (DO_HOOKS && !BASE) console.log("note: no --base build given, so the adjudicator-off cost over a baseline was not measured");
 }
+if (ASSERT && checks.some((c) => !c.ok)) process.exit(1);

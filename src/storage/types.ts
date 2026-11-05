@@ -1,3 +1,5 @@
+import type { AdjudicationRow, Verdict } from "../adjudicator/types.js";
+
 export type ContentType = "prose" | "code" | "json";
 
 /** Well-known sources; any string is accepted so callers can namespace freely. */
@@ -108,7 +110,14 @@ export interface VocabTerm {
   df: number;
 }
 
-export type PurgeScope = "index" | "sessions" | "graph" | "memories" | "usage" | "all";
+export type PurgeScope =
+  | "index"
+  | "sessions"
+  | "graph"
+  | "memories"
+  | "usage"
+  | "adjudicator"
+  | "all";
 
 export interface SessionRow {
   id: string;
@@ -443,4 +452,299 @@ export interface UsageFilter {
   /** true = only sidechain rows, false = only main-thread rows, undefined = both. */
   sidechain?: boolean | undefined;
   limit?: number | undefined;
+}
+
+// --- adjudicator (docs/design/adjudicator.md §12) ------------------------------------
+
+/** A new `adjudications` row: `id` is assigned, `ts` defaults to now, outcome to pending. */
+export type AdjudicationInput = Omit<AdjudicationRow, "id" | "ts" | "outcome" | "final"> & {
+  ts?: number | undefined;
+  outcome?: AdjudicationRow["outcome"] | undefined;
+  final?: boolean | undefined;
+};
+
+/** Columns to change; undefined leaves a column alone, null clears it. */
+export type AdjudicationPatch = {
+  [K in Exclude<keyof AdjudicationRow, "id">]?: AdjudicationRow[K] | undefined;
+};
+
+export interface AdjudicationListFilter {
+  /** Epoch ms, inclusive. */
+  since?: number | undefined;
+  surface?: string | undefined;
+  provider?: string | undefined;
+  outcome?: string | undefined;
+  /** Default 50, at most 500. */
+  limit?: number | undefined;
+  offset?: number | undefined;
+}
+
+export interface AdjudicatorCacheEntry {
+  key: string;
+  /** null is the `pending` marker an async job leaves while it runs. */
+  verdict: Verdict | null;
+  provider: string | null;
+  createdAt: number;
+  lastHitAt: number | null;
+  hits: number;
+}
+
+/** Breaker, latency ring and daily spend of one provider (§9). */
+export interface AdjudicatorProviderState {
+  provider: string;
+  /** closed | open | half_open | slow | auth_failed */
+  state: string;
+  failures: number;
+  retryAt: number | null;
+  lastOkAt: number | null;
+  lastErrorAt: number | null;
+  lastErrorClass: string | null;
+  /** The last ≤ 50 provider latencies in ms, oldest first. */
+  latencies: number[];
+  /**
+   * The budget in ms each latency was measured against, index-aligned with the END of
+   * `latencies` (a shorter array means the oldest samples predate it; 0 = unknown). The slow
+   * guard judges latency / budget, so surfaces with different budgets can share one ring.
+   */
+  latencyBudgets?: number[];
+  /** UTC day (YYYY-MM-DD) that `spendUsd` and `calls` belong to. */
+  spendDay: string | null;
+  spendUsd: number;
+  /** Provider calls made on `spendDay` (budget.dailyCalls). */
+  calls: number;
+  /**
+   * state "auth_failed": sha256(key)[0:12] of the key the provider rejected (401/403); never
+   * the key. The provider is skipped until the key changes or retryAt passes.
+   */
+  authFingerprint: string | null;
+}
+
+/** One learned bucket (§7.7): decayed counts n/s/f and the bias they yield. */
+export interface AdjudicatorBiasRow {
+  dimension: string;
+  bucket: string;
+  option: string;
+  n: number;
+  s: number;
+  f: number;
+  costMedian: number | null;
+  bias: number;
+  updatedAt: number | null;
+}
+
+export interface LatencyStats {
+  /** Rows with a value. */
+  n: number;
+  p50: number | null;
+  p95: number | null;
+}
+
+export interface AdjudicationSummary {
+  since: number | null;
+  total: number;
+  bySurface: Record<string, number>;
+  bySource: Record<string, number>;
+  byProviderStatus: Record<string, number>;
+  byAction: Record<string, number>;
+  byOutcome: Record<string, number>;
+  latency: LatencyStats;
+  providerLatency: LatencyStats;
+  /**
+   * follow = followed / advice-mode dispatches (advised, followed or ignored), each dispatch
+   * counted once (src/storage/dispatch.ts dispatchFilter: a swarm task by its agent row, by its
+   * plan row only when it has none; prompt rows are no dispatches) and leaving out those whose
+   * advice named no model (a KeptModel flag: nothing to follow). apply = applied / (applied +
+   * respected) and respect = respected / (applied + respected): apply-mode dispatches. null when
+   * the denominator is 0.
+   */
+  rates: { follow: number | null; apply: number | null; respect: number | null };
+  /**
+   * Dispatches that ran on a model the advice did not name, counted exactly like the savings
+   * report's keptModel (src/storage/dispatch.ts keptDispatch): the agent's pin was kept and it
+   * ran on it, CLAUDE_CODE_SUBAGENT_MODEL_FORCE set the model, or a fork ran on the main
+   * session's model. Only rows reconcile has priced (an actual model) count here; flagged rows
+   * leave the follow rate even before that.
+   */
+  keptModel: { pin: number; force: number; fork: number };
+  /** Σ cost_usd: the adjudicator's own provider spend. */
+  costUsd: number;
+  /** Σ savings_usd as reconcile credited it. */
+  savingsUsd: number;
+  /** savingsUsd − costUsd. */
+  netUsd: number;
+  /** Applied rows whose actual_model does not name model_final. */
+  applyIneffective: number;
+  /** Applied rows with an actual_model to compare against (the m of "n of m"). */
+  applyChecked: number;
+}
+
+/**
+ * One request sent to a provider and its answer, as stored in adjudicator_exchanges (Jev
+ * exchange log). Bodies arrive already redacted and capped; the store keeps them verbatim.
+ */
+export interface ExchangeInput {
+  /** When the request was sent (epoch ms). */
+  ts: number;
+  /** Groups the parallel batches of one provider call. */
+  callId: string;
+  batch?: number;
+  provider: string;
+  model?: string | null;
+  surface?: string | null;
+  context?: string | null;
+  method: string;
+  /** Host and path only: no query string, no credentials. */
+  target: string;
+  /** adjudications.id of the items in this request. */
+  rowIds?: number[];
+  items: number;
+  /** ok | timeout | http_error | rate_limited | invalid */
+  outcome: string;
+  httpStatus?: number | null;
+  timedOut?: boolean;
+  attempts?: number;
+  waitMs?: number | null;
+  jobWaitMs?: number | null;
+  ttfbMs?: number | null;
+  durationMs?: number | null;
+  retryWaitMs?: number;
+  deadlineMs: number;
+  budgetMs?: number | null;
+  tokensIn?: number | null;
+  tokensOut?: number | null;
+  costUsd?: number | null;
+  requestBody: string;
+  requestBytes: number;
+  requestTruncated?: boolean;
+  responseBody?: string | null;
+  responseBytes?: number | null;
+  responseTruncated?: boolean;
+  /** Already-scrubbed error message. */
+  error?: string | null;
+}
+
+/** A stored exchange without its bodies or error text: what the list reads. */
+export interface ExchangeSummaryRow {
+  id: number;
+  ts: number;
+  callId: string;
+  batch: number;
+  provider: string;
+  model: string | null;
+  surface: string | null;
+  context: string | null;
+  method: string;
+  target: string;
+  rowIds: number[];
+  items: number;
+  outcome: string;
+  httpStatus: number | null;
+  timedOut: boolean;
+  attempts: number;
+  waitMs: number | null;
+  jobWaitMs: number | null;
+  ttfbMs: number | null;
+  durationMs: number | null;
+  retryWaitMs: number;
+  deadlineMs: number;
+  budgetMs: number | null;
+  tokensIn: number | null;
+  tokensOut: number | null;
+  costUsd: number | null;
+  requestBytes: number;
+  requestTruncated: boolean;
+  responseBytes: number | null;
+  responseTruncated: boolean;
+}
+
+/** A stored exchange in full. */
+export interface ExchangeRow extends ExchangeSummaryRow {
+  requestBody: string;
+  responseBody: string | null;
+  error: string | null;
+}
+
+/** Persistence of the adjudicator; synchronous, every hook write is one statement. */
+export interface AdjudicatorStore {
+  insert(row: AdjudicationInput): number;
+  /** Returns false when no row has that id. */
+  update(id: number, patch: AdjudicationPatch): boolean;
+  get(id: number): AdjudicationRow | undefined;
+  /** Newest first; `total` counts every row matching the filter. */
+  list(filter?: AdjudicationListFilter): { rows: AdjudicationRow[]; total: number };
+  latestForSession(sessionId: string, surface: string): AdjudicationRow | undefined;
+  /**
+   * The newest row whose tool_use_id is `toolUseId` (indexed), optionally only of `surface` and
+   * with ts >= `since`.
+   */
+  byToolUseId(
+    toolUseId: string,
+    filter?: { surface?: string; since?: number },
+  ): AdjudicationRow | undefined;
+  /** Oldest first. */
+  forTask(runId: string, taskId: number): AdjudicationRow[];
+  /** Rows with final = 0, oldest first; `olderThan` (epoch ms) keeps only rows with ts < it. */
+  nonFinal(limit: number, olderThan?: number): AdjudicationRow[];
+
+  /**
+   * The cache entry for `key`. A hit with a verdict bumps hits and last_hit_at to `now`.
+   * With `maxAgeMs`, an entry created before now − maxAgeMs is a miss (and is not bumped).
+   */
+  cacheGet(key: string, now: number, maxAgeMs?: number): AdjudicatorCacheEntry | undefined;
+  /** Insert or replace; `null` writes the pending marker. */
+  cachePut(key: string, verdict: Verdict | null, provider: string | null, now?: number): void;
+  /** Drop entries older than ttlMs, then all but the maxEntries most recently used. Returns rows deleted. */
+  cachePrune(maxEntries: number, ttlMs: number, now?: number): number;
+
+  providerState(provider: string): AdjudicatorProviderState | undefined;
+  /** Merge `patch` into the stored state (or a closed default) and save it; returns the result. */
+  saveProviderState(
+    provider: string,
+    patch: Partial<Omit<AdjudicatorProviderState, "provider">>,
+  ): AdjudicatorProviderState;
+  /**
+   * Run `fn` as one write transaction that takes the write lock up front (SQLite BEGIN
+   * IMMEDIATE), so a read-modify-write of the provider state (half-open claim, spend and call
+   * counters) cannot interleave with another hook process. Nested calls join the outer one.
+   * Optional: a store without it (a test double, the try-it wrapper) runs `fn` directly.
+   * `lockWaitMs` caps how long BEGIN IMMEDIATE (and every statement in `fn`) waits for another
+   * connection's lock before it throws SQLITE_BUSY (default: the connection's own busy timeout).
+   */
+  atomically?<T>(fn: () => T, o?: { lockWaitMs?: number | undefined }): T;
+  /**
+   * Run `fn` with every lock wait capped at `ms` (SQLite busy_timeout; 0 = try once), then
+   * restore the connection's own timeout. It only ever lowers the wait. A busy database makes
+   * the statement throw instead of stalling the hook past its budget. Optional, like atomically.
+   */
+  withLockWait?<T>(ms: number, fn: () => T): T;
+
+  biasAll(): AdjudicatorBiasRow[];
+  biasUpsert(row: Omit<AdjudicatorBiasRow, "updatedAt"> & { updatedAt?: number | null }): void;
+  /** Clears the bias table only; returns rows deleted. */
+  biasReset(): number;
+
+  summary(since?: number): AdjudicationSummary;
+
+  /**
+   * Stores exchanges and, in the same transaction, deletes all but the newest `keep` (default
+   * EXCHANGE_KEEP = 100) by id. Takes no lock wait: a busy database throws SQLITE_BUSY at once
+   * and the caller (the engine) swallows it, so capture never delays or changes a verdict.
+   * Returns the new ids.
+   */
+  exchangeInsert(xs: ExchangeInput[], keep?: number): number[];
+  /**
+   * Newest first, without bodies. `limit` is clamped to 1..100; `rowId` keeps the exchanges
+   * that carried that adjudications.id; `total` counts every match.
+   */
+  exchangeList(filter?: { limit?: number; rowId?: number }): {
+    rows: ExchangeSummaryRow[];
+    total: number;
+  };
+  /** One exchange with its bodies. */
+  exchangeGet(id: number): ExchangeRow | undefined;
+  exchangeCount(): number;
+  /** Deletes every stored exchange; returns how many. */
+  exchangePurge(): number;
+  /** Clears all five adjudicator tables (the exchange log included). */
+  purge(): void;
 }

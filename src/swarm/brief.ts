@@ -4,6 +4,8 @@ import { renderProjectBrief } from "../session/brief.js";
 import { memoriesForFile, recallForText } from "../session/recall.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import type { MemoryRow } from "../storage/types.js";
+import { modelRangeText } from "./agents.js";
+import { OUTPUT_MAX } from "./format.js";
 import { inScope } from "./glob.js";
 import { clip, eligibility, type RunSnapshot, runSnapshot } from "./runtime.js";
 import type { ContextSpec, RoleSpec, RunRow, SwarmConfig, SwarmSpec, TaskRow } from "./types.js";
@@ -22,6 +24,15 @@ const ago = (ts: number, now = Date.now()): string => {
 };
 
 const firstLine = (s: string) => s.trim().split("\n")[0] ?? "";
+
+/** How much task detail the SubagentStart brief carries; the claim reply has the rest. */
+const WORKER_DETAIL_MAX = 1200;
+
+/**
+ * The claim reply's ceiling for taskBrief: em_swarm caps the reply at OUTPUT_MAX and puts
+ * a one-line "Claimed task #N … Report it with …" header (well under 300) in front of it.
+ */
+const TASK_BRIEF_MAX = OUTPUT_MAX - 300;
 
 /** Join sections in priority order and stop before the budget runs out. */
 function budgeted(sections: Array<string | undefined>, max: number): string {
@@ -275,7 +286,15 @@ export async function workerBrief(
     `You are the "${w.role.role}" worker (${w.role.agentType}) of swarm "${w.swarm.name}", run ${w.run.id}, topology ${w.swarm.topology}.`,
     `Goal: ${clip(w.run.goal, 300)}`,
   );
-  if (w.task?.detail) head.push(clip(w.task.detail, 1200));
+  if (w.task?.detail) {
+    const d = w.task.detail.trim();
+    // The pointer leads, so a brief clipped by a small max_chars still carries it.
+    head.push(
+      d.length > WORKER_DETAIL_MAX
+        ? `Task detail, shortened (em_swarm {action:"claim", task:${w.task.id}} returns it in full; read that before starting):\n${clip(d, WORKER_DETAIL_MAX)}`
+        : d,
+    );
+  }
   if (w.task?.files.length) head.push(`Files: ${w.task.files.join(", ")}`);
   const files = w.task?.files ?? [];
   const sections = [
@@ -317,10 +336,12 @@ export async function taskBrief(
     insights: true,
     maxChars: 3000,
   };
-  const sections = [
-    `Task ${taskLine(task)} of run ${run.id} (goal: ${clip(run.goal, 200)})${task.detail ? `\n${clip(task.detail, 1500)}` : ""}${
-      task.files.length ? `\nFiles: ${task.files.join(", ")}` : ""
-    }${task.deps.length ? `\nAfter: ${task.deps.map((d) => `#${d}`).join(", ")}` : ""}`,
+  // The detail is the worker's spec, so it goes out whole (plan caps it at DETAIL_MAX);
+  // the knowledge sections share what is left of the claim reply's budget.
+  const head = `Task ${taskLine(task)} of run ${run.id} (goal: ${clip(run.goal, 200)})${task.detail ? `\n${task.detail.trim()}` : ""}${
+    task.files.length ? `\n${clip(`Files: ${task.files.join(", ")}`, 600)}` : ""
+  }${task.deps.length ? `\n${clip(`After: ${task.deps.map((d) => `#${d}`).join(", ")}`, 200)}` : ""}`;
+  const knowledge = [
     await memorySection(
       db,
       [`${task.title} ${task.detail ?? ""}`, run.goal],
@@ -333,7 +354,9 @@ export async function taskBrief(
       : undefined,
     spec.insights && task.files.length ? hotSection(db, task.files) : undefined,
   ];
-  return budgeted(sections, spec.maxChars);
+  const room = Math.min(spec.maxChars, TASK_BRIEF_MAX) - head.length - 2;
+  const rest = room > 200 ? budgeted(knowledge, room) : "";
+  return rest ? `${head}\n\n${rest}` : head;
 }
 
 // --- coordinator -------------------------------------------------------------------------
@@ -356,7 +379,7 @@ export async function coordinatorBrief(
 ): Promise<string> {
   const roles = swarm.roles.map(
     (r) =>
-      `- ${r.role} → subagent_type "${r.agentType}" (${r.model ?? "inherit"}, up to ${r.count} at once${
+      `- ${r.role} → subagent_type "${r.agentType}" (${r.model ?? "inherit"}${r.range ? `, range ${modelRangeText(r.range)}` : ""}, up to ${r.count} at once${
         r.scope.length ? `, scope ${r.scope.join(" ")}` : ""
       }): ${r.description}`,
   );
@@ -372,6 +395,15 @@ export async function coordinatorBrief(
       "Steps:",
       '1. Plan: em_swarm {action:"plan", tasks:[{key, title, detail, role, deps, files}]}: small tasks one worker can finish, each naming its files; deps take task ids or earlier keys.',
       '2. Spawn a worker per claimable task with the Agent tool: subagent_type from the list, a prompt that names "task #N" (the worker claims it), run_in_background: true for parallel work. eminiar refuses spawns over capacity and briefs each worker with the project knowledge.',
+      ...(ctx.config.adjudicator?.enabled && ctx.config.adjudicator.surfaces.plan
+        ? [
+            `   Adjudicator on: em_swarm plan shows a suggestion per task and says exactly what to pass on the Agent call (\`model\` and/or \`effort\`; pinned agents, CLAUDE_CODE_SUBAGENT_MODEL_FORCE and CLAUDE_CODE_EFFORT_LEVEL change what it asks for). Follow each line as written.${
+              swarm.roles.some((r) => r.range)
+                ? " Roles listed with a range run on their fallback model unless their line says `model X (range …)`: then pass model X."
+                : ""
+            }`,
+          ]
+        : []),
       '3. Watch: em_swarm {action:"status"} (or `eminiar swarm watch` under the Monitor tool). Workers post shared facts to the blackboard.',
       '4. Review each result. Reopen with em_swarm {action:"update", task, status:"pending"} or plan follow-ups; tasks marked auto-closed were never reported by their worker, so check them.',
       '5. Finish: em_swarm {action:"finish", status:"done", summary, remember:true}, and record durable decisions with em_remember.',

@@ -10,6 +10,7 @@ documentation that Claude uses, from your terminal. Run `eminiar help` for the f
 | Command | What it does |
 |---|---|
 | `eminiar install` | Install into Claude Code. Options: `--no-model`, `--method plugin\|settings`, `--cursor`, `--team`, `--marketplace github:org/repo`, `--statusline`, `--yes`, `--force` |
+| `eminiar install --adjudicator[=X] [--accept-remote]` | Also turn on the [adjudicator](adjudicator.md) with provider `X` (`heuristic`, `embedding`, `typesafe`, `groq`, `cerebras`, `ollama`, `lmstudio` or `llamacpp`; bare `--adjudicator` = `heuristic`). Without the flag, an interactive install asks *"Use the adjudicator for tool, model and agent selection?"* (default No); `--yes` skips the question. A remote provider needs consent, and without a terminal only `--accept-remote` gives it |
 | `eminiar install --cursor` | Also register with Cursor: hooks in `~/.cursor/hooks.json`, the MCP server in `~/.cursor/mcp.json`, skills in `~/.cursor/skills/`. Without the `claude` CLI this installs for Cursor only |
 | `eminiar upgrade` | Update to the latest version and re-register with every client from the last install |
 | `eminiar uninstall [--purge-data]` | Remove from Claude Code and Cursor. Data is kept unless you add `--purge-data` |
@@ -76,7 +77,7 @@ eminiar docs remove example
 eminiar reindex                                # incremental, all scopes
 eminiar reindex --scope code --full            # code | git | metrics | docs | memories | embeddings | all
 eminiar stats [--lifetime]                     # context savings, routing interceptions, recall hit rate
-eminiar purge <index|sessions|graph|memories|usage|all> --yes   # irreversible
+eminiar purge <index|sessions|graph|memories|usage|adjudicator|all> --yes   # irreversible
 ```
 
 ## Usage insights
@@ -118,6 +119,66 @@ worker quiet for 15 minutes, and needs `--run` when several runs are active. `wa
 a `swarm.snapshot` line (or `swarm.finished` for a closed run) and then prints a line only when
 tasks, workers or run events change, never for a worker's tool calls. An option such as
 `--interval` given without a value exits 2. See [Agent swarms](swarms.md).
+
+## Adjudicator
+
+Opt-in and off by default. `eminiar adjudicator help` prints this list.
+
+```sh
+eminiar adjudicator status [--json]            # on/off, configured vs effective provider, key, consent, health
+eminiar adjudicator enable [--provider P] [--preset X] [--mode advise|apply] [--project] [--accept-remote]
+eminiar adjudicator disable [--project]
+eminiar adjudicator provider <heuristic|embedding|typesafe|openai-compatible> [--preset X] [--base-url U] [--model M]
+eminiar adjudicator provider --detect          # look for Ollama / LM Studio / llama.cpp; changes nothing
+eminiar adjudicator key set [provider] [--from-env NAME]   # hidden prompt or stdin, never argv
+eminiar adjudicator key clear [provider]
+eminiar adjudicator key status [--json]        # where each key comes from, masked
+eminiar adjudicator test "<text>" [--provider P] [--json]   # probe + score one sample; not stored
+eminiar adjudicator eval [--provider P ...] [--providers a,b] [--fixture f.json|.js|.mjs] [--replace] [--repeat N] [--save] [--json]
+eminiar adjudicator stats [--since 7d] [--json] [--reset-learning]
+eminiar adjudicator exchanges [status] [--json]   # Jev request capture: on/off, how many are kept here
+eminiar adjudicator exchanges on [--yes]          # keep the newest 100 Jev requests (contain redacted prompt text)
+eminiar adjudicator exchanges off                 # turn off and delete this project's captured requests
+eminiar adjudicator exchanges purge [--yes]       # delete this project's captured requests
+```
+
+- `status` is the default subcommand. It shows which layer decides `enabled` (environment,
+  project file, global file or default), the effective provider and why it differs from the
+  configured one, the key source, consent, the provider's breaker state with today's calls and
+  spend, the last 24 hours, and in apply mode how many applied dispatches ran the chosen model.
+- `enable` writes `~/.eminiar/config.json`. `--provider` and `--preset` take `heuristic`,
+  `embedding`, `typesafe` or `jev`, `openai-compatible`, or a preset name (`groq`, `cerebras`,
+  `ollama`, `lmstudio`, `llamacpp`, `custom`). With `--project` only `adjudicator.enabled: true`
+  goes into the committed `eminiar.config.json`; the rest stays in your global file. For a remote
+  provider it prints what will be sent and asks y/N; `--accept-remote` agrees without a
+  terminal, and `--yes` never does. A missing key is asked for at a hidden prompt.
+- `disable` keeps keys and consent. Run `/mcp reconnect` after `enable` or `disable` so the
+  `em_adjudicate` tool appears or disappears.
+- `key set` stores the key in `~/.eminiar/adjudicator.key` (mode 0600). The provider defaults to
+  the one configured; `typesafe` (or `jev`) and the preset names are accepted. A key passed as an
+  argument exits 2. `--from-env NAME` stores only the variable's name as `adjudicator.keyEnv`.
+- `test` makes one provider call, shows the heuristic and the provider side by side, and exits 1
+  when the provider fails. Nothing is stored.
+- `eval` runs the built-in labelled set through the heuristic and each provider given (default:
+  the configured one). `--fixture` adds labelled items, `--replace` uses them alone, `--repeat N`
+  repeats for latency percentiles, `--save` keeps the report for the dashboard.
+- `stats` summarises decisions, follow rate, spend and savings with their assumptions.
+  `--reset-learning` clears the learned bias.
+- `exchanges` (default `status`) manages [Jev request capture](adjudicator.md#jev-request-capture).
+  `status` shows whether capture is on (and whether `EMINIAR_ADJUDICATOR_CAPTURE=0` is forcing it
+  off) and how many requests are stored in this project. `exchanges on` writes
+  `privacy.captureExchanges` to `~/.eminiar/config.json` only; `--project` is refused (exit 2).
+  It prints what will be kept and asks y/N; without a terminal it needs `--yes`, or it changes
+  nothing and exits 1. It warns when Jev is not the provider yet, since nothing is captured until
+  it is. `exchanges off` turns capture off and deletes this project's captured requests, with no
+  prompt; other projects keep theirs until you run `exchanges purge` in each. `exchanges purge`
+  asks y/N (or needs `--yes` without a terminal), deletes this project's captured requests and
+  leaves the setting as it is. Both erase the text from the database file and the write-ahead log
+  (secure delete plus a checkpoint, best effort for the log while another process holds the
+  database); `eminiar purge adjudicator|all` does the same.
+
+Exit codes: 2 for a usage error (unknown provider, preset or mode, a key on the command line),
+1 when consent is declined or a key or provider call fails. See [Adjudicator](adjudicator.md).
 
 ## Dashboard and status line
 

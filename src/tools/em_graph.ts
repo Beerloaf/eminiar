@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { getProvider } from "../embeddings/provider.js";
+import { embedPending } from "../embeddings/queue.js";
 import { formatEdges, formatHits, nodeLabel } from "../graph/format.js";
 import { conceptId } from "../graph/ids.js";
 import { readClusters, readCycles } from "../graph/metrics.js";
@@ -21,6 +23,8 @@ import {
   reindexCode,
   reindexGitSignals,
 } from "../graph/reindex.js";
+import { indexPath } from "../index/indexer.js";
+import { reconcile } from "../memory/store.js";
 import { fileBytes, recordStat } from "../stats/record.js";
 import { getStorage } from "../storage/index.js";
 import { defineTool, errorResult, text } from "./types.js";
@@ -426,20 +430,16 @@ export const emReindex = defineTool({
       );
     }
     if (scope === "docs" || scope === "all") {
-      const { indexPath } = await import("../index/indexer.js");
       const s = indexPath(db, ctx.root, ".", { source: "file", globs: ctx.config.index.docs });
       lines.push(`docs: ${s.files} files, ${s.indexed} indexed, ${s.unchanged} unchanged`);
     }
     if (scope === "memories" || scope === "all") {
-      const { reconcile } = await import("../memory/store.js");
       const s = reconcile(ctx, db);
       lines.push(
         `memories: ${s.files} files, ${s.synced} synced, ${s.removed} removed${s.migrated ? `, ${s.migrated} migrated from the database into files` : ""}${s.skipped.length ? `, ${s.skipped.length} skipped (invalid name, e.g. ${s.skipped[0]})` : ""}`,
       );
     }
     if (scope === "embeddings" || scope === "all") {
-      const { getProvider } = await import("../embeddings/provider.js");
-      const { embedPending } = await import("../embeddings/queue.js");
       const provider = await getProvider(ctx.config);
       if (!provider) lines.push("embeddings: disabled or unavailable");
       else {

@@ -42,6 +42,38 @@ Then write, via `em_remember {kind: "onboarding", name: …, content: …}`:
   are, which local specs exist, and the rule: `em_docs {action: "lookup", query}` before
   WebFetch/WebSearch for anything the project depends on.
 
+Then ask about the adjudicator (optional; it is off by default and is never turned on
+without a yes). Skip this step if the user asked for a non-interactive or default onboarding,
+or if `eminiar adjudicator status --json` (run with `em_execute`, language shell; use
+`npx eminiar` if `eminiar` is not on PATH) shows it is already on.
+
+1. Explain in two sentences: the adjudicator scores how complex each prompt, subagent task
+   and swarm task is and suggests the eminiar tool, the Claude model size (haiku / sonnet /
+   opus) and the swarm agent role for it, to save tokens. Then ask exactly:
+   **"Use the adjudicator for tool, model and agent selection? (default: no)"**
+   Anything but a clear yes means no: say `eminiar adjudicator enable` turns it on later, and stop.
+2. On yes, ask which provider, and say for each whether text leaves the machine:
+   - **heuristic** (default): built-in rules; offline, nothing leaves this machine.
+   - **embedding**: nearest examples with the local embedding model; offline.
+   - **Jev** (TypeSafe, api.typesafe.ai): hosted; sends prompt text off this machine; needs an API key.
+   - **OpenAI-compatible**: a local server (Ollama on 11434, LM Studio on 1234, llama.cpp on
+     8080; nothing leaves the machine) or a hosted one (Groq, Cerebras; sends prompt text off
+     this machine; needs an API key). `eminiar adjudicator provider --detect` finds local servers.
+3. For a choice that sends text off the machine, quote this and get an explicit yes before
+   continuing: "The text of your prompts and subagent tasks (redacted, at most 2000 chars) is
+   sent to <host> to score them." Without that yes, fall back to the heuristic.
+4. Turn it on with `em_execute` (shell), adding `--accept-remote` only after that explicit yes:
+   `eminiar adjudicator enable --provider <heuristic|embedding|typesafe|ollama|lmstudio|llamacpp|groq|cerebras> [--accept-remote]`
+5. For Jev or a hosted preset the key goes into the local key file `~/.eminiar/adjudicator.key`
+   (mode 0600), never into the chat, a config file or a command line. Ask the user to run, in
+   their own terminal: `eminiar adjudicator key set typesafe` (or `groq` / `cerebras`), which
+   reads the key at a hidden prompt. If the key is already in an environment variable,
+   `eminiar adjudicator key set --from-env NAME` stores only the variable's name. If the user
+   pastes a key into the chat anyway, do not repeat it or put it in a command; tell them to
+   rotate it and use the hidden prompt.
+6. Finish with `eminiar adjudicator status` and tell the user to run `/mcp reconnect` so the
+   `em_adjudicate` tool loads (hooks pick the change up on the next prompt).
+
 Finish with one line listing the five names; mention that the files live under
 `.eminiar/memories/onboarding/` and the manifest at `.eminiar/docs.json`, and that both
-should be committed.
+should be committed. Add whether the adjudicator was turned on, and with which provider.

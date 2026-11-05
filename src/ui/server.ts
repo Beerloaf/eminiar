@@ -4,6 +4,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { extname, join, normalize } from "node:path";
 import { URL } from "node:url";
 import { pluginRoot } from "../version.js";
+import { adjudicatorRoute } from "./adjudicator-api.js";
 import {
   type ActionInput,
   addMemory,
@@ -563,6 +564,17 @@ export async function serve(opts: { port: number; open: boolean; root?: string }
       // --- agent swarms (validates its own ids; writes are POST) ---------------------
       if (p === "/api/swarm" || p.startsWith("/api/swarm/")) {
         const r = await swarmRoute(ctx(), { path: p, method, query: q, body: () => readJson(req) });
+        return json(res, r.status, r.body);
+      }
+
+      // --- adjudicator (validates its own query; the try-it POST is never persisted) -----
+      if (p === "/api/adjudicator" || p.startsWith("/api/adjudicator/")) {
+        const r = await adjudicatorRoute(ctx(), {
+          path: p,
+          method,
+          query: q,
+          body: () => readJson(req),
+        });
         return json(res, r.status, r.body);
       }
 

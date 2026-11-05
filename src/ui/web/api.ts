@@ -694,6 +694,8 @@ export interface SwarmRoleUi {
   description: string;
   /** null: inherits the session's model. */
   model: string | null;
+  /** null: a fixed pin; set, `model` is the fallback inside floor..ceiling. */
+  range: { floor: string; ceiling: string } | null;
   count: number;
   /** null: every tool. */
   tools: string[] | null;
@@ -843,3 +845,259 @@ export interface SwarmSyncResult {
   changed: number;
   conflicts: number;
 }
+
+// --- adjudicator (mirror src/ui/adjudicator-api.ts) ----------------------------------
+
+type AdjRowFull = import("../../adjudicator/types.js").AdjudicationRow;
+export type AdjFeatures = import("../../adjudicator/types.js").Features;
+export type AdjProviderStatus = import("../../adjudicator/types.js").ProviderStatus;
+export type AdjReason = import("../../adjudicator/types.js").Reason;
+export type AdjScoreEntry = import("../../adjudicator/types.js").ScoreEntry;
+export type AdjScoreTable = import("../../adjudicator/types.js").ScoreTable;
+export type AdjSource = import("../../adjudicator/types.js").Source;
+export interface AdjLatency {
+  n: number;
+  p50: number | null;
+  p95: number | null;
+}
+export interface AdjProviderView {
+  configured: string;
+  effective: string;
+  /** Why the configured provider is not the effective one (no_key, no_consent, ...). */
+  degraded: string | null;
+  detail: string | null;
+  remote: boolean;
+  configuredRemote: boolean;
+  local: boolean;
+  preset: string | null;
+  model: string | null;
+  baseUrl: string | null;
+  price: { inPerM: number; outPerM: number } | null;
+}
+export interface AdjHealth {
+  provider: string;
+  configured: boolean;
+  remote: boolean;
+  /** closed | open | half_open | slow | any newer state; null = never called. */
+  state: string | null;
+  failures: number;
+  retryAt: number | null;
+  lastOkAt: number | null;
+  lastErrorAt: number | null;
+  lastErrorClass: string | null;
+  latency: AdjLatency;
+  spendTodayUsd: number;
+  dailyCapUsd: number | null;
+}
+/** Dispatches whose model the advice did not name (kept pin, FORCE, fork), by reason. */
+export interface AdjKeptModel {
+  pin?: number | undefined;
+  force?: number | undefined;
+  fork?: number | undefined;
+}
+export interface AdjSummary {
+  since: number | null;
+  total: number;
+  keptModel?: AdjKeptModel;
+  bySurface: Record<string, number>;
+  bySource: Record<string, number>;
+  byProviderStatus: Record<string, number>;
+  byAction: Record<string, number>;
+  byOutcome: Record<string, number>;
+  latency: AdjLatency;
+  providerLatency: AdjLatency;
+  rates: { follow: number | null; apply: number | null; respect: number | null };
+  costUsd: number;
+  savingsUsd: number;
+  netUsd: number;
+  applyIneffective: number;
+  applyChecked: number;
+}
+export interface AdjDayBucket {
+  day: string;
+  heuristic: number;
+  blend: number;
+  cache: number;
+  fallback: number;
+  total: number;
+}
+export type AdjReconcile =
+  | { scanned: number; updated: number; finalized: number; linked: number; learned: number }
+  | { error: string };
+export interface AdjOverview {
+  enabled: boolean;
+  mode: "advise" | "apply";
+  config: Record<string, unknown> & { provider?: string; mode?: string };
+  provider: AdjProviderView;
+  keySource: "env" | "file" | "none";
+  keyFileRefused: boolean;
+  consent: boolean;
+  /** The remote origin consent applies to (scheme://host:port), null for local providers. */
+  origin?: string | null;
+  /** The warning line naming project-config adjudicator keys that were ignored, if any. */
+  projectIgnored?: string | null;
+  health: AdjHealth[];
+  apply: { checked: number; ineffective: number; effective: number };
+  summary: AdjSummary;
+  fallbackRate: number | null;
+  charts: { perDay: AdjDayBucket[]; complexity: number[] };
+  chartsCut: boolean;
+  filters: { surfaces: string[]; providers: string[]; outcomes: string[]; sources: string[] };
+  reconcile: AdjReconcile;
+  since: number | null;
+  now: number;
+}
+/** A call-log row: the stored row without its scores JSON. */
+export type AdjDecisionRow = Omit<AdjRowFull, "scores"> & { hasScores: boolean };
+export interface AdjDecisionsPage {
+  rows: AdjDecisionRow[];
+  total: number;
+  limit: number;
+  offset: number;
+  since: number | null;
+  now: number;
+}
+/** The parsed scores JSON of one decision (engine.verdictColumns). */
+export interface AdjScores {
+  complexity: number;
+  complexityReasons: AdjReason[];
+  tool: AdjScoreTable;
+  tier: AdjScoreTable;
+  role: AdjScoreTable;
+  effort: string;
+  features?: AdjFeatures;
+  alpha?: Partial<Record<"complexity" | "tier" | "role" | "tool", number>>;
+  bias?: Record<string, number>;
+}
+export interface AdjDecisionDetail {
+  row: Omit<AdjRowFull, "scores">;
+  scores: AdjScores | null;
+  now: number;
+}
+export interface AdjTierTokens {
+  tasks: number;
+  tokens: number;
+  costUsd: number;
+  tokensPerTask: number | null;
+}
+export interface AdjSavings {
+  since: number | null;
+  keptModel?: AdjKeptModel;
+  usageAvailable: boolean;
+  realisedUsd: number;
+  redoPenaltyUsd: number;
+  creditedRows: number;
+  potentialUsd: number;
+  potentialRows: number;
+  spendUsd: number;
+  netUsd: number;
+  tokensPerSuccessByTier: Record<string, AdjTierTokens | undefined>;
+  matrix: Array<{ suggested: string; actual: string; n: number }>;
+  assumptions: string[];
+  now: number;
+}
+export interface AdjEvalPayload {
+  /** The last `eminiar adjudicator eval` report (shape owned by src/adjudicator/eval.ts), or null. */
+  report: Record<string, unknown> | null;
+  error?: string;
+  now: number;
+}
+export type AdjTryItReason =
+  | "used"
+  | "disabled"
+  | "not_requested"
+  | "heuristic_configured"
+  | "no_key"
+  | "no_consent"
+  | "hook_context"
+  | "misconfigured";
+export interface AdjTryIt {
+  enabled: boolean;
+  usedProvider: boolean;
+  reason: AdjTryItReason | string;
+  provider: AdjProviderView;
+  verdict: AdjScores & {
+    source: AdjSource;
+    provider: string;
+    providerStatus: AdjProviderStatus;
+    latencyMs: number;
+    providerLatencyMs?: number;
+    usage?: { inTok: number; outTok: number; costUsd: number | null };
+    version: string;
+  };
+  features: AdjFeatures;
+  providerModel: string | null;
+  advice: string;
+  chars: number;
+  persisted: false;
+}
+
+// --- Jev impact (mirror src/ui/adjudicator-api.ts jevPayload) ------------------------
+// Types come type-only from the report module, which keeps its own imports web-safe; the
+// api module of the node side pulls node code and cannot be imported here.
+
+export type AdjJevReport = import("../../adjudicator/jev-impact.js").JevImpactReport;
+export type AdjJevInactive = import("../../adjudicator/jev-impact.js").JevImpactInactive;
+/** The provider block the route adds: the configured/effective pair, why it is degraded, health. */
+export interface AdjJevProvider
+  extends Omit<import("../../adjudicator/jev-impact.js").JevProviderSummary, "health"> {
+  health: AdjHealth | null;
+}
+export type AdjJevImpact =
+  import("../../adjudicator/jev-impact.js").JevImpactPayload<AdjJevProvider>;
+/** What GET /api/adjudicator/jev answers: the report, or {active:false} when Jev is not on. */
+export type AdjJevResponse = AdjJevImpact | AdjJevInactive;
+
+/**
+ * GET /api/adjudicator/jev. Call it only when Jev is configured and the adjudicator is on
+ * (jevActive in views/jev-helpers.ts): the panel is not mounted otherwise, so no request is made.
+ */
+export const fetchJevImpact = (since: string): Promise<AdjJevResponse> =>
+  api<AdjJevResponse>("/api/adjudicator/jev", { since });
+
+// --- Jev request log (mirror src/ui/adjudicator-api.ts jevExchangesPayload / jevExchangePayload) ---
+
+export type AdjExchangeSummary = import("../../adjudicator/types.js").ExchangeSummary;
+export type AdjExchangeDetail = import("../../adjudicator/types.js").ExchangeDetail;
+export type AdjExchangeBody = import("../../adjudicator/types.js").CapturedBody;
+
+/** Capture is off: nothing was read; the panel explains how to turn it on. */
+export interface AdjExchangesCaptureOff {
+  active: true;
+  capture: false;
+  keep: number;
+  now: number;
+}
+
+export interface AdjExchangesList {
+  active: true;
+  capture: true;
+  keep: number;
+  /** Stored rows for this filter. */
+  total: number;
+  rows: AdjExchangeSummary[];
+  now: number;
+}
+
+export interface AdjExchangeOne {
+  active: true;
+  capture: true;
+  exchange: AdjExchangeDetail;
+  now: number;
+}
+
+/** What GET /api/adjudicator/jev/exchanges answers. */
+export type AdjExchangesResponse = AdjJevInactive | AdjExchangesCaptureOff | AdjExchangesList;
+/** What GET /api/adjudicator/jev/exchange answers (a missing id is a 404 error). */
+export type AdjExchangeResponse = AdjJevInactive | AdjExchangesCaptureOff | AdjExchangeOne;
+
+/**
+ * GET /api/adjudicator/jev/exchanges: the newest stored Jev requests without bodies, optionally
+ * only those that served decision `row`. Call it only when Jev is active (jevActive).
+ */
+export const fetchJevExchanges = (limit?: number, row?: number): Promise<AdjExchangesResponse> =>
+  api<AdjExchangesResponse>("/api/adjudicator/jev/exchanges", { limit, row });
+
+/** GET /api/adjudicator/jev/exchange: one stored request with its request and response bodies. */
+export const fetchJevExchange = (id: number): Promise<AdjExchangeResponse> =>
+  api<AdjExchangeResponse>("/api/adjudicator/jev/exchange", { id });

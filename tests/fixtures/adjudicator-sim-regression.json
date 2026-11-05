@@ -1,0 +1,94 @@
+[
+  {
+    "text": "Run the full vitest suite and show me only the failing tests",
+    "tool": "em_execute",
+    "tier": "haiku",
+    "role": "tester",
+    "complexity": 1
+  },
+  {
+    "text": "Run typecheck, lint and unit tests in parallel and report which fail",
+    "tool": "em_batch_execute",
+    "tier": "haiku",
+    "role": "tester",
+    "complexity": 1
+  },
+  {
+    "text": "What calls resolveAgentPin and where is it defined?",
+    "tool": "em_symbols",
+    "tier": "haiku",
+    "role": "explorer",
+    "complexity": 0
+  },
+  {
+    "text": "What breaks if I change the signature of dispatchRule in src/adjudicator/swarm.ts?",
+    "tool": "em_graph_impact",
+    "tier": "sonnet",
+    "role": "explorer",
+    "complexity": 1
+  },
+  {
+    "text": "How does better-sqlite3 handle WAL checkpoints and busy timeouts?",
+    "tool": "em_docs",
+    "tier": "haiku",
+    "role": "researcher",
+    "complexity": 0
+  },
+  {
+    "text": "What did we decide earlier about respecting agent frontmatter model pins?",
+    "tool": "em_recall",
+    "tier": "haiku",
+    "role": "explorer",
+    "complexity": 0
+  },
+  {
+    "text": "Find where we previously logged the 'Class2 is not a constructor' crash and how it was fixed",
+    "tool": "em_search",
+    "tier": "haiku",
+    "role": "explorer",
+    "complexity": 1
+  },
+  {
+    "text": "Which commits on this branch later needed fixes, and which files are riskiest?",
+    "tool": "em_history",
+    "tier": "haiku",
+    "role": "explorer",
+    "complexity": 1
+  },
+  {
+    "text": "Read the Claude Code sub-agents docs page and tell me how per-call effort works",
+    "tool": "em_fetch_and_index",
+    "tier": "haiku",
+    "role": "researcher",
+    "complexity": 0,
+    "alsoOk": ["em_docs"]
+  },
+  {
+    "text": "Fix the typo 'recieve' in README.md",
+    "tool": "Edit",
+    "tier": "haiku",
+    "role": "coder",
+    "complexity": 0
+  },
+  {
+    "text": "Compare how other CLIs replay fixture prompts against a scorer (promptfoo, OpenAI evals) and their output formats",
+    "tool": "em_fetch_and_index",
+    "tier": "sonnet",
+    "role": "researcher",
+    "complexity": 2
+  },
+  {
+    "text": "Show simulated decisions with a badge in the dashboard adjudicator view and exclude them from the follow-rate chart",
+    "tool": "Edit",
+    "tier": "sonnet",
+    "role": "ui",
+    "complexity": 2
+  },
+  {
+    "text": "Refactor the plan-advice formatting in src/adjudicator/swarm.ts into a pure function shared by plan lines, the Next hint and the Agent note across modules",
+    "tool": "Edit",
+    "tier": "sonnet",
+    "role": "coder",
+    "complexity": 2
+  }
+]

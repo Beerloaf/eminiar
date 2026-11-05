@@ -3,11 +3,14 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { getContext } from "./context.js";
 import { kickEmbedding } from "./embeddings/queue.js";
-import { drainReindexQueue } from "./graph/reindex.js";
+import { drainReindexQueue, reindexCode, reindexGitSignals } from "./graph/reindex.js";
+import { refreshHistorySummary } from "./history/model.js";
+import { reconcile } from "./memory/store.js";
 import { markServerAlive } from "./session/server-alive.js";
 import { getStorage } from "./storage/index.js";
+import { registerServerProviders } from "./tools/em_adjudicate.js";
 import { tools } from "./tools/index.js";
-import { errorResult } from "./tools/types.js";
+import { availableTools, errorResult } from "./tools/types.js";
 import { pluginRoot, version } from "./version.js";
 
 // `em-server --probe` is the installer's and doctor's cheap "can this copy start?" check:
@@ -25,7 +28,26 @@ const server = new McpServer({ name: "eminiar", version: version() });
 // be re-parsed; the drain still starts first and overlaps the child process instead.
 const SANDBOX_TOOLS = new Set(["em_execute", "em_execute_file", "em_batch_execute"]);
 
-for (const tool of tools) {
+// Opt-in tools (em_adjudicate) are listed only when their feature is on for the config loaded
+// at start; enabling one later needs /mcp reconnect. The adjudicator's embedding provider is
+// registered here (never in a hook) when it is the effective provider, and its model warmed,
+// both in the background: start-up and tool listing never wait. Only the tools that score
+// (ADJUDICATOR_TOOLS) wait for the registration, not for the warm-up. Disabled: nothing runs.
+let startConfig: ReturnType<typeof getContext>["config"] | undefined;
+try {
+  startConfig = getContext().config;
+} catch (err) {
+  process.stderr.write(`eminiar: config not loaded at start: ${(err as Error).message}\n`);
+}
+const listed = startConfig ? availableTools(tools, startConfig) : tools.filter((t) => !t.available);
+const ADJUDICATOR_TOOLS = new Set(["em_adjudicate", "em_swarm"]);
+const providersReady: Promise<unknown> = startConfig
+  ? registerServerProviders(startConfig, { warm: true }).catch((err: unknown) =>
+      process.stderr.write(`eminiar: adjudicator provider skipped: ${(err as Error).message}\n`),
+    )
+  : Promise.resolve();
+
+for (const tool of listed) {
   server.registerTool(
     tool.name,
     {
@@ -43,6 +65,7 @@ for (const tool of tools) {
           const drain = drainReindexQueue(ctx, getStorage(ctx)).catch(() => undefined);
           if (!SANDBOX_TOOLS.has(tool.name)) await drain;
         }
+        if (ADJUDICATOR_TOOLS.has(tool.name)) await providersReady;
         return await tool.handler(rest, ctx);
       } catch (err) {
         return errorResult(`${tool.name} failed: ${(err as Error).stack ?? String(err)}`);
@@ -80,12 +103,13 @@ setImmediate(() => {
 
 // Warm the project in the background so the first em_* call is fast: parse
 // changed code into the graph, refresh git signals, embed pending chunks.
+// The server imports internal modules statically only: it is built as one file
+// (tsup.config.ts) so an in-place upgrade cannot pull a chunk from under it, and a
+// dynamic import() would make esbuild wrap modules lazily (scripts/check-bundle.mjs).
 const warm = setTimeout(async () => {
   try {
     const ctx = getContext();
     const db = getStorage(ctx);
-    const { reindexCode, reindexGitSignals } = await import("./graph/reindex.js");
-    const { reconcile } = await import("./memory/store.js");
     try {
       reconcile(ctx, db);
     } catch (err) {
@@ -95,7 +119,6 @@ const warm = setTimeout(async () => {
     try {
       reindexGitSignals(ctx, db);
       // hooks read the persisted history summary; rebuild it when HEAD moved
-      const { refreshHistorySummary } = await import("./history/model.js");
       refreshHistorySummary(ctx, db);
     } catch {
       // not a git repo

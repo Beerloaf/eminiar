@@ -650,6 +650,50 @@ export function taskRef(prompt: string | undefined): number | undefined {
 
 const isLive = (w: WorkerRow, now: number) => w.status === "running" && now - w.last_ts < STALE_MS;
 
+/** A task is for `role` when it names that role or none (in every topology). */
+const forRole = (t: TaskRow, role: string) => !t.role || t.role === role;
+
+/**
+ * Of the tasks a spawn prompt names, the one a new `role` worker is for: in an active run of
+ * the swarm (preferring `current`, the run the spawn joins by default), for this role or for
+ * no role, and still open: pending, or held by a worker that went quiet or stopped. Of those,
+ * the ones the worker could claim now (deps done; a quiet holder's task counts as pending)
+ * win, so "task #1 … task #2 comes after it" links #1; when none is claimable yet, the open
+ * set decides. Undefined unless exactly one qualifies; the others are context ("task #95
+ * already edited it").
+ */
+function soleOpenTask(
+  db: StorageAdapter,
+  swarm: SwarmSpec,
+  role: string,
+  refs: number[],
+  current: RunRow | undefined,
+  now: number,
+): TaskRow | undefined {
+  const open = (t: TaskRow) => {
+    if (t.status === "pending") return true;
+    const w = t.status === "active" && t.agent_id ? db.swarm.workerFind(t.agent_id) : undefined;
+    return !!w && !isLive(w, now);
+  };
+  const found = refs
+    .map((id) => db.swarm.taskGet(id))
+    .filter((t): t is TaskRow => {
+      if (!t || !forRole(t, role)) return false;
+      const r = db.swarm.runGet(t.run_id);
+      return r?.status === "active" && r.swarm === swarm.name && open(t);
+    });
+  const own = found.filter((t) => t.run_id === current?.id);
+  const pick = own.length ? own : found;
+  if (pick.length <= 1) return pick[0];
+  const runTasks = new Map<string, TaskRow[]>();
+  const claimable = pick.filter((t) => {
+    const all = runTasks.get(t.run_id) ?? db.swarm.tasks(t.run_id);
+    runTasks.set(t.run_id, all);
+    return eligibility({ ...t, status: "pending" }, all, swarm, role).ok;
+  });
+  return claimable.length === 1 ? claimable[0] : undefined;
+}
+
 type DenyType = "max_agents" | "count";
 
 /** Record a denial, folding repeats of the same kind for the same role into one event. */
@@ -724,13 +768,22 @@ export function reserveSpawn(
   const { swarm, role } = hit;
   return db.swarm.immediate(() => {
     const now = Date.now();
-    // A prompt naming a task of an active run of this swarm decides the run.
+    const current = db.swarm.runActive(swarm.name, opts.sessionId);
+    // A prompt naming a task of an active run of this swarm decides the run. One naming several
+    // (its task plus others for context) names the one still open for this role, if just one is.
+    // A lone reference decides the run whatever the task's role, but links the task only when it
+    // is for this role: "write tests for what the coder did in task #3" is context for a tester.
+    // Its state is not checked, so a re-spawn for a done, failed or reopened task still links.
     const ref = taskRef(opts.prompt);
-    const refTask = ref !== undefined ? db.swarm.taskGet(ref) : undefined;
+    const refTask =
+      ref !== undefined
+        ? db.swarm.taskGet(ref)
+        : soleOpenTask(db, swarm, role.role, taskRefs(opts.prompt), current, now);
+    const linkTask = refTask && forRole(refTask, role.role) ? refTask : undefined;
     const refRun = refTask ? db.swarm.runGet(refTask.run_id) : undefined;
     const run =
       (refRun && refRun.status === "active" && refRun.swarm === swarm.name ? refRun : undefined) ??
-      db.swarm.runActive(swarm.name, opts.sessionId);
+      current;
     if (opts.requireRun && !run)
       return {
         decision: "deny" as const,
@@ -757,7 +810,7 @@ export function reserveSpawn(
       if (run) denyEvent(db, run.id, role.role, type, reason);
       return { decision: "deny" as const, reason };
     }
-    const taskId = refTask && run && refTask.run_id === run.id ? refTask.id : undefined;
+    const taskId = linkTask && run && linkTask.run_id === run.id ? linkTask.id : undefined;
     db.swarm.spawnAdd({
       swarm: swarm.name,
       run_id: run?.id ?? null,

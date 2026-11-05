@@ -3,6 +3,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join } from "node:path";
 import { z } from "zod";
+import { TIERS, type Tier } from "../adjudicator/types.js";
+import { tierOf } from "../storage/dispatch.js";
 import { checkGlob, GlobError } from "./glob.js";
 
 /**
@@ -19,6 +21,7 @@ import {
   type ConfigIssue,
   type ContextSpec,
   type LoadResult,
+  type ModelRange,
   type RoleSpec,
   type SwarmConfig,
   type SwarmSpec,
@@ -96,6 +99,17 @@ const Model = z
   .max(100)
   .regex(MODEL_RE, "a model alias (inherit, sonnet, opus, haiku, fable) or a Claude model id")
   .refine(noFence, FENCE_MSG);
+const rank = (t: Tier) => TIERS.indexOf(t);
+/**
+ * Bounds the adjudicator may move a role's model within. Each is one of the Agent tool's
+ * `model` values; an unset bound is the fallback model's tier (see roleRange).
+ */
+const RawModelRange = z
+  .strictObject({ floor: z.enum(TIERS).optional(), ceiling: z.enum(TIERS).optional() })
+  .refine(
+    (r) => !r.floor || !r.ceiling || rank(r.floor) <= rank(r.ceiling),
+    `floor must not be above ceiling (${TIERS.join(" < ")})`,
+  );
 const Glob = z
   .string()
   .min(1)
@@ -169,6 +183,7 @@ const RawAgent = z.strictObject({
   description: z.string().trim().min(1).max(500).refine(noFence, FENCE_MSG),
   prompt: z.string().max(20_000).optional(),
   model: Model.optional(),
+  model_range: RawModelRange.optional(),
   tools: z.array(ToolName).max(80).optional(),
   disallowed_tools: z.array(ToolName).max(80).optional(),
   skills: z.array(SkillName).max(20).optional(),
@@ -182,6 +197,7 @@ const RawAgent = z.strictObject({
   color: z.enum(AGENT_COLORS).optional(),
   context: RawContext.optional(),
 });
+type RawAgent = z.infer<typeof RawAgent>;
 
 const RawSwarm = z.strictObject({
   description: z.string().trim().min(1).max(500),
@@ -205,6 +221,7 @@ const RawFile = z.looseObject({
   defaults: z
     .strictObject({
       model: Model.optional(),
+      model_range: RawModelRange.optional(),
       skills: z.array(SkillName).max(20).optional(),
       context: RawContext.optional(),
     })
@@ -234,6 +251,72 @@ function mergeContext(...layers: Array<RawContext | undefined>): ContextSpec {
 }
 
 const uniq = <T>(xs: T[]): T[] => [...new Set(xs)];
+
+/**
+ * A role's model range: its own `model_range`, else `defaults.model_range` (taken whole, never
+ * merged per bound), with an unset bound at the fallback's tier. The fallback (`model`, else
+ * `defaults.model`) is what the agent file pins and what the worker runs on whenever the
+ * adjudicator does not choose, so it needs a known tier inside the range. Undefined for no
+ * range, for `{}` (how a role opts out of the default) and for a range of one tier.
+ */
+function roleRange(
+  defaults: RawFile["defaults"],
+  a: RawAgent,
+  at: string[],
+  issue: (path: string[], message: string) => void,
+): ModelRange | undefined {
+  const spec = a.model_range ?? defaults?.model_range;
+  if (!spec || (!spec.floor && !spec.ceiling)) return undefined;
+  const model = a.model ?? defaults?.model;
+  const rangeKey = a.model_range ? "model_range" : "defaults.model_range";
+  const modelKey = a.model !== undefined ? "model" : "defaults.model";
+  // A problem made only of defaults is reported once, at the defaults.
+  const fromDefaults = !a.model_range && a.model === undefined;
+  const path = a.model_range
+    ? [...at, "model_range"]
+    : fromDefaults
+      ? ["defaults", "model_range"]
+      : [...at, "model"];
+  if (!model) {
+    issue(
+      path,
+      `${rangeKey} needs a fallback model inside it: set ${fromDefaults ? "defaults.model, or model on every role without one" : "model on this role or defaults.model"} (the agent file pins it, and the worker runs on it whenever the adjudicator does not choose)`,
+    );
+    return undefined;
+  }
+  if (model === "inherit") {
+    issue(
+      path,
+      `${modelKey} inherit cannot be the fallback of ${rangeKey}: the main session's model is not known in advance; set it to haiku, sonnet, opus or fable`,
+    );
+    return undefined;
+  }
+  // opusplan is opus while planning and sonnet otherwise: no one tier to check against.
+  const tier = model === "opusplan" ? undefined : tierOf(model);
+  if (!tier) {
+    issue(
+      path,
+      `${modelKey} ${model} has no single tier, so it cannot be the fallback of ${rangeKey}; use haiku, sonnet, opus, fable or a model id of one of them`,
+    );
+    return undefined;
+  }
+  const floor = spec.floor ?? tier;
+  const ceiling = spec.ceiling ?? tier;
+  const outside =
+    rank(tier) < rank(floor)
+      ? `below the floor ${floor}`
+      : rank(tier) > rank(ceiling)
+        ? `above the ceiling ${ceiling}`
+        : undefined;
+  if (outside) {
+    issue(
+      path,
+      `${modelKey} ${model} is ${outside} of ${rangeKey}: the fallback must lie inside the range`,
+    );
+    return undefined;
+  }
+  return floor === ceiling ? undefined : { floor, ceiling };
+}
 
 /** Locate the swarm file of a project, or the default path when none exists. */
 export function swarmFile(root: string): { file: string; rel: string; exists: boolean } {
@@ -393,6 +476,14 @@ function resolve(
 ): SwarmConfig {
   const swarms: SwarmSpec[] = [];
   const seenAgent = new Map<string, string>();
+  const reported = new Set<string>();
+  // Every role that inherits a broken defaults.model_range hits the same issue; list it once.
+  const once = (path: string[], message: string) => {
+    const key = `${path.join(".")}\n${message}`;
+    if (reported.has(key)) return;
+    reported.add(key);
+    issue(path, message);
+  };
   const swarmEntries = Object.entries(raw.swarms);
   if (!swarmEntries.length) issue(["swarms"], "define at least one swarm");
 
@@ -420,6 +511,7 @@ function resolve(
         description: a.description,
         prompt: (a.prompt ?? "").trim(),
         model: a.model ?? raw.defaults?.model,
+        range: roleRange(raw.defaults, a, ["swarms", name, "agents", role], once),
         tools: a.tools ? uniq(a.tools) : undefined,
         disallowedTools: a.disallowed_tools ? uniq(a.disallowed_tools) : undefined,
         skills: uniq([...(raw.defaults?.skills ?? []), ...(a.skills ?? [])]),

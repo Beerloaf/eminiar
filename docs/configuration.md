@@ -121,7 +121,7 @@ eminiar merges four layers. A later layer overrides an earlier one.
 
 | Key | Default | Description |
 |---|---|---|
-| `manifest` | `".eminiar/docs.json"` | The documentation sources manifest |
+| `manifest` | `".eminiar/docs.json"` | The documentation sources manifest, relative to the project root (see below) |
 | `ttlHours` | `168` (7 days) | Page cache lifetime |
 | `crawl.depth` | `1` | Link depth for dependency docs |
 | `crawl.maxPages` | `8` | Pages per dependency source |
@@ -132,6 +132,24 @@ eminiar merges four layers. A later layer overrides an earlier one.
 | `discover.includeDev` | `false` | Include dev dependencies in discovery |
 | `discover.subprojects` | `true` | Scan one level of sub-projects |
 | `catalog` | `[]` | Extra catalogue entries, each with a `tier`: `service`, `infra` or `library` |
+
+`docs.manifest` must be a path inside the project: an absolute path, a drive letter, a `..`
+segment or a control character (a newline, NUL) is refused by the schema, and a project
+`eminiar.config.json` or a personal config that sets one is ignored for that key only (a stderr
+note says so; the next layer's or the default value applies, and the rest of both files stays). Because
+`em_docs add` / `remove` rewrite this file, a write is also refused when:
+
+- the path, or the folder it is in, resolves outside the project through a symlink;
+- the manifest itself is a symlink, even to a file inside the project (writes replace only a
+  regular file; reads still follow a symlink that stays inside the project);
+- it is not a manifest this version can rewrite without losing data: `version` other than `1`,
+  top-level keys other than `version` and `sources`, a `sources` that is not an array, or an
+  entry that is not valid (bad name, duplicate, unknown kind);
+- it could not be read (too large, not a regular file, not JSON, a merge conflict).
+
+The refusal names the file and the reason; fix or move the file, then retry. Hooks and other
+readers never fail on it: an unreadable or outside manifest reads as empty. Writes go to a temp
+file in the same folder that is renamed over the manifest, keeping its file mode.
 
 ### `usage`
 
@@ -146,14 +164,92 @@ eminiar merges four layers. A later layer overrides an earlier one.
 
 See [Usage insights](usage.md) for the sources, the privacy notes and the savings model.
 
+### `adjudicator`
+
+Optional and off by default. See [Adjudicator](adjudicator.md). Two rules apply to this section
+only:
+
+- It must not hold a key. A field named like `apiKey`, `token`, `secret` or `password` makes the
+  config invalid. Keys go in `~/.eminiar/adjudicator.key` (`eminiar adjudicator key set`) or an
+  environment variable named by `keyEnv`.
+- Only `enabled`, `mode`, `surfaces`, `promptMode`, `minPromptChars`, `tiers`, `weights`,
+  `apply`, `advice`, `embedding`, `learning` and `cache` may be set in the committed
+  `eminiar.config.json`. Everything that decides where text and keys go or how much is spent
+  (`provider`, `typesafe`, `openai`, `keyEnv`, `remoteConsent`, `remoteConsentOrigins`,
+  `privacy`, `budget`, `timeouts`, `breaker`) comes from `~/.eminiar/config.json` only, and from
+  there only while that file is outside the project (see `EMINIAR_HOME` below).
+
+| Key | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Turn the adjudicator on. `EMINIAR_ADJUDICATOR=0` is the kill switch |
+| `provider` | `"heuristic"` | `heuristic`, `embedding`, `typesafe` (Jev) or `openai-compatible` |
+| `mode` | `"advise"` | `advise` only suggests; `apply` sets the Agent `model` on the dispatches `apply.scope` covers. See [Advise and apply](adjudicator.md#advise-and-apply) |
+| `surfaces.prompt` | `true` | Score prompts (UserPromptSubmit) |
+| `surfaces.agent` | `true` | Score subagent dispatches (PreToolUse on `Agent`) |
+| `surfaces.plan` | `true` | Add suggestions to `em_swarm plan` |
+| `surfaces.tools` | `false` | Hint when a raw tool call contradicts the prompt's advised `em_*` tool |
+| `promptMode` | `"async"` | How the provider runs on a prompt: `async` (detached; the heuristic answers now), `blocking` (inline within `timeouts.promptMs`) or `heuristic` (never) |
+| `typesafe.model` | `"jev-1.14.0"` | Jev model. `jev-latest` and `jev-preview` are replaced by the pinned version |
+| `typesafe.baseUrl` | `"https://api.typesafe.ai/v1"` | Jev endpoint |
+| `openai.preset` | `"groq"` | `groq`, `cerebras`, `ollama`, `lmstudio`, `llamacpp` or `custom` |
+| `openai.baseUrl` | unset (the preset's) | Overrides the preset's URL; required for `custom`. A non-loopback URL makes any preset remote |
+| `openai.model` | unset (the preset's) | Overrides the preset's model; required for `custom` |
+| `openai.json` | `"auto"` | `schema` (strict JSON schema), `object` (JSON mode) or `auto` (schema, falling back to JSON mode when the server rejects it) |
+| `openai.price.inPerM` | unset (the preset's) | USD per million input tokens. Without a price, a preset with an unknown price reports no cost |
+| `openai.price.outPerM` | unset (the preset's) | USD per million output tokens |
+| `embedding.k` | `5` | Nearest examples that vote |
+| `embedding.minSimilarity` | `0.55` | Cosine similarity below which an example does not count; with none, the heuristic answers |
+| `keyEnv` | unset | The NAME of an environment variable holding the key, never the key |
+| `remoteConsent` | `false` | Consent to send redacted text to a remote provider. Set by `enable`/`provider` after you agree |
+| `timeouts.promptMs` | `1200` | Provider deadline on prompts (remote providers) |
+| `timeouts.agentMs` | `800` | Provider deadline on dispatches and tool hints (remote providers) |
+| `timeouts.planMs` | `3000` | Deadline for a plan batch, `em_adjudicate score` and each eval chunk |
+| `timeouts.localMs` | `600` | Provider deadline on prompts and dispatches for local providers |
+| `timeouts.connectMs` | `150` | Port probe timeout for `provider --detect` |
+| `minPromptChars` | `12` | Shorter prompts are not scored |
+| `tiers` | `["haiku", "sonnet", "opus"]` | The model ladder, smallest first. Add `"fable"` to allow it. Each tier at most once (at most 4 entries), since every provider request carries the whole ladder |
+| `weights.providerMax` | `0.7` | Largest weight a Jev or OpenAI-compatible answer gets in the blend |
+| `weights.embeddingMax` | `0.4` | Largest weight an embedding answer gets |
+| `weights.selfReportScale` | `0.6` | Multiplier on a model's self-reported confidence (Jev's calibrated confidence is used as is) |
+| `weights.lowConfidence` | `0.55` | A tier choice below this confidence moves one tier up |
+| `weights.tierCenters` | `{"haiku": 0.6, "sonnet": 2.0, "opus": 3.4}` | The complexity each tier fits best (at most 16 entries) |
+| `weights.features` | `{}` | Per-feature weight overrides, for example `{"design": 2.0}`. `asymmetry` (default 2) sets how strongly the tier leans up; `toolProvider` above 0 lets a provider vote on the tool. At most 64 entries |
+| `apply.scope` | `"swarm"` | In apply mode, set the model on swarm worker dispatches only (`swarm`) or on every dispatch (`all`) |
+| `apply.minConfidence` | `0.7` | Apply only at or above this tier confidence |
+| `apply.floor` | `"haiku"` | Smallest tier apply mode sets |
+| `apply.ceiling` | `"opus"` | Largest tier apply mode sets |
+| `apply.respectFrontmatter` | `true` | Leave a dispatch alone when its agent file pins a `model` (`inherit` is not a pin). A swarm role with a `model_range` still moves inside its range ([Model ranges](swarms.md#model-ranges)). `false` ignores pins and ranges alike: a pinned or ranged agent is advised and set like one with no `model` line, between `apply.floor` and `apply.ceiling` |
+| `advice.mainSession` | `"user"` | Main-session `/model` note: `user` (shown to you), `context` (to Claude) or `off` |
+| `advice.cooldownPrompts` | `8` | At most one main-session note per this many prompts |
+| `learning.enabled` | `true` | Learn a bias from outcomes and feedback |
+| `learning.maxBias` | `0.3` | Bound on the learned bias |
+| `learning.minSamples` | `5` | Outcomes a bucket needs before its bias applies |
+| `learning.halfLife` | `50` | Outcomes after which an old outcome counts half |
+| `learning.costWeight` | `0.05` | How much a bucket's cost pulls its bias down |
+| `cache.ttlHours` | `24` | Lifetime of a cached blended verdict |
+| `cache.maxEntries` | `2000` | Verdict cache size |
+| `breaker.failures` | `2` | Consecutive failures that open the circuit breaker |
+| `breaker.cooldownSec` | `120` | How long an open breaker or the slow guard skips the provider |
+| `budget.dailyUsd` | `0.5` | Spend cap per remote provider per UTC day |
+| `budget.dailyCalls` | `2000` | Call cap per remote provider per UTC day (`0` = unlimited). Limits providers whose price is unknown |
+| `privacy.maxChars` | `2000` | Characters of redacted text a remote provider receives per item |
+| `privacy.storeHead` | `true` | Keep the first 80 redacted characters of each input in the database |
+| `privacy.captureExchanges` | `false` | Keep the newest 100 requests sent to TypeSafe Jev and its answers, with timing, for the dashboard. They contain redacted prompt text, at most 65,536 characters per request or answer. Personal `~/.eminiar/config.json` only: `eminiar.config.json` cannot set it. See [Jev request capture](adjudicator.md#jev-request-capture) |
+
 ## Environment variables
 
 | Variable | Effect |
 |---|---|
 | `EMINIAR_ROUTING_MODE` | Overrides `routing.mode` |
 | `EMINIAR_EMBEDDINGS=0` | Turns off embeddings |
-| `EMINIAR_HOME` | Moves the data directory (default `~/.eminiar`) |
+| `EMINIAR_HOME` | Moves the data directory (default `~/.eminiar`). A `config.json` there that lies inside or above the project (or any git work tree around it, a submodule's superproject included), or a relative `EMINIAR_HOME`, cannot set the adjudicator's provider, consent, endpoints, `keyEnv`, privacy, budget or timeouts, since a repo's `.claude/settings.json` could set this variable. The same applies when `HOME` is moved into the project |
 | `CURSOR_CONFIG_DIR` | Where `install --cursor` writes Cursor's `hooks.json`, `mcp.json` and `skills/` (default `~/.cursor`) |
 | `EMINIAR_PROJECT_ROOT` | Sets the project root. Otherwise `CLAUDE_PROJECT_DIR`, then the current directory |
 | `EMINIAR_DEBUG` | Prints stack traces from the CLI |
 | `EMINIAR_CLAUDE_DIR` | Where Claude Code keeps its transcripts (default `~/.claude`) |
+| `EMINIAR_ADJUDICATOR=0` / `=1` | Turns the adjudicator off (the kill switch) or on, over every config file |
+| `EMINIAR_ADJUDICATOR_PROVIDER` | Overrides `adjudicator.provider`. A remote provider runs only when `remoteConsentOrigins` in `~/.eminiar/config.json` lists its origin |
+| `EMINIAR_ADJUDICATOR_MODE` | Overrides `adjudicator.mode` (`advise` or `apply`) |
+| `EMINIAR_ADJUDICATOR_REMOTE=0` | Withdraws remote consent. `=1` does nothing: no environment variable can grant consent, because a project's `.claude/settings.json` can set them |
+| `EMINIAR_ADJUDICATOR_CAPTURE=0` | Turns Jev request capture off (`=1` does nothing) |
+| `EMINIAR_ADJUDICATOR_KEY` | Adjudicator provider key, checked after `keyEnv` and the provider's own variable (`TYPESAFE_API_KEY`, `GROQ_API_KEY`, `CEREBRAS_API_KEY`) and before `~/.eminiar/adjudicator.key` |

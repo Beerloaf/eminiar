@@ -127,6 +127,7 @@ nothing.
 | `enforce` | `false` | `true` denies every subagent that is not a swarm worker. See [Enforcement](#enforcement) |
 | `allowed_agents` | `[]` | With `enforce: true`, other agent types that may still run, such as `[statusline-setup]`. Ignored when `enforce` is off. `swarm-*` names are not accepted |
 | `defaults.model` | unset | Model for every role that does not set one |
+| `defaults.model_range` | unset | Model range for every role that sets no `model_range` of its own. See [Model ranges](#model-ranges) |
 | `defaults.skills` | `[]` | Skills preloaded into every role, before the role's own |
 | `defaults.context` | see [context](#context) | What every worker is told at start |
 | `swarms` | required | One or more swarms, keyed by name |
@@ -153,7 +154,8 @@ across all swarms.
 |---|---|---|
 | `description` | required | What the role does (up to 500 characters). It also goes into the agent file's description |
 | `prompt` | `""` | The role's instructions, written into the agent file body |
-| `model` | `defaults.model` | `inherit`, `sonnet`, `opus`, `haiku`, `fable` or a full model id. When nothing sets a model, the agent file has no `model` line and Claude Code uses its default for subagents |
+| `model` | `defaults.model` | `inherit`, `sonnet`, `opus`, `haiku`, `fable` or a full model id. When nothing sets a model, the agent file has no `model` line and Claude Code uses its default for subagents. With a `model_range`, this is the fallback |
+| `model_range` | `defaults.model_range` | `{ floor, ceiling }`: the tiers (`haiku`, `sonnet`, `opus`, `fable`) the adjudicator may move this worker's model between. See [Model ranges](#model-ranges) |
 | `tools` | unset | Tool allowlist. When set, eminiar adds its own `em_*` tools under both MCP name forms so routing never leaves the worker without them. Unset: the worker gets every tool |
 | `disallowed_tools` | unset | Tools the worker cannot use, such as `[Edit, Write, NotebookEdit]` for a read-only reviewer |
 | `skills` | `[]` | Skills preloaded into the worker, after `defaults.skills` |
@@ -166,6 +168,39 @@ across all swarms.
 | `effort` | unset | `low`, `medium`, `high`, `xhigh` or `max` |
 | `color` | unset | `red`, `blue`, `green`, `yellow`, `purple`, `orange`, `pink` or `cyan` |
 | `context` | from the swarm | Overrides the swarm's context for this role |
+
+### Model ranges
+
+`model` pins a worker's model. `model_range` lets the [adjudicator](adjudicator.md) choose the
+model for each task within bounds, and keeps `model` as the fallback:
+
+```yaml
+agents:
+  coder:
+    description: Implements one task at a time.
+    model: sonnet                                  # the fallback
+    model_range: { floor: haiku, ceiling: opus }   # haiku, sonnet or opus per task
+```
+
+- `floor` and `ceiling` each take `haiku`, `sonnet`, `opus` or `fable`, lowest to highest, and
+  `floor` must not be above `ceiling`. An unset bound sits at the fallback's tier: with
+  `model: sonnet`, `{ floor: haiku }` only lets the model move down, and `{ ceiling: opus }`
+  only up.
+- The fallback is the role's `model`, else `defaults.model`. It must lie inside the range, and
+  eminiar must know its tier, so `inherit` and `opusplan` are errors. A model id counts as its
+  family: `claude-sonnet-5-5` and `sonnet[1m]` are `sonnet`.
+- `defaults.model_range` applies to every role that sets no `model_range`. A role's own
+  `model_range` replaces it whole; the bounds are not merged. `model_range: {}` keeps a role on
+  its model.
+- A range of one tier, such as `{ floor: opus, ceiling: opus }` with `model: opus`, is the same
+  as no range.
+
+The agent file still pins the fallback in its frontmatter `model`, so the worker runs on it
+whenever the adjudicator is off, fails or does not choose. The range goes into the file's
+`eminiar:swarm` marker line as `range=<floor>..<ceiling>`, where the adjudicator reads it. The
+file's hash covers the range: a range edited by hand makes the file count as edited, and its
+range is no longer read. Without `model_range` nothing changes, and the agent files stay the
+same byte for byte.
 
 ### Context
 
@@ -202,7 +237,8 @@ active. Read [Security](#security) before you add one.
 ### Generated agent files
 
 Sync writes `.claude/agents/swarm-<swarm>-<role>.md` for every role. Each file starts with an
-`eminiar:swarm` marker comment. Sync only rewrites or deletes files that carry the marker. If a
+`eminiar:swarm` marker comment, which also holds the role's `range=` when it has a
+[model range](#model-ranges). Sync only rewrites or deletes files that carry the marker. If a
 hand-written agent file already has the same name, sync reports a conflict and leaves the file
 alone; rename the role or the file. A generated file that someone edited by hand is also
 reported as a conflict and kept; `eminiar swarm sync --force` overwrites it.

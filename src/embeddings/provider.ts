@@ -1,4 +1,5 @@
 import type { Config } from "../config.js";
+import { TransformersProvider } from "./transformers.js";
 
 export interface EmbeddingProvider {
   readonly model: string;
@@ -17,14 +18,14 @@ let instance: EmbeddingProvider | undefined;
 let disabled = false;
 
 /**
- * Lazily constructed singleton. The transformers.js import is deferred so the
- * hook process (which never embeds) does not pay for onnxruntime at startup.
+ * Lazily constructed singleton. TransformersProvider defers the @huggingface/transformers
+ * import to its first load, so no process pays for onnxruntime until it embeds. Internal
+ * modules are imported statically: the server is one file (tsup.config.ts).
  */
 export async function getProvider(config: Config): Promise<EmbeddingProvider | undefined> {
   if (!config.embeddings.enabled || disabled) return undefined;
   if (instance) return instance;
   try {
-    const { TransformersProvider } = await import("./transformers.js");
     instance = new TransformersProvider(config.embeddings.model, config.embeddings.dims);
     return instance;
   } catch (err) {

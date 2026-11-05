@@ -398,140 +398,148 @@ function ContextChart({ points, color }: { points: TimelinePoint[]; color: Color
 function ModelsTable({ rows, color }: { rows: ModelRow[]; color: ColorFn }): JSX.Element {
   const { sorted, th } = useSort(rows, "costUsd");
   return (
-    <table>
-      <thead>
-        <tr>
-          {th("model", "model")}
-          {th("calls", "calls", true)}
-          {th("costUsd", "cost", true)}
-          {th("share", "share", true)}
-          {th("input", "in", true)}
-          {th("output", "out", true)}
-          {th("cacheRead", "cache rd", true)}
-          {th("cacheWrite", "cache wr", true)}
-        </tr>
-      </thead>
-      <tbody>
-        {sorted.length ? (
-          sorted.map((m) => (
-            <tr>
-              <td class="nowrap">
-                <i class="kdot" style={{ background: color(m.model) }} /> {shortModel(m.model)}
-                {m.unpricedCalls ? (
-                  <span class="warn small" title="no bundled price; add config.usage.pricing">
-                    {" "}
-                    unpriced
-                  </span>
-                ) : null}
-              </td>
-              <td class="num">{m.calls}</td>
-              <td class="num">{usd(m.costUsd)}</td>
-              <td class="num">{pct(m.share)}</td>
-              <td class="num">{fmt(m.input)}</td>
-              <td class="num">{fmt(m.output)}</td>
-              <td class="num">{fmt(m.cacheRead)}</td>
-              <td class="num">{fmt(m.cacheWrite)}</td>
-            </tr>
-          ))
-        ) : (
+    <div class="scroll-x">
+      <table>
+        <thead>
           <tr>
-            <td class="muted" colSpan={8}>
-              no API calls in this range
-            </td>
+            {th("model", "model")}
+            {th("calls", "calls", true)}
+            {th("costUsd", "cost", true)}
+            {th("share", "share", true)}
+            {th("input", "in", true)}
+            {th("output", "out", true)}
+            {th("cacheRead", "cache rd", true)}
+            {th("cacheWrite", "cache wr", true)}
           </tr>
-        )}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {sorted.length ? (
+            sorted.map((m) => (
+              <tr>
+                <td class="nowrap">
+                  <i class="kdot" style={{ background: color(m.model) }} /> {shortModel(m.model)}
+                  {m.unpricedCalls ? (
+                    <span class="warn small" title="no bundled price; add config.usage.pricing">
+                      {" "}
+                      unpriced
+                    </span>
+                  ) : null}
+                </td>
+                <td class="num">{m.calls}</td>
+                <td class="num">{usd(m.costUsd)}</td>
+                <td class="num">{pct(m.share)}</td>
+                <td class="num">{fmt(m.input)}</td>
+                <td class="num">{fmt(m.output)}</td>
+                <td class="num">{fmt(m.cacheRead)}</td>
+                <td class="num">{fmt(m.cacheWrite)}</td>
+              </tr>
+            ))
+          ) : (
+            <tr>
+              <td class="muted" colSpan={8}>
+                no API calls in this range
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
 function ToolsTable({ rows }: { rows: ToolRow[] }): JSX.Element {
   const max = Math.max(1, ...rows.map((r) => r.chars));
   return (
-    <table>
-      <thead>
-        <tr>
-          <th>tool</th>
-          <th class="num">calls</th>
-          <th class="num">est. tokens</th>
-          <th class="num">avg chars</th>
-          <th class="num">errors</th>
-          <th />
-        </tr>
-      </thead>
-      <tbody>
-        {rows.length ? (
-          rows.map((r) => (
+    <div class="scroll-x">
+      <table>
+        <thead>
+          <tr>
+            <th>tool</th>
+            <th class="num">calls</th>
+            <th class="num">est. tokens</th>
+            <th class="num">avg chars</th>
+            <th class="num">errors</th>
+            <th />
+          </tr>
+        </thead>
+        <tbody>
+          {rows.length ? (
+            rows.map((r) => (
+              <tr>
+                <td>{r.tool}</td>
+                <td class="num">{r.calls}</td>
+                <td class="num">{fmt(r.estTokens)}</td>
+                <td class="num">{fmt(r.avgChars)}</td>
+                <td class={cls("num", r.errors > 0 && "warn")}>{r.errors}</td>
+                <td>
+                  <span class="bar" style={{ width: `${Math.max(2, (r.chars / max) * 80)}px` }} />
+                </td>
+              </tr>
+            ))
+          ) : (
             <tr>
-              <td>{r.tool}</td>
-              <td class="num">{r.calls}</td>
-              <td class="num">{fmt(r.estTokens)}</td>
-              <td class="num">{fmt(r.avgChars)}</td>
-              <td class={cls("num", r.errors > 0 && "warn")}>{r.errors}</td>
-              <td>
-                <span class="bar" style={{ width: `${Math.max(2, (r.chars / max) * 80)}px` }} />
+              <td class="muted" colSpan={6}>
+                no tool results recorded
               </td>
             </tr>
-          ))
-        ) : (
-          <tr>
-            <td class="muted" colSpan={6}>
-              no tool results recorded
-            </td>
-          </tr>
-        )}
-      </tbody>
-    </table>
+          )}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
 function BlocksTable({ rows, color }: { rows: Block[]; color: ColorFn }): JSX.Element {
   return (
-    <table>
-      <thead>
-        <tr>
-          <th>block (UTC)</th>
-          <th>calls at (UTC)</th>
-          <th class="num">calls</th>
-          <th class="num">cost</th>
-          <th class="num">tokens</th>
-          <th>models</th>
-        </tr>
-      </thead>
-      <tbody>
-        {rows.length ? (
-          rows.map((b) => (
+    <div class="scroll-x">
+      <table>
+        <thead>
+          <tr>
+            <th>block (UTC)</th>
+            <th>calls at (UTC)</th>
+            <th class="num">calls</th>
+            <th class="num">cost</th>
+            <th class="num">tokens</th>
+            <th>models</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.length ? (
+            rows.map((b) => (
+              <tr>
+                <td class="nowrap">
+                  {b.id.slice(0, 16).replace("T", " ")} {b.active ? <Tag>active</Tag> : null}
+                </td>
+                <td class="nowrap muted">
+                  {hhmmUtc(b.firstCall)}–{hhmmUtc(b.lastCall)}
+                </td>
+                <td class="num">{b.calls}</td>
+                <td class="num">{usd(b.costUsd)}</td>
+                <td class="num">
+                  {fmt(
+                    b.tokens.input + b.tokens.output + b.tokens.cacheCreate + b.tokens.cacheRead,
+                  )}
+                </td>
+                <td>
+                  {b.models.map((m) => (
+                    <span class="kdot-lbl">
+                      <i class="kdot" style={{ background: color(m) }} />
+                      {shortModel(m)}
+                    </span>
+                  ))}
+                </td>
+              </tr>
+            ))
+          ) : (
             <tr>
-              <td class="nowrap">
-                {b.id.slice(0, 16).replace("T", " ")} {b.active ? <Tag>active</Tag> : null}
-              </td>
-              <td class="nowrap muted">
-                {hhmmUtc(b.firstCall)}–{hhmmUtc(b.lastCall)}
-              </td>
-              <td class="num">{b.calls}</td>
-              <td class="num">{usd(b.costUsd)}</td>
-              <td class="num">
-                {fmt(b.tokens.input + b.tokens.output + b.tokens.cacheCreate + b.tokens.cacheRead)}
-              </td>
-              <td>
-                {b.models.map((m) => (
-                  <span class="kdot-lbl">
-                    <i class="kdot" style={{ background: color(m) }} />
-                    {shortModel(m)}
-                  </span>
-                ))}
+              <td class="muted" colSpan={6}>
+                no blocks in this range
               </td>
             </tr>
-          ))
-        ) : (
-          <tr>
-            <td class="muted" colSpan={6}>
-              no blocks in this range
-            </td>
-          </tr>
-        )}
-      </tbody>
-    </table>
+          )}
+        </tbody>
+      </table>
+    </div>
   );
 }
 

@@ -1,0 +1,13 @@
+---
+name: swarm/spawn-prompt-task-link
+kind: decision
+tags: [swarm, adjudicator, spawn, task-link]
+related: [file:src/swarm/runtime.ts, file:src/swarm/hooks.ts, file:src/adjudicator/hooks.ts, file:tests/unit/swarm-review.test.ts]
+created: 2026-11-04T16:04:21.015Z
+updated: 2026-11-05T08:00:02.721Z
+---
+
+How a swarm spawn prompt is linked to its task (task #100, swarm run 20261104-672098, 2026-11-04, branch feature/adjudicator). reserveSpawn (src/swarm/runtime.ts, PreToolUse(Agent)) decides the spawn's run and task from the `task #N` references in the Agent prompt (TASK_REF_RE; `task:N` and a bare `#N` do not count).
+- One distinct ref (taskRef): the task's run decides the run when that run is active and belongs to this swarm, whatever the task's role. Since task #121 (review #98 F11) the task is linked only when it is for this role or for no role (all topologies); "write tests for what the coder did in task #3" from a tester links nothing, so onPreAgent does not reuse the coder's plan row/tier. Its state is deliberately NOT checked, so a re-spawn for a reopened, done or failed task of the role still links (pinned in swarm-review.test.ts "re-check done").
+- Several refs (coordinator prompts often name other tasks for context, e.g. "task #95 already edited it"): soleOpenTask keeps only the referenced tasks that are (a) in an active run of this swarm, (b) for this role or for no role (in every topology, mesh too), and (c) still open: pending, or active but held by a known worker that is not live (done, or silent >= STALE_MS). A coordinator-held or unknown-holder active task is not open; blocked, done and failed tasks are not open. If any candidate is in `current` (runActive(swarm, session), the run the spawn joins by default), only those count. Exactly one candidate → link it, and its run decides the run. Several → since task #121 (review #98 F10) the claimable ones win: eligibility({...t, status:"pending"}, runTasks, swarm, role).ok (deps done, pipeline stage clear; a quiet holder's task counts as pending), so "task #1 … task #2 comes after it" links #1; exactly one claimable → link it. Zero or several → no task and the default run, as before.
+Why it matters: the adjudicator's onPreAgent takes run/task only from this decision (swarmPreAgent → {runId, taskId}). Without a task it re-scores the dispatch prompt instead of reusing the plan verdict, and its row has run_id NULL. Before the fix, rows 34/37 disagreed with the plan line, and in apply mode the wrong model (opus instead of the planned haiku) was applied. Pinned by tests/unit/swarm-review.test.ts "a spawn prompt naming several tasks links the one still open for its role".

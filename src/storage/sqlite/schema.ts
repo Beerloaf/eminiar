@@ -490,7 +490,201 @@ CREATE INDEX IF NOT EXISTS swarm_spawns_tool ON swarm_spawns(tool_use_id);
 CREATE INDEX IF NOT EXISTS swarm_agents_session ON swarm_agents(session_id, status);
 `,
   },
+  {
+    // Adjudicator (src/adjudicator, docs/design/adjudicator.md §12): one row per decision,
+    // the verdict cache, per-provider breaker state and the learned bias buckets. No text
+    // beyond input_head (≤ 80 redacted chars), no keys, no raw provider responses.
+    version: 8,
+    sql: `
+CREATE TABLE IF NOT EXISTS adjudications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  surface TEXT NOT NULL,
+  session_id TEXT,
+  agent_id TEXT,
+  tool_use_id TEXT,
+  run_id TEXT,
+  task_id INTEGER,
+  parent_id INTEGER,
+  input_hash TEXT NOT NULL,
+  input_head TEXT,
+  input_chars INTEGER,
+  complexity REAL,
+  tier TEXT,
+  effort TEXT,
+  tool TEXT,
+  role TEXT,
+  confidence REAL,
+  scores TEXT,
+  source TEXT,
+  provider TEXT,
+  provider_model TEXT,
+  provider_status TEXT,
+  latency_ms INTEGER,
+  provider_latency_ms INTEGER,
+  tokens_in INTEGER,
+  tokens_out INTEGER,
+  cost_usd REAL,
+  action TEXT,
+  model_requested TEXT,
+  model_final TEXT,
+  baseline_model TEXT,
+  actual_model TEXT,
+  actual_tokens INTEGER,
+  actual_cost_usd REAL,
+  baseline_cost_usd REAL,
+  savings_usd REAL,
+  outcome TEXT NOT NULL DEFAULT 'pending',
+  outcome_source TEXT,
+  outcome_ts INTEGER,
+  final INTEGER NOT NULL DEFAULT 0,
+  version TEXT,
+  feedback_note TEXT
+);
+CREATE INDEX IF NOT EXISTS adjudications_session ON adjudications(session_id, ts);
+CREATE INDEX IF NOT EXISTS adjudications_task ON adjudications(run_id, task_id);
+CREATE INDEX IF NOT EXISTS adjudications_hash ON adjudications(input_hash);
+CREATE INDEX IF NOT EXISTS adjudications_ts ON adjudications(ts);
+CREATE INDEX IF NOT EXISTS adjudications_final ON adjudications(final, ts);
+CREATE INDEX IF NOT EXISTS adjudications_tool_use ON adjudications(tool_use_id);
+CREATE TABLE IF NOT EXISTS adjudicator_cache (
+  key TEXT PRIMARY KEY,
+  verdict TEXT,
+  provider TEXT,
+  created_at INTEGER NOT NULL,
+  last_hit_at INTEGER,
+  hits INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS adjudicator_provider_state (
+  provider TEXT PRIMARY KEY,
+  state TEXT NOT NULL,
+  failures INTEGER NOT NULL DEFAULT 0,
+  retry_at INTEGER,
+  last_ok_at INTEGER,
+  last_error_at INTEGER,
+  last_error_class TEXT,
+  latencies TEXT,
+  latency_budgets TEXT,
+  spend_day TEXT,
+  spend_usd REAL NOT NULL DEFAULT 0,
+  calls INTEGER NOT NULL DEFAULT 0,
+  auth_fingerprint TEXT
+);
+CREATE TABLE IF NOT EXISTS adjudicator_bias (
+  dimension TEXT NOT NULL,
+  bucket TEXT NOT NULL,
+  option TEXT NOT NULL,
+  n REAL NOT NULL DEFAULT 0,
+  s REAL NOT NULL DEFAULT 0,
+  f REAL NOT NULL DEFAULT 0,
+  cost_median REAL,
+  bias REAL NOT NULL DEFAULT 0,
+  updated_at INTEGER,
+  PRIMARY KEY (dimension, bucket, option)
+);
+`,
+  },
+  {
+    // Jev exchange log (docs/design/adjudicator.md, task #172): the newest 100 requests sent to
+    // Jev and its answers, kept only while the personal privacy.captureExchanges setting is on.
+    // A new table, so no heal is needed and the v8 DDL stays untouched. Never stores a key, a
+    // header or the internal request keys; the bodies are redacted before they get here.
+    version: 9,
+    sql: `
+CREATE TABLE IF NOT EXISTS adjudicator_exchanges (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  call_id TEXT NOT NULL,
+  batch INTEGER NOT NULL DEFAULT 0,
+  provider TEXT NOT NULL,
+  model TEXT,
+  surface TEXT,
+  context TEXT,
+  method TEXT NOT NULL,
+  target TEXT NOT NULL,
+  row_ids TEXT NOT NULL DEFAULT '[]',
+  items INTEGER NOT NULL,
+  outcome TEXT NOT NULL,
+  http_status INTEGER,
+  timed_out INTEGER NOT NULL DEFAULT 0,
+  attempts INTEGER NOT NULL DEFAULT 1,
+  wait_ms INTEGER,
+  job_wait_ms INTEGER,
+  ttfb_ms INTEGER,
+  duration_ms INTEGER,
+  retry_wait_ms INTEGER NOT NULL DEFAULT 0,
+  deadline_ms INTEGER NOT NULL,
+  budget_ms INTEGER,
+  tokens_in INTEGER,
+  tokens_out INTEGER,
+  cost_usd REAL,
+  request_body TEXT NOT NULL,
+  request_bytes INTEGER NOT NULL,
+  request_truncated INTEGER NOT NULL DEFAULT 0,
+  response_body TEXT,
+  response_bytes INTEGER,
+  response_truncated INTEGER NOT NULL DEFAULT 0,
+  error TEXT
+);
+CREATE INDEX IF NOT EXISTS adjudicator_exchanges_ts ON adjudicator_exchanges(ts);
+`,
+  },
 ];
+
+/**
+ * Columns added to the v8 tables after v8 first ran on development databases (v8 was not yet
+ * released, so the migration was edited in place). Those databases are already at version 8
+ * and never rerun it; healAdjudicatorColumns adds what they lack. A released change to these
+ * tables gets a new migration instead.
+ */
+export const ADJUDICATOR_LATE_COLUMNS: ReadonlyArray<
+  readonly [table: string, column: string, ddl: string]
+> = [
+  ["adjudicator_provider_state", "calls", "INTEGER NOT NULL DEFAULT 0"],
+  ["adjudicator_provider_state", "auth_fingerprint", "TEXT"],
+  ["adjudications", "feedback_note", "TEXT"],
+  ["adjudicator_provider_state", "latency_budgets", "TEXT"],
+];
+
+/** Indexes added to the v8 tables after v8 first ran (see ADJUDICATOR_LATE_COLUMNS). */
+export const ADJUDICATOR_LATE_INDEXES: ReadonlyArray<
+  readonly [table: string, index: string, columns: string]
+> = [["adjudications", "adjudications_tool_use", "tool_use_id"]];
+
+/**
+ * Adds any ADJUDICATOR_LATE_COLUMNS and ADJUDICATOR_LATE_INDEXES a database lacks. Idempotent and
+ * cheap (one table_info per table, one sqlite_master lookup per index); tables that do not exist
+ * yet are left to the migration. Returns what it added: `table.column` and index names.
+ */
+export function healAdjudicatorColumns(db: Database.Database): string[] {
+  const added: string[] = [];
+  const present = new Map<string, Set<string> | null>();
+  for (const [table, column, ddl] of ADJUDICATOR_LATE_COLUMNS) {
+    let cols = present.get(table);
+    if (cols === undefined) {
+      const info = db.pragma(`table_info(${table})`) as Array<{ name: string }>;
+      cols = info.length ? new Set(info.map((c) => c.name)) : null;
+      present.set(table, cols);
+    }
+    if (!cols || cols.has(column)) continue;
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+    cols.add(column);
+    added.push(`${table}.${column}`);
+  }
+  const indexExists = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?");
+  for (const [table, index, columns] of ADJUDICATOR_LATE_INDEXES) {
+    let cols = present.get(table);
+    if (cols === undefined) {
+      const info = db.pragma(`table_info(${table})`) as Array<{ name: string }>;
+      cols = info.length ? new Set(info.map((c) => c.name)) : null;
+      present.set(table, cols);
+    }
+    if (!cols || indexExists.get(index)) continue;
+    db.exec(`CREATE INDEX IF NOT EXISTS ${index} ON ${table}(${columns})`);
+    added.push(index);
+  }
+  return added;
+}
 
 /** vec0 lives outside the migration list: it needs the extension loaded first and takes the dimension. */
 export function vecTableSql(dims: number): string {

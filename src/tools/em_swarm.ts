@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { adjudicatePlan, planAdviceBlock, planNextHint } from "../adjudicator/swarm.js";
 import { getContext, type ProjectContext } from "../context.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import { getStorage } from "../storage/index.js";
@@ -277,6 +278,9 @@ function planned(
   swarm: SwarmSpec,
   run: RunRow,
   caller: Caller,
+  advice = "",
+  /** planNextHint: what to pass on the Agent call, worded like the advice block's head. */
+  adviceHint = "",
 ): string {
   const all = db.swarm.tasks(run.id);
   const byId = new Map(all.map((t) => [t.id, t]));
@@ -294,13 +298,16 @@ function planned(
   const next = isCoordinator(caller)
     ? `Next: spawn one worker per claimable task with the Agent tool: subagent_type ${types}${
         rows.some((t) => !t.role) ? " (a task without a role fits any)" : ""
-      }, and a prompt that names "task #N" (the worker claims it); run_in_background: true runs them in parallel. Watch with em_swarm {action:"status"}.`
+      }, and a prompt that names "task #N" (the worker claims it)${
+        advice ? adviceHint : ""
+      }; run_in_background: true runs them in parallel. Watch with em_swarm {action:"status"}.`
     : "Next: the coordinator spawns workers for these; name the new task ids in your final message.";
   return capOutput(
     [
       head,
       next,
       ...rows.map((t) => `#${t.id} ${clip(t.title, 120)}${t.role ? ` (${t.role})` : ""}`),
+      ...(advice ? [advice] : []),
     ].join("\n"),
   );
 }
@@ -446,7 +453,34 @@ async function dispatch(args: Args, callerCtx: ProjectContext): Promise<string> 
       // File paths are made project-relative against the caller's own root (a worktree for
       // an isolated worker), so they match the main checkout's paths.
       const rows = addTasks(db, callerCtx, run, swarm, caller, args.tasks);
-      return planned(db, rows, swarm, run, caller);
+      // Adjudicator advice (opt-in): one batched scoring of the new tasks; nothing when off.
+      // The tasks are already stored, so the advice fails open: an error here must not make
+      // the plan look failed (a retry would plan every task twice).
+      let advice = "";
+      let adviceHint = "";
+      let adviceNote = "";
+      if (ctx.config.adjudicator?.enabled && ctx.config.adjudicator.surfaces.plan) {
+        const unavailable = "Adjudicator advice unavailable for this plan (the tasks are planned).";
+        try {
+          // adjudicatePlan does not throw: it logs its error (stderr here) and calls onError.
+          const list = await adjudicatePlan(ctx, db, run, swarm, rows, {
+            sessionId,
+            log: (line) => process.stderr.write(`eminiar: ${line}\n`),
+            onError: () => {
+              adviceNote = unavailable;
+            },
+          });
+          advice = planAdviceBlock(list);
+          adviceHint = planNextHint(list);
+        } catch (err) {
+          process.stderr.write(
+            `eminiar: adjudicator plan advice skipped: ${(err as Error)?.message ?? String(err)}\n`,
+          );
+          adviceNote = unavailable;
+        }
+      }
+      const out = planned(db, rows, swarm, run, caller, advice, adviceHint);
+      return adviceNote ? `${out}\n${adviceNote}` : out;
     }
 
     case "claim": {

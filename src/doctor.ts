@@ -1,7 +1,11 @@
 import { accessSync, constants, existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { join } from "node:path";
+import { adjudicatorDoctorChecks } from "./adjudicator/cli.js";
+import type { Config } from "./config.js";
+import { getContext } from "./context.js";
 import { ensureDirs, paths } from "./paths.js";
+import type { StorageAdapter } from "./storage/adapter.js";
 import { pluginRoot, version } from "./version.js";
 
 export interface Check {
@@ -20,8 +24,17 @@ function check(name: string, fn: () => string): Check {
   }
 }
 
+export interface DoctorOptions {
+  /** Default: the current project's config (getContext()). */
+  config?: Config;
+  root?: string;
+  /** The project DB, for the adjudicator's breaker and 24 h figures (skipped without it). */
+  db?: StorageAdapter;
+  env?: NodeJS.ProcessEnv;
+}
+
 /** Shared by `em_doctor` and `eminiar doctor`. Each check is independent and never throws. */
-export function runDoctor(): Check[] {
+export function runDoctor(opts: DoctorOptions = {}): Check[] {
   const p = ensureDirs();
   const checks: Check[] = [];
 
@@ -108,7 +121,34 @@ export function runDoctor(): Check[] {
     }),
   );
 
+  // The adjudicator (opt-in): config, effective provider, key file, consent, health. No network.
+  try {
+    let config = opts.config;
+    let root = opts.root;
+    if (!config || !root) {
+      const ctx = getContext(root);
+      config ??= ctx.config;
+      root ??= ctx.root;
+    }
+    checks.push(
+      ...adjudicatorDoctorChecks(config, {
+        root,
+        db: opts.db,
+        ...(opts.env ? { env: opts.env } : {}),
+        p95: nearestRank95,
+      }),
+    );
+  } catch (err) {
+    checks.push({ name: "adjudicator", ok: false, detail: (err as Error).message });
+  }
+
   return checks;
+}
+
+function nearestRank95(values: readonly number[]): number | undefined {
+  if (!values.length) return undefined;
+  const s = [...values].sort((a, b) => a - b);
+  return s[Math.min(s.length - 1, Math.ceil(0.95 * s.length) - 1)];
 }
 
 export function formatDoctor(checks: Check[]): string {

@@ -44,7 +44,7 @@ export function routingGuidance(mode: string): string {
   ].join("\n");
 }
 
-export const sessionStart: HookHandler = (input) => {
+export const sessionStart: HookHandler = async (input) => {
   const ctx = getContext(input.cwd);
   const sessionId = input.session_id || "unknown";
   setCurrentSession(ctx, sessionId);
@@ -94,6 +94,16 @@ export const sessionStart: HookHandler = (input) => {
   // Early, so the MAX_INJECT cut never drops it (≤600 chars; nothing without a swarm file).
   const swarm = swarmSessionStart(ctx, sessionId);
   if (swarm) parts.push(swarm);
+  // The adjudicator (off by default; loaded only when enabled): one line only when degraded.
+  if (ctx.config.adjudicator.enabled && input.client !== "cursor") {
+    try {
+      const { onSessionStart } = await import("../adjudicator/hooks.js");
+      const line = onSessionStart(ctx, db, input);
+      if (line) parts.push(line);
+    } catch {
+      // the line is optional
+    }
+  }
   // A fresh context gets the project brief; after a compaction the Session Guide has the
   // room, so only the one-line index state is added.
   try {

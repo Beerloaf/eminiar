@@ -1,8 +1,21 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { ConfigSchema, loadConfig } from "../../src/config.js";
 import { getContext, type ProjectContext, resetContextCache } from "../../src/context.js";
 import { addDocSources, pickCandidates, removeDocSource } from "../../src/docs/add.js";
 import { catalogForProvider, catalogLookup } from "../../src/docs/catalog.js";
@@ -10,8 +23,13 @@ import { categoryInfo, docCategory } from "../../src/docs/category.js";
 import { discoverDocs, rootDomain } from "../../src/docs/discover.js";
 import {
   docsTag,
+  MANIFEST_MAX_BYTES,
+  ManifestRefusedError,
   makeSource,
+  manifestPath,
+  probeManifestAt,
   readManifest,
+  readManifestAt,
   removeSource,
   upsertSources,
 } from "../../src/docs/manifest.js";
@@ -752,5 +770,402 @@ describe("resolution", () => {
     expect(miss.via).toBe("none");
     expect(miss.notes).toContain("pass urls");
     expect((await resolveProvider("env:PAYGATE")).via).toBe("none");
+  });
+});
+
+describe("manifest read bound (review #109 F5)", () => {
+  const source = { name: "zod", kind: "url", urls: ["https://zod.dev/"], addedAt: "2026-01-01" };
+  const valid = JSON.stringify({ version: 1, sources: [source] });
+  let dir: string;
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "eminiar-manifest-bound-"));
+  });
+  afterAll(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("reads a regular manifest, also through a symlink to one", () => {
+    const file = join(dir, "ok.json");
+    writeFileSync(file, valid);
+    expect(readManifestAt(file).sources.map((s) => s.name)).toEqual(["zod"]);
+    const link = join(dir, "ok-link.json");
+    symlinkSync(file, link);
+    expect(readManifestAt(link).sources.map((s) => s.name)).toEqual(["zod"]);
+  });
+
+  it("reads a missing manifest as empty", () => {
+    expect(readManifestAt(join(dir, "absent.json"))).toEqual({ version: 1, sources: [] });
+  });
+
+  it("reads a manifest over MANIFEST_MAX_BYTES as empty, and one at the bound normally", () => {
+    // Valid JSON either way: only the size decides.
+    const pad = (n: number) =>
+      `{"version":1,"sources":[${JSON.stringify(source)}],"pad":"${"x".repeat(n)}"}`;
+    const at = pad(0);
+    const fill = MANIFEST_MAX_BYTES - Buffer.byteLength(at);
+    const atBound = join(dir, "at-bound.json");
+    writeFileSync(atBound, pad(fill));
+    expect(readFileSync(atBound).length).toBe(MANIFEST_MAX_BYTES);
+    expect(readManifestAt(atBound).sources).toHaveLength(1);
+    const over = join(dir, "over.json");
+    writeFileSync(over, pad(fill + 1));
+    expect(readManifestAt(over).sources).toEqual([]);
+    const overLink = join(dir, "over-link.json");
+    symlinkSync(over, overLink);
+    expect(readManifestAt(overLink).sources).toEqual([]);
+  });
+
+  it("reads a directory, or a symlink to one, as empty", () => {
+    const sub = join(dir, "a-dir");
+    mkdirSync(sub);
+    expect(readManifestAt(sub).sources).toEqual([]);
+    const link = join(dir, "dir-link.json");
+    symlinkSync(sub, link);
+    expect(readManifestAt(link).sources).toEqual([]);
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "reads a device or a FIFO as empty without blocking",
+    () => {
+      const dev = join(dir, "zero-link.json");
+      symlinkSync("/dev/zero", dev);
+      expect(readManifestAt(dev).sources).toEqual([]);
+      const fifo = join(dir, "pipe.json");
+      execFileSync("mkfifo", [fifo]);
+      // Opening a FIFO with no writer for reading would block the hook forever.
+      expect(readManifestAt(fifo).sources).toEqual([]);
+    },
+  );
+
+  it("bounds the PreToolUse docs lookup in routing.ts too", () => {
+    const proj = join(dir, "proj");
+    mkdirSync(join(proj, ".eminiar"), { recursive: true });
+    const file = join(proj, ".eminiar", "docs.json");
+    writeFileSync(file, valid);
+    expect(docsSourceFor("https://zod.dev/api", proj)).toBe("zod");
+    writeFileSync(file, `${valid}${" ".repeat(MANIFEST_MAX_BYTES)}`);
+    expect(docsSourceFor("https://zod.dev/api", proj)).toBeUndefined();
+  });
+
+  it("docsSourceFor reads the manifest with the project root: a docs.json outside it is not read (#157)", () => {
+    const outside = join(dir, "outside-manifest.json");
+    writeFileSync(outside, valid);
+    const proj = join(dir, "proj-linked");
+    mkdirSync(join(proj, ".eminiar"), { recursive: true });
+    const link = join(proj, ".eminiar", "docs.json");
+    symlinkSync(outside, link);
+    // The same file reads fine without a root, so only the root explains the refusal.
+    expect(readManifestAt(link).sources.map((s) => s.name)).toEqual(["zod"]);
+    expect(readManifestAt(link, proj).sources).toEqual([]);
+    expect(docsSourceFor("https://zod.dev/api", proj)).toBeUndefined();
+    // A regular manifest inside the project still answers.
+    const inside = join(dir, "proj-plain");
+    mkdirSync(join(inside, ".eminiar"), { recursive: true });
+    writeFileSync(join(inside, ".eminiar", "docs.json"), valid);
+    expect(docsSourceFor("https://zod.dev/api", inside)).toBe("zod");
+  });
+});
+
+describe("manifest writes refuse a manifest they could not read (task #134)", () => {
+  const source = { name: "zod", kind: "url", urls: ["https://zod.dev/"], addedAt: "2026-01-01" };
+  const valid = JSON.stringify({ version: 1, sources: [source] });
+  const add = { name: "vitest", kind: "url" as const, urls: ["https://vitest.dev/"] };
+  let proj: string;
+  let pctx: ProjectContext;
+  let file: string;
+  beforeAll(() => {
+    proj = mkdtempSync(join(tmpdir(), "eminiar-manifest-refuse-"));
+    mkdirSync(join(proj, ".eminiar"), { recursive: true });
+    pctx = getContext(proj);
+    // The context resolves the root (macOS tmpdir is a symlink to /private/var).
+    file = manifestPath(pctx);
+  });
+  afterAll(() => {
+    rmSync(proj, { recursive: true, force: true });
+  });
+  const reset = () => rmSync(file, { recursive: true, force: true });
+  const refusal = (fn: () => unknown): ManifestRefusedError => {
+    try {
+      fn();
+    } catch (err) {
+      expect(err).toBeInstanceOf(ManifestRefusedError);
+      return err as ManifestRefusedError;
+    }
+    throw new Error("expected a ManifestRefusedError");
+  };
+
+  it("creates a missing manifest and edits a readable one", () => {
+    reset();
+    expect(probeManifestAt(file)).toEqual({ state: "missing" });
+    expect(upsertSources(pctx, [add]).added).toEqual(["vitest"]);
+    writeFileSync(file, valid);
+    expect(upsertSources(pctx, [add]).added).toEqual(["vitest"]);
+    expect(readManifest(pctx).sources.map((s) => s.name)).toEqual(["vitest", "zod"]);
+    expect(removeSource(pctx, "zod")).toBe(true);
+    expect(readManifest(pctx).sources.map((s) => s.name)).toEqual(["vitest"]);
+  });
+
+  it("refuses add and remove on an oversized manifest, naming the path and the limit", () => {
+    reset();
+    const big = `${valid}${" ".repeat(MANIFEST_MAX_BYTES)}`;
+    writeFileSync(file, big);
+    // Readers still fail open.
+    expect(readManifest(pctx).sources).toEqual([]);
+    expect(probeManifestAt(file).state).toBe("refused");
+    const e = refusal(() => upsertSources(pctx, [add]));
+    expect(e.file).toBe(file);
+    expect(e.message).toContain(file);
+    expect(e.message).toContain(`${MANIFEST_MAX_BYTES}-byte limit`);
+    refusal(() => removeSource(pctx, "zod"));
+    expect(readFileSync(file, "utf8")).toBe(big);
+  });
+
+  it("refuses a manifest that is not valid JSON or not an object (a merge conflict)", () => {
+    reset();
+    const conflict = `<<<<<<< HEAD\n${valid}\n=======\n{}\n>>>>>>> other\n`;
+    writeFileSync(file, conflict);
+    expect(refusal(() => upsertSources(pctx, [add])).reason).toBe("it is not valid JSON");
+    expect(readFileSync(file, "utf8")).toBe(conflict);
+    writeFileSync(file, "[]");
+    expect(refusal(() => removeSource(pctx, "zod")).reason).toBe("it is not a JSON object");
+    expect(readFileSync(file, "utf8")).toBe("[]");
+  });
+
+  it("refuses a directory and a dangling symlink without creating anything", () => {
+    reset();
+    mkdirSync(file);
+    expect(refusal(() => upsertSources(pctx, [add])).reason).toBe("it is not a regular file");
+    reset();
+    const target = join(pctx.root, "elsewhere.json");
+    symlinkSync(target, file);
+    expect(refusal(() => upsertSources(pctx, [add])).reason).toBe(
+      "it is a symlink to a missing file",
+    );
+    expect(existsSync(target)).toBe(false);
+    reset();
+  });
+
+  it("surfaces the refusal through addDocSources, removeDocSource and em_docs", async () => {
+    reset();
+    const big = `${valid}${" ".repeat(MANIFEST_MAX_BYTES)}`;
+    writeFileSync(file, big);
+    const pdb = getStorage(pctx);
+    await expect(addDocSources(pctx, pdb, [add], { sync: false })).rejects.toBeInstanceOf(
+      ManifestRefusedError,
+    );
+    expect(() => removeDocSource(pctx, pdb, "zod")).toThrow(ManifestRefusedError);
+    const r = await emDocs.handler(
+      { action: "add", name: "vitest", url: "https://vitest.dev/", sync: false },
+      pctx,
+    );
+    expect(r.isError).toBe(true);
+    expect(textOf(r)).toContain(file);
+    const rm = await emDocs.handler({ action: "remove", name: "zod" }, pctx);
+    expect(rm.isError).toBe(true);
+    expect(textOf(rm)).toContain("refusing to write the docs manifest");
+    expect(readFileSync(file, "utf8")).toBe(big);
+  });
+});
+
+describe("manifest writes stay inside the project and never reduce a manifest (pre-PR review F1 + F5)", () => {
+  const source = { name: "zod", kind: "url", urls: ["https://zod.dev/"], addedAt: "2026-01-01" };
+  const valid = JSON.stringify({ version: 1, sources: [source] });
+  const add = { name: "vitest", kind: "url" as const, urls: ["https://vitest.dev/"] };
+  let base: string;
+  let n = 0;
+  beforeAll(() => {
+    base = mkdtempSync(join(tmpdir(), "eminiar-manifest-escape-"));
+  });
+  afterAll(() => {
+    rmSync(base, { recursive: true, force: true });
+  });
+  /** A fresh project under `base` (its own folder, so a sibling file is "outside"). */
+  const project = (files: Record<string, string> = {}) => {
+    const proj = join(base, `p${n++}`);
+    mkdirSync(join(proj, ".git"), { recursive: true });
+    writeFileSync(join(proj, "package.json"), "{}");
+    for (const [rel, text] of Object.entries(files)) {
+      mkdirSync(join(proj, rel, ".."), { recursive: true });
+      writeFileSync(join(proj, rel), text);
+    }
+    return getContext(proj);
+  };
+  const withManifest = (c: ProjectContext, manifest: string): ProjectContext => ({
+    ...c,
+    config: { ...c.config, docs: { ...c.config.docs, manifest } },
+  });
+  const refusal = (fn: () => unknown): ManifestRefusedError => {
+    try {
+      fn();
+    } catch (err) {
+      expect(err).toBeInstanceOf(ManifestRefusedError);
+      return err as ManifestRefusedError;
+    }
+    throw new Error("expected a ManifestRefusedError");
+  };
+
+  it("the config schema refuses a docs.manifest that is absolute or climbs out", () => {
+    const ok = (m: string) => ConfigSchema.safeParse({ docs: { manifest: m } }).success;
+    for (const m of [".eminiar/docs.json", "docs/sources.json", "docs/..hidden/x.json", "a..b"])
+      expect(ok(m), m).toBe(true);
+    for (const m of [
+      "",
+      "/etc/x.json",
+      "\\\\srv\\x",
+      "C:\\x.json",
+      "c:x",
+      "..",
+      "../settings.json",
+    ])
+      expect(ok(m), m).toBe(false);
+    for (const m of ["a/../../b.json", "a\\..\\..\\b", "x/..", "./../y", "nul\0.json"])
+      expect(ok(m), m).toBe(false);
+    // A line break must not hide a `..` segment from the check (#153).
+    for (const m of ["a\n/../../x.json", "a\n../x", "a\r\n..\\x", "a\nb.json"])
+      expect(ok(m), JSON.stringify(m)).toBe(false);
+  });
+
+  it("ignores a project-set docs.manifest outside the project, keeping the rest (repro p-cfg)", () => {
+    const victim = join(base, "settings.json");
+    const before = JSON.stringify({ permissions: { deny: ["Bash(rm:*)"] }, hooks: { x: 1 } });
+    writeFileSync(victim, before);
+    const err = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      const c = project({
+        "eminiar.config.json": JSON.stringify({
+          docs: { manifest: "../settings.json", ttlHours: 5 },
+        }),
+      });
+      expect(c.config.docs.manifest).toBe(".eminiar/docs.json");
+      expect(c.config.docs.ttlHours).toBe(5);
+      expect(manifestPath(c)).toBe(join(c.root, ".eminiar", "docs.json"));
+      upsertSources(c, [add]);
+      expect(readFileSync(victim, "utf8")).toBe(before);
+      const abs = project({
+        "eminiar.config.json": JSON.stringify({ docs: { manifest: victim } }),
+      });
+      expect(loadConfig(abs.root).docs.manifest).toBe(".eminiar/docs.json");
+      const custom = project({
+        "eminiar.config.json": JSON.stringify({ docs: { manifest: "docs/sources.json" } }),
+      });
+      expect(custom.config.docs.manifest).toBe("docs/sources.json");
+      expect(err.mock.calls.map((a) => String(a[0])).join("")).toContain("ignoring docs.manifest");
+    } finally {
+      err.mockRestore();
+    }
+  });
+
+  it("refuses a manifest path outside the root even when the config was not checked", () => {
+    const victim = join(base, "victim2.json");
+    const before = JSON.stringify({ permissions: { allow: ["Bash(*)"] }, env: { X: "1" } });
+    writeFileSync(victim, before);
+    const c = withManifest(project(), "../victim2.json");
+    expect(refusal(() => upsertSources(c, [add])).reason).toBe("it is outside the project");
+    expect(refusal(() => removeSource(c, "zod")).reason).toBe("it is outside the project");
+    // Readers fail open.
+    expect(readManifest(c).sources).toEqual([]);
+    expect(readFileSync(victim, "utf8")).toBe(before);
+  });
+
+  it("refuses a committed symlink to a file outside the project (repro p-manifest 1)", () => {
+    const victim = join(base, "victim-package.json");
+    const before = JSON.stringify({ name: "victim", scripts: { test: "x" } });
+    writeFileSync(victim, before);
+    const c = project();
+    mkdirSync(join(c.root, ".eminiar"), { recursive: true });
+    symlinkSync(join("..", "..", "victim-package.json"), manifestPath(c));
+    expect(readManifest(c).sources).toEqual([]);
+    expect(refusal(() => upsertSources(c, [add])).reason).toContain("symlink");
+    expect(readFileSync(victim, "utf8")).toBe(before);
+    // Even a symlink to a manifest-shaped file outside reads as empty.
+    writeFileSync(victim, valid);
+    expect(readManifest(c).sources).toEqual([]);
+  });
+
+  it("reads a symlink to a manifest inside the project but refuses to write through it", () => {
+    // Decision: writes refuse every symlink. A rename would replace the committed link with a
+    // regular file, and writing through it would edit a file the config does not name.
+    const c = project({ "docs/real.json": valid });
+    mkdirSync(join(c.root, ".eminiar"), { recursive: true });
+    symlinkSync(join("..", "docs", "real.json"), manifestPath(c));
+    expect(readManifest(c).sources.map((s) => s.name)).toEqual(["zod"]);
+    expect(refusal(() => upsertSources(c, [add])).reason).toBe(
+      "it is a symlink, and writes replace only a regular file",
+    );
+    expect(readFileSync(join(c.root, "docs", "real.json"), "utf8")).toBe(valid);
+  });
+
+  it("refuses a manifest folder that is a symlink out of the project", () => {
+    const outside = join(base, `outside-${n}`);
+    mkdirSync(outside);
+    const c = project();
+    symlinkSync(outside, join(c.root, ".eminiar"));
+    expect(readManifest(c).sources).toEqual([]);
+    expect(refusal(() => upsertSources(c, [add])).reason).toBe(
+      "its folder resolves outside the project (a symlink)",
+    );
+    expect(readdirSync(outside)).toEqual([]);
+    // A missing folder below it is refused as well, rather than created out there.
+    const deep = withManifest(c, ".eminiar/sub/docs.json");
+    refusal(() => upsertSources(deep, [add]));
+    expect(readdirSync(outside)).toEqual([]);
+  });
+
+  it("refuses a manifest a write would reduce: other version, unknown keys, bad sources (F5)", () => {
+    const c = project();
+    const file = manifestPath(c);
+    mkdirSync(join(c.root, ".eminiar"), { recursive: true });
+    const bad = { name: "Bad Name", kind: "url", urls: ["https://x/"] };
+    const cases: Array<[unknown, string]> = [
+      [
+        { version: 2, sources: [source] },
+        "it has version 2, and this eminiar only writes version 1",
+      ],
+      [{ sources: [source] }, "it has no version (this eminiar writes version 1)"],
+      [
+        { version: 1, sources: [source], extra: { keep: true } },
+        "it has keys this eminiar does not know (extra)",
+      ],
+      [{ version: 1, sources: { zod: source } }, "its sources is not an array"],
+      [{ version: 1, sources: [source, bad] }, "1 of its sources is not valid entries"],
+      [
+        { version: 1, sources: [source, { name: "pkg", kind: "git" }, source] },
+        "2 of its sources are not valid entries",
+      ],
+    ];
+    for (const [json, reason] of cases) {
+      const text = JSON.stringify(json);
+      writeFileSync(file, text);
+      expect(probeManifestAt(file, { root: c.root, write: true })).toEqual({
+        state: "refused",
+        reason,
+      });
+      expect(refusal(() => upsertSources(c, [add])).reason).toBe(reason);
+      expect(refusal(() => removeSource(c, "zod")).reason).toBe(reason);
+      expect(readFileSync(file, "utf8")).toBe(text);
+    }
+    // Readers still take the entries they understand.
+    writeFileSync(
+      file,
+      JSON.stringify({ version: 2, sources: [source, { name: "pkg", kind: "git" }] }),
+    );
+    expect(readManifest(c).sources.map((s) => s.name)).toEqual(["zod"]);
+    // A plain v1 manifest without sources is fine to extend.
+    writeFileSync(file, JSON.stringify({ version: 1 }));
+    expect(upsertSources(c, [add]).added).toEqual(["vitest"]);
+  });
+
+  it("writes through a temp file renamed into place, keeping the file mode", () => {
+    const c = project({ ".eminiar/docs.json": valid });
+    const file = manifestPath(c);
+    chmodSync(file, 0o600);
+    expect(upsertSources(c, [add]).added).toEqual(["vitest"]);
+    expect(readManifest(c).sources.map((s) => s.name)).toEqual(["vitest", "zod"]);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    expect(readdirSync(join(c.root, ".eminiar"))).toEqual(["docs.json"]);
+    // A new manifest in a folder that does not exist yet.
+    const fresh = withManifest(project(), "docs/sources.json");
+    upsertSources(fresh, [add]);
+    expect(readManifest(fresh).sources.map((s) => s.name)).toEqual(["vitest"]);
   });
 });

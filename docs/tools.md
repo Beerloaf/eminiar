@@ -2,16 +2,16 @@
 
 [← Docs index](README.md)
 
-eminiar adds 24 MCP tools. In Claude Code their full names are
-`mcp__plugin_eminiar_eminiar__em_*`. This page uses the short names.
+eminiar adds 24 MCP tools, plus `em_adjudicate` while the opt-in adjudicator is on. In Claude
+Code their full names are `mcp__plugin_eminiar_eminiar__em_*`. This page uses the short names.
 
 You do not normally call these tools yourself. Claude calls them, and the hooks remind Claude to
 use them. This page helps you understand what Claude does and what to ask for.
 
 **Contents:** [Run code](#run-code) · [Search and fetch](#search-and-fetch) ·
 [Memory](#memory) · [Documentation](#documentation) · [Code graph](#code-graph) ·
-[History](#history) · [Agent swarms](#agent-swarms) · [Housekeeping](#housekeeping) ·
-[Slash commands](#slash-commands)
+[History](#history) · [Agent swarms](#agent-swarms) · [Adjudicator](#adjudicator) ·
+[Housekeeping](#housekeeping) · [Slash commands](#slash-commands)
 
 ## Run code
 
@@ -151,6 +151,30 @@ and `read` (settings installed by an eminiar older than 0.12 need `eminiar upgra
 that are not swarm workers can only `list`, `status`, `read` and `post`. See
 [Agent swarms](swarms.md).
 
+With the adjudicator on and `adjudicator.surfaces.plan` set, `plan` also appends a suggested
+agent, model and effort for each new task. See [Adjudicator](adjudicator.md#swarm-plans).
+
+## Adjudicator
+
+| Tool | Parameters | Use for |
+|---|---|---|
+| `em_adjudicate` | `action`, `text`, `tasks`, `id`, `outcome`, `note`, `since` | Score how complex a request or task is, and which tool, Claude model size and swarm role fit it |
+
+The tool is registered only while `adjudicator.enabled` is on; after `eminiar adjudicator enable`
+run `/mcp reconnect`. See [Adjudicator](adjudicator.md).
+
+| Action | Parameters | Does |
+|---|---|---|
+| `score` | `text` (≤ 8000 chars) or `tasks: [{key (≤ 40), title (≤ 400), detail? (≤ 4000), role? (≤ 60)}]` (≤ 20) | One line per item: complexity, tier and effort, tool, role, confidence, the top reasons, the source and latency, and a decision id. Uses the provider within `timeouts.planMs`. Refused while the adjudicator is off |
+| `explain` | `id` | One stored decision in full: the input head, the tier, role and tool tables with reasons, the complexity terms, blend weights and bias, the features, provider status, latency, tokens and cost, and the outcome with actual model and savings |
+| `stats` | `since` (ISO date or `7d`, `12h`) | Decisions by surface and source, provider status, latency, follow / apply / respect rates, outcomes, spend, realised and net savings, and potential savings |
+| `feedback` | `id`, `outcome`: `good`, `too_small` or `too_big`, `note?` (≤ 4000; stored redacted and cut to 500) | Closes the decision with that outcome and updates the learned bias. Refused while the adjudicator is off |
+
+```text
+em_adjudicate {action: "score", text: "rename parseDate in src/utils/date.ts"}
+em_adjudicate {action: "feedback", id: 42, outcome: "too_small", note: "needed opus"}
+```
+
 ## Housekeeping
 
 | Tool | Use for |
@@ -159,7 +183,7 @@ that are not swarm workers can only `list`, `status`, `read` and `post`. See
 | `em_usage` | Tokens, cache, cost and insights per model call from the local transcripts. `view`: `summary`, `daily`, `weekly`, `monthly`, `models`, `sessions`, `blocks`, `turns`, `tools`, `insights`, `savings`; `scope`: `project` or `session`; `since`: `30d` or an ISO date; `json`. See [Usage insights](usage.md) |
 | `em_doctor` | Installation health |
 | `em_reindex` | Rebuild part of the index: `code`, `git`, `metrics`, `docs`, `memories`, `embeddings` or `all`. Incremental unless `full: true` |
-| `em_purge` | Permanently delete project data: `index`, `sessions`, `graph`, `memories` (the database mirror only), `usage` (API calls, tool uses, context events, transcript offsets, statusline snapshots) or `all`. Needs `confirm: true` |
+| `em_purge` | Permanently delete project data: `index`, `sessions`, `graph`, `memories` (the database mirror only), `usage` (API calls, tool uses, context events, transcript offsets, statusline snapshots), `adjudicator` (decisions, verdict cache, provider breaker state, learned bias, captured Jev requests) or `all`. Needs `confirm: true` |
 
 ## Slash commands
 

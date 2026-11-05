@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { ConfigSchema } from "../config.js";
@@ -22,33 +22,92 @@ import { pinNode, pinnedNode, pinnedRoot, pinRoot } from "./node-resolve.js";
 import { pluginCacheStale, probeServer } from "./register.js";
 import { run } from "./shell.js";
 
-/** Spawn a binary, send one MCP initialize request, expect a JSON-RPC reply within `ms`. */
-function mcpHandshake(bin: string, ms = 15_000): Promise<string> {
+export interface HandshakeOptions {
+  /** How long to wait for the child to exit after SIGTERM before SIGKILL (and again after SIGKILL before giving up). */
+  exitMs?: number;
+  /** Test seam: start the child. Defaults to `spawn(bin)` with piped stdio. */
+  spawn?: (bin: string) => ChildProcess;
+}
+
+/**
+ * Spawn a binary, send one MCP initialize request, expect a JSON-RPC reply within `ms`.
+ * Resolves only after the child has exited: stdin is closed and SIGTERM sent, SIGKILL follows after
+ * `exitMs`, and after a further `exitMs` it resolves regardless, so doctor never hangs or leaves the
+ * server flushing (its compile cache lands in EMINIAR_HOME) after the CLI has returned.
+ */
+export function mcpHandshake(
+  bin: string,
+  ms = 15_000,
+  opts: HandshakeOptions = {},
+): Promise<string> {
+  const exitMs = opts.exitMs ?? 2_000;
+  const start = opts.spawn ?? ((b: string) => spawn(b, [], { stdio: ["pipe", "pipe", "pipe"] }));
   return new Promise((resolve) => {
-    const child = spawn(bin, [], { stdio: ["pipe", "pipe", "pipe"] });
+    let child: ChildProcess;
+    try {
+      child = start(bin);
+    } catch (e) {
+      resolve(`spawn failed: ${(e as Error).message}`);
+      return;
+    }
     let buf = "";
     let err = "";
-    const timer = setTimeout(() => {
-      child.kill();
-      resolve(`no reply in ${ms / 1000}s${err ? `: ${err.trim().slice(-200)}` : ""}`);
-    }, ms);
-    child.stdout.on("data", (d: Buffer) => {
-      buf += d.toString();
-      if (buf.includes('"result"')) {
-        clearTimeout(timer);
-        child.kill();
-        const m = /"serverInfo":\{"name":"([^"]+)","version":"([^"]+)"/.exec(buf);
-        resolve(m ? `${m[1]} v${m[2]}` : "ok");
-      }
-    });
-    child.stderr.on("data", (d: Buffer) => {
-      err += d.toString();
+    let exited = child.exitCode !== null || child.signalCode !== null;
+    let result: string | undefined;
+    const timers: NodeJS.Timeout[] = [];
+    const done = () => {
+      for (const t of timers) clearTimeout(t);
+      if (result !== undefined) resolve(result);
+    };
+    const finish = (r: string) => {
+      if (result !== undefined) return;
+      result = r;
+      for (const t of timers) clearTimeout(t);
+      timers.length = 0;
+      if (exited) return done();
+      try {
+        child.stdin?.end();
+      } catch {}
+      try {
+        child.kill("SIGTERM");
+      } catch {}
+      timers.push(
+        setTimeout(() => {
+          try {
+            child.kill("SIGKILL");
+          } catch {}
+          timers.push(setTimeout(done, exitMs));
+        }, exitMs),
+      );
+    };
+    child.on("exit", () => {
+      exited = true;
+      if (result !== undefined) done();
     });
     child.on("error", (e) => {
-      clearTimeout(timer);
-      resolve(`spawn failed: ${e.message}`);
+      // A spawn failure never produces 'exit'; there is no process to wait for.
+      if (child.pid === undefined) exited = true;
+      finish(`spawn failed: ${e.message}`);
     });
-    child.stdin.write(
+    // EPIPE when the child dies before reading the request is reported via 'exit'/'error' above.
+    child.stdin?.on("error", () => {});
+    timers.push(
+      setTimeout(
+        () => finish(`no reply in ${ms / 1000}s${err ? `: ${err.trim().slice(-200)}` : ""}`),
+        ms,
+      ),
+    );
+    child.stdout?.on("data", (d: Buffer) => {
+      buf += d.toString();
+      if (buf.includes('"result"')) {
+        const m = /"serverInfo":\{"name":"([^"]+)","version":"([^"]+)"/.exec(buf);
+        finish(m ? `${m[1]} v${m[2]}` : "ok");
+      }
+    });
+    child.stderr?.on("data", (d: Buffer) => {
+      err += d.toString();
+    });
+    child.stdin?.write(
       `${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "doctor", version: "0" } } })}\n`,
     );
   });
@@ -77,7 +136,25 @@ export async function fullDoctor(opts: { fix?: boolean } = {}): Promise<Check[]>
     }
   }
 
-  const checks = runDoctor();
+  let ctxDb:
+    | {
+        config: ReturnType<typeof getContext>["config"];
+        root: string;
+        db?: ReturnType<typeof getStorage>;
+      }
+    | undefined;
+  try {
+    const ctx = getContext();
+    ctxDb = { config: ctx.config, root: ctx.root };
+    try {
+      ctxDb.db = getStorage(ctx, { vectors: false });
+    } catch {
+      // the "project" check below reports a broken DB
+    }
+  } catch {
+    ctxDb = undefined;
+  }
+  const checks = runDoctor(ctxDb ?? {});
   // runDoctor treats a missing pin as informational; for a plugin install it is the
   // difference between the desktop app connecting or not.
   if (rec?.method === "plugin" && !pinnedRoot()) {
@@ -258,6 +335,15 @@ export async function fullDoctor(opts: { fix?: boolean } = {}): Promise<Check[]>
     }
   } catch (err) {
     checks.push({ name: "project", ok: false, detail: (err as Error).message });
+  }
+  // Live adjudicator probe (2 s): the provider's /models, or local server detection.
+  if (ctxDb?.config.adjudicator.enabled) {
+    try {
+      const { adjudicatorLiveChecks } = await import("../adjudicator/cli.js");
+      checks.push(...(await adjudicatorLiveChecks(ctxDb.config)));
+    } catch (err) {
+      checks.push({ name: "adjudicator probe", ok: false, detail: (err as Error).message });
+    }
   }
   checks.push({
     name: "sandbox languages",

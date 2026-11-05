@@ -21,6 +21,8 @@ export interface EminiarPaths {
   installFile: string;
   hookLog: string;
   statuslineCache: string;
+  /** Adjudicator provider keys (JSON, mode 0600); written only by `eminiar adjudicator key set`. */
+  adjudicatorKey: string;
 }
 
 export function paths(): EminiarPaths {
@@ -38,6 +40,7 @@ export function paths(): EminiarPaths {
     installFile: join(home, "install.json"),
     hookLog: join(home, "hook.log"),
     statuslineCache: join(home, "statusline.cache"),
+    adjudicatorKey: join(home, "adjudicator.key"),
   };
 }
 

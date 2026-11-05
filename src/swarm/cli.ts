@@ -1,5 +1,6 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import type { Writable } from "node:stream";
 import { parseArgs } from "node:util";
 import { getContext, type ProjectContext } from "../context.js";
 import type { StorageAdapter } from "../storage/adapter.js";
@@ -66,7 +67,37 @@ function items(db: StorageAdapter, runs: RunRow[]): RunListItem[] {
   );
 }
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+/** Write errors that mean the reader of the output went away (`… | head -1`). */
+const READER_GONE = new Set(["EPIPE", "ERR_STREAM_DESTROYED"]);
+
+/**
+ * Watches `stream` for its reader going away: `gone()` turns true and `wait(ms)` returns early
+ * once an EPIPE arrives or the stream is closed. Other errors are rethrown as before.
+ */
+function readerWatch(stream: Writable | undefined) {
+  let gone = false;
+  let wake: (() => void) | undefined;
+  const onError = (err: NodeJS.ErrnoException) => {
+    if (!READER_GONE.has(err.code ?? "")) throw err;
+    gone = true;
+    wake?.();
+  };
+  // The listener is never removed: an EPIPE for the last line can arrive after watch returns.
+  stream?.on("error", onError);
+  return {
+    gone: () => gone || (!!stream && (stream.destroyed || !stream.writable)),
+    wait: (ms: number) =>
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(done, ms);
+        function done() {
+          clearTimeout(timer);
+          wake = undefined;
+          resolve();
+        }
+        wake = done;
+      }),
+  };
+}
 
 const VALUE_OPTIONS = ["limit", "run", "interval", "agent", "role"] as const;
 
@@ -77,7 +108,12 @@ export async function swarmCommand(
   args: string[],
   callerCtx: ProjectContext,
   io: CliIO = defaultIO,
-  opts: { maxTicks?: number } = {},
+  opts: {
+    maxTicks?: number;
+    /** The stream `io.out` writes to (default process.stdout with the default io): `watch`
+     * stops quietly with 0 when its reader goes away. */
+    output?: Writable;
+  } = {},
 ): Promise<number> {
   const { values, positionals } = parseArgs({
     args,
@@ -246,6 +282,8 @@ export async function swarmCommand(
               role: r.role,
               subagent_type: r.agentType,
               model: r.model ?? null,
+              // null: a fixed pin; otherwise the tiers dispatch may pick between.
+              range: r.range ?? null,
               count: r.count,
               file: plan.find((a) => a.agentType === r.agentType)?.action ?? null,
             })),
@@ -405,6 +443,10 @@ export async function swarmCommand(
         return rows.length;
       };
       scan(db.swarm.events(first.id, { limit: WATCH_PAGE }));
+      // `swarm watch | head -1` or `| grep -m1 swarm.idle` closes the pipe while we poll: the
+      // next write then fails with EPIPE. That is the reader saying it is done, so stop and
+      // exit 0 quietly (as any CLI does) instead of dying on an unhandled 'error' event.
+      const reader = readerWatch(opts.output ?? (io === defaultIO ? process.stdout : undefined));
       let key: string | undefined;
       for (let tick = 0; ; tick++) {
         const run = db.swarm.runGet(first.id);
@@ -420,7 +462,9 @@ export async function swarmCommand(
         if (step.line) io.out(JSON.stringify(step.line));
         if (run.status !== "active") return 0;
         if (opts.maxTicks !== undefined && tick + 1 >= opts.maxTicks) return 0;
-        await sleep(Math.max(250, interval * 1000));
+        if (reader.gone()) return 0;
+        await reader.wait(Math.max(250, interval * 1000));
+        if (reader.gone()) return 0;
       }
     }
 

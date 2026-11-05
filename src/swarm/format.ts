@@ -1,4 +1,4 @@
-import type { SyncAction, SyncResult } from "./agents.js";
+import { modelRangeText, type SyncAction, type SyncResult } from "./agents.js";
 import { clip, type RunSnapshot, type WorkerView } from "./runtime.js";
 import type {
   ConfigIssue,
@@ -187,7 +187,7 @@ export function formatSwarmList(
     for (const r of s.roles) {
       const state = byAgent.get(r.agentType);
       lines.push(
-        `  ${r.role} → ${r.agentType} · ${r.model ?? "inherit"} · ×${r.count}${r.isolation ? " · worktree" : ""} · ${
+        `  ${r.role} → ${r.agentType} · ${r.model ?? "inherit"}${r.range ? ` (${modelRangeText(r.range)})` : ""} · ×${r.count}${r.isolation ? " · worktree" : ""} · ${
           state ? SYNC_STATE[state.action] : "n/a"
         }${state?.action === "conflict" ? ` (${state.reason ?? state.path})` : ""}`,
       );

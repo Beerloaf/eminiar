@@ -1,3 +1,4 @@
+import { emAdjudicate } from "./em_adjudicate.js";
 import { emArchitecture } from "./em_architecture.js";
 import { emBatchExecute } from "./em_batch_execute.js";
 import { emDocs } from "./em_docs.js";
@@ -45,6 +46,7 @@ export const tools: ToolDef<any>[] = [
   emIndexStatus,
   emStats,
   emUsage,
+  emAdjudicate,
   emPurge,
   emDoctor,
 ];

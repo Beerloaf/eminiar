@@ -17,6 +17,7 @@ import {
   resetSwarmConfigCache,
   STARTER_YAML,
 } from "../../src/swarm/config.js";
+import { capOutput, OUTPUT_MAX } from "../../src/swarm/format.js";
 import { globMatch, inScope } from "../../src/swarm/glob.js";
 import {
   addTasks,
@@ -578,6 +579,60 @@ describe("swarm runtime", () => {
     expect(registerWorker(db, cfg, { agentId: "agent-z", agentType: "Explore" })).toBeUndefined();
   });
 
+  it("gives a claim the whole task detail and points the start brief at it", async () => {
+    const swarm = cfg.swarms[0]!;
+    const role = swarm.roles[0]!;
+    const run = startRun(db, cfg, { swarm: "feat", goal: "long detail", sessionId: "LD" });
+    // A detail at the plan limit (DETAIL_MAX 4000) whose last instruction must survive.
+    const tail = "LAST-INSTRUCTION: run the tests.";
+    const detail = `${"spec line. ".repeat(400).slice(0, 4000 - tail.length - 1)} ${tail}`;
+    expect(detail.length).toBe(4000);
+    const [long, short] = addTasks(db, { root }, run, swarm, coordinator(), [
+      { title: "long", role: "coder", detail, files: ["src/a.ts"] },
+      { title: "short", role: "coder", detail: "Do the small thing." },
+    ]);
+    const longTask = db.swarm.taskGet(long!.id)!;
+
+    for (const maxChars of [500, 4000, 9000]) {
+      const tb = await taskBrief(
+        db,
+        run,
+        { ...role, context: { ...role.context, maxChars } },
+        longTask,
+      );
+      expect(tb).toContain(detail);
+      expect(tb).toContain("Files: src/a.ts");
+      // The claim reply wraps the brief in a header and caps it at OUTPUT_MAX: nothing is cut.
+      const header = `Claimed task #${longTask.id} (run ${run.id}). Report it with em_swarm {action:"update", task:${longTask.id}, status:"done"|"failed"|"blocked", result}.`;
+      const reply = [header, tb].join("\n\n");
+      expect(reply.length).toBeLessThanOrEqual(OUTPUT_MAX);
+      expect(capOutput(reply)).toBe(reply);
+    }
+
+    // The start brief keeps the detail short but says where the rest is, ahead of the cut.
+    const wb = await workerBrief(getContext(root), db, { run, swarm, role, task: longTask });
+    expect(wb).not.toContain(tail);
+    expect(wb).toContain(`em_swarm {action:"claim", task:${longTask.id}} returns it in full`);
+    const small = await workerBrief(getContext(root), db, {
+      run,
+      swarm,
+      role: { ...role, context: { ...role.context, maxChars: 500 } },
+      task: longTask,
+    });
+    expect(small).toContain("returns it in full");
+
+    // A short detail goes out as is, with no pointer.
+    const sb = await workerBrief(getContext(root), db, {
+      run,
+      swarm,
+      role,
+      task: db.swarm.taskGet(short!.id)!,
+    });
+    expect(sb).toContain("Do the small thing.");
+    expect(sb).not.toContain("returns it in full");
+    finishRun(getContext(root), db, run, coordinator(), { status: "cancelled" });
+  });
+
   it("describes tool calls compactly", () => {
     expect(toolHead(root, "Read", { file_path: join(root, "src/x.ts") })).toBe("Read src/x.ts");
     expect(toolHead(root, "mcp__plugin_eminiar_eminiar__em_search", { queries: ["a"] })).toBe(
@@ -754,6 +809,102 @@ describe("enforceIntent", () => {
           ? r.config.enforce && r.config.enabled
           : r.state === "invalid" && r.enforce === true;
       expect(parsed, c.name).toBe(c.intent);
+    }
+  });
+});
+
+describe("swarm model_range display", () => {
+  const RANGED = `
+version: 1
+swarms:
+  feat:
+    description: test swarm
+    max_agents: 3
+    agents:
+      coder:
+        description: writes code
+        model: sonnet
+        model_range: { floor: haiku, ceiling: opus }
+        count: 2
+      tester:
+        description: tests code
+        model: haiku
+`;
+
+  it("shows the range next to the model in the list, the coordinator brief and the JSON", async () => {
+    const { formatSwarmList } = await import("../../src/swarm/format.js");
+    const { swarmCommand } = await import("../../src/swarm/cli.js");
+    const c = ok(RANGED);
+    const list = formatSwarmList(c, [], []);
+    expect(list).toContain("  coder → swarm-feat-coder · sonnet (haiku..opus) · ×2 · n/a");
+    expect(list).toContain("  tester → swarm-feat-tester · haiku · ×1 · n/a");
+
+    process.env.EMINIAR_HOME = mkdtempSync(join(tmpdir(), "em-home-"));
+    const root = mkdtempSync(join(tmpdir(), "em-swarm-range-"));
+    writeFileSync(join(root, "package.json"), "{}");
+    mkdirSync(join(root, ".eminiar"));
+    writeFileSync(join(root, ".eminiar", "swarm.yaml"), RANGED);
+    resetContextCache();
+    resetSwarmConfigCache();
+    try {
+      const db = getStorage(getContext(root), { vectors: false });
+      const cfg = activeSwarmConfig(root)!;
+      const run = startRun(db, cfg, { swarm: "feat", goal: "range", sessionId: "R" });
+      const cb = await coordinatorBrief(getContext(root), db, cfg, cfg.swarms[0]!, run);
+      expect(cb).toContain(
+        '- coder → subagent_type "swarm-feat-coder" (sonnet, range haiku..opus, up to 2 at once): writes code',
+      );
+      expect(cb).toContain(
+        '- tester → subagent_type "swarm-feat-tester" (haiku, up to 1 at once): tests code',
+      );
+
+      const out: string[] = [];
+      const code = await swarmCommand(["list", "--json"], getContext(root), {
+        out: (s) => out.push(s),
+        err: () => {},
+      });
+      expect(code).toBe(0);
+      const roles = JSON.parse(out.join("\n")).swarms[0].roles;
+      expect(roles).toMatchObject([
+        { role: "coder", model: "sonnet", range: { floor: "haiku", ceiling: "opus" } },
+        { role: "tester", model: "haiku", range: null },
+      ]);
+    } finally {
+      closeAllStorage();
+    }
+  });
+
+  it("tells the coordinator how to read a ranged role's line while the adjudicator is on (#108)", async () => {
+    const SENTENCE =
+      "Roles listed with a range run on their fallback model unless their line says `model X (range …)`: then pass model X.";
+    process.env.EMINIAR_HOME = mkdtempSync(join(tmpdir(), "em-home-"));
+    const root = mkdtempSync(join(tmpdir(), "em-swarm-range-brief-"));
+    writeFileSync(join(root, "package.json"), "{}");
+    mkdirSync(join(root, ".eminiar"));
+    writeFileSync(join(root, ".eminiar", "swarm.yaml"), RANGED);
+    resetContextCache();
+    resetSwarmConfigCache();
+    try {
+      const ctx = getContext(root);
+      const db = getStorage(ctx, { vectors: false });
+      const cfg = activeSwarmConfig(root)!;
+      const swarm = cfg.swarms[0]!;
+      const run = startRun(db, cfg, { swarm: "feat", goal: "range brief", sessionId: "RB" });
+      const on = {
+        ...ctx,
+        config: { ...ctx.config, adjudicator: { ...ctx.config.adjudicator, enabled: true } },
+      };
+      expect(await coordinatorBrief(on, db, cfg, swarm, run)).toContain(
+        `Follow each line as written. ${SENTENCE}`,
+      );
+      // Adjudicator off, or no ranged role: the line (and the sentence) stay out.
+      expect(await coordinatorBrief(ctx, db, cfg, swarm, run)).not.toContain(SENTENCE);
+      const unranged = { ...swarm, roles: swarm.roles.map((r) => ({ ...r, range: undefined })) };
+      const plain = await coordinatorBrief(on, db, cfg, unranged, run);
+      expect(plain).toContain("Follow each line as written.");
+      expect(plain).not.toContain(SENTENCE);
+    } finally {
+      closeAllStorage();
     }
   });
 });

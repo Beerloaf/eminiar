@@ -141,7 +141,8 @@ export interface SuggestExtra {
 /** Registered documentation sources (default manifest location; cheap, cached by the OS). */
 function docsSources(root: string): DocSource[] {
   try {
-    return readManifestAt(join(root, ".eminiar", "docs.json")).sources;
+    // `root` keeps a committed docs.json symlink that points outside the project unread.
+    return readManifestAt(join(root, ".eminiar", "docs.json"), root).sources;
   } catch {
     return [];
   }
@@ -710,7 +711,26 @@ export const preToolUse: HookHandler = async (
   const spawn = swarmPreAgent(ctx, input);
   if (spawn?.kind === "deny") return spawn.output;
   // A swarm worker is briefed at SubagentStart; a prompt brief as well would say it twice.
-  const swarmWorker = spawn?.kind === "worker";
+  const out = await route(ctx, input as RoutedInput, spawn?.kind === "worker");
+  // The adjudicator (off by default) is loaded only when enabled, so off costs this one check.
+  // It extends routing's output (the Agent model joins routing's one updatedInput); never denies.
+  if (!ctx.config.adjudicator.enabled || input.client === "cursor") return out;
+  try {
+    const { afterRouting } = await import("../adjudicator/hooks.js");
+    return await afterRouting(ctx, input, spawn, out);
+  } catch {
+    return out;
+  }
+};
+
+type RoutedInput = HookInput & { tool_name: string; tool_input: Record<string, unknown> };
+
+/** Routing proper: knowledge hints, then the routing mode's decision for this call. */
+async function route(
+  ctx: ProjectContext,
+  input: RoutedInput,
+  swarmWorker: boolean,
+): Promise<HookOutput | undefined> {
   // Project knowledge is pushed in every routing mode: switching routing off should not
   // hide decisions, fix history or the docs that are already indexed.
   const memo = joinHints(
@@ -793,7 +813,7 @@ export const preToolUse: HookHandler = async (
       ? joinHints((await briefFor(ctx, String(input.tool_input.prompt ?? ""))).trim(), hint)
       : hint;
   return withContext(annotate(s), extra);
-};
+}
 
 /** Native tools routing may redirect; their every call is counted, denied or not. */
 const ROUTED_TOOLS = new Set(["Bash", "Read", "Grep", "WebFetch", "WebSearch"]);

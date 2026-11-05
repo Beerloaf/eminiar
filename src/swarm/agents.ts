@@ -12,15 +12,23 @@ import {
 } from "node:fs";
 import { createRequire } from "node:module";
 import { join, relative } from "node:path";
-import type { RoleSpec, SwarmConfig, SwarmSpec, Topology } from "./types.js";
+import { TIERS } from "../adjudicator/types.js";
+import type { ModelRange, RoleSpec, SwarmConfig, SwarmSpec, Topology } from "./types.js";
 
 /**
  * Generated agent files are `---\n<frontmatter>\n---\n<marker line>\n<body>`. The marker is
  * the first line after the frontmatter and carries a hash of everything else, so sync can
- * tell its own untouched files from hand-written or hand-edited ones.
+ * tell its own untouched files from hand-written or hand-edited ones. A role with a model
+ * range also carries `range=<floor>..<ceiling>` there (before `hash=`), and the hash covers it.
  */
 export const MARKER_PREFIX = "<!-- eminiar:swarm ";
 const HASH_RE = /\bhash=([0-9a-f]{12})\b/;
+const RANGE_RE = /\srange=([a-z]+)\.\.([a-z]+)(?=\s)/;
+
+/** A model range as the marker writes it: `floor..ceiling`. */
+export function modelRangeText(r: ModelRange): string {
+  return `${r.floor}..${r.ceiling}`;
+}
 
 /** eminiar tools a worker always keeps, whatever its `tools` allowlist says. */
 export const WORKER_EM_TOOLS = [
@@ -107,8 +115,16 @@ function frontmatter(swarm: SwarmSpec, role: RoleSpec): Record<string, unknown> 
   return fm;
 }
 
-const hashOf = (fm: string, rest: string) =>
-  createHash("sha1").update(`${fm}\n${rest}`).digest("hex").slice(0, 12);
+/**
+ * A ranged role hashes its range in front of the frontmatter (which starts with `name:`, so
+ * the two inputs never coincide). An unranged role hashes what it always did, so its file
+ * stays byte for byte the same.
+ */
+const hashOf = (fm: string, rest: string, range?: string) =>
+  createHash("sha1")
+    .update(range ? `range=${range}\n${fm}\n${rest}` : `${fm}\n${rest}`)
+    .digest("hex")
+    .slice(0, 12);
 
 /** The full agent file for one role. Deterministic, so sync can compare by content. */
 export function renderAgentFile(config: SwarmConfig, swarm: SwarmSpec, role: RoleSpec): string {
@@ -137,27 +153,56 @@ export function renderAgentFile(config: SwarmConfig, swarm: SwarmSpec, role: Rol
     "6. Your final message goes back to the coordinator: lead with the outcome, then the files you changed and anything left open.",
     "",
   ].join("\n");
-  const marker = `${MARKER_PREFIX}swarm=${swarm.name} role=${role.role} hash=${hashOf(fm, rest)} · generated from ${config.rel} by \`eminiar swarm sync\`; edit the YAML, not this file (it is overwritten). -->`;
+  const range = role.range ? modelRangeText(role.range) : undefined;
+  const marker = `${MARKER_PREFIX}swarm=${swarm.name} role=${role.role}${range ? ` range=${range}` : ""} hash=${hashOf(fm, rest, range)} · generated from ${config.rel} by \`eminiar swarm sync\`; edit the YAML, not this file (it is overwritten). -->`;
   return `---\n${fm}\n---\n${marker}\n${rest}`;
 }
 
 /** How a file on disk relates to sync: ours untouched, ours but edited by hand, or not ours. */
 export type GeneratedState = "generated" | "edited" | "foreign";
 
-export function generatedState(raw: string): GeneratedState {
+/** The marker's range, when it names two tiers, floor first. */
+function markerRange(marker: string): ModelRange | undefined {
+  const m = RANGE_RE.exec(marker);
+  const floor = TIERS.find((t) => t === m?.[1]);
+  const ceiling = TIERS.find((t) => t === m?.[2]);
+  return floor && ceiling && TIERS.indexOf(floor) <= TIERS.indexOf(ceiling)
+    ? { floor, ceiling }
+    : undefined;
+}
+
+function readGenerated(raw: string): { state: GeneratedState; range?: ModelRange | undefined } {
   // A checkout with autocrlf turns the file into CRLF; it is still ours and unedited.
   const content = raw.replace(/\r\n/g, "\n");
-  if (!content.startsWith("---\n")) return "foreign";
+  if (!content.startsWith("---\n")) return { state: "foreign" };
   const end = content.indexOf("\n---\n", 3);
-  if (end === -1) return "foreign";
+  if (end === -1) return { state: "foreign" };
   const fm = content.slice(4, end);
   const after = content.slice(end + 5);
   const nl = after.indexOf("\n");
   const marker = nl === -1 ? after : after.slice(0, nl);
-  if (!marker.startsWith(MARKER_PREFIX)) return "foreign";
+  if (!marker.startsWith(MARKER_PREFIX)) return { state: "foreign" };
   const hash = HASH_RE.exec(marker)?.[1];
-  if (!hash) return "foreign";
-  return hashOf(fm, nl === -1 ? "" : after.slice(nl + 1)) === hash ? "generated" : "edited";
+  if (!hash) return { state: "foreign" };
+  const range = markerRange(marker);
+  const body = nl === -1 ? "" : after.slice(nl + 1);
+  const same = hashOf(fm, body, range && modelRangeText(range)) === hash;
+  return { state: same ? "generated" : "edited", range };
+}
+
+export function generatedState(raw: string): GeneratedState {
+  return readGenerated(raw).state;
+}
+
+/**
+ * The model range of an agent file, from its marker's `range=`, for readers that see only the
+ * file (the adjudicator's pin lookup). Undefined unless sync wrote the file and nobody edited
+ * it since: a hand edit breaks the hash, so the range may not be the swarm file's any more and
+ * only the frontmatter `model` pin counts.
+ */
+export function agentFileRange(raw: string): ModelRange | undefined {
+  const g = readGenerated(raw);
+  return g.state === "generated" ? g.range : undefined;
 }
 
 /** True for any file sync generated (edited or not). */

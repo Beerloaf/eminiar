@@ -316,7 +316,15 @@ function SwarmCard({ s }: { s: SwarmDefUi }): JSX.Element {
                     {r.hasHooks ? <span class="sw-badge">hooks</span> : null}
                     {r.isolation ? <span class="sw-badge">{r.isolation}</span> : null}
                   </td>
-                  <td class="mono">{r.model ?? "inherit"}</td>
+                  <td class="mono">
+                    {r.model ?? "inherit"}
+                    {r.range ? (
+                      <span class="muted">
+                        {" "}
+                        ({r.range.floor}..{r.range.ceiling})
+                      </span>
+                    ) : null}
+                  </td>
                   <td class="num">{r.count}</td>
                   <td class="small">
                     {r.tools ? r.tools.join(", ") : "all"}
