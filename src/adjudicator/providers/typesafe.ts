@@ -5,6 +5,7 @@ import {
   buildCatalogue,
   buildItems,
   type Catalogue,
+  COMPLEXITY_CRITERIA,
   jevQuestionId,
   jevQuestions,
   jevState,
@@ -57,9 +58,11 @@ const Answer = z.union([
   }),
   z.object({
     type: z.literal("score"),
-    score: z.number().min(0).max(1),
+    // On the rubric's own levels (0..criteria-1), echoed in `legend`; not 0..1.
+    score: z.number().min(0),
     confidence: z.number().min(0).max(1).optional(),
     probabilities: Probabilities.optional(),
+    legend: z.record(z.string(), z.string()).optional(),
   }),
   z.object({ type: z.literal("noul"), noul: z.number().min(0).max(1) }),
 ]);
@@ -203,8 +206,8 @@ function mapAnswers(
     const item = items[i];
     if (!item) return;
     const a: ProviderAnswer = { key: req.key };
-    const c = get(jevQuestionId(item.id, "complexity"));
-    if (c?.type === "score") a.complexity = { value: c.score * 4, confidence: c.confidence ?? 0.5 };
+    const c = complexityOf(get(jevQuestionId(item.id, "complexity")));
+    if (c) a.complexity = c;
     const tier = choiceDist(
       get(jevQuestionId(item.id, "tier")),
       cat.tiers.map((t) => t.name),
@@ -227,6 +230,21 @@ function mapAnswers(
     if (a.complexity || a.tier || a.role) out.push(a);
   });
   return out;
+}
+
+/**
+ * Jev scores on the rubric's levels: 0..4 for COMPLEXITY_CRITERIA, with the levels echoed in
+ * `legend`. The top level comes from the legend when it has one, else from the rubric; a score
+ * above it is malformed and skipped. Rescaled to the 0..4 complexity axis.
+ */
+function complexityOf(a: Answer | undefined): ProviderAnswer["complexity"] {
+  if (a?.type !== "score") return undefined;
+  const levels = Object.keys(a.legend ?? {})
+    .map(Number)
+    .filter(Number.isInteger);
+  const top = levels.length > 1 ? Math.max(...levels) : COMPLEXITY_CRITERIA.length - 1;
+  if (top <= 0 || a.score > top) return undefined;
+  return { value: (a.score * 4) / top, confidence: a.confidence ?? 0.5 };
 }
 
 /** A calibrated Dist over the catalogue's options; probabilities for unknown options are dropped. */

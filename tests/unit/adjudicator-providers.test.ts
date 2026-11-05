@@ -289,7 +289,11 @@ function jevReply(
   const qs = (call.body?.questions ?? {}) as Record<string, { type: string; criteria?: unknown }>;
   const answers: Record<string, unknown> = {};
   for (const [id, q] of Object.entries(qs)) {
-    if (q.type === "score") answers[id] = { type: "score", score: o.score ?? 0.5, confidence: 0.8 };
+    if (q.type === "score") {
+      // Like the live API: the score is on the criteria's levels, echoed in `legend`.
+      const legend = Object.fromEntries((q.criteria as string[]).map((c, i) => [String(i), c]));
+      answers[id] = { type: "score", score: o.score ?? 2, confidence: 0.8, legend };
+    }
     else if (q.type === "noul")
       answers[id] = { type: "noul", noul: id.endsWith(".risky") ? 0.9 : 0.2 };
     else {
@@ -450,10 +454,10 @@ describe("typesafe (Jev) provider", () => {
     expect(res.answers[0]?.tool?.calibrated).toBe(true);
   });
 
-  it("maps answers to calibrated Dists, complexity × 4 and input-token cost", async () => {
+  it("maps answers to calibrated Dists, complexity on the rubric levels and input-token cost", async () => {
     const { cfg, r } = typesafe();
     const f = mockFetch((c) =>
-      jevReply(c, { score: 0.75, usage: { input_tokens: 2_000_000, output_tokens: 500 } }),
+      jevReply(c, { score: 3, usage: { input_tokens: 2_000_000, output_tokens: 500 } }),
     );
     const p = createTypesafeProvider(r, cfg, { fetch: f, env: { TYPESAFE_API_KEY: SENTINEL } });
     const res = await p.adjudicate(reqs(2), { signal: signal(), deadlineMs: 2000 });
@@ -525,6 +529,37 @@ describe("typesafe (Jev) provider", () => {
     });
     const res = await odd.adjudicate(reqs(2), { signal: signal(), deadlineMs: 2000 });
     expect(res.answers).toEqual([{ key: "k1", complexity: { value: 0, confidence: 0.9 } }]);
+  });
+
+  it("reads the complexity score on the legend's levels, not 0..1 (live jev-1.14.0 shapes)", async () => {
+    const { cfg, r } = typesafe();
+    const legend = Object.fromEntries(COMPLEXITY_CRITERIA.map((c, i) => [String(i), c]));
+    const f = mockFetch(
+      json({
+        answers: {
+          // A score above 1 used to fail the schema and be dropped.
+          "i0.complexity": { type: "score", score: 1.99, confidence: 0.96, legend },
+          // A score below 1 used to be multiplied by 4 (0.9 → 3.6 for a typo fix).
+          "i1.complexity": { type: "score", score: 0.9, confidence: 0.98, legend },
+          // Above the legend's top level: malformed, skipped.
+          "i2.complexity": { type: "score", score: 5, confidence: 0.9, legend },
+          // A legend on another scale is rescaled to 0..4.
+          "i3.complexity": {
+            type: "score",
+            score: 1,
+            confidence: 0.7,
+            legend: { "0": "low", "1": "mid", "2": "high" },
+          },
+        },
+      }),
+    );
+    const p = createTypesafeProvider(r, cfg, { fetch: f, env: { TYPESAFE_API_KEY: SENTINEL } });
+    const res = await p.adjudicate(reqs(4), { signal: signal(), deadlineMs: 2000 });
+    expect(res.answers).toEqual([
+      { key: "k0", complexity: { value: 1.99, confidence: 0.96 } },
+      { key: "k1", complexity: { value: 0.9, confidence: 0.98 } },
+      { key: "k3", complexity: { value: 2, confidence: 0.7 } },
+    ]);
   });
 
   it("throws no_key without sending when the key is gone at send time", async () => {
