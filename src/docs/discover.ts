@@ -52,6 +52,13 @@ export interface ProviderCandidate {
    */
   nonRegistry?: boolean | undefined;
   /**
+   * True only when the project's own files show every mention of this package comes from the
+   * default public registry (lockfile `resolved`/`source` entries pointing at registry.npmjs.org,
+   * registry.yarnpkg.com or pypi.org; a Go module on a vendor-run host with no replace or go.work).
+   * Absent means unverified, and the docs triage then sends the name only if it is in the catalogue.
+   */
+  publicVerified?: boolean | undefined;
+  /**
    * Set only by the opt-in docs triage (src/decisions/features/docs.ts) when it is live: how much
    * a coding agent benefits from this package's documentation, 0..1, and whether the triage
    * recommends indexing it. Absent otherwise, so discovery is unchanged.
@@ -338,11 +345,182 @@ interface Signal {
   project: string;
   /** The manifest takes this dependency from a git, URL or path source, not the registry. */
   nonRegistry?: boolean;
+  /** The project's own files show this dependency comes from the default public registry. */
+  publicVerified?: boolean;
 }
 
-function npmSignals(dir: string, includeDev: boolean, project: string): Signal[] {
+/** Hosts that mean the default public registry for npm and PyPI. */
+const PUBLIC_NPM_REGISTRY = /^https:\/\/(registry\.npmjs\.org|registry\.yarnpkg\.com)\//;
+const PUBLIC_PYPI_HOSTS = new Set(["pypi.org", "files.pythonhosted.org"]);
+
+/** Go module hosts run by a vendor, whose modules are public by convention. github.com is not one. */
+const PUBLIC_GO_HOSTS =
+  /^(golang\.org|google\.golang\.org|gopkg\.in|go\.uber\.org|k8s\.io|sigs\.k8s\.io|cloud\.google\.com|go\.opentelemetry\.io)\//;
+
+function urlHost(u: string): string | undefined {
+  try {
+    return new URL(u.trim()).hostname.toLowerCase();
+  } catch {
+    return undefined;
+  }
+}
+
+/** Directories whose lockfiles and registry config apply to `dir`: the project, then the root. */
+function scopeDirs(dir: string, root: string): string[] {
+  return dir === root ? [root] : [dir, root];
+}
+
+/** Does an .npmrc in scope point the default registry somewhere other than the public one? */
+function npmRegistryOverridden(dirs: string[]): boolean {
+  for (const d of dirs) {
+    const rc = readText(join(d, ".npmrc"));
+    if (!rc) continue;
+    for (const m of rc.matchAll(/^\s*registry\s*=\s*(\S+)/gm)) {
+      if (!PUBLIC_NPM_REGISTRY.test(m[1]!.replace(/\/?$/, "/"))) return true;
+    }
+  }
+  return false;
+}
+
+/** Top-level npm package names a lockfile in scope resolves from the public registry. */
+function npmVerifiedNames(dirs: string[]): Set<string> {
+  const ok = new Set<string>();
+  if (npmRegistryOverridden(dirs)) return ok;
+  for (const d of dirs) {
+    const lock = readJson(join(d, "package-lock.json"));
+    const pk = lock?.packages as Record<string, { resolved?: unknown }> | undefined;
+    if (pk && typeof pk === "object") {
+      for (const [k, v] of Object.entries(pk)) {
+        const m = /^node_modules\/([^/]+)$/.exec(k);
+        if (m && typeof v?.resolved === "string" && PUBLIC_NPM_REGISTRY.test(v.resolved))
+          ok.add(m[1]!);
+      }
+    }
+    const yarn = readText(join(d, "yarn.lock"));
+    if (yarn) {
+      for (const block of yarn.split(/\n\s*\n/)) {
+        const head = /^"?([^@\s"][^@"]*)@/m.exec(block.trim())?.[1];
+        const res = /^\s*resolved\s+"?([^"\s]+)/m.exec(block)?.[1];
+        if (head && res && PUBLIC_NPM_REGISTRY.test(res)) ok.add(head);
+      }
+    }
+  }
+  return ok;
+}
+
+/** Names of the repo's own packages (workspace members, sub-projects): never public registry names. */
+function localPackageNames(root: string, projects: string[]): Set<string> {
+  const names = new Set<string>();
+  const dirs = new Set(projects);
+  const rootPkg = readJson(join(root, "package.json"));
+  const ws = rootPkg?.workspaces;
+  const patterns: string[] = [];
+  if (Array.isArray(ws)) patterns.push(...ws.filter((x): x is string => typeof x === "string"));
+  else if (ws && typeof ws === "object" && Array.isArray((ws as { packages?: unknown }).packages))
+    patterns.push(
+      ...((ws as { packages: unknown[] }).packages.filter(
+        (x) => typeof x === "string",
+      ) as string[]),
+    );
+  const pnpm = readText(join(root, "pnpm-workspace.yaml"));
+  if (pnpm) for (const m of pnpm.matchAll(/^\s*-\s*["']?([^"'\s#]+)/gm)) patterns.push(m[1]!);
+  for (const pat of patterns) {
+    if (pat.startsWith("!")) continue;
+    try {
+      for (const d of fg.sync(`${pat.replace(/\/$/, "")}/package.json`, {
+        cwd: root,
+        ignore: ["**/node_modules/**"],
+        deep: 4,
+      }))
+        dirs.add(join(root, d, ".."));
+    } catch {
+      // an unreadable pattern adds nothing
+    }
+  }
+  for (const d of dirs) {
+    const n = readJson(join(d, "package.json"))?.name;
+    if (typeof n === "string") names.add(n);
+  }
+  return names;
+}
+
+function pipIndexLinesPrivate(text: string): boolean {
+  for (const m of text.matchAll(
+    /^\s*(?:--)?(?:extra[-_]index[-_]url|index[-_]url|find[-_]links|-i|-f)\b[\s=:]+(\S+)/gim,
+  )) {
+    const h = urlHost(m[1]!);
+    if (!h || !PUBLIC_PYPI_HOSTS.has(h)) return true;
+  }
+  return false;
+}
+
+/** Is a non-default Python package index declared anywhere in scope? Then no name is verified. */
+function pythonIndexPrivate(dirs: string[]): boolean {
+  for (const d of dirs) {
+    const py = readText(join(d, "pyproject.toml"));
+    if (
+      py &&
+      (/^\s*\[\[?tool\.(uv\.index|poetry\.source|pdm\.source)\]\]?/m.test(py) ||
+        /^\s*(extra-)?index-url\s*=/m.test(py) ||
+        /^\s*find-links\s*=/m.test(py))
+    )
+      return true;
+    for (const f of ["pip.conf", "pip.ini", "uv.toml", "setup.cfg", "requirements.txt"]) {
+      const t = readText(join(d, f));
+      if (t && pipIndexLinesPrivate(t)) return true;
+    }
+    for (const f of ["requirements-dev.txt", "requirements.in", "constraints.txt"]) {
+      const t = readText(join(d, f));
+      if (t && pipIndexLinesPrivate(t)) return true;
+    }
+  }
+  return false;
+}
+
+/** Python package names a lockfile in scope records as coming from pypi.org. */
+function pythonVerifiedNames(dirs: string[]): Set<string> {
+  const ok = new Set<string>();
+  if (pythonIndexPrivate(dirs)) return ok;
+  for (const d of dirs) {
+    const uv = readText(join(d, "uv.lock"));
+    if (uv) {
+      for (const block of uv.split(/^\[\[package\]\]/m).slice(1)) {
+        const name = /^name\s*=\s*"([^"]+)"/m.exec(block)?.[1];
+        const reg = /^source\s*=\s*\{\s*registry\s*=\s*"([^"]+)"/m.exec(block)?.[1];
+        const h = reg ? urlHost(reg) : undefined;
+        if (name && h && PUBLIC_PYPI_HOSTS.has(h)) ok.add(name.toLowerCase());
+      }
+    }
+    const pf = readJson(join(d, "Pipfile.lock"));
+    const sources = pf?._meta as { sources?: { url?: string; name?: string }[] } | undefined;
+    const onlyPypi =
+      Array.isArray(sources?.sources) &&
+      sources.sources.length > 0 &&
+      sources.sources.every((s) => {
+        const h = typeof s.url === "string" ? urlHost(s.url) : undefined;
+        return !!h && PUBLIC_PYPI_HOSTS.has(h);
+      });
+    if (pf && onlyPypi) {
+      for (const sec of ["default", "develop"]) {
+        const m = pf[sec] as Record<string, { index?: string; version?: string }> | undefined;
+        if (!m || typeof m !== "object") continue;
+        for (const [n, v] of Object.entries(m)) if (v?.index === "pypi") ok.add(n.toLowerCase());
+      }
+    }
+  }
+  return ok;
+}
+
+function npmSignals(
+  dir: string,
+  includeDev: boolean,
+  project: string,
+  root: string,
+  localNames: Set<string>,
+): Signal[] {
   const pkg = readJson(join(dir, "package.json"));
   if (!pkg) return [];
+  const verified = npmVerifiedNames(scopeDirs(dir, root));
   const sections = ["dependencies", ...(includeDev ? ["devDependencies"] : [])];
   const out: Signal[] = [];
   for (const s of sections) {
@@ -354,55 +532,85 @@ function npmSignals(dir: string, includeDev: boolean, project: string): Signal[]
       const other =
         typeof ver === "string" &&
         /^(git|https?:|github:|gitlab:|bitbucket:|[\w.-]+\/[\w.-]+$)/.test(ver);
-      out.push({ kind: "npm", key: name, project, ...(other ? { nonRegistry: true } : {}) });
+      const own = localNames.has(name);
+      out.push({
+        kind: "npm",
+        key: name,
+        project,
+        ...(other || own ? { nonRegistry: true } : {}),
+        ...(!other && !own && verified.has(name) ? { publicVerified: true } : {}),
+      });
     }
   }
   return out;
 }
 
-function pythonSignals(dir: string, project: string): Signal[] {
+function pythonSignals(dir: string, project: string, root: string): Signal[] {
   const out: Signal[] = [];
+  const dirs = scopeDirs(dir, root);
+  const verified = pythonVerifiedNames(dirs);
+  const privateIndex = pythonIndexPrivate(dirs);
+  const editable = (spec: string) => /@|:\/\/|^\s*-e\b|\bfile:|\.\.?\//.test(spec);
   const py = readText(join(dir, "pyproject.toml"));
   if (py) {
     const block = /dependencies\s*=\s*\[([\s\S]*?)\]/.exec(py)?.[1] ?? "";
-    for (const m of block.matchAll(/["']([A-Za-z0-9_.-]+)([^"']*)/g))
+    for (const m of block.matchAll(/["']([A-Za-z0-9_.-]+)([^"']*)/g)) {
+      const key = m[1]!.toLowerCase();
+      const non = privateIndex || editable(m[2] ?? "");
       out.push({
         kind: "pypi",
-        key: m[1]!.toLowerCase(),
+        key,
         project,
-        ...(/@|:\/\//.test(m[2] ?? "") ? { nonRegistry: true } : {}),
+        ...(non ? { nonRegistry: true } : {}),
+        ...(!non && verified.has(key) ? { publicVerified: true } : {}),
       });
+    }
   }
   const req = readText(join(dir, "requirements.txt"));
   if (req) {
     // a private index may serve any name in the file: none of them counts as public
-    const privateIndex = /^\s*(--(extra-)?index-url|-i)\b(?!.*pypi\.org)/m.test(req);
     for (const line of req.split("\n")) {
       const name = /^\s*([A-Za-z0-9_.-]+)/.exec(line)?.[1];
-      if (name && !line.trim().startsWith("#") && !line.trim().startsWith("-"))
+      if (name && !line.trim().startsWith("#") && !line.trim().startsWith("-")) {
+        const key = name.toLowerCase();
+        const non = privateIndex || editable(line);
         out.push({
           kind: "pypi",
-          key: name.toLowerCase(),
+          key,
           project,
-          ...(privateIndex || /@|:\/\//.test(line) ? { nonRegistry: true } : {}),
+          ...(non ? { nonRegistry: true } : {}),
+          ...(!non && verified.has(key) ? { publicVerified: true } : {}),
         });
+      }
     }
   }
   return out;
 }
 
-function goSignals(dir: string, project: string): Signal[] {
+function goSignals(dir: string, project: string, root: string): Signal[] {
   const mod = readText(join(dir, "go.mod"));
   if (!mod) return [];
   const out: Signal[] = [];
+  // a go.work or any replace directive may point modules at local or private sources
+  const workspace = scopeDirs(dir, root).some((d) => existsSync(join(d, "go.work")));
+  const replaced = mod.includes("=>");
+  const push = (key: string) => {
+    const ok = !workspace && !replaced && PUBLIC_GO_HOSTS.test(key);
+    out.push({
+      kind: "go",
+      key,
+      project,
+      ...(workspace || replaced ? { nonRegistry: true } : {}),
+      ...(ok ? { publicVerified: true } : {}),
+    });
+  };
   const block = /require\s*\(([\s\S]*?)\)/g;
   for (const m of mod.matchAll(block))
     for (const line of m[1]!.split("\n")) {
       const path = /^\s*([^\s/]+\/[^\s]+)\s+v/.exec(line)?.[1];
-      if (path && !/\/\/\s*indirect/.test(line)) out.push({ kind: "go", key: path, project });
+      if (path && !/\/\/\s*indirect/.test(line)) push(path);
     }
-  for (const m of mod.matchAll(/^require\s+([^\s(]+)\s+v/gm))
-    out.push({ kind: "go", key: m[1]!, project });
+  for (const m of mod.matchAll(/^require\s+([^\s(]+)\s+v/gm)) push(m[1]!);
   return out;
 }
 
@@ -965,6 +1173,7 @@ export function discoverDocs(ctx: ProjectContext, opts: DiscoverOptions = {}): D
   const full = ctx.config.docs.crawl.api;
   const crawlFor = (e: CatalogEntry) => (e.tier === "service" ? full : e.crawl);
 
+  const localNames = localPackageNames(root, projects);
   const local: LocalCandidate[] = [];
   const signals: Signal[] = [];
   const unknownEnv = new Map<string, { vars: string[]; projects: Set<string> }>();
@@ -975,9 +1184,9 @@ export function discoverDocs(ctx: ProjectContext, opts: DiscoverOptions = {}): D
     // a sub-project's code is scanned once, as part of itself, not again under the root
     const own = dir === root && projects.length > 1 ? undefined : dir;
     local.push(...localCandidates(root, dir, project, isRegistered));
-    signals.push(...npmSignals(dir, includeDev, project));
-    signals.push(...pythonSignals(dir, project));
-    signals.push(...goSignals(dir, project));
+    signals.push(...npmSignals(dir, includeDev, project, root, localNames));
+    signals.push(...pythonSignals(dir, project, root));
+    signals.push(...goSignals(dir, project, root));
     signals.push(...imageSignals(dir, project));
     signals.push(...fileSignals(dir, project));
     const api = apiSignals(own ?? dir, project);
@@ -1014,11 +1223,13 @@ export function discoverDocs(ctx: ProjectContext, opts: DiscoverOptions = {}): D
       usedBy: string;
       evidence: string;
       nonRegistry?: boolean | undefined;
+      publicVerified?: boolean | undefined;
     },
   ) => {
     const cur = byName.get(c.name);
     if (cur) {
       if (!c.nonRegistry) delete cur.nonRegistry;
+      if (!c.publicVerified) delete cur.publicVerified;
       if (!cur.usedBy.includes(c.usedBy)) cur.usedBy.push(c.usedBy);
       if (!cur.evidence.includes(c.evidence)) cur.evidence.push(c.evidence);
       return;
@@ -1036,6 +1247,7 @@ export function discoverDocs(ctx: ProjectContext, opts: DiscoverOptions = {}): D
       evidence: [c.evidence],
       registered: registeredNames.has(c.name) || registeredProviders.has(c.provider),
       ...(c.nonRegistry ? { nonRegistry: true } : {}),
+      ...(c.publicVerified ? { publicVerified: true } : {}),
     });
   };
 
@@ -1071,6 +1283,7 @@ export function discoverDocs(ctx: ProjectContext, opts: DiscoverOptions = {}): D
         usedBy: project,
         evidence,
         ...(s.nonRegistry ? { nonRegistry: true } : {}),
+        ...(s.publicVerified ? { publicVerified: true } : {}),
       });
     } else if (s.kind === "image" && !s.key.includes(".") && !s.key.includes("/")) {
       // official-looking image we do not know; the project's own images carry a registry host

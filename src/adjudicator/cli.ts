@@ -244,15 +244,23 @@ function enabledIn(file: string): boolean | undefined {
 /**
  * Which layer decides `enabled`. A personal `false` wins for anything that can send text (it beats
  * a project `true` and EMINIAR_ADJUDICATOR=1); only EMINIAR_ADJUDICATOR=0 is stronger or equal.
- * Otherwise env > project > personal > default.
+ * Otherwise env > project > personal > default, except that a project `true` or
+ * EMINIAR_ADJUDICATOR=1 without a personal `enabled: true` turns on the local heuristic only
+ * (withPersonalVetoes in src/config.ts), which the returned text says.
  */
 export function enabledSource(root: string, env: NodeJS.ProcessEnv): string {
   const e = env.EMINIAR_ADJUDICATOR;
   if (e === "0") return "env EMINIAR_ADJUDICATOR=0";
   const personal = enabledIn(paths().configFile);
   if (personal === false) return `personal ${tilde(paths().configFile)} (enabled: false wins)`;
-  if (e === "1") return "env EMINIAR_ADJUDICATOR=1";
-  if (enabledIn(projectFile(root)) !== undefined) return "project eminiar.config.json";
+  const heuristicOnly = (s: string) =>
+    personal === true
+      ? s
+      : `${s} (local heuristic only: a provider runs once ${tilde(paths().configFile)} says enabled: true)`;
+  if (e === "1") return heuristicOnly("env EMINIAR_ADJUDICATOR=1");
+  const project = enabledIn(projectFile(root));
+  if (project !== undefined)
+    return project ? heuristicOnly("project eminiar.config.json") : "project eminiar.config.json";
   if (personal !== undefined) return `global ${tilde(paths().configFile)}`;
   return "default";
 }

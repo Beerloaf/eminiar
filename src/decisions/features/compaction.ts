@@ -103,6 +103,24 @@ function taskOf(sections: GuideSection[]): string {
   return s ? (s.items[s.items.length - 1] ?? "") : "";
 }
 
+/**
+ * Keep file paths readable but safe for the remote redactor, which turns a long mixed-case path
+ * with a digit into "[b64].ts": strip the project root prefix (the home directory never leaves),
+ * then shorten any other long path to its last two segments.
+ */
+export function readablePaths(text: string, root: string): string {
+  let out = text;
+  const r = root.replace(/[\\/]+$/, "");
+  if (r) {
+    for (const sep of ["/", "\\"]) out = out.split(r + sep).join("");
+  }
+  return out.replace(/[^\s|,;()"'`]*[\\/][^\s|,;()"'`]*/g, (tok) => {
+    if (tok.length < 28) return tok;
+    const parts = tok.split(/[\\/]+/).filter(Boolean);
+    return parts.slice(-2).join("/");
+  });
+}
+
 async function runCompactionJob(
   job: DecisionJob,
   client: DecisionClient,
@@ -123,10 +141,10 @@ async function runCompactionJob(
       {
         feature: "compaction",
         subject: `snapshot:${snapshotId}`,
-        context: taskOf(sections),
+        context: readablePaths(taskOf(sections), job.projectRoot),
         items: sections
           .slice(0, MAX_ITEMS)
-          .map((s) => ({ id: s.id, text: s.text, label: s.label })),
+          .map((s) => ({ id: s.id, text: readablePaths(s.text, job.projectRoot), label: s.label })),
         questions: [USEFUL],
         baseline: { kept: baselineKept },
         budgetMs: fc.jobMs,

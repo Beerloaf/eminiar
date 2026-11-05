@@ -82,6 +82,16 @@ function termsOf(query: string): string | undefined {
   return t || undefined;
 }
 
+/**
+ * The cache context of an error request: a hash of the whole normalised error text (case and
+ * whitespace folded), so two errors that share a long preamble but differ later never share a
+ * "same failure?" verdict. Term sets cannot tell them apart (they are capped at the first terms).
+ */
+export function errorContext(query: string): string | undefined {
+  const n = query.toLowerCase().replace(/\s+/g, " ").trim();
+  return n ? `error ${hash12(n)} ${hash12(n.slice(-200))}` : undefined;
+}
+
 interface Spec {
   path: RecallPath;
   query: string;
@@ -124,7 +134,7 @@ function inputOf(
     baseline: spec.baseline,
     questionVersion: QUESTION_VERSION,
   };
-  const cc = termsOf(spec.query);
+  const cc = spec.path === "error" ? errorContext(spec.query) : termsOf(spec.query);
   if (cc) input.cacheContext = cc;
   if (sessionId) input.sessionId = sessionId;
   return input;
@@ -143,16 +153,20 @@ export function decideRecall(spec: Spec, dropBelow: number): (a: Answers) => Dec
       const yn = a?.kind === "yes_no" ? a : undefined;
       return { key: it.id, i, p: yn ? yn.p : -1, drop: !!yn?.calibrated && !clears(yn, dropBelow) };
     });
-    const keys = [
-      ...scored
-        .filter((s) => !s.drop)
-        .sort((x, y) => y.p - x.p || x.i - y.i)
-        .map((s) => s.key),
-      ...(spec.rest ?? []),
+    // The shown text groups memories before docs, so compare (and emit) in that grouping: a
+    // memory-vs-doc order change alone changes nothing the reader sees.
+    const grouped = (ks: string[]) => [
+      ...ks.filter((k) => k.startsWith("memory:")),
+      ...ks.filter((k) => !k.startsWith("memory:")),
     ];
-    const head = keys.slice(0, spec.baseline.length);
-    const changed =
-      head.length === spec.baseline.length && head.every((k, n) => k === spec.baseline[n]) ? 0 : 1;
+    const ranked = scored
+      .filter((s) => !s.drop)
+      .sort((x, y) => y.p - x.p || x.i - y.i)
+      .map((s) => s.key);
+    const keys = grouped([...ranked, ...(spec.rest ?? [])]);
+    const base = grouped(spec.baseline);
+    const head = keys.slice(0, base.length);
+    const changed = head.length === base.length && head.every((k, n) => k === base[n]) ? 0 : 1;
     const decision: Decision = { decision: keys, changed };
     // A dashboard line only (no `deliver`): recall's effect is the reordered recall block.
     if (changed)

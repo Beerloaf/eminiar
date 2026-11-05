@@ -236,9 +236,6 @@ export function createDecisionClient(
       }
       if (input.items.length === 0 || input.questions.length === 0) return result("skipped");
 
-      const cap = fc().maxCallsPerDay;
-      if (cap > 0 && db.decisions.callsToday(feature, t0) >= cap) return rowResult("feature_cap");
-
       // The deterministic path stands for a question kind the provider cannot answer.
       const { r, p: provider } = resolved();
       if (!provider || !input.questions.every((q) => provider.supports(q.kind, q)))
@@ -282,6 +279,10 @@ export function createDecisionClient(
       };
 
       if (missing.length === 0) return finish("cached", hit);
+
+      // Only provider calls count towards the daily cap, so a complete cache hit never meets it.
+      const cap = fc().maxCallsPerDay;
+      if (cap > 0 && db.decisions.callsToday(feature, t0) >= cap) return rowResult("feature_cap");
 
       // The provider's breaker row is the adjudicator's own, so breaker and budget are shared.
       const fingerprint = currentKeyFingerprint(r, env);

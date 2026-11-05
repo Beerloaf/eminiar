@@ -37,7 +37,12 @@ function findSecretFields(v: unknown, path: (string | number)[] = []): (string |
  * hook process ~1 ms to construct and ~1.5 ms to parse for the first time, and the adjudicator
  * is off by default. loadConfig skips it entirely while it is untouched (adjudicatorDefaults).
  */
-/** The default commit-advice exclusions: lock files, minified output and anything key-shaped. */
+/**
+ * The default commit-advice exclusions: lock files, minified output, anything key-shaped, the
+ * secret-bearing directories and data names of the built-in floor (DIFF_DENY_FLOOR in
+ * src/decisions/diff-redact.ts, which applies whatever this says) and Helm-style values files,
+ * which hold deployment secrets under keys that do not look secret.
+ */
 export const COMMIT_EXCLUDE = [
   "**/*.lock",
   "**/package-lock.json",
@@ -66,6 +71,35 @@ export const COMMIT_EXCLUDE = [
   "**/.pgpass",
   "**/kubeconfig*",
   "**/.aws/**",
+  "**/secret/**",
+  "**/credential/**",
+  "**/credentials/**",
+  "**/cred/**",
+  "**/creds/**",
+  "**/vault/**",
+  "**/private/**",
+  "**/key/**",
+  "**/keys/**",
+  "**/.docker/**",
+  "**/.gnupg/**",
+  "**/*creds*.*",
+  "**/auth.json",
+  "**/vault.*",
+  "**/*.tfvars",
+  "**/*.tfvars.*",
+  "**/*.tfstate",
+  "**/*.tfstate.*",
+  "**/.npmrc",
+  "**/.pypirc",
+  "**/.yarnrc*",
+  "**/.git-credentials",
+  "**/.dockercfg",
+  "**/values*.yaml",
+  "**/values*.yml",
+  "**/*-values.yaml",
+  "**/*-values.yml",
+  "**/*_values.yaml",
+  "**/*_values.yml",
 ];
 
 /**
@@ -1087,19 +1121,24 @@ function personalLayer(projectRoot: string): Record<string, unknown> {
  * - adjudicator.promptMode: "heuristic" (no provider call on prompts) wins over a project
  *   "async"/"blocking";
  * - adjudicator.minPromptChars: a project value below the personal one is raised to it.
- * When the personal file says nothing, the project layer still applies as before (a team can turn
- * the adjudicator on; consent and keys still come only from the personal file). The other project
- * keys (mode, tiers, weights, apply, advice, embedding, learning, cache) send nothing.
+ * And the project file or the env is never the only thing that makes a provider run (task #326):
+ * unless the personal file itself says `enabled: true`, a project `enabled: true` or
+ * EMINIAR_ADJUDICATOR=1 turns on the local heuristic only (provider "heuristic", so no prompt
+ * text and no decision feature leaves the machine), even when the personal file already names a
+ * provider, keys, consent and features (a provider set without running `enable`).
+ * The other project keys (mode, tiers, weights, apply, advice, embedding, learning, cache) send
+ * nothing.
  */
 function withPersonalVetoes(
   personal: Record<string, unknown>,
   merged: Record<string, unknown>,
 ): Record<string, unknown> {
-  const p = personal.adjudicator;
+  const p = isPlainObject(personal.adjudicator) ? personal.adjudicator : {};
   const m = merged.adjudicator;
-  if (!isPlainObject(p) || !isPlainObject(m)) return merged;
+  if (!isPlainObject(m)) return merged;
   const adj: Record<string, unknown> = { ...m };
   if (p.enabled === false) adj.enabled = false;
+  else if (adj.enabled === true && p.enabled !== true) adj.provider = "heuristic";
   if (isPlainObject(p.surfaces) && isPlainObject(m.surfaces)) {
     const s: Record<string, unknown> = { ...m.surfaces };
     for (const k of Object.keys(p.surfaces)) if (p.surfaces[k] === false) s[k] = false;

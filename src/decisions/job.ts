@@ -1,5 +1,7 @@
 import { spawn as nodeSpawn } from "node:child_process";
-import { basename } from "node:path";
+import { lstatSync, realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { authLockout, overBudget } from "../adjudicator/breaker.js";
 import { currentKeyFingerprint, resolveAdjudicator } from "../adjudicator/config.js";
 import type { AdjudicatorConfig } from "../config.js";
@@ -21,8 +23,15 @@ type SpawnFn = typeof nodeSpawn;
 export interface DecisionSpawnDeps {
   spawn?: SpawnFn;
   execPath?: string;
-  /** The hook script (default process.argv[1], i.e. dist/hook.js inside a hook). */
-  script?: string;
+  /**
+   * The running installation, as a module URL (default this module's own import.meta.url, i.e.
+   * a file in the plugin's dist/). The spawned script is always the hook.js next to it; there is
+   * no way to name the script, and no environment variable (EMINIAR_PLUGIN_ROOT, process.argv)
+   * is consulted. Tests point it at a fixture directory.
+   */
+  moduleUrl?: string;
+  /** The working directory a planted script is refused under (default process.cwd()). */
+  cwd?: string;
   env?: NodeJS.ProcessEnv;
 }
 
@@ -105,20 +114,91 @@ export function releaseJobSlot(
   }
 }
 
-/**
- * Only the plugin's hook entry understands `--decision`. Spawning any other script (the MCP
- * server's dist/server.js, a test runner, the CLI) would start a second server or do nothing
- * useful, so a wrong script is refused.
- */
-export function isHookScript(script: string): boolean {
-  return /^hook\.(?:js|mjs|cjs)$/.test(basename(script));
+const HOOK_NAME = /^hook\.(?:js|mjs|cjs)$/;
+
+/** True when `p` is `root` or lies under it (both already resolved). */
+function within(p: string, root: string): boolean {
+  const rel = relative(root, p);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
-/** Start the detached child and write the job to its stdin. Never throws; false when it could not. */
+/**
+ * The hook entry of the running installation: the real path of the hook.js next to this module
+ * (the bundle is flat, so server.js, cli.js, hook.js and the hook-*.js chunks share dist/).
+ * Derived from the module's own location only: never from EMINIAR_PLUGIN_ROOT, which a cloned
+ * repo's .claude/settings.json `env` block can set, and never from process.argv[1]. Undefined
+ * when there is no such regular file (a symlinked hook.js is refused), e.g. when running from src/.
+ */
+export function trustedHookScript(moduleUrl: string = import.meta.url): string | undefined {
+  try {
+    const moduleFile = realpathSync(fileURLToPath(moduleUrl));
+    const candidate = join(dirname(moduleFile), "hook.js");
+    if (!lstatSync(candidate).isFile()) return undefined;
+    return realpathSync(candidate) === candidate ? candidate : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export interface HookScriptCheck {
+  moduleUrl?: string | undefined;
+  /** Roots a planted script may sit in: the job's project root and the working directory. */
+  projectRoot?: string | undefined;
+  cwd?: string | undefined;
+}
+
+/**
+ * Only the running installation's hook entry understands `--decision`, and only it may be
+ * spawned. A script is accepted when it is the absolute, already-canonical path that
+ * trustedHookScript() returns: any other file named hook.js (one under the project, a relative
+ * path, a symlink, even one to the real hook, the MCP server's dist/server.js, a test runner) is
+ * refused. A
+ * script under the project root or the working directory is refused too, unless the running
+ * module itself lives there (then the project already supplies the running code, e.g. Claude
+ * Code started in $HOME or the plugin developed in place, and refusing would protect nothing).
+ */
+export function isHookScript(script: string, check: HookScriptCheck = {}): boolean {
+  try {
+    if (typeof script !== "string" || !isAbsolute(script)) return false;
+    if (!HOOK_NAME.test(basename(script))) return false;
+    const expected = trustedHookScript(check.moduleUrl);
+    // The path itself must be the canonical one: a symlink (or a path through a symlinked
+    // directory) to the real hook is refused too, not only one that resolves elsewhere.
+    if (!expected || script !== expected || realpathSync(script) !== expected) return false;
+    const moduleFile = realpathSync(fileURLToPath(check.moduleUrl ?? import.meta.url));
+    for (const root of [check.projectRoot, check.cwd ?? process.cwd()]) {
+      if (!root || !isAbsolute(root)) continue;
+      let real: string;
+      try {
+        real = realpathSync(root);
+      } catch {
+        continue;
+      }
+      if (within(expected, real) && !within(moduleFile, real)) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Start the detached child and write the job to its stdin. Never throws; false when it could not.
+ * The script is always the running installation's hook.js (trustedHookScript), never a caller-
+ * or environment-supplied path.
+ */
 export function spawnDecisionJob(job: DecisionJob, deps: DecisionSpawnDeps = {}): boolean {
   try {
-    const script = deps.script ?? process.argv[1];
-    if (!script || !isHookScript(script)) return false;
+    const script = trustedHookScript(deps.moduleUrl);
+    if (
+      !script ||
+      !isHookScript(script, {
+        moduleUrl: deps.moduleUrl,
+        projectRoot: job.projectRoot,
+        cwd: deps.cwd,
+      })
+    )
+      return false;
     const child = (deps.spawn ?? nodeSpawn)(
       deps.execPath ?? process.execPath,
       [script, "--decision"],

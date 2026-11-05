@@ -20,6 +20,7 @@ function cand(name: string, over: Partial<ProviderCandidate> = {}): ProviderCand
     title: name,
     urls: [],
     confidence: "registry",
+    publicVerified: true,
     usedBy: ["."],
     evidence: [`npm:${name}`],
     registered: false,

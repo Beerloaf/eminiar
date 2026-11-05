@@ -5,9 +5,10 @@
  * the model (F11), the store carries the job-gate methods (no structural cast) and a wrong hook
  * script is never spawned.
  */
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type AdjudicatorConfig, AdjudicatorConfigSchema } from "../../src/config.js";
 import { createDecisionClient } from "../../src/decisions/client.js";
@@ -334,19 +335,28 @@ describe("a wrong hook script is never spawned", () => {
     return { spawn: vi.fn(() => child) as never, child };
   };
 
-  it("recognises only the plugin hook entry", () => {
-    expect(isHookScript("/p/dist/hook.js")).toBe(true);
-    expect(isHookScript("/p/dist/server.js")).toBe(false);
-    expect(isHookScript("/p/dist/cli.js")).toBe(false);
-    expect(isHookScript("/usr/bin/vitest")).toBe(false);
+  // A fake install: dist/server.js (the running module) with dist/hook.js beside it.
+  const dist = join(mkdtempSync(join(tmpdir(), "em-w3-hook-")), "dist");
+  mkdirSync(dist);
+  writeFileSync(join(dist, "server.js"), "");
+  writeFileSync(join(dist, "hook.js"), "");
+  const moduleUrl = pathToFileURL(join(dist, "server.js")).href;
+  const hook = realpathSync(join(dist, "hook.js"));
+
+  it("recognises only the running installation's hook entry", () => {
+    expect(isHookScript(hook, { moduleUrl })).toBe(true);
+    expect(isHookScript("/p/dist/hook.js", { moduleUrl })).toBe(false);
+    expect(isHookScript(realpathSync(join(dist, "server.js")), { moduleUrl })).toBe(false);
+    expect(isHookScript("/p/dist/cli.js", { moduleUrl })).toBe(false);
+    expect(isHookScript("/usr/bin/vitest", { moduleUrl })).toBe(false);
   });
 
-  it("refuses dist/server.js and an unset script, accepts dist/hook.js", () => {
+  it("refuses without an installed hook.js (running from src/), spawns the installed one", () => {
     const a = fake();
-    expect(spawnDecisionJob(job, { spawn: a.spawn, script: "/p/dist/server.js" })).toBe(false);
+    expect(spawnDecisionJob(job, { spawn: a.spawn })).toBe(false);
     expect(a.spawn).not.toHaveBeenCalled();
     const b = fake();
-    expect(spawnDecisionJob(job, { spawn: b.spawn, script: "/p/dist/hook.js" })).toBe(true);
+    expect(spawnDecisionJob(job, { spawn: b.spawn, moduleUrl })).toBe(true);
     expect(b.spawn).toHaveBeenCalledTimes(1);
   });
 });

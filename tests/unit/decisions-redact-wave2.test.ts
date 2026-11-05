@@ -54,9 +54,13 @@ describe("block scalars and multi-line values under secret keys", () => {
   });
 
   it("does not carry masking across hunks or onto non-secret keys", () => {
+    // An indented line opening a later hunk has its owner outside the hunk and is dropped
+    // (task #323); a column-0 line there is not masked by the earlier hunk's secret.
     const d =
-      "diff --git a/v.yaml b/v.yaml\n@@ -1 +1 @@\n+db_password: |\n@@ -9 +9 @@\n+  keep_me: 1\n";
-    expect(redactDiff(d, { maxChars: 8000 }).text).toContain("keep_me");
+      "diff --git a/v.yaml b/v.yaml\n@@ -1 +1 @@\n+db_password: |\n@@ -9 +9,2 @@\n+  orphan: 1\n+keep_me: 1\n";
+    const t = redactDiff(d, { maxChars: 8000 }).text;
+    expect(t).toContain("keep_me");
+    expect(t).not.toContain("orphan");
     expect(text("v.yaml", ["notes: |", "  visible text"])).toContain("visible text");
   });
 });

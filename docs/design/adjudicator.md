@@ -245,7 +245,7 @@ adjudicator: {
 Rules:
 
 - **(a)** `envOverrides()` adds:
-  - `EMINIAR_ADJUDICATOR=0|1` → `enabled`
+  - `EMINIAR_ADJUDICATOR=0|1` → `enabled` (a personal `enabled: false` beats `=1`; see the 2026-11-06 note in the consent section)
   - `EMINIAR_ADJUDICATOR_PROVIDER` → `provider` (a remote one runs only if the personal config
     already consents to its origin)
   - `EMINIAR_ADJUDICATOR_MODE`
@@ -341,6 +341,10 @@ Environment variables can only withdraw consent. Claude Code applies a trusted p
 to a remote host with the user's own stored key. So:
 
 - `EMINIAR_ADJUDICATOR=1` may turn the feature on (heuristic or local providers);
+  *(Note 2026-11-06: the later feature work changed this precedence. A personal `enabled: false` now
+  always beats `=1` and a project `true`, and unless the personal file itself says `enabled: true`,
+  `=1` or a project `true` turns on the local heuristic only: no provider runs and every decision
+  feature is off. See docs/adjudicator.md.)*
 - `EMINIAR_ADJUDICATOR_PROVIDER` may pick a remote provider, which runs only when
   `remoteConsentOrigins` already lists its origin;
 - `EMINIAR_ADJUDICATOR_REMOTE=1` grants nothing; `=0` and `EMINIAR_ADJUDICATOR=0` still withdraw

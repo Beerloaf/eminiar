@@ -16,7 +16,7 @@ import { scoreActs } from "../types.js";
  * Decision feature "docs" (docs/design/jev-integration-options.md, option F): score each
  * dependency by how much a coding agent benefits from having its documentation indexed, and let
  * the scores order the registry and library candidates of `em_docs discover`. Only the package
- * ecosystem and name leave the machine. Shadow, off, unsupported and error leave the discovery
+ * ecosystem and name of catalogued or lockfile-verified public packages leave the machine. Shadow, off, unsupported and error leave the discovery
  * untouched (the output is byte-identical to the deterministic one).
  */
 export const feature: DecisionFeatureModule = {
@@ -39,23 +39,17 @@ export const DOCS_QUESTION: DecisionQuestionSpec = {
 
 const ECOSYSTEM: Record<string, string> = { npm: "npm", pypi: "PyPI", go: "Go module" };
 
-/** Go module hosts whose modules are public by convention; any other host may be internal. */
-const PUBLIC_GO_HOSTS =
-  /^(github\.com|gitlab\.com|bitbucket\.org|golang\.org|google\.golang\.org|gopkg\.in|go\.uber\.org|k8s\.io|sigs\.k8s\.io|cloud\.google\.com|go\.opentelemetry\.io)\//;
-
 /**
- * May this package name leave the machine? Only names a public registry plausibly serves:
- * unscoped npm names, PyPI names and Go modules on well-known public hosts, none of them taken
- * from a git, URL or path source. Catalogue entries (known public libraries) always pass.
+ * May this package name leave the machine? Only names in the bundled catalogue of well-known
+ * packages, or ones the project's own files show come from the default public registry
+ * (`publicVerified`: lockfile entries resolved from registry.npmjs.org or pypi.org, a Go module on
+ * a vendor-run host without replace or go.work). Workspace members, git, URL and path sources and
+ * names a private index could serve are never sent. When unsure, the name stays home.
  */
 export function isPublicName(p: ProviderCandidate): boolean {
   if (p.nonRegistry) return false;
   if (p.confidence === "catalog") return true;
-  const [eco, ...rest] = p.provider.split(":");
-  const name = rest.join(":");
-  if (eco === "npm") return !name.startsWith("@") && !name.includes("/");
-  if (eco === "go") return PUBLIC_GO_HOSTS.test(name);
-  return eco === "pypi";
+  return p.publicVerified === true && /^(npm|pypi|go):/.test(p.provider);
 }
 
 /** The candidates worth scoring: unregistered public packages, most widely used first. */

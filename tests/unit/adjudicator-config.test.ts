@@ -132,6 +132,11 @@ describe("adjudicator config schema", () => {
     process.env.EMINIAR_ADJUDICATOR_MODE = "apply";
     process.env.EMINIAR_ADJUDICATOR_REMOTE = "1";
     let c = loadConfig(root).adjudicator;
+    // Project and env alone turn on the heuristic only (#326)...
+    expect([c.enabled, c.provider]).toEqual([true, "heuristic"]);
+    // ...the env picks the provider once the personal file says enabled: true.
+    writeFileSync(join(home, "config.json"), JSON.stringify({ adjudicator: { enabled: true } }));
+    c = loadConfig(root).adjudicator;
     // EMINIAR_ADJUDICATOR_REMOTE=1 grants nothing (#48).
     expect([c.enabled, c.provider, c.mode, c.remoteConsent]).toEqual([
       true,
@@ -781,6 +786,7 @@ describe("remote consent is bound to an origin (#33)", () => {
       paths().configFile,
       JSON.stringify({
         adjudicator: {
+          enabled: true,
           provider: "openai-compatible",
           openai: { preset: "custom", baseUrl: "https://other.example/v1", model: "m" },
         },

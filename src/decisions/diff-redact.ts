@@ -6,11 +6,16 @@ import { isSecretName } from "../adjudicator/redact.js";
  * BEFORE the generic redaction every client call applies and is stricter than it:
  *
  *  - files are filtered by a deny list (the config's commit.exclude plus a built-in floor that
- *    cannot be configured away: .env, keys, certificates, lock files, binaries) and an allow list
- *    of source/text extensions; a file that fails either is dropped, its name and content with it
+ *    cannot be configured away: .env, keys, certificates, tool credential files, Terraform vars
+ *    and state, secret-bearing directories and data-file names, lock files, binaries) and an
+ *    allow list of source/text extensions; a file that fails either is dropped, its name and
+ *    content with it
  *  - only a hunk's ADDED lines are kept (no context, no removed lines, no hunk headers)
- *  - a secret-named assignment keeps its name and loses its value; long hex / base64 runs are
- *    replaced by a placeholder; every line is cut short
+ *  - a secret-named assignment keeps its name and loses its value, and every line its value runs
+ *    on to (block scalars, open or triple quotes, backslash continuations, open brackets,
+ *    heredocs, a value on the next line) is dropped
+ *  - in YAML/TOML/JSON, a hunk's leading lines whose key is outside the hunk are dropped
+ *  - long hex / base64 runs are replaced by a placeholder; every line is cut short
  *  - the whole text is cut to a small maxChars
  *
  * Pure and linear in the input.
@@ -69,28 +74,91 @@ export const DIFF_DENY_FLOOR: string[] = [
   "**/*.map",
   "**/*.sqlite*",
   "**/*.db",
+  // Terraform variables and state in any form (state holds every resource attribute in clear).
+  "**/*.tfvars.*",
+  "**/*.tfstate",
+  "**/*.tfstate.*",
+  // Credential stores of package managers, registries and tools, by their fixed names.
+  "**/.dockercfg",
+  "**/.dockerconfigjson",
+  "**/.git-credentials",
+  "**/.yarnrc*",
+  "**/.htpasswd",
+  "**/htpasswd*",
+  "**/_netrc",
+  "**/.boto",
+  "**/.s3cfg",
+  "**/.my.cnf",
+  "**/gh/hosts.yml",
+  "**/*.ovpn",
+  "**/*.age",
+  "**/*.enc",
 ];
 
 /**
+ * Directories that hold secrets whatever their files are called (credentials/prod.yaml,
+ * secret/db.yaml, keys/prod.json, .docker/config.json): everything under them is denied, source
+ * files included. Singular and plural, case-insensitive (matchesGlob).
+ */
+export const SECRET_DIRS = [
+  "secret",
+  "secrets",
+  ".secret",
+  ".secrets",
+  "credential",
+  "credentials",
+  ".credentials",
+  "cred",
+  "creds",
+  "vault",
+  "vaults",
+  ".vault",
+  "private",
+  "key",
+  "keys",
+  ".docker",
+  ".gnupg",
+  ".password-store",
+];
+for (const d of SECRET_DIRS) DIFF_DENY_FLOOR.push(`**/${d}/**`);
+
+/**
  * Secret-bearing NAMES in data/config files (config/secrets.yaml, db_password.txt, api-keys.json,
- * auth_token.yml...). Source files named like this (token-bucket.ts) stay allowed: their values are
- * scrubbed line by line instead.
+ * prod-creds.yaml, vault.yml, wallet.json...). Source files named like this (token-bucket.ts) stay
+ * allowed: their values are scrubbed line by line instead.
  */
 const SECRET_NAME_PARTS = [
   "secret",
   "password",
   "passwd",
   "credential",
+  "creds",
   "token",
   "api-key",
   "api_key",
   "apikey",
   "private-key",
   "private_key",
+  "vault",
+  "wallet",
+  "mnemonic",
+  "keystore",
+  "htpasswd",
+  "bearer",
+  "adminsdk",
 ];
+/**
+ * Exact stems, alone or after a `-`, `_` or `.`: auth.json, gcp-key.json, db_pass.txt are secret
+ * stores, author.json, monkey.json and passport.json are not.
+ */
+const SECRET_STEMS = ["auth", "key", "pass"];
 const DATA_EXTS = ["json", "yaml", "yml", "toml", "txt", "ini", "cfg", "conf", "properties", "xml"];
-for (const part of SECRET_NAME_PARTS)
-  for (const ext of DATA_EXTS) DIFF_DENY_FLOOR.push(`**/*${part}*.${ext}`);
+for (const ext of DATA_EXTS) {
+  for (const part of SECRET_NAME_PARTS) DIFF_DENY_FLOOR.push(`**/*${part}*.${ext}`);
+  for (const stem of SECRET_STEMS)
+    for (const g of [`${stem}`, `*-${stem}`, `*_${stem}`, `*.${stem}`])
+      DIFF_DENY_FLOOR.push(`**/${g}.${ext}`);
+}
 
 /** Only these file kinds are sent (extension, or a well-known bare name). */
 export const DIFF_ALLOW = [
@@ -134,6 +202,22 @@ const MAX_FILES = 40;
 /** A hard ceiling whatever the config asks for. */
 export const DIFF_MAX_CHARS = 8000;
 
+const compiled = new Map<string, RegExp | null>();
+
+/** A glob's RegExp, built once per glob (the floor alone is a few hundred). */
+function globRegExp(glob: string): RegExp | null {
+  let re = compiled.get(glob);
+  if (re === undefined) {
+    try {
+      re = globToRegExp(glob);
+    } catch {
+      re = null;
+    }
+    if (compiled.size < 4096) compiled.set(glob, re);
+  }
+  return re;
+}
+
 function globToRegExp(glob: string): RegExp {
   let re = "";
   for (let i = 0; i < glob.length; i++) {
@@ -154,13 +238,7 @@ function globToRegExp(glob: string): RegExp {
 
 /** Does `path` match any glob? `*` stays inside a segment, `**` crosses them; case-insensitive. */
 export function matchesGlob(path: string, globs: readonly string[]): boolean {
-  return globs.some((g) => {
-    try {
-      return globToRegExp(g).test(path);
-    } catch {
-      return false;
-    }
-  });
+  return globs.some((g) => globRegExp(g)?.test(path) ?? false);
 }
 
 /** Is a file's diff allowed to leave the machine at all? */
@@ -191,13 +269,83 @@ function scrubLine(raw: string): string | undefined {
 }
 
 /**
- * A value that carries on past its own line: lines after it belong to the secret and must not be
- * sent. Either everything more indented than the key (block scalars `| > |- >- |2`, YAML plain or
- * nested continuation) or everything up to and including the line that closes an open quote.
+ * A secret value that carries on past its own line: the lines after it belong to the secret and
+ * are never sent.
+ *  - indent: everything more indented than the key (YAML block scalars `| > |- >- |2`, plain or
+ *    nested continuation)
+ *  - quote: up to and including the line that closes an open quote, a TOML/Python triple quote
+ *    (`"""`, `'''`, also r/b/u/f-prefixed) or a JS template literal
+ *  - backslash: while lines end in a backslash, plus the first line that does not (.properties,
+ *    shell, Python)
+ *  - brackets: until the brackets the value opened are closed again (`password = (`, `"token": {`)
+ *  - heredoc: up to the terminator line (`$(cat <<EOF`)
+ *  - value: the key ends its line with nothing after it (`"token":` with the value on the next
+ *    line): the next non-blank line is the value, and that line may open any of the above
+ * Every kind also ends at the next hunk header (a hunk's added lines are one contiguous run).
  */
-interface Continuation {
-  indent: number;
-  quote?: string;
+type Continuation =
+  | { kind: "indent"; indent: number }
+  | { kind: "quote"; quote: string }
+  | { kind: "backslash" }
+  | { kind: "brackets"; depth: number }
+  | { kind: "heredoc"; until: string }
+  | { kind: "value" };
+
+const TRIPLE = /^(?:[rRbBuUfF]{1,2})?("""|''')/;
+const HEREDOC = /<<[-~]?\s*(["']?)([A-Za-z_]\w*)\1/;
+
+/** Does `s` end in an odd number of backslashes (a line continuation)? A loop, not a regex. */
+function endsWithBackslash(s: string): boolean {
+  let n = 0;
+  for (let i = s.length - 1; i >= 0 && s[i] === "\\"; i--) n++;
+  return n % 2 === 1;
+}
+
+/** Brackets opened minus closed outside quoted strings; linear. */
+function bracketDepth(s: string): number {
+  let d = 0;
+  let q = "";
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) {
+      if (c === "\\") i++;
+      else if (c === q) q = "";
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") q = c;
+    else if (c === "(" || c === "[" || c === "{") d++;
+    else if (c === ")" || c === "]" || c === "}") d--;
+  }
+  return d;
+}
+
+/** How a secret's value (already trimmed) carries on, if it does. */
+function valueContinuation(
+  value: string,
+  indent: number,
+  yaml: boolean,
+  allowPending: boolean,
+): Continuation | undefined {
+  if (BLOCK_HEADER.test(value)) return { kind: "indent", indent };
+  const here = HEREDOC.exec(value);
+  if (here) return { kind: "heredoc", until: here[2] as string };
+  const triple = TRIPLE.exec(value);
+  if (triple) {
+    if (!value.slice(triple[0].length).includes(triple[1] as string))
+      return { kind: "quote", quote: triple[1] as string };
+  } else {
+    const q = value[0];
+    if (q === '"' || q === "'" || q === "`") {
+      const closed = q === '"' ? /^"(?:[^"\\]|\\.)*"/ : q === "'" ? /^'(?:[^']|'')*'/ : /^`[^`]*`/;
+      if (!closed.test(value)) return { kind: "quote", quote: q };
+    }
+  }
+  const depth = bracketDepth(value);
+  if (depth > 0) return { kind: "brackets", depth };
+  if (endsWithBackslash(value)) return { kind: "backslash" };
+  if (yaml) return { kind: "indent", indent };
+  if (!value && allowPending) return { kind: "value" };
+  return undefined;
 }
 
 function continuation(raw: string, yaml: boolean): Continuation | undefined {
@@ -205,14 +353,7 @@ function continuation(raw: string, yaml: boolean): Continuation | undefined {
   const m = ASSIGN.exec(line);
   if (!m || !isSecretName(m[2] as string)) return undefined;
   const indent = (/^\s*(?:-\s+)*/.exec(line) as RegExpExecArray)[0].length;
-  const value = (m[4] as string).trim();
-  if (BLOCK_HEADER.test(value)) return { indent };
-  const q = value[0];
-  if (q === '"' || q === "'" || q === "`") {
-    const closed = q === '"' ? /^"(?:[^"\\]|\\.)*"/ : q === "'" ? /^'(?:[^']|'')*'/ : /^`[^`]*`/;
-    if (!closed.test(value)) return { indent, quote: q };
-  }
-  return yaml ? { indent } : undefined;
+  return valueContinuation((m[4] as string).trim(), indent, yaml, true);
 }
 
 function leadingIndent(s: string): number {
@@ -223,6 +364,53 @@ function leadingIndent(s: string): number {
 function closesQuote(raw: string, q: string): boolean {
   if (q === '"') return /^(?:[^"\\]|\\.)*"/.test(raw);
   return raw.includes(q);
+}
+
+/** Consume `raw` under `cont`: the continuation left after it (undefined = it ended). */
+function consume(cont: Continuation, raw: string): Continuation | undefined {
+  switch (cont.kind) {
+    case "quote":
+      return closesQuote(raw, cont.quote) ? undefined : cont;
+    case "backslash":
+      return endsWithBackslash(raw.trimEnd()) ? cont : undefined;
+    case "brackets": {
+      const depth = cont.depth + bracketDepth(raw);
+      return depth > 0 ? { kind: "brackets", depth } : undefined;
+    }
+    case "heredoc":
+      return raw.trim() === cont.until ? undefined : cont;
+    case "value":
+      if (!raw.trim()) return cont;
+      return valueContinuation(raw.replace(/\t/g, " ").trim(), 0, false, false);
+    default:
+      return cont;
+  }
+}
+
+/**
+ * Structured data files where a hunk's first added lines may belong to a key the hunk does not
+ * show (git diff -U0 has no context): an indented YAML line under a `db_password: |` header, a
+ * TOML line inside a `"""` string or a multi-line array, a bare JSON value under a `"token":` key.
+ * Their leading lines are dropped until one whose owner is known: a YAML line at column 0, a
+ * TOML `key =` or `[table]` line, a JSON `"key":` line. The hunk header's line numbers are not
+ * trusted for this (a new file loses at most a leading `{` or comment).
+ */
+type DataKind = "yaml" | "toml" | "json";
+
+function dataKind(path: string): DataKind | undefined {
+  if (/\.ya?ml$/i.test(path)) return "yaml";
+  if (/\.toml$/i.test(path)) return "toml";
+  if (/\.json$/i.test(path)) return "json";
+  return undefined;
+}
+
+const TOML_ROOT = /^\s*(?:\[\[?[^\]]+\]\]?\s*(?:#.*)?$|[A-Za-z0-9_.-]+\s*=|"[^"]*"\s*=)/;
+const JSON_KEY = /^\s*"(?:[^"\\]|\\.)*"\s*:/;
+
+function rooted(kind: DataKind, raw: string): boolean {
+  if (kind === "yaml") return leadingIndent(raw) === 0;
+  if (kind === "toml") return TOML_ROOT.test(raw);
+  return JSON_KEY.test(raw);
 }
 
 export interface RedactedDiff {
@@ -267,21 +455,29 @@ export function redactDiff(
       continue;
     }
     const added: string[] = [];
-    const yaml = /\.ya?ml$/i.test(path);
+    const kind = dataKind(path);
+    const yaml = kind === "yaml";
     let cont: Continuation | undefined;
+    let orphan = false;
     for (const l of sec.split("\n")) {
       if (l.startsWith("@@")) {
         cont = undefined;
+        orphan = kind !== undefined;
         continue;
       }
       if (!l.startsWith("+") || l.startsWith("+++")) continue;
       const raw = l.slice(1);
+      if (orphan) {
+        if (!raw.trim() || !rooted(kind as DataKind, raw)) continue;
+        orphan = false;
+      }
       if (cont) {
-        if (cont.quote) {
-          if (closesQuote(raw, cont.quote)) cont = undefined;
+        if (cont.kind !== "indent") {
+          cont = consume(cont, raw);
           continue;
         }
-        if (!raw.trim() || leadingIndent(raw) > cont.indent) continue;
+        // A tab never indents YAML structure, so a tab-led line cannot end the value either.
+        if (!raw.trim() || /^ *\t/.test(raw) || leadingIndent(raw) > cont.indent) continue;
         cont = undefined;
       }
       const s = scrubLine(raw);

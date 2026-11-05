@@ -1,11 +1,9 @@
 import { createHash } from "node:crypto";
-import { join } from "node:path";
 import { resolveAdjudicator } from "../../adjudicator/config.js";
 import { type AdjudicatorConfig, loadConfig } from "../../config.js";
 import type { ProjectContext } from "../../context.js";
 import type { StorageAdapter } from "../../storage/adapter.js";
 import type { SwarmEventRow, TaskRow } from "../../swarm/types.js";
-import { pluginRoot } from "../../version.js";
 import { decisionFeatureActive, decisionFeatureConfig } from "../config.js";
 import type { DecisionFeatureModule } from "../feature.js";
 import { claimJobSlot, providerAllowsJob, releaseJobSlot, spawnDecisionJob } from "../job.js";
@@ -254,7 +252,9 @@ export function kickSwarmJudge(
     payload,
   };
   if (!claimJobSlot(db, job, now)) return false;
-  const ok = spawnDecisionJob(job, { script: join(pluginRoot(), "dist", "hook.js") });
+  // The script is the running installation's own hook.js (job.ts trustedHookScript), never a
+  // path from EMINIAR_PLUGIN_ROOT, which a cloned repo's .claude/settings.json env can set.
+  const ok = spawnDecisionJob(job);
   if (!ok) releaseJobSlot(db, job);
   if (ok) for (const t of todo) inFlight.set(`${run}/${t.id}`, now);
   return ok;

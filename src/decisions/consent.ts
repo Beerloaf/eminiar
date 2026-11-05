@@ -26,7 +26,7 @@ export function consentLine(c: DataClass, o: { origin: string; maxChars: number 
     case "swarm":
       return `sends task titles, statuses, the first line of task results, worker roles and tool-call counts, the first line of worker final messages, spawn prompts and other trail events, and redacted blackboard posts of swarm runs to ${o.origin}`;
     case "packages":
-      return `sends package names only (public-registry npm, PyPI and Go names; no versions, scoped npm packages, private or internal hosts, or git, URL and path sources) to ${o.origin}`;
+      return `sends package names only, never versions, and only for well-known catalogued packages or names your lockfile shows came from the default public registry (registry.npmjs.org or pypi.org; Go modules on vendor-run hosts); workspace members, scoped npm packages, git, URL and path sources, names a declared private index could serve, and anything unverified are never sent, to ${o.origin}`;
   }
 }
 

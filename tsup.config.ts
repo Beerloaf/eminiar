@@ -67,19 +67,19 @@ function oneSharedHookChunk(): NonNullable<Options["esbuildPlugins"]>[number] {
       build.onLoad({ filter: HOOK_LAZY }, (args) => {
         const src = readFileSync(args.path, "utf8");
         const hub = HOOK_STATIC.map((p) => `import ${JSON.stringify(p)};`).join("\n");
-        return { contents: `${src}\n${hub}\n`, loader: "ts", resolveDir: dirname(args.path) };
+        return {
+          contents: `${src}\n${hub}\n`,
+          loader: "ts",
+          resolveDir: dirname(args.path),
+        };
       });
-      build.onEnd((result) => {
+      // esbuild and tsup ignore result.errors edits made in onEnd, so the guard has to throw.
+      build.onEnd(() => {
         const missed = [...lazy].filter((p) => !HOOK_LAZY.test(p));
         if (missed.length)
-          result.errors.push({
-            id: "",
-            pluginName: "one-shared-hook-chunk",
-            text: `import() of ${missed.join(", ")} is not in HOOK_LAZY (tsup.config.ts); add it so hook.js keeps loading one shared chunk`,
-            location: null,
-            notes: [],
-            detail: undefined,
-          });
+          throw new Error(
+            `one-shared-hook-chunk: import() of ${missed.join(", ")} is not in HOOK_LAZY (tsup.config.ts); add it so hook.js keeps loading one shared chunk`,
+          );
       });
     },
   };

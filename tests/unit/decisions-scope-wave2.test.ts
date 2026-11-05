@@ -132,8 +132,20 @@ describe("docs triage sends public names only", () => {
     );
     writeFileSync(join(root, "requirements.txt"), "fastapi-zz==1\nwhl-zz @ https://x/y.whl\n");
     writeFileSync(
+      join(root, "package-lock.json"),
+      JSON.stringify({
+        packages: {
+          "node_modules/left-padz": { resolved: "https://registry.npmjs.org/left-padz/-/l.tgz" },
+        },
+      }),
+    );
+    writeFileSync(
+      join(root, "uv.lock"),
+      '[[package]]\nname = "fastapi-zz"\nsource = { registry = "https://pypi.org/simple" }\n',
+    );
+    writeFileSync(
       join(root, "go.mod"),
-      "module m\nrequire (\n  github.com/acme/pubmod v1.0.0\n  git.corp.internal/team/lib v1.0.0\n)\n",
+      "module m\nrequire (\n  golang.org/x/pubmod v1.0.0\n  git.corp.internal/team/lib v1.0.0\n)\n",
     );
     resetContextCache();
     const d = discoverDocs(getContext(root));
@@ -145,7 +157,7 @@ describe("docs triage sends public names only", () => {
     const sent = scorable(d).map((p) => p.provider);
     expect(sent).toContain("npm:left-padz");
     expect(sent).toContain("pypi:fastapi-zz");
-    expect(sent).toContain("go:github.com/acme/pubmod");
+    expect(sent).toContain("go:golang.org/x/pubmod");
     expect(sent).not.toContain("npm:@acme/internal");
     expect(sent).not.toContain("npm:gitdep-zz");
     expect(sent).not.toContain("pypi:whl-zz");
@@ -171,6 +183,6 @@ describe("consent text", () => {
     expect(consentLine("session", o)).toMatch(/em_execute command output only/);
     expect(consentLine("session", o)).toMatch(/never em_execute_file or em_batch_execute/);
     expect(consentLine("swarm", o)).toMatch(/worker final messages, spawn prompts/);
-    expect(consentLine("packages", o)).toMatch(/public-registry/);
+    expect(consentLine("packages", o)).toMatch(/default public registry/);
   });
 });

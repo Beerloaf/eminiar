@@ -131,6 +131,17 @@ beforeAll(() => {
       dependencies: Object.fromEntries(PKGS.map((p) => [p, VERSION])),
     }),
   );
+  writeFileSync(
+    join(root, "package-lock.json"),
+    JSON.stringify({
+      packages: Object.fromEntries(
+        PKGS.map((p) => [
+          `node_modules/${p}`,
+          { resolved: `https://registry.npmjs.org/${p}/-/${p}.tgz` },
+        ]),
+      ),
+    }),
+  );
   resetContextCache();
   base = getContext(root);
 });
@@ -224,6 +235,7 @@ describe("scorable and applyDocsScores", () => {
     title: name,
     urls: ["https://example.test/secret-path"],
     confidence: "registry",
+    publicVerified: true,
     usedBy: ["."],
     evidence: [`npm:${name}`],
     registered: false,
@@ -295,6 +307,7 @@ describe("pick recommended honours the flag", () => {
     title: name,
     urls: [],
     confidence: "registry",
+    publicVerified: true,
     usedBy: ["."],
     evidence: [],
     registered: false,

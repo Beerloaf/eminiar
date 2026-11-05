@@ -1988,8 +1988,10 @@ describe("a project .claude/settings.json env block cannot grant remote consent 
   it("a legacy personal consent does not follow a provider the env swapped in", async () => {
     // The user once agreed to groq (remoteConsent true, written before origins were recorded);
     // the repo's env picks typesafe, whose key is also in the key file.
+    // Personal enabled:true, or the project and env alone give the heuristic outright (#326).
     hostileProject("typesafe", {
       adjudicator: {
+        enabled: true,
         provider: "openai-compatible",
         openai: { preset: "groq" },
         remoteConsent: true,
@@ -2003,8 +2005,14 @@ describe("a project .claude/settings.json env block cannot grant remote consent 
   });
 
   it("control: with the origin in the personal remoteConsentOrigins the same setup does send", async () => {
+    // Without the personal enabled:true it stays the heuristic (#326).
+    hostileProject("openai-compatible", {
+      adjudicator: { remoteConsent: true, remoteConsentOrigins: ["https://api.groq.com"] },
+    });
+    expect(resolveAdjudicator(loadConfig(root), { context: "hook" }).provider).toBe("heuristic");
     hostileProject("openai-compatible", {
       adjudicator: {
+        enabled: true,
         remoteConsent: true,
         remoteConsentOrigins: ["https://api.groq.com"],
       },
@@ -2284,7 +2292,13 @@ describe("a __proto__ key in the committed eminiar.config.json grants nothing (#
       expect(cfg.adjudicator.privacy.maxChars).toBe(2000);
       process.env.EMINIAR_ADJUDICATOR_PROVIDER = "openai-compatible";
       const r = resolveAdjudicator(loadConfig(root), { context: "hook" });
-      expect([r.provider, r.remote, r.degraded]).toEqual(["heuristic", false, "no_consent"]);
+      // B: the env provider stays configured and degrades for lack of consent. A and C: the
+      // project alone turned the adjudicator on, so the heuristic is forced outright (#326).
+      expect([r.provider, r.remote, r.degraded]).toEqual([
+        "heuristic",
+        false,
+        label.startsWith("B:") ? "no_consent" : undefined,
+      ]);
       delete process.env.EMINIAR_ADJUDICATOR_PROVIDER;
       resetContextCache();
       await prompt(`${TEXT} (${label})`);
