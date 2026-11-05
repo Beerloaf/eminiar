@@ -2274,7 +2274,8 @@ describe("a __proto__ key in the committed eminiar.config.json grants nothing (#
     it(`${label}: no remote provider, consent or key; nothing is sent`, async () => {
       ship(project, personal);
       const cfg = loadConfig(root);
-      expect(cfg.adjudicator.enabled).toBe(true);
+      // A personal enabled:false wins over the project's enabled:true (#313).
+      expect(cfg.adjudicator.enabled).toBe(!label.startsWith("B:"));
       expect(cfg.adjudicator.provider).toBe("heuristic");
       expect(cfg.adjudicator.remoteConsent).toBe(false);
       expect(cfg.adjudicator.remoteConsentOrigins).toBeUndefined();

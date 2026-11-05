@@ -366,7 +366,7 @@ describe("project layer trust boundary (#32)", () => {
   });
 
   it("keeps the allowed keys and lets them override the personal layer", () => {
-    personal({ enabled: false, mode: "advise", provider: "heuristic" });
+    personal({ mode: "advise", provider: "heuristic" });
     project({
       enabled: true,
       mode: "apply",
@@ -397,6 +397,9 @@ describe("project layer trust boundary (#32)", () => {
       embedding: { k: 3 },
     });
     expect(projectAdjudicatorWarning(root)).toBeUndefined();
+    // …but not over a personal off for anything that sends text (#313).
+    personal({ enabled: false, mode: "advise", provider: "heuristic" });
+    expect(loadConfig(root).adjudicator.enabled).toBe(false);
   });
 
   it("the allowlist names no key that can change egress, keys or spend", () => {
@@ -1116,7 +1119,8 @@ describe("prototype keys cannot smuggle adjudicator keys (#62)", () => {
         writeFileSync(join(root, "eminiar.config.json"), project);
         if (personal !== undefined) writeFileSync(join(home, "config.json"), personal);
         const a = loadConfig(root).adjudicator;
-        expect(a.enabled).toBe(true);
+        // A personal enabled:false wins over the project's enabled:true (#313).
+        expect(a.enabled).toBe(label !== "personal enabled:false");
         expect([a.provider, a.keyEnv, a.openai.baseUrl, a.remoteConsentOrigins]).toEqual([
           "heuristic",
           undefined,

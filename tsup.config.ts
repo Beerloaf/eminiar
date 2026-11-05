@@ -1,5 +1,5 @@
-import { existsSync, readdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { dirname, join, resolve, sep } from "node:path";
 import { defineConfig, type Options } from "tsup";
 
 // Native and heavy deps stay external so they resolve from node_modules at runtime
@@ -34,6 +34,56 @@ const shared: Options = {
 
 /** Everything the hook build writes: dist/hook.js(.map) and its dist/hook-*.js(.map) chunks. */
 const HOOK_OUTPUT = ["hook.js", "hook.js.map", "hook-*"];
+
+const SRC = resolve("src") + sep;
+/** The modules src/hook.ts imports statically: everything a hook process loads up front. */
+const HOOK_STATIC = ["src/hooks/dispatch.ts", "src/hooks/log.ts"].map((p) => resolve(p));
+/** The hook build's lazy entries: every internal module reached through import(). */
+const HOOK_LAZY =
+  /[\\/]src[\\/](adjudicator[\\/](hooks|async)|decisions[\\/](hooks|run-job|features[\\/][a-z-]+))\.ts$/;
+
+/**
+ * esbuild splits a module into its own chunk for every distinct set of entries (hook.js plus each
+ * import() target) that reaches it. The lazy adjudicator and decision-feature entries each reach
+ * a different slice of what hook.js loads statically, so hook.js ended up loading ten files
+ * instead of three, and each file costs the hook process a read, a parse and a link (F7: about
+ * +0.9 ms p50 over the pre-branch hook with everything off). In this build only, every lazy entry
+ * also imports what hook.ts imports. They run inside a hook process that has loaded those modules
+ * already, so nothing changes at run time, but every statically loaded module is now reached by
+ * the same set of entries and lands in one shared chunk: hook.js loads two files. The server and
+ * CLI builds are untouched (dist/server.js must not gain hook code, see check-bundle.mjs).
+ * onEnd fails the build when an import() target is not covered by HOOK_LAZY.
+ */
+function oneSharedHookChunk(): NonNullable<Options["esbuildPlugins"]>[number] {
+  return {
+    name: "one-shared-hook-chunk",
+    setup(build) {
+      const lazy = new Set<string>();
+      build.onResolve({ filter: /^\.\.?\// }, (args) => {
+        if (args.kind === "dynamic-import" && `${args.resolveDir}${sep}`.startsWith(SRC))
+          lazy.add(resolve(args.resolveDir, args.path).replace(/\.js$/, ".ts"));
+        return undefined;
+      });
+      build.onLoad({ filter: HOOK_LAZY }, (args) => {
+        const src = readFileSync(args.path, "utf8");
+        const hub = HOOK_STATIC.map((p) => `import ${JSON.stringify(p)};`).join("\n");
+        return { contents: `${src}\n${hub}\n`, loader: "ts", resolveDir: dirname(args.path) };
+      });
+      build.onEnd((result) => {
+        const missed = [...lazy].filter((p) => !HOOK_LAZY.test(p));
+        if (missed.length)
+          result.errors.push({
+            id: "",
+            pluginName: "one-shared-hook-chunk",
+            text: `import() of ${missed.join(", ")} is not in HOOK_LAZY (tsup.config.ts); add it so hook.js keeps loading one shared chunk`,
+            location: null,
+            notes: [],
+            detail: undefined,
+          });
+      });
+    },
+  };
+}
 
 export default defineConfig([
   {
@@ -71,6 +121,7 @@ export default defineConfig([
       options.chunkNames = "hook-[name]-[hash]";
     },
     esbuildPlugins: [
+      oneSharedHookChunk(),
       {
         name: "clean-hook-output",
         setup(build) {

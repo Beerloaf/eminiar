@@ -36,13 +36,18 @@ export function decisionInactiveReason(
   return undefined;
 }
 
-const memo = new WeakMap<AdjudicatorConfig, Map<DecisionFeature, boolean>>();
+const memo = new WeakMap<AdjudicatorConfig, Map<DecisionFeature, { env: string; v: boolean }>>();
+
+/** The process env switches that withdraw a feature without a config change. */
+const switches = (env: NodeJS.ProcessEnv) =>
+  `${env.EMINIAR_ADJUDICATOR ?? ""}|${env.EMINIAR_ADJUDICATOR_FEATURES ?? ""}|${env.EMINIAR_ADJUDICATOR_REMOTE ?? ""}`;
 
 /**
  * Is feature `f` on? True only when the adjudicator is enabled with a working provider (key and
  * origin consent resolved), the feature is enabled, a remote provider's origin has the feature's
- * data class agreed, and EMINIAR_ADJUDICATOR_FEATURES is not 0. Off costs two property reads. Memoised per
- * config object for the process env; an explicit `env` is evaluated every time.
+ * data class agreed, and EMINIAR_ADJUDICATOR_FEATURES is not 0. Off costs two property reads.
+ * Memoised per config object and the process env's kill switches (a changed config file gives a
+ * new object, see getContext); an explicit `env` is evaluated every time.
  */
 export function decisionFeatureActive(
   cfg: AdjudicatorConfig,
@@ -51,12 +56,13 @@ export function decisionFeatureActive(
 ): boolean {
   if (!cfg.enabled || !cfg.features[f].enabled) return false;
   if (env) return decisionInactiveReason(cfg, f, env) === undefined;
-  const m = memo.get(cfg) ?? new Map<DecisionFeature, boolean>();
+  const m = memo.get(cfg) ?? new Map<DecisionFeature, { env: string; v: boolean }>();
   memo.set(cfg, m);
+  const key = switches(process.env);
   const hit = m.get(f);
-  if (hit !== undefined) return hit;
+  if (hit !== undefined && hit.env === key) return hit.v;
   const v = decisionInactiveReason(cfg, f) === undefined;
-  m.set(f, v);
+  m.set(f, { env: key, v });
   return v;
 }
 

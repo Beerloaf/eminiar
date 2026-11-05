@@ -134,178 +134,187 @@ const buildFeaturesObject = () =>
     })
     .prefault({});
 
+/** The adjudicator section's fields except `features`, which has a schema of its own. */
+const adjudicatorFields = () => ({
+  /** Off by default; EMINIAR_ADJUDICATOR=0 is the kill switch. */
+  enabled: z.boolean().default(false),
+  provider: z.enum(PROVIDER_IDS).default("heuristic"),
+  /** advise = hints only; apply = may set the Agent `model` (best effort). */
+  mode: z.enum(MODES).default("advise"),
+  surfaces: z
+    .object({
+      prompt: z.boolean().default(true),
+      agent: z.boolean().default(true),
+      plan: z.boolean().default(true),
+      tools: z.boolean().default(false),
+    })
+    .prefault({}),
+  /** The provider's role on UserPromptSubmit. */
+  promptMode: z.enum(["heuristic", "async", "blocking"]).default("async"),
+  typesafe: z
+    .object({
+      model: z.string().default("jev-1.14.0"),
+      baseUrl: z.string().url().default("https://api.typesafe.ai/v1"),
+    })
+    .prefault({}),
+  openai: z
+    .object({
+      preset: z
+        .enum(["groq", "cerebras", "ollama", "lmstudio", "llamacpp", "custom"])
+        .default("groq"),
+      /** Overrides the preset's URL; required for `custom`. */
+      baseUrl: z.string().url().optional(),
+      /** Overrides the preset's model; required for `custom`. */
+      model: z.string().optional(),
+      json: z.enum(["schema", "object", "auto"]).default("auto"),
+      /** USD per million tokens; without it a preset with an unknown price reports no cost. */
+      price: z
+        .object({ inPerM: z.number().nonnegative(), outPerM: z.number().nonnegative() })
+        .optional(),
+    })
+    .prefault({}),
+  embedding: z
+    .object({
+      k: z.number().int().positive().default(5),
+      minSimilarity: z.number().min(0).max(1).default(0.55),
+    })
+    .prefault({}),
+  /** NAME of an env var holding the key, never the key itself. */
+  keyEnv: z
+    .string()
+    .regex(/^[A-Za-z_][A-Za-z0-9_]*$/, "keyEnv is the name of an environment variable")
+    .optional(),
+  /**
+   * Consent to send redacted prompt text to a remote provider; granted only by
+   * ~/.eminiar/config.json. EMINIAR_ADJUDICATOR_REMOTE=0 withdraws it; no env var grants it.
+   */
+  remoteConsent: z.boolean().default(false),
+  /**
+   * The origins (scheme://host[:port]) the user agreed to, written by the CLI's consent prompt;
+   * read only from ~/.eminiar/config.json. Consent covers a remote provider only when its origin
+   * is listed here (or, for a legacy `remoteConsent: true` without this list, a built-in preset
+   * origin of a provider the env did not pick). See resolveAdjudicator().
+   */
+  remoteConsentOrigins: z.array(z.string().max(512)).max(64).optional(),
+  timeouts: z
+    .object({
+      promptMs: z.number().int().positive().default(1200),
+      agentMs: z.number().int().positive().default(800),
+      planMs: z.number().int().positive().default(3000),
+      localMs: z.number().int().positive().default(600),
+      connectMs: z.number().int().positive().default(150),
+    })
+    .prefault({}),
+  minPromptChars: z.number().int().min(0).default(12),
+  /**
+   * Ordered ladder, smallest first; "fable" may be inserted by the user. Every provider request
+   * carries the whole ladder and a committed project file may set it, so it is bounded: each
+   * tier at most once (task #56).
+   */
+  tiers: z
+    .array(z.enum(TIERS))
+    .min(1)
+    .max(TIERS.length)
+    .refine((t) => new Set(t).size === t.length, "adjudicator.tiers must not repeat a tier")
+    .meta({ uniqueItems: true })
+    .default(["haiku", "sonnet", "opus"]),
+  weights: z
+    .object({
+      providerMax: z.number().min(0).max(1).default(0.7),
+      embeddingMax: z.number().min(0).max(1).default(0.4),
+      selfReportScale: z.number().min(0).max(1).default(0.6),
+      lowConfidence: z.number().min(0).max(1).default(0.55),
+      tierCenters: z
+        .record(z.string().max(32), z.number())
+        .refine((o) => Object.keys(o).length <= 16, "at most 16 tier centers")
+        .meta({ maxProperties: 16 })
+        .default({ haiku: 0.6, sonnet: 2.0, opus: 3.4 }),
+      /** Per-feature weight overrides (§7.2), e.g. {"design": 2.0, "toolProvider": 0.2}. */
+      features: z
+        .record(z.string().max(64), z.number())
+        .refine((o) => Object.keys(o).length <= 64, "at most 64 feature weights")
+        .meta({ maxProperties: 64 })
+        .default({}),
+    })
+    .prefault({}),
+  apply: z
+    .object({
+      scope: z.enum(["swarm", "all"]).default("swarm"),
+      minConfidence: z.number().min(0).max(1).default(0.7),
+      floor: z.enum(TIERS).default("haiku"),
+      ceiling: z.enum(TIERS).default("opus"),
+      respectFrontmatter: z.boolean().default(true),
+    })
+    .prefault({}),
+  advice: z
+    .object({
+      mainSession: z.enum(["off", "user", "context"]).default("user"),
+      cooldownPrompts: z.number().int().min(0).default(8),
+    })
+    .prefault({}),
+  learning: z
+    .object({
+      enabled: z.boolean().default(true),
+      maxBias: z.number().min(0).max(1).default(0.3),
+      minSamples: z.number().int().min(0).default(5),
+      halfLife: z.number().positive().default(50),
+      costWeight: z.number().min(0).default(0.05),
+    })
+    .prefault({}),
+  cache: z
+    .object({
+      ttlHours: z.number().positive().default(24),
+      maxEntries: z.number().int().positive().default(2000),
+    })
+    .prefault({}),
+  breaker: z
+    .object({
+      failures: z.number().int().positive().default(2),
+      cooldownSec: z.number().int().positive().default(120),
+    })
+    .prefault({}),
+  budget: z
+    .object({
+      dailyUsd: z.number().nonnegative().default(0.5),
+      /**
+       * Calls per remote provider per UTC day; 0 = unlimited. Caps providers whose price is
+       * unknown (cost null), which dailyUsd cannot limit.
+       */
+      dailyCalls: z.number().int().nonnegative().default(2000),
+    })
+    .prefault({}),
+  privacy: z
+    .object({
+      maxChars: z.number().int().positive().default(2000),
+      storeHead: z.boolean().default(true),
+      /**
+       * Keep the newest 100 requests sent to Jev and its answers (redacted prompt text
+       * included). Personal ~/.eminiar/config.json only; eminiar.config.json cannot set it.
+       * EMINIAR_ADJUDICATOR_CAPTURE=0 turns it off; no env var turns it on.
+       */
+      captureExchanges: z.boolean().default(false),
+    })
+    .prefault({}),
+});
+
+/** "<dataClass>@<origin>" lines written by `eminiar adjudicator features on`; personal config only. */
+const featureConsentField = () => z.array(z.string().max(512)).max(32).default([]);
+
 const buildAdjudicatorObject = () =>
   z.object({
-    /** Off by default; EMINIAR_ADJUDICATOR=0 is the kill switch. */
-    enabled: z.boolean().default(false),
-    provider: z.enum(PROVIDER_IDS).default("heuristic"),
-    /** advise = hints only; apply = may set the Agent `model` (best effort). */
-    mode: z.enum(MODES).default("advise"),
-    surfaces: z
-      .object({
-        prompt: z.boolean().default(true),
-        agent: z.boolean().default(true),
-        plan: z.boolean().default(true),
-        tools: z.boolean().default(false),
-      })
-      .prefault({}),
-    /** The provider's role on UserPromptSubmit. */
-    promptMode: z.enum(["heuristic", "async", "blocking"]).default("async"),
-    typesafe: z
-      .object({
-        model: z.string().default("jev-1.14.0"),
-        baseUrl: z.string().url().default("https://api.typesafe.ai/v1"),
-      })
-      .prefault({}),
-    openai: z
-      .object({
-        preset: z
-          .enum(["groq", "cerebras", "ollama", "lmstudio", "llamacpp", "custom"])
-          .default("groq"),
-        /** Overrides the preset's URL; required for `custom`. */
-        baseUrl: z.string().url().optional(),
-        /** Overrides the preset's model; required for `custom`. */
-        model: z.string().optional(),
-        json: z.enum(["schema", "object", "auto"]).default("auto"),
-        /** USD per million tokens; without it a preset with an unknown price reports no cost. */
-        price: z
-          .object({ inPerM: z.number().nonnegative(), outPerM: z.number().nonnegative() })
-          .optional(),
-      })
-      .prefault({}),
-    embedding: z
-      .object({
-        k: z.number().int().positive().default(5),
-        minSimilarity: z.number().min(0).max(1).default(0.55),
-      })
-      .prefault({}),
-    /** NAME of an env var holding the key, never the key itself. */
-    keyEnv: z
-      .string()
-      .regex(/^[A-Za-z_][A-Za-z0-9_]*$/, "keyEnv is the name of an environment variable")
-      .optional(),
-    /**
-     * Consent to send redacted prompt text to a remote provider; granted only by
-     * ~/.eminiar/config.json. EMINIAR_ADJUDICATOR_REMOTE=0 withdraws it; no env var grants it.
-     */
-    remoteConsent: z.boolean().default(false),
-    /**
-     * The origins (scheme://host[:port]) the user agreed to, written by the CLI's consent prompt;
-     * read only from ~/.eminiar/config.json. Consent covers a remote provider only when its origin
-     * is listed here (or, for a legacy `remoteConsent: true` without this list, a built-in preset
-     * origin of a provider the env did not pick). See resolveAdjudicator().
-     */
-    remoteConsentOrigins: z.array(z.string().max(512)).max(64).optional(),
-    timeouts: z
-      .object({
-        promptMs: z.number().int().positive().default(1200),
-        agentMs: z.number().int().positive().default(800),
-        planMs: z.number().int().positive().default(3000),
-        localMs: z.number().int().positive().default(600),
-        connectMs: z.number().int().positive().default(150),
-      })
-      .prefault({}),
-    minPromptChars: z.number().int().min(0).default(12),
-    /**
-     * Ordered ladder, smallest first; "fable" may be inserted by the user. Every provider request
-     * carries the whole ladder and a committed project file may set it, so it is bounded: each
-     * tier at most once (task #56).
-     */
-    tiers: z
-      .array(z.enum(TIERS))
-      .min(1)
-      .max(TIERS.length)
-      .refine((t) => new Set(t).size === t.length, "adjudicator.tiers must not repeat a tier")
-      .meta({ uniqueItems: true })
-      .default(["haiku", "sonnet", "opus"]),
-    weights: z
-      .object({
-        providerMax: z.number().min(0).max(1).default(0.7),
-        embeddingMax: z.number().min(0).max(1).default(0.4),
-        selfReportScale: z.number().min(0).max(1).default(0.6),
-        lowConfidence: z.number().min(0).max(1).default(0.55),
-        tierCenters: z
-          .record(z.string().max(32), z.number())
-          .refine((o) => Object.keys(o).length <= 16, "at most 16 tier centers")
-          .meta({ maxProperties: 16 })
-          .default({ haiku: 0.6, sonnet: 2.0, opus: 3.4 }),
-        /** Per-feature weight overrides (§7.2), e.g. {"design": 2.0, "toolProvider": 0.2}. */
-        features: z
-          .record(z.string().max(64), z.number())
-          .refine((o) => Object.keys(o).length <= 64, "at most 64 feature weights")
-          .meta({ maxProperties: 64 })
-          .default({}),
-      })
-      .prefault({}),
-    apply: z
-      .object({
-        scope: z.enum(["swarm", "all"]).default("swarm"),
-        minConfidence: z.number().min(0).max(1).default(0.7),
-        floor: z.enum(TIERS).default("haiku"),
-        ceiling: z.enum(TIERS).default("opus"),
-        respectFrontmatter: z.boolean().default(true),
-      })
-      .prefault({}),
-    advice: z
-      .object({
-        mainSession: z.enum(["off", "user", "context"]).default("user"),
-        cooldownPrompts: z.number().int().min(0).default(8),
-      })
-      .prefault({}),
-    learning: z
-      .object({
-        enabled: z.boolean().default(true),
-        maxBias: z.number().min(0).max(1).default(0.3),
-        minSamples: z.number().int().min(0).default(5),
-        halfLife: z.number().positive().default(50),
-        costWeight: z.number().min(0).default(0.05),
-      })
-      .prefault({}),
-    cache: z
-      .object({
-        ttlHours: z.number().positive().default(24),
-        maxEntries: z.number().int().positive().default(2000),
-      })
-      .prefault({}),
-    breaker: z
-      .object({
-        failures: z.number().int().positive().default(2),
-        cooldownSec: z.number().int().positive().default(120),
-      })
-      .prefault({}),
-    budget: z
-      .object({
-        dailyUsd: z.number().nonnegative().default(0.5),
-        /**
-         * Calls per remote provider per UTC day; 0 = unlimited. Caps providers whose price is
-         * unknown (cost null), which dailyUsd cannot limit.
-         */
-        dailyCalls: z.number().int().nonnegative().default(2000),
-      })
-      .prefault({}),
-    privacy: z
-      .object({
-        maxChars: z.number().int().positive().default(2000),
-        storeHead: z.boolean().default(true),
-        /**
-         * Keep the newest 100 requests sent to Jev and its answers (redacted prompt text
-         * included). Personal ~/.eminiar/config.json only; eminiar.config.json cannot set it.
-         * EMINIAR_ADJUDICATOR_CAPTURE=0 turns it off; no env var turns it on.
-         */
-        captureExchanges: z.boolean().default(false),
-      })
-      .prefault({}),
+    ...adjudicatorFields(),
     features: buildFeaturesObject(),
-    /** "<dataClass>@<origin>" lines written by `eminiar adjudicator features on`; personal config only. */
-    featureConsent: z.array(z.string().max(512)).max(32).default([]),
+    featureConsent: featureConsentField(),
   });
 
 /**
  * The adjudicator section (docs/design/adjudicator.md §5). The secret-field check runs on the
  * raw input, before zod strips unknown keys, so `{"openai": {"apiKey": "..."}}` is rejected
- * instead of silently dropped.
+ * instead of silently dropped. `lean` leaves the `features` schema out (parseConfig fills in
+ * featureDefaults() when the input has no `features` key), so an adjudicator without feature
+ * settings does not build and run that schema in every hook process (F7).
  */
-const buildAdjudicatorSchema = () =>
+const withSecretCheck = <T extends z.ZodType>(inner: T) =>
   z
     .preprocess((v, ctx) => {
       for (const path of findSecretFields(v))
@@ -317,12 +326,20 @@ const buildAdjudicatorSchema = () =>
             "adjudicator config must not hold keys or tokens: run `eminiar adjudicator key set`, or set keyEnv to the NAME of an env var",
         });
       return v;
-    }, buildAdjudicatorObject())
+    }, inner)
     .prefault({});
+const buildAdjudicatorSchema = () => withSecretCheck(buildAdjudicatorObject());
 let adjudicatorSchema: ReturnType<typeof buildAdjudicatorSchema> | undefined;
 export const AdjudicatorConfigSchema = z.lazy(
   () => (adjudicatorSchema ??= buildAdjudicatorSchema()),
 );
+const buildLeanConfigSchema = () =>
+  BaseConfigSchema.extend({
+    adjudicator: withSecretCheck(
+      z.object({ ...adjudicatorFields(), featureConsent: featureConsentField() }),
+    ),
+  });
+let leanConfigSchema: ReturnType<typeof buildLeanConfigSchema> | undefined;
 export type AdjudicatorConfig = z.infer<ReturnType<typeof buildAdjudicatorObject>>;
 
 /**
@@ -1060,19 +1077,95 @@ function personalLayer(projectRoot: string): Record<string, unknown> {
 }
 
 /**
- * Precedence: defaults < ~/.eminiar/config.json < <root>/eminiar.config.json < EMINIAR_* env.
+ * A personal "off" that neither the project file nor the env can switch back on (task #313).
+ * eminiar.config.json comes with any cloned repo and a repo's .claude/settings.json `env` block
+ * reaches the session, so both may only make the adjudicator MORE conservative than the user's
+ * own ~/.eminiar/config.json says, for every project key that decides whether text is sent:
+ * - adjudicator.enabled: false (the adjudicator and every decision feature; features need it on)
+ *   wins over a project `enabled: true` and EMINIAR_ADJUDICATOR=1;
+ * - adjudicator.surfaces.<name>: false wins over a project true;
+ * - adjudicator.promptMode: "heuristic" (no provider call on prompts) wins over a project
+ *   "async"/"blocking";
+ * - adjudicator.minPromptChars: a project value below the personal one is raised to it.
+ * When the personal file says nothing, the project layer still applies as before (a team can turn
+ * the adjudicator on; consent and keys still come only from the personal file). The other project
+ * keys (mode, tiers, weights, apply, advice, embedding, learning, cache) send nothing.
+ */
+function withPersonalVetoes(
+  personal: Record<string, unknown>,
+  merged: Record<string, unknown>,
+): Record<string, unknown> {
+  const p = personal.adjudicator;
+  const m = merged.adjudicator;
+  if (!isPlainObject(p) || !isPlainObject(m)) return merged;
+  const adj: Record<string, unknown> = { ...m };
+  if (p.enabled === false) adj.enabled = false;
+  if (isPlainObject(p.surfaces) && isPlainObject(m.surfaces)) {
+    const s: Record<string, unknown> = { ...m.surfaces };
+    for (const k of Object.keys(p.surfaces)) if (p.surfaces[k] === false) s[k] = false;
+    adj.surfaces = s;
+  }
+  if (p.promptMode === "heuristic") adj.promptMode = "heuristic";
+  if (
+    typeof p.minPromptChars === "number" &&
+    typeof m.minPromptChars === "number" &&
+    m.minPromptChars < p.minPromptChars
+  )
+    adj.minPromptChars = p.minPromptChars;
+  return { ...merged, adjudicator: adj };
+}
+
+/** The env vars loadConfig reads (envOverrides), in configSourceSignature. */
+const CONFIG_ENV = [
+  "EMINIAR_ROUTING_MODE",
+  "EMINIAR_EMBEDDINGS",
+  "EMINIAR_ADJUDICATOR",
+  "EMINIAR_ADJUDICATOR_PROVIDER",
+  "EMINIAR_ADJUDICATOR_MODE",
+  "EMINIAR_ADJUDICATOR_REMOTE",
+  "EMINIAR_ADJUDICATOR_CAPTURE",
+] as const;
+
+function fileSignature(file: string): string {
+  try {
+    const s = statSync(file, { throwIfNoEntry: false });
+    return s ? `${s.ino}:${s.size}:${s.mtimeMs}:${s.ctimeMs}` : "-";
+  } catch {
+    return "?";
+  }
+}
+
+/**
+ * What loadConfig(projectRoot) read: the identity of the personal and project files (inode, size,
+ * mtime, ctime; two stat calls) and the env vars it looks at. A long-lived process (MCP server,
+ * dashboard) compares it before reusing a loaded Config, so `features off`, a removed consent or a
+ * personal `enabled: false` reaches it on the next call without a restart (task #307).
+ */
+export function configSourceSignature(projectRoot: string): string {
+  let env = "";
+  for (const k of CONFIG_ENV) env += `${process.env[k] ?? ""}\u0000`;
+  return `${fileSignature(paths().configFile)}|${fileSignature(join(projectRoot, "eminiar.config.json"))}|${env}`;
+}
+
+/**
+ * Precedence: defaults < ~/.eminiar/config.json < <root>/eminiar.config.json < EMINIAR_* env,
+ * except that a personal "off" for anything that sends text wins (withPersonalVetoes).
  * The project file is the one teams commit.
  */
 export function loadConfig(projectRoot: string): Config {
-  const merged = deepMerge(
+  const personal = personalLayer(projectRoot);
+  const merged = withPersonalVetoes(
+    personal,
     deepMerge(
-      personalLayer(projectRoot),
-      withoutUnsafeDocsManifest(
-        projectLayer(readJson(join(projectRoot, "eminiar.config.json"))),
-        "eminiar.config.json",
+      deepMerge(
+        personal,
+        withoutUnsafeDocsManifest(
+          projectLayer(readJson(join(projectRoot, "eminiar.config.json"))),
+          "eminiar.config.json",
+        ),
       ),
+      envOverrides(),
     ),
-    envOverrides(),
   );
   // zod reads inherited properties: hand it a plain own-key copy, never the merged object.
   const parsed = parseConfig(ownJson(merged) as Record<string, unknown>);
@@ -1085,7 +1178,8 @@ export function loadConfig(projectRoot: string): Config {
  * ConfigSchema.safeParse, except that an untouched adjudicator section (absent, or only
  * `enabled: false`, e.g. the EMINIAR_ADJUDICATOR=0 kill switch) takes its defaults without
  * building or parsing the adjudicator schema. Anything else in it, including keys the secret
- * check must refuse, goes through the full schema.
+ * check must refuse, goes through the adjudicator schema: the full one when it has a `features`
+ * key, else the lean one (no features schema) plus featureDefaults().
  */
 function parseConfig(merged: Record<string, unknown>) {
   const { adjudicator: adj, ...rest } = merged;
@@ -1094,7 +1188,18 @@ function parseConfig(merged: Record<string, unknown>) {
     (isPlainObject(adj) &&
       Object.keys(adj).every((k) => k === "enabled") &&
       (adj.enabled === undefined || adj.enabled === false));
-  if (!untouched) return ConfigSchema.safeParse(merged);
+  if (!untouched) {
+    // No feature settings: the lean schema plus featureDefaults() (pinned equal by a unit test).
+    if (!isPlainObject(adj) || Object.hasOwn(adj, "features"))
+      return ConfigSchema.safeParse(merged);
+    leanConfigSchema ??= buildLeanConfigSchema();
+    const lean = leanConfigSchema.safeParse(merged);
+    if (!lean.success) return lean;
+    // Same key order as the full schema: features, then featureConsent.
+    const { featureConsent, ...fields } = lean.data.adjudicator;
+    const adjudicator = { ...fields, features: featureDefaults(), featureConsent };
+    return { success: true as const, data: { ...lean.data, adjudicator } as Config };
+  }
   const base = BaseConfigSchema.safeParse(rest);
   if (!base.success) return base;
   return { success: true as const, data: { ...base.data, adjudicator: adjudicatorDefaults() } };
