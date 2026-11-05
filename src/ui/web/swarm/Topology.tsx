@@ -1,4 +1,5 @@
 import type { JSX } from "preact";
+import { useEffect, useRef } from "preact/hooks";
 import type { SwarmEvent, SwarmRunDetail, SwarmTopology, SwarmWorkerUi } from "../api.js";
 import { cls } from "../util.js";
 import { onActivate, pure, useNow } from "./bits.js";
@@ -21,7 +22,7 @@ const FLASH_MS = 2_500;
  * Above this many workers, each role's stale and done workers fold into one "+N" node and
  * at most RUNNING_CAP of its running workers get their own node (the rest join the fold).
  */
-const FOLD_AT = 12;
+export const FOLD_AT = 12;
 const RUNNING_CAP = 6;
 /** Hierarchical: nodes per row before the next row. */
 const PER_ROW = 8;
@@ -32,7 +33,8 @@ const ROW_H = 110;
  */
 const MIN_SCALE = 0.95;
 
-type Item =
+/** One node of the canvas: a worker, a fold of quiet workers, or a role with none yet. */
+export type Item =
   | { type: "worker"; id: string; role: string; w: SwarmWorkerUi }
   | {
       type: "group";
@@ -45,12 +47,12 @@ type Item =
     }
   | { type: "idle"; id: string; role: string };
 
-interface Placed {
+export interface Placed {
   item: Item;
   x: number;
   y: number;
 }
-interface Layout {
+export interface Layout {
   w: number;
   h: number;
   hub: { x: number; y: number };
@@ -98,7 +100,11 @@ const groupWords = (g: { running: number; stale: number; done: number }): string
 const SLOT = 116;
 const MARGIN = 56;
 
-function layout(
+/**
+ * Node positions for a topology. Exported for ConfigTopology (the static preview of a
+ * configured swarm), which places the same items without a run.
+ */
+export function layout(
   topology: SwarmTopology,
   groups: Item[][],
   stages: string[],
@@ -182,9 +188,14 @@ function layout(
 }
 
 /** Clip a label to `n` characters (11px mono is ~6.6px a character: a node slot holds ~17). */
-const clipLabel = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+export const clipLabel = (s: string, n: number): string =>
+  s.length > n ? `${s.slice(0, n - 1)}…` : s;
 
-function spoke(topology: SwarmTopology, a: { x: number; y: number }, b: { x: number; y: number }) {
+export function spoke(
+  topology: SwarmTopology,
+  a: { x: number; y: number },
+  b: { x: number; y: number },
+) {
   if (topology === "hierarchical") {
     const my = (a.y + b.y) / 2;
     return `M${a.x},${a.y} C${a.x},${my} ${b.x},${my} ${b.x},${b.y}`;
@@ -236,8 +247,15 @@ function TopologyView({
   const isHot = (it: Item) =>
     live && (it.type === "worker" ? hot.has(it.id) : it.type === "idle" && hotRole.has(it.role));
 
+  // A canvas wider than its card scrolls sideways: start centred on the coordinator.
+  const wrap = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = wrap.current;
+    if (el && el.scrollWidth > el.clientWidth)
+      el.scrollLeft = (L.hub.x / L.w) * el.scrollWidth - el.clientWidth / 2;
+  }, [topology]);
   return (
-    <div class="sw-topo-wrap">
+    <div class="sw-topo-wrap" ref={wrap}>
       <svg
         class={cls("sw-topo", `topo-${topology}`)}
         viewBox={`0 0 ${L.w} ${L.h}`}
@@ -267,23 +285,37 @@ function TopologyView({
             y2={b.y}
           />
         ))}
-        {L.nodes.map((n) => (
-          <path
-            key={n.item.id}
-            class={cls(
-              "sw-edge spoke",
-              isHot(n.item) && "hot",
-              n.item.type !== "worker" && "ghost",
-            )}
-            d={spoke(topology, L.hub, n)}
-            style={{ stroke: isHot(n.item) ? roleColor(n.item.role, roles) : undefined }}
-          />
-        ))}
+        {L.nodes.map((n) => {
+          const d = spoke(topology, L.hub, n);
+          const hotEdge = isHot(n.item);
+          const color = roleColor(n.item.role, roles);
+          const running = live && n.item.type === "worker" && n.item.w.status === "running";
+          return (
+            <g key={n.item.id}>
+              <path
+                class={cls(
+                  "sw-edge spoke",
+                  hotEdge && "hot",
+                  running && "live",
+                  n.item.type !== "worker" && "ghost",
+                  n.item.type === "worker" && picked === n.item.id && "picked",
+                )}
+                d={d}
+                style={{ stroke: hotEdge || running ? color : undefined }}
+              />
+              {/* a comet runs hub → worker along a hot edge (CSS only; static without motion) */}
+              {hotEdge ? (
+                <path class="sw-comet" d={d} pathLength={100} style={{ stroke: color }} />
+              ) : null}
+            </g>
+          );
+        })}
         <g
           class={cls("sw-node hub", live && "live")}
           transform={`translate(${L.hub.x},${L.hub.y})`}
         >
           {live ? <circle class="sw-halo" r={30} /> : null}
+          {live ? <circle class="sw-halo late" r={30} /> : null}
           <circle class="sw-core" r={22} />
           <text class="sw-glyph" dy={6}>
             {GLYPH.coordinator}
@@ -337,8 +369,14 @@ function TopologyView({
           return (
             <g
               key={item.id}
-              class={cls("sw-node worker", `st-${w.status}`, isPicked && "picked")}
+              class={cls(
+                "sw-node worker",
+                `st-${w.status}`,
+                live && w.status === "running" && "glow",
+                isPicked && "picked",
+              )}
               transform={`translate(${x},${y})`}
+              style={{ "--rc": color } as JSX.CSSProperties}
               // lowercase: on SVG, Preact sets attributes verbatim and `tabIndex` is ignored
               tabindex={0}
               role="button"
@@ -348,6 +386,7 @@ function TopologyView({
               onKeyDown={onActivate(toggle)}
             >
               <circle class="sw-focus" r={27} />
+              {isPicked ? <circle class="sw-ring" r={24} /> : null}
               {w.status === "running" && live ? (
                 <circle class="sw-halo" r={24} style={{ stroke: color }} />
               ) : null}

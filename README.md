@@ -131,8 +131,17 @@ Declare worker roles in `.eminiar/swarm.yaml`, with their prompts, models, tools
 hooks. eminiar generates a Claude Code agent file per role. `/eminiar:em-swarm <swarm> <goal>`
 makes the main session the coordinator: it plans small tasks, fans workers out in parallel and
 reviews what comes back. Every worker starts with the memories, history risk and hot files for
-its task. Capacity limits, a shared blackboard and a live Swarms tab in the dashboard come with
-it. Nothing changes until you run `eminiar swarm init` ([details](docs/swarms.md)).
+its task. Capacity limits, a shared blackboard and a Swarms tab in the dashboard (a live run
+monitor, plus a visual editor for the swarm file) come with it. Nothing changes until you run `eminiar swarm init` ([details](docs/swarms.md)).
+
+The run monitor shows progress, workers and the topology as a run happens. The configuration
+studio edits roles, models and topology without hand-written YAML
+([monitor](docs/dashboard.md#swarms), [studio](docs/swarms.md#edit-in-the-dashboard)).
+
+| | |
+|:---:|:---:|
+| [<img alt="Swarm run: progress rings, task and worker counts, and the live topology of a run" src="docs/images/dashboard-swarm-dark.webp" width="430">](docs/dashboard.md#swarms) | [<img alt="Swarm configuration studio: swarms, topology picker and the swarm file" src="docs/images/dashboard-swarm-config-dark.webp" width="430">](docs/dashboard.md#configure) |
+| **Run monitor:** progress, workers, topology | **Configuration studio:** edit the swarm file visually |
 
 ### ⚖️ Adjudicator (opt-in)
 
@@ -157,6 +166,8 @@ graph, a memory editor with a memory graph, and a docs manager.
 | **History graph:** branches to files and memories | **Memory graph:** what each memory is about |
 | [<img alt="History: commits classified by kind, with the branch graph" src="docs/images/dashboard-history-dark.webp" width="430">](docs/dashboard.md#history) | [<img alt="Hotspots: fan-in, churn and complexity per file" src="docs/images/dashboard-hotspots-dark.webp" width="430">](docs/dashboard.md#architecture) |
 | **History:** classified commits and fix tracing | **Hotspots:** where change is risky |
+| [<img alt="Swarm run: progress rings, task and worker counts, and the live topology of a run" src="docs/images/dashboard-swarm-light.webp" width="430">](docs/dashboard.md#swarms) | [<img alt="Swarm configuration studio: the role drawer with model, effort and isolation" src="docs/images/dashboard-swarm-config-role-dark.webp" width="430">](docs/dashboard.md#configure) |
+| **Swarm run:** live monitor (light theme) | **Role drawer:** model policy, effort, isolation |
 
 ## What Claude sees
 
@@ -271,6 +282,13 @@ Your code, tool output and memories stay on your machine. eminiar uses the netwo
   prompt and task text to that provider ([what is sent](docs/adjudicator.md#providers-and-privacy)).
 
 The dashboard listens on `127.0.0.1` only.
+
+## About
+
+eminiar is for people who use Claude Code or Cursor on a real codebase and want it to remember
+decisions, see the structure of the code and stop filling its context with raw output. It is
+local-first: one SQLite database per project, no cloud service, and the dashboard listens on
+`127.0.0.1` only. It is open source under the MIT license, written by Ryan Dick.
 
 ## License
 

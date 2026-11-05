@@ -6,13 +6,31 @@
  * only the tasks changed since the client's last snapshot, so a big run stays cheap to poll.
  * Spec: docs/design/agent-swarms.md ("Dashboard: Swarms tab").
  */
-import { mkdirSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { z } from "zod";
+import { TIERS } from "../adjudicator/types.js";
 import type { ProjectContext } from "../context.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import { getStorage } from "../storage/index.js";
 import { planAgentSync, type SyncActionKind, syncAgents } from "../swarm/agents.js";
-import { activeSwarmConfig, loadSwarmConfig, STARTER_YAML, swarmFile } from "../swarm/config.js";
+import {
+  AGENT_COLORS,
+  activeSwarmConfig,
+  DEFAULT_CONTEXT,
+  loadSwarmConfig,
+  STARTER_YAML,
+  swarmFile,
+} from "../swarm/config.js";
+import type { SwarmDoc, SwarmDocActiveRun, SwarmDocRename } from "../swarm/doc-types.js";
+import {
+  checkSwarmText,
+  docWarnings,
+  hashText,
+  lineDiff,
+  readSwarmDoc,
+  renderSwarmDoc,
+  SWARM_FILE_MAX_CHARS,
+  starterDoc,
+} from "../swarm/edit.js";
 import {
   type Caller,
   COORDINATOR,
@@ -26,6 +44,13 @@ import {
   toolIo,
   workerStatus,
 } from "../swarm/runtime.js";
+import {
+  SwarmSaveConflict,
+  SwarmSaveInvalid,
+  SwarmSaveRefused,
+  saveSwarmFile,
+} from "../swarm/save.js";
+import { SWARM_TEMPLATES } from "../swarm/templates.js";
 import type {
   ConfigIssue,
   RunRow,
@@ -36,6 +61,7 @@ import type {
   TaskStatus,
   WorkerStatus,
 } from "../swarm/types.js";
+import { TOPOLOGIES } from "../swarm/types.js";
 
 /** Run ids are `YYYYMMDD-<6 hex>` (runtime.newRunId). */
 export const RUN_ID_RE = /^\d{8}-[0-9a-f]{6}$/;
@@ -446,19 +472,20 @@ function runFromId(ctx: ProjectContext, id: unknown): { run?: RunRow; error?: Re
 }
 
 function initSwarm(ctx: ProjectContext): Reply {
-  const where = swarmFile(ctx.root);
-  if (where.exists) return fail(409, `${where.rel} already exists; edit it instead`);
-  mkdirSync(dirname(where.file), { recursive: true });
+  let rel: string;
   try {
-    // wx: never overwrite a file created between the check and the write.
-    writeFileSync(where.file, STARTER_YAML, { flag: "wx" });
+    // Same containment checks as the studio save (symlinked folder, hard link, ...).
+    // A null base hash means create: an existing file is a conflict, never overwritten.
+    rel = saveSwarmFile(ctx.root, STARTER_YAML, null).rel;
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "EEXIST")
-      return fail(409, `${where.rel} already exists; edit it instead`);
+    if (err instanceof SwarmSaveRefused) return fail(403, err.reason);
+    if (err instanceof SwarmSaveConflict)
+      return fail(409, `${swarmFile(ctx.root).rel} already exists; edit it instead`);
+    if (err instanceof SwarmSaveInvalid) return fail(400, err.message, { issues: err.issues });
     throw err;
   }
   const config = activeSwarmConfig(ctx.root);
-  return ok({ created: where.rel, sync: syncAgents(ctx.root, config) });
+  return ok({ created: rel, sync: syncAgents(ctx.root, config) });
 }
 
 function syncSwarm(ctx: ProjectContext): Reply {
@@ -517,6 +544,236 @@ function releaseSwarmWorker(ctx: ProjectContext, body: Record<string, unknown>):
     if (err instanceof SwarmError) return fail(409, err.message);
     throw err;
   }
+}
+
+// --- config studio (GET /api/swarm/config, /templates; POST /config/validate, /config/save) ---
+
+const CfgName = z.string().min(1).max(64);
+const ConfigBody = z
+  .strictObject({
+    doc: z.record(z.string(), z.unknown()).optional(),
+    text: z.string().max(SWARM_FILE_MAX_CHARS).optional(),
+    renames: z
+      .array(z.strictObject({ swarm: CfgName, role: CfgName.optional(), to: CfgName }))
+      .max(50)
+      .optional(),
+    baseHash: z
+      .string()
+      .regex(/^[0-9a-f]{64}$/)
+      .nullable(),
+    sync: z.boolean().optional(),
+  })
+  .refine((b) => (b.doc === undefined) !== (b.text === undefined), {
+    message: "send exactly one of doc or text",
+  });
+
+const CONFIG_LIMITS = {
+  name: 32,
+  agentName: 64,
+  description: 500,
+  prompt: 20_000,
+  maxAgents: 16,
+  count: 8,
+  maxTurns: 500,
+  memories: 10,
+  docs: 10,
+  maxChars: [500, 9000],
+  fileChars: SWARM_FILE_MAX_CHARS,
+};
+
+function configMeta() {
+  return {
+    models: ["inherit", "haiku", "sonnet", "opus", "fable", "opusplan"],
+    tiers: [...TIERS],
+    colors: [...AGENT_COLORS],
+    topologies: [...TOPOLOGIES],
+    efforts: ["low", "medium", "high", "xhigh", "max"],
+    defaultContext: DEFAULT_CONTEXT,
+    limits: CONFIG_LIMITS,
+  };
+}
+
+function activeRunsOf(ctx: ProjectContext): SwarmDocActiveRun[] {
+  try {
+    return getStorage(ctx)
+      .swarm.runs({ status: "active", limit: RUNS_LIMIT_MAX })
+      .map((r) => ({ id: r.id, swarm: r.swarm, goal: r.goal }));
+  } catch {
+    return [];
+  }
+}
+
+export function swarmConfigDoc(ctx: ProjectContext) {
+  const read = readSwarmDoc(ctx.root);
+  const activeRuns = activeRunsOf(ctx);
+  return {
+    state: read.state,
+    file: read.rel,
+    text: read.text,
+    hash: read.hash,
+    doc: read.doc,
+    issues: read.issues,
+    warnings: read.doc ? docWarnings(read.doc, activeRuns, read.doc) : [],
+    locked: read.locked,
+    starter: read.state === "absent" ? starterDoc() : undefined,
+    activeRuns,
+    meta: configMeta(),
+  };
+}
+
+export function swarmTemplates() {
+  return {
+    templates: SWARM_TEMPLATES.map((t) => ({
+      id: t.id,
+      name: t.name,
+      description: t.description,
+      useWhen: t.useWhen,
+      topology: t.swarm.topology ?? "hierarchical",
+      roles: Object.entries(t.swarm.agents).map(([role, r]) => ({
+        role,
+        model: r.model ?? "inherit",
+        count: r.count ?? 1,
+      })),
+      swarm: t.swarm,
+    })),
+  };
+}
+
+interface Prepared {
+  text: string;
+  hash: string;
+  issues: ConfigIssue[];
+  warnings: ReturnType<typeof docWarnings>;
+  changed: number[];
+  removed: number;
+  locked: string[];
+  baseText: string | null;
+  noop: boolean;
+}
+
+/** Render or check the body against the file as it is now. A Reply is a refusal. */
+async function prepareConfig(
+  ctx: ProjectContext,
+  body: Record<string, unknown>,
+): Promise<{ reply: Reply } | { p: Prepared; parsed: z.infer<typeof ConfigBody> }> {
+  const parsedBody = ConfigBody.safeParse(body);
+  if (!parsedBody.success)
+    return {
+      reply: fail(400, parsedBody.error.issues[0]?.message ?? "invalid body", {
+        issues: parsedBody.error.issues.map((i) => ({
+          path: i.path.join("."),
+          message: i.message,
+        })),
+      }),
+    };
+  const b = parsedBody.data;
+  const read = readSwarmDoc(ctx.root);
+  if (read.state === "invalid" && read.text === null && read.issues.length > 0)
+    return { reply: fail(500, read.issues[0]?.message ?? `cannot read ${read.rel}`) };
+  if (read.hash !== b.baseHash)
+    return {
+      reply: fail(
+        409,
+        read.hash === null
+          ? "the swarm file was removed since it was loaded"
+          : b.baseHash === null
+            ? "a swarm file already exists"
+            : "the swarm file changed since it was loaded",
+        { current: read.hash === null ? null : { text: read.text, hash: read.hash } },
+      ),
+    };
+  const meta = { file: read.file, rel: read.rel };
+  let text: string;
+  let issues: ConfigIssue[] = [];
+  let draft: SwarmDoc | null = null;
+  if (b.doc !== undefined) {
+    draft = b.doc as unknown as SwarmDoc;
+    const r = renderSwarmDoc(read.text, draft, (b.renames ?? []) as SwarmDocRename[], meta);
+    if (!r.ok) return { reply: fail(422, r.error, { locked: r.locked ?? read.locked }) };
+    text = r.text;
+    if (r.result.state === "invalid") issues = r.result.issues;
+  } else {
+    text = b.text as string;
+    const { result, enforceOk } = checkSwarmText(text, meta);
+    if (result.state === "invalid") issues = result.issues;
+    if (!enforceOk)
+      issues = [
+        ...issues,
+        {
+          path: "enforce",
+          message: "the `enforce:` line must be a plain top-level `enforce: true|false`",
+        },
+      ];
+    try {
+      const Y = await import("yaml");
+      draft = Y.parse(text, { merge: true, maxAliasCount: 200 }) as SwarmDoc;
+    } catch {
+      draft = null;
+    }
+  }
+  const diff = lineDiff(read.text ?? "", text);
+  const warnings =
+    draft && typeof draft === "object" ? docWarnings(draft, activeRunsOf(ctx), read.doc) : [];
+  return {
+    parsed: b,
+    p: {
+      text,
+      // A no-op save keeps the on-disk hash (the text round-trip differs for invalid UTF-8).
+      hash: read.text === text && read.hash ? read.hash : hashText(text),
+      issues,
+      warnings,
+      changed: diff.changed,
+      removed: diff.removed,
+      locked: read.locked,
+      baseText: read.text,
+      noop: read.text === text,
+    },
+  };
+}
+
+async function validateConfig(ctx: ProjectContext, body: Record<string, unknown>): Promise<Reply> {
+  const r = await prepareConfig(ctx, body);
+  if ("reply" in r) return r.reply;
+  const { p } = r;
+  return ok({
+    ok: p.issues.length === 0,
+    text: p.text,
+    hash: p.hash,
+    issues: p.issues,
+    warnings: p.warnings,
+    changed: p.changed,
+    removed: p.removed,
+    locked: p.locked,
+  });
+}
+
+async function saveConfig(ctx: ProjectContext, body: Record<string, unknown>): Promise<Reply> {
+  const r = await prepareConfig(ctx, body);
+  if ("reply" in r) return r.reply;
+  const { p, parsed } = r;
+  if (p.issues.length) return fail(400, "the swarm file is not valid", { issues: p.issues });
+  let created = false;
+  if (!p.noop) {
+    try {
+      // The target is always the project's own swarm file; the client never names a path.
+      created = saveSwarmFile(ctx.root, p.text, parsed.baseHash).created;
+    } catch (err) {
+      if (err instanceof SwarmSaveRefused) return fail(403, err.reason);
+      if (err instanceof SwarmSaveConflict) return fail(409, err.message, { current: err.current });
+      if (err instanceof SwarmSaveInvalid) return fail(400, err.message, { issues: err.issues });
+      throw err;
+    }
+  }
+  const sync = parsed.sync ? syncAgents(ctx.root, activeSwarmConfig(ctx.root)) : null;
+  return ok({
+    saved: !p.noop,
+    created,
+    changed: p.changed,
+    hash: p.hash,
+    text: p.text,
+    warnings: p.warnings,
+    sync,
+  });
 }
 
 /**
@@ -583,6 +840,24 @@ export async function swarmRoute(
       more: events.length === EVENTS_PAGE,
       now: Date.now(),
     });
+  }
+  if (path === "/api/swarm/config") {
+    if (!isGet) return fail(405, "GET only");
+    return ok(swarmConfigDoc(ctx));
+  }
+  if (path === "/api/swarm/templates") {
+    if (!isGet) return fail(405, "GET only");
+    return ok(swarmTemplates());
+  }
+  if (path === "/api/swarm/config/validate" || path === "/api/swarm/config/save") {
+    if (method !== "POST") return fail(405, "POST only");
+    let cfgBody: Record<string, unknown>;
+    try {
+      cfgBody = await readBody();
+    } catch {
+      return fail(400, "invalid JSON body");
+    }
+    return path.endsWith("/validate") ? validateConfig(ctx, cfgBody) : saveConfig(ctx, cfgBody);
   }
   if (path === "/api/swarm/init") {
     if (method !== "POST") return fail(405, "POST only");

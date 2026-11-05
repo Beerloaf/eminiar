@@ -1,6 +1,13 @@
 /** Fetch wrapper for the dashboard API: every call carries the selected project root. */
 import type { DocCategory } from "../../docs/category.js";
 import type {
+  SwarmDoc,
+  SwarmDocActiveRun,
+  SwarmDocRename,
+  SwarmDocSwarm,
+  SwarmDocWarning,
+} from "../../swarm/doc-types.js";
+import type {
   NoteRow,
   RunRow,
   RunStatus,
@@ -21,7 +28,8 @@ export function setRoot(r: string): void {
   root = r;
   const u = new URL(location.href);
   u.searchParams.set("root", r);
-  history.replaceState(null, "", u.toString());
+  // Keep history.state: the router stamps each entry's position there for the leave guard.
+  history.replaceState(history.state, "", u.toString());
 }
 
 export type Params = Record<string, string | number | boolean | undefined | null>;
@@ -40,6 +48,8 @@ export class ApiError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    /** The parsed JSON error body (409 carries `current`, 400 `issues`, 422 `locked`). */
+    readonly body?: unknown,
   ) {
     super(message);
   }
@@ -56,7 +66,7 @@ export async function api<T>(path: string, params?: Params, init?: RequestInit):
       `${path} is not available on the running server; restart \`eminiar ui\` to pick up the rebuilt bundle`,
       r.status,
     );
-  if (!r.ok) throw new ApiError(body.error ?? `HTTP ${r.status}`, r.status);
+  if (!r.ok) throw new ApiError(body.error ?? `HTTP ${r.status}`, r.status, body);
   if (body && typeof body === "object" && "error" in body && body.error)
     throw new ApiError(String(body.error), r.status);
   return body;
@@ -1101,3 +1111,76 @@ export const fetchJevExchanges = (limit?: number, row?: number): Promise<AdjExch
 /** GET /api/adjudicator/jev/exchange: one stored request with its request and response bodies. */
 export const fetchJevExchange = (id: number): Promise<AdjExchangeResponse> =>
   api<AdjExchangeResponse>("/api/adjudicator/jev/exchange", { id });
+
+// --- swarm config studio (GET /api/swarm/config, POST /api/swarm/config/{validate,save}) ----
+
+export type { SwarmDoc, SwarmDocActiveRun, SwarmDocRename, SwarmDocSwarm, SwarmDocWarning };
+export interface SwarmConfigMeta {
+  models: string[];
+  tiers: string[];
+  colors: string[];
+  topologies: string[];
+  efforts: string[];
+  defaultContext: Record<string, unknown>;
+  limits: Record<string, number | number[]>;
+}
+export interface SwarmConfigDoc {
+  state: "absent" | "ok" | "invalid";
+  file: string;
+  text: string | null;
+  hash: string | null;
+  doc: SwarmDoc | null;
+  issues: SwarmIssue[];
+  warnings: SwarmDocWarning[];
+  locked: string[];
+  starter?: SwarmDoc;
+  activeRuns: SwarmDocActiveRun[];
+  meta: SwarmConfigMeta;
+}
+export interface SwarmConfigDraft {
+  /** Exactly one of `doc` (structured) or `text` (raw YAML). */
+  doc?: SwarmDoc;
+  text?: string;
+  renames?: SwarmDocRename[];
+  /** Hash of the file the draft was based on; null creates the file. */
+  baseHash: string | null;
+  sync?: boolean;
+}
+export interface SwarmConfigValidation {
+  ok: boolean;
+  text: string;
+  hash: string;
+  issues: SwarmIssue[];
+  warnings: SwarmDocWarning[];
+  /** 1-based lines of `text` that differ from the file on disk. */
+  changed: number[];
+  removed: number;
+  locked: string[];
+}
+export interface SwarmConfigSaved {
+  saved: boolean;
+  created: boolean;
+  changed: number[];
+  hash: string;
+  text: string;
+  warnings: SwarmDocWarning[];
+  sync: SwarmSyncResult | null;
+}
+export interface SwarmTemplateUi {
+  id: string;
+  name: string;
+  description: string;
+  useWhen: string;
+  topology: Topology;
+  roles: Array<{ role: string; model: string; count: number }>;
+  swarm: SwarmDocSwarm;
+}
+
+export const fetchSwarmConfig = (): Promise<SwarmConfigDoc> =>
+  api<SwarmConfigDoc>("/api/swarm/config");
+export const fetchSwarmTemplates = (): Promise<{ templates: SwarmTemplateUi[] }> =>
+  api<{ templates: SwarmTemplateUi[] }>("/api/swarm/templates");
+export const validateSwarmConfig = (draft: SwarmConfigDraft): Promise<SwarmConfigValidation> =>
+  post<SwarmConfigValidation>("/api/swarm/config/validate", draft);
+export const saveSwarmConfig = (draft: SwarmConfigDraft): Promise<SwarmConfigSaved> =>
+  post<SwarmConfigSaved>("/api/swarm/config/save", draft);

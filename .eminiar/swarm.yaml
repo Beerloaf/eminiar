@@ -7,6 +7,7 @@ sync: auto            # regenerate the agent files at session start when this fi
 
 defaults:
   model: sonnet
+  model_range: { floor: haiku, ceiling: opus }   # every role picks its own size per task; reviewers pin opus below
   context:            # what eminiar tells each worker when it starts
     memories: 5       # project memories matching the role and task
     docs: 2           # documentation pages matching the task
@@ -43,8 +44,6 @@ swarms:
       researcher:
         description: Investigates external options (providers, local model runtimes, APIs, latency/cost) and reports findings with sources.
         model: sonnet
-        model_range: { floor: haiku }    # sonnet fallback; adjudicator may drop to haiku
-        effort: high
         color: cyan
         disallowed_tools: [Edit, Write, NotebookEdit]
         context:
@@ -63,7 +62,6 @@ swarms:
       architect:
         description: Designs the change from the code graph, history, past decisions and the research notes.
         model: opus
-        effort: high
         color: purple
         disallowed_tools: [Edit, Write, NotebookEdit]
         memory_tags: [decision, constraint]
@@ -78,8 +76,6 @@ swarms:
       coder:
         description: Implements one backend/CLI/hook task at a time with the smallest diff that works.
         model: opus
-        model_range: { floor: sonnet }   # opus fallback; adjudicator may drop to sonnet
-        effort: high
         count: 4                 # at most four coders at once
         color: blue
         scope: ["src/**", "bin/**", "scripts/**", "hooks/**", "skills/**", "docs/**"]
@@ -101,8 +97,6 @@ swarms:
       ui:
         description: Builds dashboard views and their API endpoints (Preact web app under src/ui).
         model: opus
-        model_range: { floor: sonnet }   # opus fallback; adjudicator may drop to sonnet
-        effort: high
         color: green
         scope: ["src/ui/**", "docs/dashboard.md"]
         hooks:
@@ -121,8 +115,6 @@ swarms:
       tester:
         description: Writes and runs tests that pin the new behaviour, its edge cases and failure paths.
         model: sonnet
-        model_range: { floor: haiku }    # sonnet fallback; adjudicator may drop to haiku
-        effort: high
         count: 2
         color: yellow
         scope: ["tests/**"]
@@ -135,6 +127,7 @@ swarms:
       reviewer:
         description: Adversarial reviewer that tries to break the change before it ships.
         model: opus
+        model_range: {}          # pinned: reviewers always run on opus
         effort: xhigh
         count: 2
         color: red
@@ -154,14 +147,20 @@ swarms:
     max_agents: 3
     agents:
       correctness:
+        model: opus
+        model_range: {}    # pinned: reviewers always run on opus
         description: Hunts for logic errors and unhandled edge cases.
         disallowed_tools: [Edit, Write, NotebookEdit]
         prompt: Find bugs, each with a concrete failing input. Post each under the key "finding-<n>".
       security:
+        model: opus
+        model_range: {}    # pinned: reviewers always run on opus
         description: Looks for injection, path traversal, leaked secrets and unsafe defaults.
         disallowed_tools: [Edit, Write, NotebookEdit]
         prompt: Report only exploitable issues, each with the input that triggers it.
       tests:
+        model: opus
+        model_range: {}    # pinned: reviewers always run on opus
         description: Checks that every changed behaviour has a test that would fail without it.
         disallowed_tools: [Edit, Write, NotebookEdit]
         prompt: List untested behaviour together with the test you would add.

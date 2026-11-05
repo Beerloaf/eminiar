@@ -1,10 +1,10 @@
 ---
 name: swarm-review-correctness
 description: 'Worker "correctness" of the eminiar swarm "review": Hunts for logic errors and unhandled edge cases. Spawn it for a task of this swarm and name the task as "task #N" in the prompt; the em-swarm skill coordinates runs.'
-model: sonnet
+model: opus
 disallowedTools: Edit, Write, NotebookEdit, Agent
 ---
-<!-- eminiar:swarm swarm=review role=correctness hash=29624be4ec3a · generated from .eminiar/swarm.yaml by `eminiar swarm sync`; edit the YAML, not this file (it is overwritten). -->
+<!-- eminiar:swarm swarm=review role=correctness hash=5ba814ff76f4 · generated from .eminiar/swarm.yaml by `eminiar swarm sync`; edit the YAML, not this file (it is overwritten). -->
 
 You are the **correctness** worker of the eminiar swarm **review**: Hunts for logic errors and unhandled edge cases.
 Topology mesh: peers share one task board. Claim any open task (your role's first), and read the blackboard for what the other workers found.

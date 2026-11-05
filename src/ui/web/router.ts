@@ -1,50 +1,67 @@
 import { useEffect, useState } from "preact/hooks";
+import { createRouteSync, parseHash, type Route, routeHash, type View } from "./route.js";
 
-export const VIEWS = [
-  "overview",
-  "usage",
-  "explore",
-  "galaxy",
-  "architecture",
-  "history",
-  "memory",
-  "docs",
-  "coverage",
-  "sessions",
-  "swarm",
-  "adjudicator",
-  "system",
-] as const;
-export type View = (typeof VIEWS)[number];
+export { parseHash, type Route, routeHash, SUBS, VIEWS, type View } from "./route.js";
 
-export interface Route {
-  view: View;
-  params: Record<string, string>;
+export function navigate(
+  to: View | `${View}/${string}`,
+  params: Record<string, string | undefined> = {},
+): void {
+  location.hash = routeHash(to, params);
 }
 
-/** `#/explore?file=src/x.ts` → { view: "explore", params: { file } }. */
-function parse(): Route {
-  const h = location.hash.replace(/^#\/?/, "");
-  const [v = "", qs = ""] = h.split("?");
-  const view = (VIEWS as readonly string[]).includes(v) ? (v as View) : "overview";
-  const params: Record<string, string> = {};
-  for (const [k, val] of new URLSearchParams(qs)) params[k] = val;
-  return { view, params };
+/** Asked before the route changes; false keeps the current page (the hash is put back). */
+type LeaveGuard = (to: Route) => boolean;
+let leaveGuard: LeaveGuard | null = null;
+
+/**
+ * Let a page with unsaved work veto leaving it (the Configuration Studio). The router asks the
+ * guard before it re-renders, so the page is still mounted when it decides. Returns the
+ * function that removes the guard.
+ */
+export function setLeaveGuard(guard: LeaveGuard): () => void {
+  leaveGuard = guard;
+  return () => {
+    if (leaveGuard === guard) leaveGuard = null;
+  };
 }
 
-export function navigate(view: View, params: Record<string, string | undefined> = {}): void {
-  const qs = new URLSearchParams();
-  for (const [k, v] of Object.entries(params)) if (v) qs.set(k, v);
-  const s = qs.toString();
-  location.hash = `/${view}${s ? `?${s}` : ""}`;
+/**
+ * Ask the guard about a change that is not a route change (switching project remounts the
+ * page). True when nothing guards, or the guard allows leaving.
+ */
+export function confirmLeave(): boolean {
+  return !leaveGuard || leaveGuard({ view: "overview", sub: null, params: {} });
 }
 
 export function useRoute(): Route {
-  const [route, setRoute] = useState<Route>(parse);
+  const [route, setRoute] = useState<Route>(() => parseHash(location.hash));
   useEffect(() => {
-    const on = () => setRoute(parse());
+    // The guard is asked synchronously in the event, before Preact re-renders, so the page
+    // is still mounted when it decides. popstate also covers a traversal to an entry whose
+    // query differs (?root=), for which Chrome fires no hashchange.
+    const sync = createRouteSync({
+      history,
+      hash: () => location.hash,
+      urlWithHash: (h) => {
+        const u = new URL(location.href);
+        u.hash = h;
+        return u.toString();
+      },
+      allow: (to) => !leaveGuard || leaveGuard(to),
+      show: setRoute,
+      setTimer: (fn, ms) => setTimeout(fn, ms),
+      clearTimer: (t) => clearTimeout(t as ReturnType<typeof setTimeout> | undefined),
+    });
+    sync.start();
+    const on = () => sync.onLocation();
+    window.addEventListener("popstate", on);
     window.addEventListener("hashchange", on);
-    return () => window.removeEventListener("hashchange", on);
+    return () => {
+      window.removeEventListener("popstate", on);
+      window.removeEventListener("hashchange", on);
+      sync.stop();
+    };
   }, []);
   return route;
 }

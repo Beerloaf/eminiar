@@ -254,6 +254,25 @@ Edit the YAML, not the generated files: the next sync overwrites them. Claude Co
 files when a session starts. If a new worker type is missing from the Agent tool, open
 `/agents` or restart the session.
 
+## Edit in the dashboard
+
+The dashboard's **Swarms → Configure** page (`#/swarm/config`) edits the swarm file with forms,
+templates, a topology picker and a live preview, and **Raw YAML** is always available. See the
+[dashboard docs](dashboard.md#configure) for the controls and the four config endpoints.
+
+- **Model policy.** A role is either pinned to one `model`, or given a `model_range` (floor and
+  ceiling) inside which the [adjudicator](adjudicator.md) picks a model per task, or it
+  inherits `defaults.model_range`.
+- **Locked paths.** YAML anchors and aliases, merge keys (`<<`), `x-*` keys and role `hooks`
+  are never rewritten by the form. Edit them in raw YAML mode.
+- **Write safety.** Saves go only to `.eminiar/swarm.yaml`, inside the project, and refuse
+  symlinks. A save carries the hash of the file it started from. If the file changed since, it
+  fails with 409 and nothing is overwritten. The write is atomic (temp file, then rename), and
+  the result must pass the same validation as the CLI.
+- **Comments.** The first structural save re-serialises the file. Comment text survives, but
+  trailing comments can be re-aligned or move onto their own line, and comments on items inside
+  a list that is replaced are lost. Editing a single scalar changes only that line.
+
 ## Topologies
 
 A topology is a rule about which worker may claim which task. In every topology a task can be

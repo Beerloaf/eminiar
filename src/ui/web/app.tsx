@@ -2,7 +2,8 @@ import type { JSX } from "preact";
 import { useEffect, useState } from "preact/hooks";
 import { api, getRoot, type Status, setRoot } from "./api.js";
 import { ToastHost, useAsync } from "./components.js";
-import { navigate, useRoute, type View } from "./router.js";
+import { rootSync } from "./route.js";
+import { confirmLeave, navigate, useRoute, type View } from "./router.js";
 import { ago, cls } from "./util.js";
 import { Adjudicator } from "./views/Adjudicator.js";
 import { Architecture } from "./views/Architecture.js";
@@ -68,6 +69,18 @@ export function App(): JSX.Element {
     setRoot(r);
     setRootState(r);
   };
+  // Back/Forward can land on an entry whose ?root= names another project than the one shown
+  // (the selector rewrites only the current entry). Once the router has accepted the move, make
+  // the screen match the URL. The router's guard already asked about a route change; if its
+  // page is gone by now, confirmLeave() finds no guard and does not ask twice. A move that stays
+  // on the same guarded page (only ?root= differs) is asked here, and a refusal puts the URL back.
+  useEffect(() => {
+    const step = rootSync(new URLSearchParams(location.search).get("root"), root, confirmLeave);
+    if (step.kind === "switch") {
+      changeRoot(step.root);
+      setTick((x) => x + 1);
+    } else if (step.kind === "restore") setRoot(step.root);
+  }, [route]);
   const projects = useAsync(
     () =>
       api<{ current: string; projects: Array<{ id: string; root: string | null }> }>(
@@ -140,7 +153,12 @@ export function App(): JSX.Element {
           title={root}
           value={root}
           onChange={(e) => {
-            changeRoot((e.target as HTMLSelectElement).value);
+            const el = e.target as HTMLSelectElement;
+            if (!confirmLeave()) {
+              el.value = root;
+              return;
+            }
+            changeRoot(el.value);
             setTick((x) => x + 1);
           }}
         >
@@ -160,7 +178,7 @@ export function App(): JSX.Element {
         {view === "docs" && <Docs params={route.params} />}
         {view === "coverage" && <Coverage />}
         {view === "sessions" && <Sessions />}
-        {view === "swarm" && <Swarm params={route.params} />}
+        {view === "swarm" && <Swarm params={route.params} sub={route.sub} />}
         {view === "adjudicator" && <Adjudicator params={route.params} />}
         {view === "system" && <System onChanged={() => setTick((x) => x + 1)} />}
       </main>
