@@ -765,3 +765,112 @@ describe("formatAdvice", () => {
     );
   });
 });
+
+describe("ui role is UI-only work (task #111, F6)", () => {
+  const role = (t: string) => score(t).role.choice;
+
+  it.each([
+    "make the sidebar collapsible",
+    "add a legend to the token usage chart",
+    "show the tier in the sidebar, the header and the footer",
+    "use a custom hook for the polling in the stats view",
+    "remember the selected dashboard tab in localStorage",
+  ])("keeps UI-only work with the ui role: %s", (t) => {
+    expect(extractFeatures(t).otherLayer, t).toBe(false);
+    expect(role(t), t).toBe("ui");
+  });
+
+  it.each([
+    "add an api endpoint for the dashboard stats",
+    "add OAuth PKCE login to the dashboard",
+    "wire the flag through the server, CLI and dashboard",
+    "add an --open flag to eminiar dashboard",
+    "pass the session id from the hook to the dashboard",
+    "change the scorer, the engine and the dashboard view to use the new tiers",
+  ])("sends cross-layer work to the coder: %s", (t) => {
+    expect(role(t), t).toBe("coder");
+    // The ui intent's own vote goes to the coder, so ui does not lead and is not a close second.
+    const s = score(t).role;
+    expect(s.entries.find((e) => e.option === "ui")?.score ?? 0, t).toBeLessThan(
+      s.entries.find((e) => e.option === "coder")?.score ?? 0,
+    );
+  });
+
+  it.each([
+    "add an api endpoint for the dashboard stats",
+    "wire the flag through the server, CLI and dashboard",
+    "add an --open flag to eminiar dashboard",
+    "pass the session id from the hook to the dashboard",
+    "change the scorer, the engine and the dashboard view to use the new tiers",
+  ])("flags another layer in the features: %s", (t) => {
+    expect(extractFeatures(t).otherLayer, t).toBe(true);
+  });
+
+  it("does not flag a debug log in the dashboard view as another layer", () => {
+    const t = "add a debug log in the dashboard view";
+    expect(extractFeatures(t).otherLayer).toBe(false);
+  });
+
+  // Review #98 F4: a plural UI noun after the last item names every item of the list.
+  it.each([
+    "add a chart to the sessions, memories and stats views",
+    "add a tooltip to the overview, usage and cost charts",
+    "add a badge to the runs, tasks and events tabs",
+  ])("reads a shared trailing UI noun as a list of UI places: %s", (t) => {
+    expect(extractFeatures(t).otherLayer, t).toBe(false);
+    expect(role(t), t).toBe("ui");
+  });
+
+  it.each([
+    "wire the flag through the server, CLI and dashboard",
+    "add a filter to the dashboard, the CLI and the api",
+    // A later item with its own article does not share the trailing noun.
+    "update the server, the CLI and the dashboard views to show the tier",
+  ])("keeps a list of areas cross-layer: %s", (t) => {
+    expect(extractFeatures(t).otherLayer, t).toBe(true);
+    expect(role(t), t).toBe("coder");
+  });
+
+  it("keeps broad work with its role: a cross-layer replacement is architect", () => {
+    expect(
+      role("replace the custom auth layer with OAuth across the server, CLI and dashboard"),
+    ).toBe("architect");
+  });
+
+  it("treats a hand-built Features without otherLayer as single-layer, without throwing", () => {
+    const f = extractFeatures("make the sidebar collapsible");
+    const { otherLayer: _drop, ...bare } = f as typeof f & { otherLayer?: boolean };
+    expect(() => scoreHeuristic(bare as typeof f)).not.toThrow();
+    expect(scoreHeuristic(bare as typeof f).role.choice).toBe("ui");
+    // Risk alone still makes it cross-layer when the extras are absent.
+    const risky = { ...bare, risk: 1 } as typeof f;
+    expect(scoreHeuristic(risky).role.choice).toBe("coder");
+  });
+
+  it("falls back to the coder when the catalogue has no ui role", () => {
+    const t = "add an api endpoint for the dashboard stats";
+    const s = scoreHeuristic(
+      extractFeatures(t),
+      {},
+      { roles: [{ name: "coder" }, { name: "tester" }] },
+    );
+    expect(s.role.choice).toBe("coder");
+    expect(s.role.entries.map((e) => e.option)).not.toContain("ui");
+  });
+});
+
+describe("debug intent: cause of failing X (task #111, F7)", () => {
+  it.each(["find the cause of failing builds on CI", "what is the root cause of failing deploys"])(
+    "reads the cause of failing things as debugging: %s",
+    (t) => {
+      expect(extractIntents(t).debug, t).toBeGreaterThan(0);
+    },
+  );
+
+  it.each(["show the list of failing tests", "rerun only the failing tests"])(
+    "keeps a plain selector of failing things out of debug: %s",
+    (t) => {
+      expect(extractIntents(t).debug ?? 0, t).toBe(0);
+    },
+  );
+});

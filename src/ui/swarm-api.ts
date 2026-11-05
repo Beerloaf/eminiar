@@ -113,6 +113,8 @@ function swarmView(
       description: r.description,
       // null: the role inherits the session's model / keeps every tool.
       model: r.model ?? null,
+      // null: a fixed pin; set, the dispatch may pick any tier in floor..ceiling.
+      range: r.range ?? null,
       count: r.count,
       tools: r.tools ?? null,
       disallowedTools: r.disallowedTools ?? null,

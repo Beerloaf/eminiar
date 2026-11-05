@@ -13,14 +13,16 @@
  * Claude Code 2.1.292, but it stays advice for the coordinator to pass), respect
  * CLAUDE_CODE_SUBAGENT_MODEL_FORCE, an explicit `model` and a frontmatter pin (managed, project,
  * user or plugin agent; one that cannot be read is not overridden) in advise mode as in apply
- * mode (the advice then names the pin, never a model to pass), skip the Cursor client, and never
- * throw (advice must not break a hook).
+ * mode (the advice then names the pin, never a model to pass), move a ranged swarm agent
+ * (swarm.yaml `model_range`) only inside its range, skip the Cursor client, and never throw
+ * (advice must not break a hook).
  */
 
 import { readdirSync, readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { AdjudicatorConfig } from "../config.js";
 import { getContext, type ProjectContext } from "../context.js";
+import { manifestPath, readManifestAt } from "../docs/manifest.js";
 import { hookLog } from "../hooks/log.js";
 import type { HookInput, HookOutput } from "../hooks/types.js";
 import type { StorageAdapter } from "../storage/adapter.js";
@@ -33,19 +35,33 @@ import { type AsyncJob, spawnAsyncJob } from "./async.js";
 import { resolveAdjudicator } from "./config.js";
 import { adjudicateOne, cacheKeyFor, type EngineOptions } from "./engine.js";
 import { subagentModelForced } from "./env.js";
-import { extractFeatures } from "./features.js";
+import { extractFeatures, type FeatureHints } from "./features.js";
 import { topIntent } from "./heuristic.js";
 import { biasFor, reconcile } from "./learn.js";
 import type { FetchLike } from "./providers/http.js";
 import {
+  ADVISED_PICK_FIELD,
+  FALLBACK_PIN_FIELD,
   isPinned,
   type KeptModel,
+  RANGED_FLAG,
   resolveBaseline,
   tierOf,
   tierRank,
   withKeptModel,
 } from "./savings.js";
-import { dispatchRule, effortForced, keptModelOf, pinnedPart } from "./swarm.js";
+import {
+  appliedTier,
+  dispatchRule,
+  effortForced,
+  keptModelOf,
+  type PlanRange,
+  pinnedPart,
+  ROLE_NOTE_MIN,
+  rangedPart,
+  rangedPasses,
+  rangedTier,
+} from "./swarm.js";
 import {
   type AdjudicationAction,
   type AdjudicationRequest,
@@ -53,10 +69,10 @@ import {
   type AdjudicatorProvider,
   AGENT_EFFORT_SINCE,
   type Features,
-  TIERS,
   type Tier,
   type Verdict,
 } from "./types.js";
+import { briefUnitsOf } from "./units.js";
 
 /** The UserPromptSubmit advice line. */
 export const ADVICE_MAX = 220;
@@ -96,6 +112,23 @@ function log(line: string): void {
 /** Is this surface on for this hook call? Cursor never gets adjudicator output. */
 function active(cfg: AdjudicatorConfig, input: Pick<HookInput, "client">): boolean {
   return cfg.enabled && input.client !== "cursor";
+}
+
+/**
+ * The project's indexed documentation names (em_docs manifest: each source's name and its npm/
+ * pypi/go/crate package), lower case, for the features' `libraries` hint: a kebab-case name is a
+ * package only when listed (review #98 F3). Undefined when nothing is registered, so the lexical
+ * rule stands. One small sync read (routing.ts reads the same file on preToolUse), only for a
+ * request that gets scored; a hook process handles one event, so there is nothing to cache.
+ */
+function docsLibraries(ctx: ProjectContext): string[] | undefined {
+  const names = new Set<string>();
+  for (const src of readManifestAt(manifestPath(ctx)).sources) {
+    names.add(src.name.toLowerCase());
+    const pkg = /^(?:npm|pypi|go|crates?):(.+)$/.exec(String(src.provider ?? ""))?.[1];
+    if (pkg) names.add(pkg.toLowerCase());
+  }
+  return names.size ? [...names] : undefined;
 }
 
 function engineOptions(db: StorageAdapter, cfg: AdjudicatorConfig, deps: HookDeps): EngineOptions {
@@ -144,7 +177,48 @@ export function adviceLine(v: Verdict, f: Features): string {
 }
 
 /**
+ * The opening tags of turns Claude Code sends through UserPromptSubmit that the user did not
+ * type: a subagent's hand-back (`<agent-message from="…">`), a background task's notification
+ * (`<task-notification>`), a CI monitor's event (`<ci-monitor-event>`) and harness context
+ * (`<system-reminder>`, `<system-reminder id="…">`).
+ */
+const HARNESS_ENVELOPE =
+  /^\s*<(?:agent-message|task-notification|ci-monitor-event|system-reminder)[\s>]/;
+
+/** One closed `<system-reminder …>…</system-reminder>` block at the start (after whitespace). */
+const LEADING_REMINDER = /^\s*<system-reminder(?:\s[^>]*)?>[\s\S]*?<\/system-reminder>/;
+
+/**
+ * The prompt without its leading closed system-reminder blocks, trimmed. Claude Code can put
+ * harness context ahead of the typed text (a worktree note, for example); the rest is the user's.
+ */
+export function stripLeadingReminders(text: string): string {
+  let rest = text;
+  for (let m = LEADING_REMINDER.exec(rest); m; m = LEADING_REMINDER.exec(rest)) {
+    rest = rest.slice(m[0].length);
+  }
+  return rest.trim();
+}
+
+/**
+ * Is this prompt a harness envelope rather than the user's words? Only the start counts: after
+ * leading whitespace, `<agent-message`, `<task-notification`, `<ci-monitor-event` or
+ * `<system-reminder` followed by
+ * `>` or whitespace. Closed system-reminder blocks are stripped first: text after them is the
+ * user's, and only nothing left (or another envelope, or an unclosed reminder) is an envelope.
+ * A prompt that mentions one of these tags later on is the user's, and anything that is not a
+ * string is not an envelope (when unsure, the prompt is scored).
+ */
+export function isHarnessEnvelope(text: unknown): boolean {
+  if (typeof text !== "string" || !HARNESS_ENVELOPE.test(text)) return false;
+  const rest = stripLeadingReminders(text);
+  return rest === "" || HARNESS_ENVELOPE.test(rest);
+}
+
+/**
  * Score the prompt: skipped below minPromptChars, for slash commands and chat-only input.
+ * A harness envelope (isHarnessEnvelope) is not a prompt at all: no row, no advice, no
+ * cooldown tick, and the previous prompt keeps its tool hint.
  * promptMode heuristic → no provider; async → a detached job; blocking → inline within promptMs.
  */
 export async function onPrompt(
@@ -157,7 +231,12 @@ export async function onPrompt(
   try {
     const cfg = ctx.config.adjudicator;
     if (!active(cfg, input) || !cfg.surfaces.prompt) return undefined;
-    const text = (input.prompt ?? "").trim();
+    const raw = (input.prompt ?? "").trim();
+    // A subagent's hand-back or a task notification arrives while the user's prompt is still
+    // being worked on: leave that prompt's row, hint and cooldown as they are.
+    if (isHarnessEnvelope(raw)) return undefined;
+    // Harness context ahead of typed text: score the typed text.
+    const text = stripLeadingReminders(raw);
     if (text.length < cfg.minPromptChars || text.startsWith("/") || extractFeatures(text).chat) {
       // A skipped prompt still ends the previous prompt's tool hint.
       if (cfg.surfaces.tools) closeToolHint(db, sessionId);
@@ -171,7 +250,13 @@ export async function onPrompt(
       opts.projectRoot = ctx.root;
     }
     if (sessionId && sessionId !== "unknown") opts.row = { sessionId };
-    const a = await adjudicateOne({ key: "prompt", surface: "prompt", text }, opts);
+    const req: AdjudicationRequest = { key: "prompt", surface: "prompt", text };
+    const libraries = docsLibraries(ctx);
+    if (libraries) {
+      const hints: FeatureHints = { libraries };
+      req.hints = hints;
+    }
+    const a = await adjudicateOne(req, opts);
     const out: PromptAdvice = { context: adviceLine(a.verdict, a.features) };
     const main = mainSessionAdvice(db, cfg, sessionId, a.verdict, (deps.now ?? Date.now)());
     if (main) {
@@ -209,7 +294,8 @@ function mainSessionAdvice(
   st.n = (Number(st.n) || 0) + 1;
   let line: string | undefined;
   if (st.last === undefined || st.n - st.last >= cfg.advice.cooldownPrompts) {
-    const base = resolveBaseline(db, { sessionId, ts: now });
+    // The main session's own model: CLAUDE_CODE_SUBAGENT_MODEL is a subagent baseline only.
+    const base = resolveBaseline(db, { sessionId, ts: now, env: {} });
     const current = base.source === "session" ? tierOf(base.model) : undefined;
     const advice = v.tier.choice;
     if (current && tierRank(advice) >= 0 && tierRank(current) - tierRank(advice) >= 2) {
@@ -299,13 +385,12 @@ export interface AgentAdvice {
   rowId?: number;
 }
 
-/** The tier within [floor, ceiling] on the haiku < sonnet < opus < fable ladder. */
+/**
+ * The tier within [floor, ceiling] on the haiku < sonnet < opus < fable ladder. Same rule as
+ * swarm.ts appliedTier, which plan lines use, so the plan line and the Agent note agree.
+ */
 export function clampTier(tier: string, floor: Tier, ceiling: Tier): Tier | undefined {
-  const r = tierRank(tier);
-  if (r < 0) return undefined;
-  const lo = tierRank(floor);
-  const hi = Math.max(lo, tierRank(ceiling));
-  return TIERS[Math.min(hi, Math.max(lo, r))];
+  return appliedTier(tier, floor, ceiling);
 }
 
 /**
@@ -317,15 +402,31 @@ function withPin(
   rowId: number,
   pin: AgentPin,
   kept: KeptModel | undefined,
+  extra: Record<string, unknown> = {},
 ): { scores?: string } {
   try {
     // The KeptModel flag (pinDeferred / forced / fork): the advice named no model, so reconcile
     // neither detects a follow nor credits savings for the row (savings.ts).
-    const scores = withKeptModel(db.adjudicator.get(rowId)?.scores, kept, { pin });
+    const scores = withKeptModel(db.adjudicator.get(rowId)?.scores, kept, { pin, ...extra });
     return scores === undefined ? {} : { scores };
   } catch {
     return {};
   }
+}
+
+/**
+ * The role-table confidence a stored row was scored with: its scores JSON `role` table (the one
+ * its role came from), else the brief's heuristic role confidence (units.ts).
+ */
+function storedRoleConfidence(scores: string | null | undefined): number | undefined {
+  if (!scores) return undefined;
+  try {
+    const c = (JSON.parse(scores) as { role?: { confidence?: unknown } } | null)?.role?.confidence;
+    if (typeof c === "number" && Number.isFinite(c)) return c;
+  } catch {
+    return undefined;
+  }
+  return briefUnitsOf(scores)?.roleConfidence;
 }
 
 /** The swarm task of a worker dispatch: this project's ledger, else the coordination root's. */
@@ -400,27 +501,49 @@ export async function onPreAgent(
   const pinUnknown = cfg.apply.respectFrontmatter && pin.status === "unknown";
   const isForced = subagentModelForced(env);
   const fork = isFork(agentType);
+  const effortSet = !!str(ti.effort) || effortForced(env);
+  // A ranged swarm agent (swarm.yaml model_range) runs on its fallback pin unless the adjudicator
+  // picks another tier inside its range. A fork and FORCE come first, as in dispatchRule.
+  const ranged: PlanRange | undefined =
+    cfg.apply.respectFrontmatter &&
+    !fork &&
+    !isForced &&
+    pin.status === "ranged" &&
+    pin.range &&
+    isPinned(pin.model)
+      ? { floor: pin.range.floor, ceiling: pin.range.ceiling, fallback: pin.model }
+      : undefined;
   // One rule table for plan advice, the plan's Next line and this note (swarm.ts dispatchRule).
-  const rule = dispatchRule({
-    fork,
-    forced: isForced,
-    pin: pinnedRespected || pinUnknown,
-    effortSet: !!str(ti.effort) || effortForced(env),
-  });
+  // Before the verdict a ranged agent may move; whether its pick does is settled below.
+  const facts = { fork, forced: isForced, pin: pinnedRespected || pinUnknown, effortSet };
+  const before = dispatchRule({ ...facts, ranged: !!ranged });
   const applyMode = cfg.mode === "apply";
   const inScope = cfg.apply.scope === "all" || !!worker;
-  const mayApply = applyMode && inScope && rule.model === "pass" && !explicit;
+  const mayApply =
+    applyMode && inScope && (before.model === "pass" || before.model === "ranged") && !explicit;
   const sessionId =
     input.session_id && input.session_id !== "unknown" ? input.session_id : undefined;
   // Without the adjudicator: FORCE runs CLAUDE_CODE_SUBAGENT_MODEL (else the main session's model)
-  // and ignores pins; a fork runs on the main session's model.
+  // and ignores pins; a fork runs on the main session's model; a ranged agent runs on its
+  // fallback; an agent without a `model` line runs on CLAUDE_CODE_SUBAGENT_MODEL when it is set
+  // (`model: inherit` outranks it). FORCE is settled here, so only that variable is passed on.
+  const subagentEnv =
+    before.model === "fork" || before.model === "forced" || pin.inherit
+      ? {}
+      : { CLAUDE_CODE_SUBAGENT_MODEL: env.CLAUDE_CODE_SUBAGENT_MODEL };
+  // A ranged agent whose range is not respected (apply.respectFrontmatter off) still runs its
+  // `model:` line without the adjudicator, so that pin is its baseline, as for a plain pin. Only
+  // the baseline widens: `pinned` stays plain so a respected range never takes the pin branch.
+  const baselinePin = pin.status === "ranged" ? pin.model : pinned;
   const baseline = resolveBaseline(db, {
     pinned:
-      rule.model === "fork"
+      before.model === "fork"
         ? undefined
-        : rule.model === "forced"
+        : before.model === "forced"
           ? str(env.CLAUDE_CODE_SUBAGENT_MODEL)
-          : pinned,
+          : baselinePin,
+    fallbackPin: ranged?.fallback,
+    env: subagentEnv,
     sessionId,
     ts: now,
   });
@@ -446,10 +569,15 @@ export async function onPreAgent(
   opts.call = mayApply && !plan ? "inline" : "never";
   opts.row = row;
   const req: AdjudicationRequest = { key: "agent", surface: "agent", text };
+  const hints: FeatureHints = {};
   if (task) {
-    req.hints = { files: task.files.length, deps: task.deps.length };
-    if (task.role) req.hints.role = task.role;
+    hints.files = task.files.length;
+    hints.deps = task.deps.length;
+    if (task.role) hints.role = task.role;
   }
+  const libraries = docsLibraries(ctx);
+  if (libraries) hints.libraries = libraries;
+  if (Object.keys(hints).length) req.hints = hints;
   const a = await adjudicateOne(req, opts);
   const v = a.verdict;
   const tier = plan?.tier ?? v.tier.choice;
@@ -458,6 +586,21 @@ export async function onPreAgent(
   const effort = plan?.effort ?? v.effort;
   const role = plan?.role ?? v.role.choice;
   const clamped = clampTier(tier, cfg.apply.floor, cfg.apply.ceiling);
+  // The plan row's brief scoring when there is one (its verdict is the decision), else this one's;
+  // a row without `units` counts as not saturated (units.ts).
+  const units = plan ? briefUnitsOf(plan.scores) : a.units;
+  const saturated = !!units?.saturated;
+  const roleConf = (plan ? storedRoleConfidence(plan.scores) : undefined) ?? v.role.confidence;
+  // A ranged agent's pick inside its range ∩ apply.floor..ceiling; it moves the model only when
+  // it is not the fallback's tier (the bare tier would replace a pinned id or [1m] variant).
+  const pick = ranged ? rangedTier(tier, ranged, cfg.apply.floor, cfg.apply.ceiling) : undefined;
+  const moves = !!ranged && rangedPasses(pick, ranged.fallback);
+  const rule = dispatchRule({
+    ...facts,
+    ranged: moves,
+    pin: facts.pin || (!!ranged && !moves),
+    saturated,
+  });
 
   let action: AdjudicationAction;
   let model: Tier | undefined;
@@ -476,6 +619,17 @@ export async function onPreAgent(
     modelFinal = isForced
       ? (str(env.CLAUDE_CODE_SUBAGENT_MODEL) ?? null)
       : (explicit ?? (isPinned(pinned) ? pinned : null));
+  } else if (ranged) {
+    // Inside the range only; a pick that is the fallback's tier, or a low confidence, leaves the
+    // call alone and the agent runs on its fallback.
+    if (moves && pick && conf >= cfg.apply.minConfidence) {
+      action = "applied";
+      model = pick;
+      modelFinal = pick;
+    } else {
+      action = moves ? "advised" : "respected";
+      modelFinal = ranged.fallback;
+    }
   } else if (clamped && conf >= cfg.apply.minConfidence && !pinUnknown) {
     action = "applied";
     model = clamped;
@@ -488,12 +642,19 @@ export async function onPreAgent(
   // savings credit later (also when the coordinator passes a model anyway: it was not advised).
   const kept = model ? undefined : keptModelOf(rule);
   const pinDeferred = kept === "pin";
+  const advised = ranged ? pick : clamped;
   if (a.rowId !== undefined) {
     try {
       db.adjudicator.update(a.rowId, {
         action,
         modelFinal,
-        ...withPin(db, a.rowId, pin, kept),
+        // A ranged dispatch is flagged with its fallback, the savings baseline. Every dispatch
+        // stores the tier its note names (the ranged pick, else the verdict clamped to the apply
+        // bounds), the model follow detection compares the call with (savings.ts advisedPick).
+        ...withPin(db, a.rowId, pin, kept, {
+          ...(ranged ? { [RANGED_FLAG]: true, [FALLBACK_PIN_FIELD]: ranged.fallback } : {}),
+          ...(advised ? { [ADVISED_PICK_FIELD]: advised } : {}),
+        }),
       });
     } catch {
       // the row keeps its verdict without the action
@@ -509,23 +670,34 @@ export async function onPreAgent(
     return out;
   }
   // The Agent call takes `effort` (Claude Code 2.1.292+) unless CLAUDE_CODE_EFFORT_LEVEL outranks
-  // it or the call already passes one; the hook never sets it.
+  // it, the call already passes one, or the brief is saturated; the hook never sets it.
   const effortHint =
     rule.effort === "pass"
       ? `pass effort:'${effort}' (Claude Code ${AGENT_EFFORT_SINCE}+)`
-      : `suggested effort ${effort}`;
+      : saturated && !effortSet
+        ? `effort ${effort}: informational (brief saturated)`
+        : `suggested effort ${effort}`;
   const extras = [effortHint];
-  if (role && role !== "none") extras.push(`role ${role}`);
+  // A role is named only from a confident role table.
+  if (role && role !== "none" && roleConf >= ROLE_NOTE_MIN) extras.push(`role ${role}`);
   if (applyMode && inScope && pinUnknown && !isForced && !explicit)
     extras.push("not applied: the agent's model pin is unknown");
+  const span = ranged
+    ? `range ${ranged.floor}–${ranged.ceiling}, fallback ${ranged.fallback}; `
+    : "";
   let note: string;
   if (action === "applied") {
-    note = `adjudicator: model ${model} applied (${why}); ${extras.join(", ")}`;
+    note = `adjudicator: model ${model} applied (${span}${why}); ${extras.join(", ")}`;
   } else if (rule.model === "forced") {
     // Claude Code ignores `model` on the call and the agent's pin: the model is informational.
     note = `adjudicator: CLAUDE_CODE_SUBAGENT_MODEL_FORCE sets the model${
       clamped ? ` (adjudicator would pick ${clamped}; ${why})` : ` (${why})`
     }; ${extras.join(", ")}`;
+  } else if (rule.model === "ranged" && !explicit) {
+    note = `adjudicator: model ${pick} would do (${span}${why}): pass model:'${pick}'; ${extras.join(", ")}`;
+  } else if (ranged && pinDeferred && !explicit) {
+    // The pick is the fallback's tier (or outside the apply bounds): the fallback stays.
+    note = `adjudicator: ${rangedPart(ranged, pick)}; ${extras.join(", ")}`;
   } else if (pinDeferred && !explicit) {
     const part = pinnedPart(
       { status: pinUnknown ? "unknown" : "pinned", model: pinned, source: pin.source },

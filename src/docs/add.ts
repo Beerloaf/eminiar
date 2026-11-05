@@ -12,6 +12,7 @@ import {
   clearSyncState,
   type DocSourceInput,
   docsTag,
+  ManifestRefusedError,
   removeSource,
   slugify,
   upsertSources,
@@ -214,6 +215,9 @@ export async function addDocSources(
       out.updated = r.updated;
       out.file = r.file;
     } catch (err) {
+      // A manifest that is present but was not read fails every source the same way: surface
+      // it as one error instead of a skipped line per source.
+      if (err instanceof ManifestRefusedError) throw err;
       // one bad definition fails the batch validation; retry one by one so the rest land
       for (const s of ready) {
         try {

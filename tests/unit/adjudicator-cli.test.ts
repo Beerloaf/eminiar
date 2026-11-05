@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -27,6 +27,8 @@ import { runDoctor } from "../../src/doctor.js";
 import { frozenDefaults } from "../../src/install/install.js";
 import { paths } from "../../src/paths.js";
 import { SqliteAdapter } from "../../src/storage/sqlite/adapter.js";
+import { syncAgents } from "../../src/swarm/agents.js";
+import { loadSwarmConfig } from "../../src/swarm/config.js";
 
 const SENTINEL = "sk-SENTINEL-adjudicator-key-Zq9X";
 const ENV_KEYS = [
@@ -821,6 +823,71 @@ describe("doctor", () => {
       deps: { provider: fakeProvider().provider },
     });
     expect(checks).toEqual([expect.objectContaining({ name: "adjudicator probe", ok: true })]);
+  });
+});
+
+describe("apply mode while every swarm role pins a model (#108)", () => {
+  const PINS =
+    'every role of swarm "feat" pins a model, so apply mode cannot change any worker (add model_range in swarm.yaml, then `eminiar swarm sync`)';
+  const yaml = (coder: string) =>
+    `version: 1\nswarms:\n  feat:\n    description: a swarm\n    agents:\n      coder:\n        description: writes code\n${coder}      reviewer:\n        description: reviews code\n        model: opus\n`;
+  /** swarm.yaml plus the agent files `eminiar swarm sync` writes from it. */
+  function swarm(coder = "        model: sonnet\n") {
+    mkdirSync(join(root, ".eminiar"), { recursive: true });
+    writeFileSync(join(root, ".eminiar", "swarm.yaml"), yaml(coder));
+    const r = loadSwarmConfig(root);
+    if (r.state !== "ok") throw new Error(JSON.stringify(r));
+    syncAgents(root, r.config);
+  }
+  // User agents come from HOME: keep the real ~/.claude/agents out.
+  const env = () => ({ HOME: home });
+  async function status(e: NodeJS.ProcessEnv = env()) {
+    const t = fakeIo({ env: e });
+    expect(await run(["status"], t.io)).toBe(0);
+    const j = fakeIo({ env: e });
+    expect(await run(["status", "--json"], j.io)).toBe(0);
+    const doctor = adjudicatorDoctorChecks(loadConfig(root), { root, db, env: e }).find(
+      (c) => c.name === "adjudicator swarm pins",
+    );
+    return { text: t.text(), json: JSON.parse(j.text()).pinnedSwarms, doctor };
+  }
+
+  it("status warns and doctor informs in apply mode; advise mode stays quiet", async () => {
+    swarm();
+    writeAdjudicatorPatch(paths().configFile, { enabled: true, mode: "apply" });
+    const on = await status();
+    expect(on.text).toContain(`warning: ${PINS}`);
+    expect(on.json).toEqual(["feat"]);
+    // Information, not a failure: install and doctor still pass.
+    expect(on.doctor).toEqual({ name: "adjudicator swarm pins", ok: true, detail: PINS });
+
+    writeAdjudicatorPatch(paths().configFile, { mode: "advise" });
+    const advise = await status();
+    expect(advise.text).not.toContain("pins a model");
+    expect(advise.json).toBeNull();
+    expect(advise.doctor).toBeUndefined();
+  });
+
+  it("a ranged or unpinned role, FORCE, respectFrontmatter off or no swarm file clear it", async () => {
+    writeAdjudicatorPatch(paths().configFile, { enabled: true, mode: "apply" });
+    const quiet = (s: Awaited<ReturnType<typeof status>>) => {
+      expect(s.text).not.toContain("pins a model");
+      expect(s.json).toEqual([]);
+      expect(s.doctor).toBeUndefined();
+    };
+    quiet(await status()); // no swarm.yaml
+    swarm("        model: sonnet\n        model_range: { floor: haiku, ceiling: opus }\n");
+    quiet(await status());
+    swarm("        model: inherit\n");
+    quiet(await status());
+    swarm();
+    expect((await status()).json).toEqual(["feat"]);
+    // FORCE has its own warning; the pins are moot under it.
+    const forcedRun = await status({ ...env(), CLAUDE_CODE_SUBAGENT_MODEL_FORCE: "1" });
+    expect(forcedRun.text).toContain("CLAUDE_CODE_SUBAGENT_MODEL_FORCE is on");
+    quiet(forcedRun);
+    writeAdjudicatorPatch(paths().configFile, { apply: { respectFrontmatter: false } });
+    quiet(await status());
   });
 });
 

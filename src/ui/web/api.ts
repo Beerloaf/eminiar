@@ -694,6 +694,8 @@ export interface SwarmRoleUi {
   description: string;
   /** null: inherits the session's model. */
   model: string | null;
+  /** null: a fixed pin; set, `model` is the fallback inside floor..ceiling. */
+  range: { floor: string; ceiling: string } | null;
   count: number;
   /** null: every tool. */
   tools: string[] | null;

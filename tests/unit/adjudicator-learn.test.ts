@@ -94,6 +94,20 @@ function row(over: Partial<AdjudicationInput> = {}): number {
   });
 }
 
+/** Run `fn` with these process.env values set, then restore what was there. */
+function withEnv(vars: Record<string, string>, fn: () => void): void {
+  const saved = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+  Object.assign(process.env, vars);
+  try {
+    fn();
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
 // 1000 in / 500 out at list prices.
 const OPUS = 0.004 + 0.01; // opus-5-5: $4 / $20
 const HAIKU = 0.001 + 0.0025; // haiku alias → 4.5: $1 / $5
@@ -167,6 +181,61 @@ describe("savings: tiers, baseline, repricing", () => {
       source: "fallback",
     });
     expect(resolveBaseline(db, { ts })).toEqual({ model: FALLBACK_MODEL, source: "fallback" });
+  });
+
+  it("reads CLAUDE_CODE_SUBAGENT_MODEL only from the env it is given, never process.env (#124)", () => {
+    db.apiCallsUpsert([call({ ts: NOW - 20 * MIN, model: "claude-opus-5-5" })]);
+    const ts = NOW - 10 * MIN;
+    const session = { model: "claude-opus-5-5", source: "session" };
+    const env = { CLAUDE_CODE_SUBAGENT_MODEL: " sonnet " };
+    withEnv({ CLAUDE_CODE_SUBAGENT_MODEL: "haiku", CLAUDE_CODE_SUBAGENT_MODEL_FORCE: "0" }, () => {
+      // No env given: no env baseline, though this process sets the model with FORCE off.
+      expect(resolveBaseline(db, { sessionId: "S", ts })).toEqual(session);
+      expect(resolveBaseline(undefined, { ts })).toEqual({
+        model: FALLBACK_MODEL,
+        source: "fallback",
+      });
+      expect(resolveBaseline(db, { sessionId: "S", ts, env: {} })).toEqual(session);
+    });
+    withEnv({ CLAUDE_CODE_SUBAGENT_MODEL: "haiku", CLAUDE_CODE_SUBAGENT_MODEL_FORCE: "1" }, () => {
+      // Opted in: the given env's model; this process's FORCE flag is not read either.
+      expect(resolveBaseline(db, { sessionId: "S", ts, env })).toEqual({
+        model: "sonnet",
+        source: "env",
+      });
+      // "inherit" or an empty value names no model.
+      for (const m of ["inherit", "", "  "])
+        expect(
+          resolveBaseline(db, { sessionId: "S", ts, env: { CLAUDE_CODE_SUBAGENT_MODEL: m } }),
+          m,
+        ).toEqual(session);
+      // A pin and a ranged fallback outrank it.
+      expect(resolveBaseline(db, { pinned: "opus", sessionId: "S", ts, env })).toEqual({
+        model: "opus",
+        source: "pinned",
+      });
+      expect(
+        resolveBaseline(db, { fallbackPin: "haiku", pinned: "opus", sessionId: "S", ts, env }),
+      ).toEqual({ model: "haiku", source: "ranged" });
+    });
+  });
+
+  it("reads FORCE in that env with Claude Code's on/off rule (#124)", () => {
+    db.apiCallsUpsert([call({ ts: NOW - 20 * MIN, model: "claude-opus-5-5" })]);
+    const q = { sessionId: "S", ts: NOW - 10 * MIN };
+    const withForce = (v: string) => ({
+      ...q,
+      env: { CLAUDE_CODE_SUBAGENT_MODEL: "haiku", CLAUDE_CODE_SUBAGENT_MODEL_FORCE: v },
+    });
+    // On: Claude Code sets the model, so the env model is no baseline (the hook passes it as the pin).
+    for (const v of ["1", "true", "TRUE", "yes", "On", " on "])
+      expect(resolveBaseline(db, withForce(v)), v).toEqual({
+        model: "claude-opus-5-5",
+        source: "session",
+      });
+    // Off, empty or undocumented ("2"): the env model is the baseline.
+    for (const v of ["0", "false", "no", "off", "OFF", "", "2"])
+      expect(resolveBaseline(db, withForce(v)), v).toEqual({ model: "haiku", source: "env" });
   });
 
   it("reprices the same token vector through usage pricing, honouring overrides", () => {
@@ -478,6 +547,16 @@ describe("reconcile: prompt windows", () => {
     expect(db.adjudicator.get(p2)?.actualCostUsd).toBeCloseTo(SONNET, 10);
     // Prompts never teach.
     expect(db.adjudicator.biasAll()).toEqual([]);
+  });
+
+  it("backfills a missing baseline from the session, not the reconciling process's env (#124)", () => {
+    db.apiCallsUpsert([call({ ts: NOW - 40 * MIN, model: "claude-opus-5-5" })]);
+    const agent = row({ ts: NOW - 30 * MIN });
+    const prompt = row({ surface: "prompt", ts: NOW - 20 * MIN });
+    withEnv({ CLAUDE_CODE_SUBAGENT_MODEL: "haiku" }, () => reconcile(db, { now: NOW }));
+    // Before #124 both took "haiku" from this process's CLAUDE_CODE_SUBAGENT_MODEL.
+    expect(db.adjudicator.get(agent)?.baselineModel).toBe("claude-opus-5-5");
+    expect(db.adjudicator.get(prompt)?.baselineModel).toBe("claude-opus-5-5");
   });
 });
 

@@ -1,4 +1,14 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import type { ProjectContext } from "../context.js";
 import type { StorageAdapter } from "../storage/adapter.js";
@@ -100,22 +110,126 @@ function normalize(raw: unknown): DocsManifest {
   return { version: 1, sources: out };
 }
 
-/** Read a manifest file; a missing or malformed file reads as empty. */
-export function readManifestAt(file: string): DocsManifest {
-  if (!existsSync(file)) return empty();
-  try {
-    return normalize(JSON.parse(readFileSync(file, "utf8")));
-  } catch {
-    return empty();
+/**
+ * Largest manifest read, in bytes. The real one is a few KB; the bound keeps a hostile repo
+ * (a committed symlink, or a project-set `docs.manifest`) from making every hook read a huge
+ * file or a device.
+ */
+export const MANIFEST_MAX_BYTES = 1024 * 1024;
+
+/** What is at a manifest path: nothing, a manifest, or a file that was not read (and why). */
+export type ManifestProbe =
+  | { state: "missing" }
+  | { state: "ok"; manifest: DocsManifest }
+  | { state: "refused"; reason: string };
+
+/**
+ * Thrown by every manifest write when a file is present but was not read: writing would replace
+ * the committed sources with only the ones this call knows about.
+ */
+export class ManifestRefusedError extends Error {
+  readonly file: string;
+  readonly reason: string;
+  constructor(file: string, reason: string) {
+    super(
+      `refusing to write the docs manifest ${file}: ${reason}, so it was not read and writing it would drop its sources; fix or move it, then retry`,
+    );
+    this.name = "ManifestRefusedError";
+    this.file = file;
+    this.reason = reason;
   }
+}
+
+/**
+ * Look at a manifest file without trusting it: a regular file of at most MANIFEST_MAX_BYTES
+ * holding a JSON object is `ok`; no entry is `missing`; anything else (too large, a directory,
+ * a device, a FIFO, a dangling symlink, unreadable, not JSON) is `refused`.
+ */
+export function probeManifestAt(file: string): ManifestProbe {
+  let fd: number | undefined;
+  try {
+    // statSync follows symlinks; checking first keeps a FIFO or device from ever being opened.
+    const st = statSync(file, { throwIfNoEntry: false });
+    if (!st) {
+      // A dangling symlink would have a write create its target, wherever that points.
+      return lstatSync(file, { throwIfNoEntry: false })
+        ? { state: "refused", reason: "it is a symlink to a missing file" }
+        : { state: "missing" };
+    }
+    if (!st.isFile()) return { state: "refused", reason: "it is not a regular file" };
+    if (st.size > MANIFEST_MAX_BYTES) return { state: "refused", reason: tooLarge(st.size) };
+    // O_NONBLOCK: a path swapped for a FIFO after the stat cannot block the open.
+    fd = openSync(file, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+    const fst = fstatSync(fd);
+    if (!fst.isFile()) return { state: "refused", reason: "it is not a regular file" };
+    if (fst.size > MANIFEST_MAX_BYTES) return { state: "refused", reason: tooLarge(fst.size) };
+    // Read at most the size seen, so a file growing after the fstat is not followed.
+    const buf = Buffer.alloc(fst.size);
+    let off = 0;
+    while (off < buf.length) {
+      const n = readSync(fd, buf, off, buf.length - off, off);
+      if (n === 0) break;
+      off += n;
+    }
+    let raw: unknown;
+    try {
+      raw = JSON.parse(buf.toString("utf8", 0, off));
+    } catch {
+      return { state: "refused", reason: "it is not valid JSON" };
+    }
+    if (!raw || typeof raw !== "object" || Array.isArray(raw))
+      return { state: "refused", reason: "it is not a JSON object" };
+    return { state: "ok", manifest: normalize(raw) };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    // Removed between the stat and the open: nothing is there to lose.
+    if (code === "ENOENT") return { state: "missing" };
+    return { state: "refused", reason: `it could not be read (${code ?? (err as Error).message})` };
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // already closed or invalid; nothing to release
+      }
+    }
+  }
+}
+
+function tooLarge(size: number): string {
+  return `it is ${size} bytes, over the ${MANIFEST_MAX_BYTES}-byte limit`;
+}
+
+/**
+ * Read a manifest file; a missing, malformed or oversized file, or a path that is not a
+ * regular file (a directory, a device, a FIFO, also through a symlink), reads as empty.
+ * For readers only (hooks fail open): a write must use readManifestForWrite.
+ */
+export function readManifestAt(file: string): DocsManifest {
+  const p = probeManifestAt(file);
+  return p.state === "ok" ? p.manifest : empty();
 }
 
 export function readManifest(ctx: ProjectContext): DocsManifest {
   return readManifestAt(manifestPath(ctx));
 }
 
+/**
+ * Read the manifest to change it: a missing one is empty, a present one that was not read
+ * throws ManifestRefusedError instead of reading as empty.
+ */
+export function readManifestForWrite(ctx: ProjectContext): DocsManifest {
+  const file = manifestPath(ctx);
+  const p = probeManifestAt(file);
+  if (p.state === "refused") throw new ManifestRefusedError(file, p.reason);
+  return p.state === "ok" ? p.manifest : empty();
+}
+
+/** Write the manifest; throws ManifestRefusedError rather than replace a file it could not read. */
 export function writeManifest(ctx: ProjectContext, m: DocsManifest): string {
   const file = manifestPath(ctx);
+  const p = probeManifestAt(file);
+  if (p.state === "refused") throw new ManifestRefusedError(file, p.reason);
   mkdirSync(dirname(file), { recursive: true });
   const sorted = {
     version: 1 as const,
@@ -173,7 +287,7 @@ export function upsertSources(
   ctx: ProjectContext,
   inputs: DocSourceInput[],
 ): { added: string[]; updated: string[]; file: string } {
-  const m = readManifest(ctx);
+  const m = readManifestForWrite(ctx);
   const added: string[] = [];
   const updated: string[] = [];
   for (const input of inputs) {
@@ -192,7 +306,7 @@ export function upsertSources(
 }
 
 export function removeSource(ctx: ProjectContext, name: string): boolean {
-  const m = readManifest(ctx);
+  const m = readManifestForWrite(ctx);
   const before = m.sources.length;
   m.sources = m.sources.filter((s) => s.name !== name);
   if (m.sources.length === before) return false;

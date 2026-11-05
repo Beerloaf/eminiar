@@ -29,6 +29,7 @@ import type { PricingOverrides } from "../usage/pricing.js";
 import { complexityBucket, topIntent } from "./heuristic.js";
 import {
   actualCost,
+  advisedPick,
   allRows,
   dominantModel,
   keptModel,
@@ -635,12 +636,19 @@ class Reconciler {
 
     // Follow detection: the coordinator passed a model; compare it with the advice it saw.
     // A dispatch whose advice named no model (a kept pin, FORCE, a fork: savings.ts keptModel)
-    // has nothing to follow: no follow, no credit.
+    // has nothing to follow: no follow, no credit. The advice is the tier the line or note named
+    // (savings.ts advisedPick: the verdict clamped to the apply bounds, and to the role's range
+    // for a ranged dispatch); a row written without it compares the raw verdict tier.
     const deferred = keptModel(row) !== undefined;
     let action = row.action ?? null;
     if (action === "advised" && row.modelRequested && !deferred) {
       const parent = row.parentId ? this.db.adjudicator.get(row.parentId) : undefined;
-      const advice = parent?.tier ?? row.tier ?? undefined;
+      const advice =
+        (parent ? advisedPick(parent) : undefined) ??
+        advisedPick(row) ??
+        parent?.tier ??
+        row.tier ??
+        undefined;
       const requested = tierOf(row.modelRequested) ?? row.modelRequested;
       if (advice && requested === advice) {
         if (advice !== (tierOf(baseline) ?? baseline)) action = "followed";

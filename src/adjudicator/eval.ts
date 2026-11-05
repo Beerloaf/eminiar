@@ -694,6 +694,9 @@ export async function runEval(o: EvalOptions): Promise<EvalReport> {
           budgetMs,
           persist: false,
           ignoreEnabled: true,
+          // Eval items are scored as one text, like the heuristic rows above (units.ts splits
+          // plan briefs per statement; that would shift multi-statement items off the baseline).
+          units: false,
           ...(o.env ? { env: o.env } : {}),
           log,
         });

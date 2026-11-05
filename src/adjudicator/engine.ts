@@ -3,6 +3,11 @@
  *
  *   cache → heuristic → gate (enabled, consent, key, breaker, slow, budget) → provider → blend → persist
  *
+ * The heuristic scores a plan or agent brief per statement (units.ts): its hardest statement sets
+ * the complexity, tier and effort, role and tool are votes summed over the statements, and the
+ * routine checks and hand-in steps a brief ends with are left out. Every other surface, and every
+ * request when `units` is false, is scored as one text.
+ *
  * `adjudicate()` NEVER throws and never waits past its budget: a provider that hangs is cut off
  * by a timer racing the call (its AbortSignal fires at the same moment), so the heuristic comes
  * back within budget + a few ms. Persistence and cache failures (DB busy, v8 not migrated) are
@@ -13,7 +18,8 @@
  * lockout.
  *
  * Cache: keyed by sha256(SCORER_VERSION | configured provider | model | surface | inputs | text),
- * where inputs are the hints, tool/role catalogues, tier ladder and weights (cacheKeyFor), so
+ * where inputs are the hints, tool/role catalogues, tier ladder and weights, plus UNITS_VERSION for
+ * a brief scored per statement (cacheKeyFor), so
  * the hooks pick up verdicts the server's embedding provider wrote for the same request. Only provider-blended verdicts
  * are cached (the heuristic is cheaper than a lookup). A null entry is the `pending` marker of a
  * running async job; it dedupes jobs for PENDING_TTL_MS.
@@ -59,6 +65,7 @@ import {
   type Surface,
   type Verdict,
 } from "./types.js";
+import { type BriefUnits, scoreUnits, UNITS_VERSION, unitScored } from "./units.js";
 
 /** How long a pending marker blocks a second async job for the same key. */
 export const PENDING_TTL_MS = 30_000;
@@ -106,6 +113,12 @@ export interface EngineOptions {
   tools?: readonly string[] | undefined;
   /** Role options when a request carries no hints.roles (e.g. the active swarm's roles). */
   roles?: ReadonlyArray<{ name: string; description?: string }> | undefined;
+  /**
+   * Score plan and agent briefs per statement (units.ts). Default true; false scores every
+   * request as one text (the eval harness, which compares providers on prompts). An async job's
+   * child always uses the default.
+   */
+  units?: boolean | undefined;
   /** Passed to createProvider (fetch, log, env, tools seams). */
   deps?: ProviderDeps | undefined;
   /** A ready provider (test seam, or the server's long-lived instance); null forces heuristic. */
@@ -137,6 +150,12 @@ export interface Adjudication {
   queued?: boolean;
   /** The model the provider reported, when it answered. */
   providerModel?: string;
+  /**
+   * How a plan or agent brief was scored per statement, with `saturated` (the whole text sums
+   * past the 0..4 clamp) and the heuristic's role confidence; also stored as `units` in the row's
+   * scores JSON (units.briefUnitsOf reads it back). Absent for one-text scoring.
+   */
+  units?: BriefUnits;
 }
 
 /** The provider budget for a surface; local providers use timeouts.localMs on hook surfaces. */
@@ -164,6 +183,13 @@ export interface CacheKeyContext {
   tools?: readonly string[] | undefined;
   /** Role options used when the request has no hints.roles (EngineOptions.roles). */
   roles?: ReadonlyArray<{ name: string; description?: string }> | undefined;
+  /** EngineOptions.units: false keys plan and agent requests as one-text scores. */
+  units?: boolean | undefined;
+}
+
+/** Whether this request is scored per statement under these options (units.ts). */
+function byUnits(surface: string, units: boolean | undefined): boolean {
+  return units !== false && unitScored(surface);
 }
 
 /** JSON with object keys sorted, so equal inputs always hash the same. */
@@ -197,10 +223,14 @@ export function cacheKeyFor(
     roles: roles
       ?.map((x) => ({ name: x.name, description: x.description ?? "" }))
       .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)),
+    // The docs names change the PKG rule (features.ts); a set, so order and repeats do not count.
+    libraries: h?.libraries ? [...new Set(h.libraries)].sort() : undefined,
     tools: ctx.tools ? [...ctx.tools].sort() : undefined,
     // The ladder is ordered, so its order stays.
     tiers: ctx.config?.tiers,
     weights: ctx.config?.weights,
+    // A brief scored per statement blends onto another heuristic than the same text scored whole.
+    units: byUnits(req.surface, ctx.units) ? UNITS_VERSION : undefined,
   });
   return createHash("sha256")
     .update([SCORER_VERSION, r.configured, r.model ?? "", req.surface, inputs, text].join("|"))
@@ -215,7 +245,11 @@ function toolsOf(opts: EngineOptions): readonly string[] | undefined {
 /** The verdict columns of an adjudications row (insert, or the async job's update). */
 export function verdictColumns(
   v: Verdict,
-  o: { features?: Features | undefined; providerModel?: string | undefined } = {},
+  o: {
+    features?: Features | undefined;
+    providerModel?: string | undefined;
+    units?: BriefUnits | undefined;
+  } = {},
 ): AdjudicationPatch {
   const u = v.usage;
   const scores = {
@@ -229,6 +263,7 @@ export function verdictColumns(
     alpha: v.alpha,
     bias: v.bias,
     heuristicComplexity: v.heuristicComplexity,
+    units: o.units,
   };
   return {
     complexity: v.complexity,
@@ -277,6 +312,7 @@ interface Item {
   queued?: boolean;
   providerModel?: string | undefined;
   job?: AsyncJob;
+  units?: BriefUnits | undefined;
 }
 
 /**
@@ -310,7 +346,12 @@ export async function adjudicate(
     const firstSurface = items[0]?.req.surface ?? "prompt";
     const budgetMs = Math.max(0, opts.budgetMs ?? surfaceBudget(cfg, firstSurface, r.local));
     const locks = new LockBudget(start + budgetMs, now);
-    const keyCtx: CacheKeyContext = { config: cfg, tools: toolsOf(opts), roles: opts.roles };
+    const keyCtx: CacheKeyContext = {
+      config: cfg,
+      tools: toolsOf(opts),
+      roles: opts.roles,
+      units: opts.units,
+    };
     for (const it of items) it.cacheKey = cacheKeyFor(it.req, r, keyCtx);
 
     if (!enabled) {
@@ -533,6 +574,7 @@ export async function adjudicate(
       },
       cacheKey: it.cacheKey,
       features: it.features,
+      ...(it.units ? { units: it.units } : {}),
     }));
   }
 }
@@ -550,21 +592,24 @@ export async function adjudicateOne(
 
 function prepare(req: AdjudicationRequest, index: number, opts: EngineOptions): Item {
   const cfg = opts.config;
-  const features = extractFeatures(req.text, req.hints);
   const catalogue: Catalogue = { tiers: cfg.tiers };
   const tools = toolsOf(opts);
   if (tools) catalogue.tools = tools;
   const roles = req.hints?.roles ?? opts.roles;
   if (roles?.length) catalogue.roles = roles;
-  const h = scoreHeuristic(
-    features,
-    { tierCenters: cfg.weights.tierCenters, features: cfg.weights.features },
-    catalogue,
-  );
+  const weights = { tierCenters: cfg.weights.tierCenters, features: cfg.weights.features };
+  // A brief per statement (units.ts); `features` stay the whole text's either way.
+  const brief = byUnits(req.surface, opts.units)
+    ? scoreUnits(req.text, req.hints, weights, catalogue)
+    : undefined;
+  const features = brief?.features ?? extractFeatures(req.text, req.hints);
+  const h = brief?.set ?? scoreHeuristic(features, weights, catalogue);
   let bias: Record<string, number> = {};
   if (cfg.learning.enabled && opts.bias)
     bias = typeof opts.bias === "function" ? opts.bias(req, features, h) : opts.bias;
-  return { req, index, features, h, bias, cacheKey: "", cfg };
+  const it: Item = { req, index, features, h, bias, cacheKey: "", cfg };
+  if (brief) it.units = brief.units;
+  return it;
 }
 
 /** prepare() for the last-resort path: falls back to empty features if scoring itself throws. */
@@ -618,11 +663,13 @@ function finish(
     };
     if (it.queued) out.queued = true;
     if (it.providerModel) out.providerModel = it.providerModel;
+    if (it.units) out.units = it.units;
     if (persist && opts.store) {
       const store = opts.store;
       const cols = verdictColumns(verdict, {
         features: it.features,
         providerModel: it.providerModel,
+        units: it.units,
       });
       const row: AdjudicationInput = {
         ...(cols as Omit<AdjudicationInput, "surface" | "inputHash">),

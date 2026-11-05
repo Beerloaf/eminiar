@@ -379,6 +379,28 @@ describe("provider rows", () => {
     expect(formatEvalReport(r)).toMatch(/unknown/);
   });
 
+  it("scores each item as one text: a silent provider's blended row equals the shipped heuristic", async () => {
+    // Provider runs go through adjudicate() on surface "plan", which splits briefs per statement
+    // unless eval passes units:false; the held-out set has multi-statement items that would shift.
+    const silent = fakeProvider({ skip: () => true });
+    const r = await runEval({
+      config: adj(),
+      fixture: { items: HELDOUT_SET, mode: "replace" },
+      candidates: [{ id: "openai-compatible", provider: silent, label: "silent" }],
+    });
+    const ship = row(r, "heuristic (shipped)");
+    const bl = row(r, "silent (blended)");
+    expect(bl.ops?.answered).toBe(0);
+    expect(bl.n).toBe(HELDOUT_SET.length);
+    const dims = (x: EvalRow) => ({
+      tier: x.tier,
+      complexity: x.complexity,
+      role: x.role,
+      tool: x.tool,
+    });
+    expect(dims(bl)).toEqual(dims(ship));
+  });
+
   it("verdict compares the blended provider with the shipped heuristic", async () => {
     // An oracle for tier: always the label.
     const byText = new Map(EVAL_SET.map((i, n) => [`e${n}`, i.tier]));

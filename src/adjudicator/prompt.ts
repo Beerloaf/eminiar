@@ -43,6 +43,7 @@ export const TOOL_DESCRIPTIONS: Record<(typeof TOOL_IDS)[number], string> = {
   em_graph_impact: "what depends on or breaks from a change",
   em_history: "git history of a file or change",
   em_execute: "run a command or tests, keep output small",
+  em_batch_execute: "run several commands in one call, keep output small",
   em_execute_file: "process a large file without reading it",
   em_docs: "answer from indexed library docs",
   em_fetch_and_index: "fetch and index a web page",

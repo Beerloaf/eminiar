@@ -282,6 +282,8 @@ export async function swarmCommand(
               role: r.role,
               subagent_type: r.agentType,
               model: r.model ?? null,
+              // null: a fixed pin; otherwise the tiers dispatch may pick between.
+              range: r.range ?? null,
               count: r.count,
               file: plan.find((a) => a.agentType === r.agentType)?.action ?? null,
             })),

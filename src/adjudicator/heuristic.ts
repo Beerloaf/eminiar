@@ -48,6 +48,16 @@
  * the paths term do not count, and scope counts half (the tool searches the breadth, not the
  * model).
  *
+ * Tool routing (§7.4): a docs or history intent names where the answer is, so the generic question
+ * words that come with it ("how does", "which") do not also vote for a code search; callers and
+ * usages of a symbol are a references lookup (em_symbols), the effect of a change is impact
+ * (em_graph_impact); several commands in one go (in parallel, or three or more listed) are one
+ * em_batch_execute call; a URL, a fetch verb or "latest version" sends docs to em_fetch_and_index.
+ * Bounded UI work (no refactor, not broad) confined to the UI is the ui role's change, not the
+ * coder's. With risk, another layer named (an endpoint, the server, the CLI, a hook, the database,
+ * a login) or the UI as one area of a list ("the server, CLI and dashboard") it is cross-layer and
+ * the coder's, UI noun included.
+ *
  * Asymmetric tier loss (§7.3): the tier logit is −asymmetry·max(0, c − centre) −
  * max(0, centre − c). Under-tiering costs a redo (the tokens of the failed attempt plus the
  * retry, more than the saving), so with the default 2:1 a request between two centres goes up
@@ -343,24 +353,33 @@ export function scoreTier(
 
 const WRITES: Intent[] = ["implement", "edit_small", "refactor"];
 
-export function scoreTool(f: Features, c: number, tools: readonly string[]): ScoreTable {
+export function scoreTool(
+  f: Features & Partial<FeatureExtras>,
+  c: number,
+  tools: readonly string[],
+): ScoreTable {
   const raw = new Map<string, { s: number; reasons: Reason[] }>();
   const i = f.intents;
   const rule = (intent: Intent, tool: string, w: number, extra = "") => {
     const v = i[intent] ?? 0;
     if (v > 0) add(raw, tool, w * v, `intent.${intent}`, `${intent} → ${tool}${extra}`);
   };
-  rule("lookup", "em_symbols", 0.6);
-  rule("lookup", "em_search", 0.4);
-  rule("impact", "em_graph_impact", 1);
+  // A docs or history question names where the answer is; its question words are not a code search.
+  const lookup = Math.max(0, (i.lookup ?? 0) - Math.max(i.docs ?? 0, i.history ?? 0));
+  if (lookup > 0) {
+    add(raw, "em_symbols", 0.6 * lookup, "intent.lookup", "lookup → em_symbols");
+    add(raw, "em_search", 0.4 * lookup, "intent.lookup", "lookup → em_search");
+  }
+  rule("impact", f.refs ? "em_symbols" : "em_graph_impact", 1, f.refs ? " (callers/usages)" : "");
   rule("history", "em_history", 1);
-  rule("run", "em_execute", 1);
+  const run = f.batch ? "em_batch_execute" : "em_execute";
+  rule("run", run, 1);
   // Tests next to a write intent are tests to write; on their own, tests to run.
   if (WRITES.some((w) => (i[w] ?? 0) > 0)) rule("test", "Edit", 1, " (write tests)");
-  else rule("test", "em_execute", 1);
+  else rule("test", run, 1);
   rule("bigfile", "em_execute_file", 1);
-  rule("docs", "em_docs", 0.6);
-  rule("docs", "em_fetch_and_index", 0.4);
+  rule("docs", f.fetch ? "em_fetch_and_index" : "em_docs", 0.6);
+  rule("docs", f.fetch ? "em_docs" : "em_fetch_and_index", 0.4);
   rule("research", "em_fetch_and_index", 0.6);
   rule("research", "em_search", 0.3);
   rule("recall", "em_recall", 1);
@@ -426,14 +445,32 @@ function profile(name: string, description: string): Partial<Record<Intent, numb
   return p;
 }
 
-export function scoreRole(f: Features, catalogue?: Catalogue["roles"], c = 0): ScoreTable {
+export function scoreRole(
+  f: Features & Partial<FeatureExtras>,
+  catalogue?: Catalogue["roles"],
+  c = 0,
+): ScoreTable {
   const raw = new Map<string, { s: number; reasons: Reason[] }>();
   const options = catalogue?.length ? catalogue.map((r) => r.name) : [...DEFAULT_ROLES];
   const known = new Set(options);
+  // Bounded UI work (no refactor, not broad) confined to the UI is the ui role's change. With risk
+  // or another layer named (an endpoint, the CLI, a login, one area of a list) it is one change
+  // across layers: the coder's, and the UI noun's own vote goes to the coder too.
+  const bounded = !(f.intents.refactor ?? 0) && f.scope < 1;
+  const crossLayer = bounded && (f.risk > 0 || f.otherLayer === true);
+  const uiWork = known.has("ui") && (f.intents.ui ?? 0) > 0 && bounded && !crossLayer;
   for (const [intent, v] of Object.entries(f.intents) as Array<[Intent, number]>) {
     if (!(v > 0)) continue;
-    for (const [role, w] of Object.entries(ROLE_MAP[intent] ?? {}))
+    const edit = intent === "implement" || intent === "edit_small";
+    for (const [r, w] of Object.entries(ROLE_MAP[intent] ?? {})) {
+      const role =
+        uiWork && edit && r === "coder"
+          ? "ui"
+          : crossLayer && r === "ui" && known.has("coder")
+            ? "coder"
+            : r;
       if (known.has(role)) add(raw, role, w * v, `intent.${intent}`, `${intent} → ${role}`);
+    }
   }
   // Custom roles: overlap between the request's intents and the role description's intents.
   for (const r of catalogue ?? []) {

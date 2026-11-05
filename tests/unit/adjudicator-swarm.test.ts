@@ -47,6 +47,7 @@ import {
   planLines,
   planNextHint,
   planPassing,
+  ROLE_NOTE_MIN,
   taskRequest,
 } from "../../src/adjudicator/swarm.js";
 import {
@@ -197,7 +198,7 @@ describe("plan advice helpers", () => {
     expect(r.hints?.roles?.map((x) => x.name)).toEqual(["coder", "tester"]);
   });
 
-  it("prints one line per task, with a role-differs note", () => {
+  it("prints one line per task, with a role-differs note from a confident role table", () => {
     const a: PlanAdvice[] = [
       {
         taskId: 5,
@@ -208,6 +209,7 @@ describe("plan advice helpers", () => {
         effort: "low",
         complexity: 1.2,
         confidence: 0.823,
+        roleConfidence: 0.7,
       },
       {
         taskId: 6,
@@ -218,6 +220,7 @@ describe("plan advice helpers", () => {
         effort: "high",
         complexity: 3.6,
         confidence: 0.7,
+        roleConfidence: 0.95,
       },
       {
         taskId: 7,
@@ -226,12 +229,23 @@ describe("plan advice helpers", () => {
         effort: "medium",
         complexity: 2,
         confidence: 0.5,
+        roleConfidence: 0.9,
       },
     ];
     expect(planLines(a)).toEqual([
       "#5 → swarm-feat-coder · model haiku · effort low (complexity 1, conf 0.82); role suggested: tester (planned: coder)",
       "#6 → swarm-feat-coder · model opus · effort high (complexity 4, conf 0.70)",
       "#7 → swarm-feat-tester · effort medium (complexity 2, conf 0.50); role suggested: tester",
+    ]);
+    // Below ROLE_NOTE_MIN, or with no role confidence, no role note (S2: the planner knows more).
+    expect(ROLE_NOTE_MIN).toBe(0.7);
+    const quiet = [
+      { ...a[0]!, roleConfidence: 0.69 },
+      { ...a[2]!, roleConfidence: undefined },
+    ];
+    expect(planLines(quiet)).toEqual([
+      "#5 → swarm-feat-coder · model haiku · effort low (complexity 1, conf 0.82)",
+      "#7 → swarm-feat-tester · effort medium (complexity 2, conf 0.50)",
     ]);
     expect(planAdviceBlock([])).toBe("");
     expect(planAdviceBlock(a, {})).toMatch(/^Adjudicator suggestions: pass the model as `model`/);
@@ -631,14 +645,21 @@ describe("em_swarm plan advice and em_adjudicate", () => {
         { title: "Redesign the storage layer across every adapter and migration", role: "coder" },
         { title: "Write integration tests for the new migration path", role: "tester" },
         {
-          title: "Write and run the unit tests, test cases and test coverage for the parser",
-          detail: "add vitest test files; run the test suite until the tests pass",
+          // Every statement is test work (per-statement scoring, units.ts, where "run the test
+          // suite until the tests pass" alone is boilerplate and moves nothing).
+          title: "Unit tests, integration tests and regression tests for the parser",
+          detail: "Snapshot tests for the printer. Test coverage for every branch of the lexer.",
           role: "coder",
+        },
+        {
+          // The same work with no planned role: nothing argues for another role.
+          title: "Unit tests, integration tests and regression tests for the lexer",
+          detail: "Snapshot tests for the printer. Test coverage for every branch of the parser.",
         },
       ],
     });
     expect(calls).toHaveLength(1);
-    expect(calls[0]).toHaveLength(3);
+    expect(calls[0]).toHaveLength(4);
     expect(calls[0]?.every((r) => r.surface === "plan")).toBe(true);
     expect(out).toContain(
       'names "task #N" (the worker claims it), passing `model` and `effort` as each suggestion below says; run_in_background',
@@ -647,10 +668,11 @@ describe("em_swarm plan advice and em_adjudicate", () => {
       "Adjudicator suggestions: pass the model as `model` and the effort as `effort` on each Agent call",
     );
     const lines = out.split("\n").filter((l) => /^#\d+ → /.test(l));
-    expect(lines).toHaveLength(3);
+    expect(lines).toHaveLength(4);
+    // A saturated brief (units.ts) shows its effort as informational.
     for (const l of lines)
       expect(l).toMatch(
-        /^#\d+ → swarm-feat-(coder|tester) · model (haiku|sonnet|opus|fable) · effort (low|medium|high|xhigh|max) \(complexity \d, conf \d\.\d\d\)/,
+        /^#\d+ → swarm-feat-(coder|tester) · model (haiku|sonnet|opus|fable) · effort (low|medium|high|xhigh|max)(: informational)? \((brief saturated; )?complexity \d, conf \d\.\d\d\)/,
       );
 
     const run = db.swarm.runs({ status: "active", limit: 1 })[0]!;
@@ -668,11 +690,20 @@ describe("em_swarm plan advice and em_adjudicate", () => {
       expect((TIERS as readonly string[]).includes(rows[0]!.tier ?? "")).toBe(true);
       expect(lines.some((l) => l.startsWith(`#${t.id} → `))).toBe(true);
     }
-    // a coder task the provider calls tester work carries the role-differs note
-    const coderIds = tasks.filter((t) => t.role === "coder").map((t) => t.id);
-    const noted = lines.filter((l) => l.includes("role suggested: tester (planned: coder)"));
-    expect(noted.length, lines.join("\n")).toBeGreaterThan(0);
-    for (const l of noted) expect(coderIds.some((id) => l.startsWith(`#${id} `))).toBe(true);
+    // A role note needs a role table at ROLE_NOTE_MIN (the heuristic's role: the embedding
+    // provider has no role weight). The planned role's hint votes in every statement, so the
+    // coder task's tester table stays below it and gets no note; the unplanned task gets one.
+    const roleConf = (id: number) =>
+      JSON.parse(db.adjudicator.forTask(run.id, id)[0]!.scores!).role.confidence as number;
+    const [coder, , testWork, unplanned] = tasks;
+    const lineOf = (id: number) => lines.find((l) => l.startsWith(`#${id} `)) ?? "";
+    expect(roleConf(testWork!.id)).toBeLessThan(ROLE_NOTE_MIN);
+    expect(lineOf(testWork!.id), lines.join("\n")).not.toMatch(/role suggested/);
+    expect(roleConf(unplanned!.id)).toBeGreaterThanOrEqual(ROLE_NOTE_MIN);
+    expect(lineOf(unplanned!.id)).toMatch(
+      /^#\d+ → swarm-feat-tester · .*; role suggested: tester$/,
+    );
+    expect(lineOf(coder!.id)).not.toMatch(/role suggested/);
   });
 
   it("falls back to the heuristic when the provider fails, still within one call", async () => {

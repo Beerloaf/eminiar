@@ -439,6 +439,84 @@ describe("ledger review", () => {
     expect(db.swarm.runActive("feat", "S")?.id).toBe(current.id);
   });
 
+  it("a spawn prompt naming several tasks links the one still open for its role", () => {
+    const run = fresh("several refs");
+    const feat = cfg.swarms[0]!;
+    const [done, mine, forTester, held, quiet] = addTasks(db, { root }, run, feat, coord(), [
+      { title: "already done", role: "coder" },
+      { title: "the coder's task", role: "coder" },
+      { title: "the tester's task", role: "tester" },
+      { title: "held by a live coder", role: "coder" },
+      { title: "held by a quiet coder", role: "coder" },
+    ]);
+    claimTask(db, run, feat, worker("TL0"), done!.id);
+    updateTask(db, run, worker("TL0"), { task: done!.id, status: "done" });
+    for (const [id, t] of [
+      ["TL1", held],
+      ["TQ1", quiet],
+    ] as const) {
+      db.swarm.workerUpsert({
+        run_id: run.id,
+        agent_id: id,
+        agent_type: "swarm-feat-coder",
+        role: "coder",
+      });
+      claimTask(db, run, feat, worker(id), t!.id);
+    }
+    (db as unknown as { db: { prepare(s: string): { run(...a: unknown[]): void } } }).db
+      .prepare("UPDATE swarm_agents SET last_ts = 0 WHERE agent_id = 'TQ1'")
+      .run();
+    // another session's run of this swarm, and a run of another swarm
+    const other = startRun(db, cfg, { swarm: "feat", goal: "other session", sessionId: "S2" });
+    const [elsewhere] = addTasks(db, { root }, other, feat, coord(), [
+      { title: "there", role: "coder" },
+    ]);
+    const line = cfg.swarms.find((s) => s.name === "line")!;
+    const lineRun = startRun(db, cfg, { swarm: "line", goal: "another swarm" });
+    const [foreign] = addTasks(db, { root }, lineRun, line, coord(), [{ title: "no role" }]);
+
+    let n = 0;
+    const spawn = (prompt: string, sessionId = "S") => {
+      const toolUseId = `multi-${++n}`;
+      const d = reserveSpawn(db, cfg, {
+        agentType: "swarm-feat-coder",
+        prompt,
+        sessionId,
+        toolUseId,
+      });
+      releaseSpawn(db, toolUseId);
+      return d?.decision === "allow" ? { run: d.run?.id, task: d.taskId } : d;
+    };
+    const ref = (t: { id: number } | undefined) => `task #${t!.id}`;
+    const toMine = { run: run.id, task: mine!.id };
+    // The shape that went unlinked: the task plus a closed one named for context.
+    expect(spawn(`You are a coder for ${ref(mine)}; ${ref(done)} already edited it`)).toEqual(
+      toMine,
+    );
+    // Another role's task, one a live worker holds, another swarm's: context as well.
+    expect(spawn(`${ref(mine)}; the tester then does ${ref(forTester)}`)).toEqual(toMine);
+    expect(spawn(`${ref(mine)} (${ref(held)} is in progress)`)).toEqual(toMine);
+    expect(spawn(`${ref(mine)}, like ${ref(foreign)}`)).toEqual(toMine);
+    // A task whose worker went quiet is still open.
+    expect(spawn(`take over ${ref(quiet)}; ${ref(done)} is done`)).toEqual({
+      run: run.id,
+      task: quiet!.id,
+    });
+    // The session's run is preferred; another active run of the swarm still counts alone.
+    expect(spawn(`${ref(mine)} or ${ref(elsewhere)}`)).toEqual(toMine);
+    const toElsewhere = { run: other.id, task: elsewhere!.id };
+    expect(spawn(`${ref(mine)} or ${ref(elsewhere)}`, "S2")).toEqual(toElsewhere);
+    expect(spawn(`${ref(elsewhere)}; ${ref(done)} is done`)).toEqual(toElsewhere);
+    // Several open, or none: no task and the default run, as before.
+    expect(spawn(`${ref(mine)} and ${ref(quiet)}`)).toEqual({ run: run.id, task: undefined });
+    expect(spawn(`${ref(done)} and ${ref(forTester)}`)).toEqual({ run: run.id, task: undefined });
+    // A lone reference still links the task it names, whatever its state.
+    expect(spawn(`re-check ${ref(done)}`)).toEqual({ run: run.id, task: done!.id });
+    expect(db.swarm.spawnsPendingOfSwarm("feat", 0)).toBe(0);
+    for (const r of [other, lineRun])
+      finishRun(getContext(root), db, r, coord(), { status: "cancelled" });
+  });
+
   it("#5 capacity spans runs; finish closes the run's workers; reservations keep counting", () => {
     const run = fresh("capacity");
     for (const id of ["C1", "C2"]) {

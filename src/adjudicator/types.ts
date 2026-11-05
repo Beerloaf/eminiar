@@ -80,6 +80,7 @@ export const TOOL_IDS = [
   "em_graph_impact",
   "em_history",
   "em_execute",
+  "em_batch_execute",
   "em_execute_file",
   "em_docs",
   "em_fetch_and_index",
@@ -163,6 +164,11 @@ export interface AdjudicationRequest {
     roles?: Array<{ name: string; description?: string }>;
     files?: number;
     deps?: number;
+    /**
+     * The project's indexed documentation names, lower case (the em_docs manifest; the hooks
+     * pass them): a kebab-case name counts as a package only when listed (features.ts PKG rule).
+     */
+    libraries?: readonly string[];
   };
 }
 

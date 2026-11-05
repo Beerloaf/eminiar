@@ -12,7 +12,7 @@ PreToolUse/UserPromptSubmit, model-config). The design depends on them.
 | Subagent model precedence: the Agent call's `model` param, then the subagent frontmatter `model` (`inherit` means the main model), then `CLAUDE_CODE_SUBAGENT_MODEL`, then the main model. `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` overrides all of them. Claude Code substitutes a model when the requested one is outside the org's `availableModels`. | When FORCE is set, the adjudicator never tries to change the model. |
 | The Agent call's `model` accepts only `sonnet`, `opus`, `haiku` or `fable`: no `inherit` and no full ids. Frontmatter accepts aliases, full ids and `inherit`. | Tiers are limited to those four aliases. |
 | From Claude Code 2.1.292 the Agent call takes an `effort` parameter for a non-fork subagent; it overrides the agent file's `effort` and lasts across resumes, and `CLAUDE_CODE_EFFORT_LEVEL` outranks both (sub-agents "Choose an effort level"). Levels are `low`, `medium`, `high`, `xhigh`, `max`; a level the model lacks falls back to the highest one below it (model-config "Adjust effort level"). | Effort per dispatch is advice for the coordinator to pass as `effort` on the Agent call (informational while `CLAUDE_CODE_EFFORT_LEVEL` is set). The hook never injects an `effort` key, in apply mode too. |
-| PreToolUse `updatedInput` replaces the whole input, so every unchanged field must be included. Rules are re-evaluated, and in auto mode a changed call without `permissionDecision` may be denied. The docs don't say whether a model set by a hook takes effect. | Rewriting through the hook is best-effort. Advice to the coordinator is the main, reliable path: `em_swarm plan` shows a suggested model and effort per task and the coordinator passes `model` and `effort` on the Agent call. A model pin in the agent's definition is respected in advise mode as in apply mode: the advice names the pin, never a different `model` to pass. The optional `apply` mode is opt-in, and a test must check that the merge keeps every field. |
+| PreToolUse `updatedInput` replaces the whole input, so every unchanged field must be included. Rules are re-evaluated, and in auto mode a changed call without `permissionDecision` may be denied. A model set this way takes effect: a live probe on Claude Code 2.1.309 (`claude -p`, swarm run `20261104-672098` task #99, n=1 per case) ran the subagent on the hook's model, ahead of the agent file's pin and of a `model` passed on the call. A plugin mod's `agent.spawn` hook outranks the call's `model`. | The optional `apply` mode is opt-in and deterministic for the dispatches it may change; a test checks that the merge keeps every field. Advice to the coordinator stays the default: `em_swarm plan` shows a suggested model and effort per task and the coordinator passes `model` and `effort` on the Agent call, which works only as well as the coordinator follows the line. Both respect a model pin in the agent's definition: the advice names the pin, never a different `model` to pass, and apply leaves it. A swarm role opts in to model choice with `model_range` (§16). Reconcile still checks that the applied model ran (§11). |
 | UserPromptSubmit cannot change the main session's model. It can only add context or block. | Main-session model choice is advice text only. |
 
 **Product decision** (coordinator, from the user's request): choosing model size for dispatched
@@ -70,11 +70,12 @@ It can be blended with one provider:
 
 **P2 Advice first.**
 
-- The reliable path is advice: `em_swarm plan` lists a suggested role, model and effort for each
+- The default path is advice: `em_swarm plan` lists a suggested role, model and effort for each
   task, and the coordinator passes `model` on the Agent call.
-- `apply` mode is opt-in and best-effort: it rewrites the Agent input through PreToolUse
-  `updatedInput`. Claude Code does not document whether a hook-set model takes effect, so we
-  measure whether it did.
+- `apply` mode is opt-in: it rewrites the Agent input through PreToolUse `updatedInput`. Claude
+  Code takes a hook-set model (verified on 2.1.309, see Constraints), and we still measure
+  whether it ran: FORCE, an organisation's `availableModels`, a mod's `agent.spawn` hook or a
+  dispatch linked to the wrong calls can change or hide the outcome (§11).
 
 **P3 Fail open and fast.**
 
@@ -120,6 +121,10 @@ It can be blended with one provider:
 - `features.ts`: `extractFeatures(text, hints)` returns `Features`. Pure, under 1 ms.
 - `heuristic.ts`: `scoreHeuristic(features, weights, catalogue)` returns a `ScoreSet` with
   reasons.
+- `units.ts`: `scoreUnits(text, hints)` scores a plan or agent brief per statement and takes the
+  hardest one (§7.9); `briefUnitsOf(scores)` reads a row's `units` back.
+- `agent-pin.ts`: `resolveAgentPin(agentType, lookup)` finds an agent's model pin (`pinned`,
+  `ranged`, `unpinned` or `unknown`) in Claude Code's lookup order (§11).
 - `blend.ts`: `blend(heuristic, answer | undefined, bias, weights)` returns a `Verdict`.
   `formatAdvice(v)` builds the one-line hint.
 - `prompt.ts`: the rubric and catalogue text, the Jev question builder, the OpenAI strict
@@ -469,7 +474,8 @@ For each tier t in `config.tiers`:
 
 Effort from c: < 1.5 low, < 2.5 medium, < 3.5 high, < 3.75 xhigh, otherwise max (`max` only at
 the very top of the scale, so defaults stay conservative). It is advice: the coordinator passes it
-as `effort` on the Agent call (Claude Code ≥ 2.1.292); the hook never injects it.
+as `effort` on the Agent call (Claude Code ≥ 2.1.292); the hook never injects it. A saturated
+brief's effort is informational (§7.9).
 
 ### 7.4 Tool table
 
@@ -498,6 +504,12 @@ Intent maps to role:
 The table adds a token-overlap score against the active swarm's role descriptions
 (`swarm.yaml`), so custom roles can score. When a swarm run is active, options are limited to
 that swarm's roles.
+
+A role note (the plan's "role suggested: …", the Agent note's "role X") needs a role-table
+confidence of at least `ROLE_NOTE_MIN` = 0.7 (`swarm.ts`). On a stored plan row it is read from
+`scores.role.confidence`, then `units.roleConfidence`; otherwise from the live verdict. Measured
+before the gate, no planned-vs-scored role mismatch on this repo's swarm plans reached 0.6, so
+plans show none; a plain dispatch with no role hint still gets one when its text is clear.
 
 ### 7.6 Blend (`blend.ts`)
 
@@ -547,6 +559,50 @@ With the default weights, heuristic-only must:
 - reach ≥ 0.8 complexity accuracy within ±1
 
 Document the weights next to the code.
+
+### 7.9 Briefs: scored per statement (`units.ts`)
+
+Swarm run `20261104-672098` (task #102) found that §7.2 sums intents, scope, risk and paths over
+the whole text, so a long brief hits the 4.0 clamp: 67% of this repo's 101 plan tasks were
+clamped, 91% scored opus and 72% effort max. Plan and agent text are now scored per statement;
+prompt, tool and mcp text still score as one text (`EngineOptions.units: false` scores every
+surface that way).
+
+1. Statements: the first line (task title or dispatch description) first, then each sentence or
+   line of the first 4000 characters (`UNIT_CHARS`). List markers are stripped; pasted output (a
+   fenced block, a run of trace or log lines) joins the statement before it.
+2. Boilerplate is dropped per clause (split on "; " and ", then"): routine checks (run
+   typecheck, lint, tests or the build; "keep … green"; bare check lists) and hand-in protocol
+   (report, claim, close the task, post to the blackboard, return formats, attribution lines).
+   The first statement always stays, a clause that opens on a `code identifier` is never a
+   protocol verb, and review work ("check that X has a test") is kept. A check step followed by
+   real work (", and" / "by" / "after" + fix, redesign, migrate, implement …) is kept; routine
+   follow-ups ("fix any failures") are still dropped.
+3. Repeated statements count once. The first `UNIT_MAX` − 1 = 39 statements are units of their
+   own; the 40th unit holds every statement from the 40th on (`tail`), and those are still scored
+   one by one (past 40 of them, in up to 40 joined runs), so work at the end of a long brief is
+   never lost and joining never re-creates whole-text saturation. Every statement is scored with
+   the unchanged §7.1–7.3 scorer and the request's hints; at most 79 scorings per brief.
+4. Complexity, its reasons, the tier table and the effort come from the hardest statement (ties:
+   higher risk, then the earlier statement). Role and tool are raw votes summed over the
+   statements and normalised once; the plan's role hint is in every vote, so the planned role
+   stands unless the text says otherwise throughout.
+5. A one-statement text with nothing dropped returns exactly the whole-text `ScoreSet`.
+
+Outputs: `Adjudication.units` (`BriefUnits`: `scored` (scorings), `dropped`, `skipped`
+(statements past the cap, scored inside the last unit), `winner`, `sum`, `saturated`,
+`roleConfidence`), stored as `scores.units` and read back by `briefUnitsOf`. `sum`
+is the whole-text complexity before the clamp, and `saturated` means `sum` > 4
+(`SATURATED_AT`): the brief names more work than its hardest statement scores, so its effort is
+informational on every surface (§11). `Adjudication.features` stays the whole text's features,
+which rows and the learned bias read. Plan and agent cache keys gain `UNITS_VERSION`;
+`SCORER_VERSION` is unchanged.
+
+Measured on the same 101 tasks: clamped 67% → 17%, opus 91% → 63%, effort max 72% → 22%, role
+different from the plan 23 → 1; on 1044 real dispatch prompts, clamped 70% → 7% and opus
+89.5% → 47%. Appended boilerplate or a repeated detail changes nothing, and so does reordering
+statements. Of the 35 real dispatch prompts past the cap, none is under-tiered (task #130,
+`UNITS_VERSION` 2). p95 is 1.5–2.4 ms per brief.
 
 ## 8. Providers
 
@@ -643,7 +699,7 @@ Probe and detect results are cached for 60 s and never run in PreToolUse.
 | Point | Cost when disabled | Work when enabled | Added p95 budget |
 |---|---|---|---|
 | SessionStart: `src/hooks/session-start.ts`, next to the swarm line | 1 bool check | one line (≤ 200 chars) only when enabled but degraded (no_key, no_consent, breaker open, apply ineffective); ollama preset: an async keep-alive warm-up job | ≤ 5 ms, no network inline |
-| UserPromptSubmit: `src/hooks/capture.ts`, after recall (L117-133), before `budgetWarnings` | 1 bool check | skip below `minPromptChars`, slash commands and chat-only input; cache → heuristic → insert row (surface prompt) → one advice line. `promptMode` async spawns the provider job; blocking calls the provider with a deadline of `promptMs` (`localMs` for local presets) | ≤ 150 ms inline including the process (heuristic < 5 ms); blocking ≤ 1.2 s |
+| UserPromptSubmit: `src/hooks/capture.ts`, after recall (L117-133), before `budgetWarnings` | 1 bool check | skip harness envelopes (`hooks.ts` `isHarnessEnvelope`: the text starts, after whitespace, with `<agent-message`, `<task-notification`, `<ci-monitor-event` or `<system-reminder` followed by `>` or whitespace; leading closed `<system-reminder>…</system-reminder>` blocks are stripped first (`stripLeadingReminders`), and the turn is an envelope only when nothing is left or another envelope (or an unclosed reminder) follows; no row, no advice, no cooldown tick, no `closeToolHint`), then score the stripped text: below `minPromptChars`, slash commands and chat-only input are skipped on it; cache → heuristic → insert row (surface prompt) → one advice line. `promptMode` async spawns the provider job; blocking calls the provider with a deadline of `promptMs` (`localMs` for local presets) | ≤ 150 ms inline including the process (heuristic < 5 ms); blocking ≤ 1.2 s |
 | PreToolUse, non-Agent tools: `src/hooks/routing.ts` | nothing | only when `surfaces.tools` is on: one indexed SELECT of the session's latest prompt verdict; a hint at most once per prompt, when the raw tool contradicts the advised em_* tool and routing produced no hint | ≤ 2 ms |
 | PreToolUse Agent/Task: `routing.ts`, right after `swarmPreAgent` (L710) | nothing | `onPreAgent(ctx, input, spawn)` returns `{model?, note?}`: plan row (run, task) → cache → heuristic. On a miss in apply mode, call the provider with a deadline of `agentMs`. The result is merged into the ONE `updatedInput` routing returns (§11) | ≤ 10 ms advise; ≤ 800 ms on an apply-mode miss |
 | SessionEnd: `capture.ts` `sessionEnd` | nothing | `reconcile(db, {limit: 200})` | ≤ 20 ms |
@@ -682,9 +738,17 @@ feeds `reconcile`.
 
 Input text:
 
-- For a swarm worker (`spawn.kind === "worker"`): the swarm task's title + detail from
-  `db.swarm`.
-- Otherwise: `tool_input.description + "\n" + prompt`.
+- For a swarm worker (`spawn.kind === "worker"`) linked to its task: the swarm task's title +
+  detail from `db.swarm`. The run and task come only from the spawn decision
+  (`src/swarm/runtime.ts` `reserveSpawn`), which reads the `task #N` refs in the Agent prompt
+  (`task:N` and a bare `#N` do not count). One distinct ref links that task only when it is for
+  the dispatched role or for no role; its state is not checked, so a re-spawn for a reopened
+  task still links. Several refs (coordinator prompts often name other tasks for context) link
+  the sole candidate that is in an active run of this swarm, for this role or no role, and still
+  open; when several are open the claimable ones (deps done) win, and exactly one must be left.
+  Swarm run `20261104-672098` tasks #100 and #121.
+- Otherwise: `tool_input.description + "\n" + prompt`. Without a linked task the row has no run,
+  task or plan parent, and the dispatch text is scored afresh.
 
 Each dispatch inserts an `agent` row with:
 
@@ -703,8 +767,8 @@ Apply happens only when ALL of these hold:
    everything else is off. The hook, the plan advice and the CLI's status/doctor all read it there.
 4. `tool_input.model` is absent. An explicit choice always wins, and the row's action becomes
    `"respected"`.
-5. With `respectFrontmatter`: the agent's frontmatter model is absent or `"inherit"`. For swarm
-   agents it comes from `RoleSpec.model`; for others src/adjudicator/agent-pin.ts
+5. With `respectFrontmatter`: the agent's frontmatter model is absent or `"inherit"`, or the
+   agent is ranged and its pick moves the model (below). src/adjudicator/agent-pin.ts
    `resolveAgentPin` finds the definition in Claude Code's order: managed > project
    `.claude/agents` (cwd up to the repo root, closest first) > user `~/.claude/agents` > plugin
    agents (`installed_plugins.json` + `CLAUDE_CODE_PLUGIN_DIRS`, scoped name) > built-ins.
@@ -712,7 +776,20 @@ Apply happens only when ALL of these hold:
    (nothing found, unreadable, conflicting copies, scan limits, a session-only `--agents` agent)
    is never overridden: the action is `advised` and the row's `scores.pin` says why.
 6. tier confidence ≥ `apply.minConfidence`.
-7. The tier, clamped to [floor, ceiling], is one of sonnet/opus/haiku/fable.
+7. The tier, clamped to [floor, ceiling] (for a ranged agent also to its range), is one of
+   sonnet/opus/haiku/fable; for a ranged agent it is not its fallback's tier.
+
+Ranged agents (swarm run `20261104-672098` tasks #103 and #104; docs/swarms.md "Model ranges"):
+a swarm role with `model_range: {floor, ceiling}` keeps `model` as its fallback pin in the agent
+file's frontmatter, and `eminiar swarm sync` writes `range=<floor>..<ceiling>` into the file's
+marker, covered by its hash. `resolveAgentPin` returns status `ranged` (`model` = the fallback,
+plus `range`) only when the file is generated and its hash verifies (`agentFileRange`), the range
+spans two tiers or more and the fallback's tier lies inside it; anything else, a hand edit
+included, is the plain pin of the frontmatter `model`. The pick is `rangedTier`: the tier
+clamped to the range ∩ [floor, ceiling]. When the pick is the fallback's tier, or the two do not
+meet, no `model` is passed and the agent keeps its fallback (KeptModel `pin`), so a pinned id or
+`[1m]` variant is never swapped for the bare alias. With `respectFrontmatter` off the range is
+ignored like any pin.
 
 Then:
 
@@ -729,7 +806,9 @@ Then:
   applied at routing's return points. `routing.ts` gets only call-outs.
 - Never inject `effort`. Effort and role are advice: one `additionalContext` line, e.g.
   "adjudicator: pass effort:'high' (Claude Code 2.1.292+), role reviewer" ("suggested effort
-  high" when the call already passes `effort` or `CLAUDE_CODE_EFFORT_LEVEL` is set).
+  high" when the call already passes `effort` or `CLAUDE_CODE_EFFORT_LEVEL` is set; "effort
+  high: informational (brief saturated)" for a saturated brief, §7.9). The role is named only
+  from `ROLE_NOTE_MIN` (§7.5).
 - In advise mode, `onPreAgent` never calls the network. It records the row and, when the
   coordinator passed no model and the advice differs from the baseline, adds one note:
   "adjudicator: model haiku would do (complexity 1, conf 0.8): pass model:'haiku'".
@@ -738,6 +817,12 @@ Then:
   opus (adjudicator would pick haiku; remove the model pin in <file> to let it choose)", and the
   row's scores JSON gets `pinDeferred: true`, so reconcile detects no follow and credits no
   savings for it.
+- A ranged agent's note names the range and the fallback: "adjudicator: model haiku would do
+  (range haiku–opus, fallback sonnet; complexity 1, conf 0.82): pass model:'haiku'; …", in apply
+  mode "adjudicator: model haiku applied (range haiku–opus, fallback sonnet; …)", and for a kept
+  fallback "adjudicator: fallback sonnet (range haiku–opus; matches the adjudicator's pick); …"
+  (or "…; no pick inside apply.floor..ceiling)"). Its rows (agent and plan) get `ranged: true`
+  and `fallbackPin`, plus `pinDeferred` when the fallback is kept; the baseline is the fallback.
 - One rule table decides what every surface tells the coordinator to pass (`swarm.ts`
   `dispatchRule`, shared by plan advice, the plan's "Next:" line and `onPreAgent`; checked
   against sub-agents.md):
@@ -746,11 +831,14 @@ Then:
   |---|---|---|---|
   | fork (`subagent_type: "fork"`) | none: runs on the main session's model | none: per-call effort is for non-fork subagents | `fork: true` |
   | `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` on | informational (call `model` and pins ignored) | effort rule | `forced: true` |
-  | pin respected (pinned or unknown) | none: the pin is kept | effort rule | `pinDeferred: true` |
+  | ranged, and the pick moves the model | pass the pick (`rangedTier`) | effort rule | `ranged: true`, `fallbackPin` |
+  | pin respected (pinned or unknown), or ranged with the fallback kept | none: the pin is kept | effort rule | `pinDeferred: true` (ranged: also `ranged`, `fallbackPin`) |
   | otherwise | pass | effort rule | none |
 
-  Effort rule: pass `effort` unless `CLAUDE_CODE_EFFORT_LEVEL` is set or the call already
-  passes one (then informational). The first matching row wins. A fork gets only an
+  Effort rule: pass `effort` unless `CLAUDE_CODE_EFFORT_LEVEL` is set, the call already passes
+  one, or the brief is saturated (§7.9); then it is informational. Without the ranged and
+  saturated facts the table gives the same result as before them (an exhaustive test checks
+  it). The first matching row wins. A fork gets only an
   informational note ("adjudicator: fork runs on the main session's model; no `model` or
   `effort` to pass (…)") and is never applied (`respected` in apply mode); `resolveAgentPin`
   treats `fork` as a built-in with no pin. Under FORCE the note is "adjudicator:
@@ -764,8 +852,21 @@ Then:
   agent row tracks is counted the same way.
 
 Effectiveness check: `reconcile` compares `model_final` with the model that `api_calls` show for
-the agent. Each mismatch counts as `apply_ineffective`. `status` and doctor report "apply did not
-take effect on n of m dispatches: use advise".
+the agent. Each mismatch counts as `apply_ineffective`; `status` reports "apply: k of n applied
+dispatches ran the chosen model" and doctor "apply effective k of n". Since Claude Code takes the
+hook's model (Constraints), a mismatch points elsewhere: FORCE, an organisation's
+`availableModels` substitution, a mod's `agent.spawn` hook, another plugin's `updatedInput`
+(their merge order is undocumented), or a link gap (the dispatch tied to another subagent's
+calls, such as a fork that runs on the main session's model, or calls not ingested yet). The
+transcript keeps the pre-hook input, without the `model`, so only `api_calls` show the applied
+model.
+
+In apply mode, `status` and doctor also say when every role of an opted-in swarm resolves to a
+plain pin (cli.ts `pinnedSwarms`, the same rule as the plan's `ALL_PINNED_NOTE`, §16; skipped
+under FORCE, which has its own warning, and with `respectFrontmatter` off): apply respects those
+pins, so it cannot change any of their workers. `status` prints a `warning:` line and lists the
+swarms as `pinnedSwarms` in `--json` (null outside apply mode); doctor adds the check "adjudicator
+swarm pins" as information (ok), since the pins are respected by design.
 
 ## 12. Persistence
 
@@ -854,11 +955,20 @@ It is idempotent: rows with `final=1` are skipped. It looks at non-final rows ol
 - A row becomes final once its outcome is known, or after 24 h.
 - When a row turns final, its bias buckets are updated (§7.7).
 
-Baseline: what would have run without the adjudicator, resolved in this order:
+Baseline: what would have run without the adjudicator, resolved in this order (savings.ts
+`resolveBaseline`; `Baseline.source` in brackets):
 
-1. the role or agent frontmatter model, if it is pinned (not inherit)
-2. otherwise the main-session model at ts: the latest main-thread `api_calls` row before ts
-3. otherwise usage's fallback model (`FALLBACK_MODEL` in `src/usage/savings.ts`)
+1. a ranged agent's fallback, the frontmatter `model` its role pins (`ranged`)
+2. the role or agent frontmatter model, if it is pinned (not inherit) (`pinned`)
+3. for an agent with no `model` line, `CLAUDE_CODE_SUBAGENT_MODEL` when it is set (`env`). It is
+   opt-in: `onPreAgent` passes only that variable, and passes nothing for a fork, under FORCE
+   or for `model: inherit`, which outranks it
+4. otherwise the main-session model at ts: the latest main-thread `api_calls` row before ts
+   (`session`)
+5. otherwise usage's fallback model (`FALLBACK_MODEL` in `src/usage/savings.ts`) (`fallback`)
+
+Under FORCE the baseline is `CLAUDE_CODE_SUBAGENT_MODEL` (else the session model), and for a
+fork the session model (§11).
 
 `baseline_cost_usd` = the same token vector (input, output, cache read, cache write 5m/1h)
 repriced at the baseline model with `resolvePrice`/`costOfCall` from `src/usage/pricing.ts`,
@@ -884,8 +994,10 @@ Every savings figure is shown with its assumptions:
    turns, so the dashboard shows tokens per successful task by tier next to it.
 2. List prices, with cache pricing unchanged.
 3. Credit only for dispatches that were followed or applied, and none for a dispatch whose advice
-   named no model: it kept the agent's model pin (`pinDeferred` in the row's scores: pinned or
-   unknown), `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` was on (`forced`), or it was a fork (`fork`).
+   named no model: it kept the agent's model pin (`pinDeferred` in the row's scores: pinned,
+   unknown, or a ranged agent's fallback), `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` was on (`forced`),
+   or it was a fork (`fork`). A ranged dispatch that moved the model earns credit like any
+   followed advice, against its fallback.
 4. The adjudicator's own spend is subtracted.
 5. No credit for tool advice: eminiar's `em_stats` already counts context kept out by `em_*`
    tools, so crediting it here would double-count. We report only the tool-advice follow rate.
@@ -903,8 +1015,11 @@ Every savings figure is shown with its assumptions:
 | `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` on (`1`/`true`/`yes`/`on`) | no apply; action respected; the advice calls the model informational and names no pin; the row gets `forced` (no credit); status and doctor warn when mode is apply |
 | a fork (`subagent_type: "fork"`) | no apply, no `model` or `effort` advice; the row gets `fork` (no credit) |
 | explicit Agent model, or pinned frontmatter | no apply; action respected |
+| ranged agent whose pick is its fallback's tier, or outside apply.floor..ceiling | no apply; action respected; the agent runs on its fallback; the row gets `pinDeferred` (no credit) |
+| apply mode while every role of a swarm pins a model without a range | apply changes none of its workers; the plan block names it (`ALL_PINNED_NOTE`), `status` warns and doctor notes it (§11) |
+| a hand-edited ranged agent file | its hash fails, so the range is not read: a plain pin of the frontmatter `model` |
 | model outside the org's `availableModels` | Claude Code substitutes another; reconcile records `actual_model` and the mismatch |
-| Claude Code ignores a hook-set model | detected as `apply_ineffective`; status and doctor recommend advise |
+| the applied model did not run (a mod's `agent.spawn` hook, another plugin's `updatedInput`, a link gap; §11) | detected as `apply_ineffective`; status and doctor show "k of n" |
 | async child dies or hangs | its own deadline kills it; the pending marker expires after 30 s; the heuristic stands |
 | embedding model not cached or not warm | embedding provider unavailable; heuristic; doctor shows "model not downloaded" |
 | prompt injection in the scored text | outputs are enums and numbers only; apply is clamped by floor, ceiling and minConfidence; nothing is ever denied |
@@ -972,21 +1087,43 @@ is embedding.
     would pick haiku; remove the pin in swarm.yaml to let it choose) · effort low (…)"; an
     unreadable definition shows "model pin is unknown (…)". Under FORCE no pin is named and the
     model reads "model haiku (informational)".
-  - Add "role suggested: tester (planned: coder)" when the role differs.
+  - A ranged role (§11) reads "#5 → swarm-feature-coder · model haiku (range haiku–opus,
+    fallback sonnet) · effort low (…)" when its pick moves the model, and "fallback sonnet
+    (range haiku–opus; matches the adjudicator's pick)" (or "…; no pick inside
+    apply.floor..ceiling)") when it keeps the fallback. `PlanAdvice.model` is then the pick, and
+    the plan row stores `ranged`, `fallbackPin`, `pin {status: "ranged", …}` and
+    `baselineModel` = the fallback.
+  - A saturated brief (§7.9) reads "effort max: informational (brief saturated; complexity 4,
+    …)". The head adds "; a saturated brief's effort is informational: pass no `effort`" when
+    others are not saturated, and says "every brief is saturated, naming more work than its
+    hardest statement scores" when all are.
+  - Add "role suggested: tester (planned: coder)" when the role differs and the role table's
+    confidence is at least `ROLE_NOTE_MIN` (§7.5).
+  - When every role of the swarm resolves to a plain pin (pins respected, FORCE off), the
+    block's second line is `ALL_PINNED_NOTE`: "every role pins a model: the adjudicator cannot
+    change any worker (add model_range in swarm.yaml)". The simulation of swarm run
+    `20261104-90e129` expected model switching where every role was pinned, which is what this
+    line, and the matching `status`/doctor warning in apply mode (§11), now say.
   - The advice step fails open: the tasks are already stored, so an error there logs to
     stderr (em_swarm passes `log` and `onError` to adjudicatePlan, which never throws) and the
     plan returns its normal text plus "Adjudicator advice unavailable for this plan (the tasks
     are planned)." (a reported failure would make the coordinator plan twice).
 - The "Next:" text comes from the same rule as the advice head (`planPassing` /
   `planNextHint`): it names `model` only when some task has a model to pass (FORCE off, agent
-  not pinned), `effort` only when it is not informational, and adds "leave `model` unset for
-  pinned agents" (or "… (CLAUDE_CODE_SUBAGENT_MODEL_FORCE sets it)") as needed.
-- No `PlanTask` schema change, no `swarm.yaml` key, no new `TaskRow` columns, no new
-  `EVENT_KINDS`. The swarm ledger stays stable, and the suggestions live in `adjudications`.
-- `coordinatorBrief` (`src/swarm/brief.ts`, steps block L371-378) gets one line when enabled:
-  "Adjudicator on: em_swarm plan shows a suggested model and effort per task; pass them as
-  `model` and `effort` on the Agent call (`effort` needs Claude Code 2.1.292+; a pinned agent
-  keeps its model)."
+  not pinned, or ranged with a moving pick), `effort` only when it is not informational, and
+  adds "leave `model` unset for pinned agents" (a ranged agent that keeps its fallback counts as
+  pinned) or "… (CLAUDE_CODE_SUBAGENT_MODEL_FORCE sets it)" as needed.
+- No `PlanTask` schema change, no new `TaskRow` columns, no new `EVENT_KINDS`. The swarm ledger
+  stays stable, and the suggestions live in `adjudications`. `swarm.yaml` gained one key, the
+  opt-in per-role `model_range` (and `defaults.model_range`; docs/swarms.md "Model ranges",
+  task #103): without it, config, agent files and hashes are byte-identical to before.
+- `coordinatorBrief` (`src/swarm/brief.ts`, steps block) gets one line when enabled: "Adjudicator
+  on: em_swarm plan shows a suggestion per task and says exactly what to pass on the Agent call
+  (`model` and/or `effort`; pinned agents, CLAUDE_CODE_SUBAGENT_MODEL_FORCE and
+  CLAUDE_CODE_EFFORT_LEVEL change what it asks for). Follow each line as written." When a role
+  has a range (the worker list shows "sonnet, range haiku..opus"), the line adds: "Roles listed
+  with a range run on their fallback model unless their line says `model X (range …)`: then pass
+  model X."
 - In apply mode, `onPreAgent` finds the plan row by (run, task) through
   `spawn.kind === "worker"`, so it needs no extra provider call.
 
@@ -994,7 +1131,8 @@ is embedding.
 
 - `status [--json]`: enabled; configured vs effective provider and why; mode; surfaces; key
   source (env, file or none, masked); consent; breaker and health; last-24 h summary; apply
-  effectiveness.
+  effectiveness; in apply mode, a warning for FORCE and one for swarms whose every role pins a
+  model (`pinnedSwarms`, §11).
 - `enable [--provider P] [--preset X] [--mode advise|apply] [--project] [--accept-remote]`:
   - writes `~/.eminiar/config.json`; `--project` writes only `adjudicator.enabled: true` into
     `eminiar.config.json`
@@ -1042,6 +1180,8 @@ the dashboard System tab via `/api/doctor`):
 - 24 h fallback rate, and p95 against the budget
 - `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` set while mode is apply
 - apply effectiveness
+- every role of an opted-in swarm pinned without a range while mode is apply (information, check
+  "adjudicator swarm pins": apply cannot change those workers; fix with `model_range`)
 - embedding model cached
 
 `fullDoctor` (`src/install/doctor.ts`) adds a live probe with a 2 s timeout: typesafe

@@ -9,8 +9,9 @@
  * What a suggestion tells the coordinator to pass follows ONE rule table, dispatchRule, shared
  * with the PreToolUse(Agent) note (hooks.ts onPreAgent) and the plan's "Next:" line (em_swarm):
  * a fork names neither `model` nor `effort`; under CLAUDE_CODE_SUBAGENT_MODEL_FORCE the model is
- * informational; a respected pin is kept (pass no `model`); CLAUDE_CODE_EFFORT_LEVEL, or an
- * `effort` already on the call, makes the effort informational.
+ * informational; a ranged agent (swarm.yaml `model_range`) gets the pick inside its range; a
+ * respected pin is kept (pass no `model`); CLAUDE_CODE_EFFORT_LEVEL, an `effort` already on the
+ * call, or a saturated brief makes the effort informational.
  *
  * Everything here is a no-op while the adjudicator is off or `surfaces.plan` is false, and it
  * never throws: the plan is already committed when this runs, so a scoring failure costs the
@@ -20,13 +21,22 @@
 import type { Config } from "../config.js";
 import type { ProjectContext } from "../context.js";
 import type { StorageAdapter } from "../storage/adapter.js";
-import type { RunRow, SwarmSpec, TaskRow } from "../swarm/types.js";
+import type { ModelRange, RunRow, SwarmSpec, TaskRow } from "../swarm/types.js";
 import { type AgentPin, resolveAgentPin } from "./agent-pin.js";
 import { type Adjudication, adjudicate, type EngineOptions } from "./engine.js";
 import { subagentModelForced } from "./env.js";
 import { complexityBucket, topIntent } from "./heuristic.js";
 import { biasFromRows, type LearningConfig } from "./learn.js";
-import { isPinned, type KeptModel, tierOf, withKeptModel } from "./savings.js";
+import {
+  ADVISED_PICK_FIELD,
+  FALLBACK_PIN_FIELD,
+  isPinned,
+  type KeptModel,
+  RANGED_FLAG,
+  tierOf,
+  tierRank,
+  withKeptModel,
+} from "./savings.js";
 import {
   type AdjudicationRequest,
   type AdjudicatorProvider,
@@ -59,15 +69,22 @@ export function modelForced(env: NodeJS.ProcessEnv = process.env): boolean {
  *   CLAUDE_CODE_SUBAGENT_MODEL_FORCE forced: informational (the    per the effort rule
  *                                    call's model and pins are
  *                                    ignored)
+ *   ranged (swarm.yaml model_range)  ranged: pass the pick inside  per the effort rule
+ *                                    the role's range ∩ apply
+ *                                    floor..ceiling (rangedTier)
  *   pin respected (pinned/unknown)   pin: pass no `model`          per the effort rule
  *   otherwise                        pass                          per the effort rule
  *
- * Effort rule: CLAUDE_CODE_EFFORT_LEVEL set, or `effort` already on the call → informational
- * (the env outranks the call); else pass `effort` (Claude Code AGENT_EFFORT_SINCE+).
- * A model other than `pass` is never credited with savings (savings.ts KeptModel).
+ * A ranged agent whose pick is its fallback's tier, or whose range does not meet the apply
+ * bounds, passes no `model`: it keeps its fallback pin, so it takes the `pin` row (passing the
+ * bare tier would swap a pinned model id or [1m] variant for the alias).
+ * Effort rule: CLAUDE_CODE_EFFORT_LEVEL set, `effort` already on the call (the env outranks the
+ * call), or a saturated brief (units.ts) → informational; else pass `effort` (Claude Code
+ * AGENT_EFFORT_SINCE+). A model other than `pass` or `ranged` is never credited with savings
+ * (savings.ts KeptModel).
  */
 export interface DispatchRule {
-  model: "pass" | "pin" | "forced" | "fork";
+  model: "pass" | "ranged" | "pin" | "forced" | "fork";
   effort: "pass" | "informational" | "fork";
 }
 
@@ -75,18 +92,82 @@ export interface DispatchFacts {
   fork?: boolean | undefined;
   /** CLAUDE_CODE_SUBAGENT_MODEL_FORCE is on. */
   forced: boolean;
+  /**
+   * The agent has a model range respected under apply.respectFrontmatter, and its pick inside
+   * the range is a tier other than its fallback's (else it is a kept pin: `pin`).
+   */
+  ranged?: boolean | undefined;
   /** The agent's pin (pinned or unknown) is respected under apply.respectFrontmatter. */
   pin?: boolean | undefined;
   /** CLAUDE_CODE_EFFORT_LEVEL is set, or the call already passes `effort`. */
   effortSet: boolean;
+  /** The brief sums past the 0..4 clamp (units.ts BriefUnits.saturated). */
+  saturated?: boolean | undefined;
 }
 
 export function dispatchRule(f: DispatchFacts): DispatchRule {
   if (f.fork) return { model: "fork", effort: "fork" };
   return {
-    model: f.forced ? "forced" : f.pin ? "pin" : "pass",
-    effort: f.effortSet ? "informational" : "pass",
+    model: f.forced ? "forced" : f.ranged ? "ranged" : f.pin ? "pin" : "pass",
+    effort: f.effortSet || f.saturated ? "informational" : "pass",
   };
+}
+
+/** A role note ("role suggested: …") needs at least this role-table confidence. */
+export const ROLE_NOTE_MIN = 0.7;
+
+/**
+ * The tier a ranged agent's advice picks: `tier` clamped to the role's range ∩ the apply bounds
+ * (`floor`..`ceiling`, read like hooks.ts clampTier). Undefined when `tier` is not on the ladder
+ * or the two do not meet; the agent then keeps its fallback.
+ */
+export function rangedTier(
+  tier: string | undefined,
+  range: ModelRange,
+  floor: Tier,
+  ceiling: Tier,
+): Tier | undefined {
+  const r = tierRank(tier);
+  const applyLo = tierRank(floor);
+  const lo = Math.max(tierRank(range.floor), applyLo);
+  const hi = Math.min(tierRank(range.ceiling), Math.max(applyLo, tierRank(ceiling)));
+  if (r < 0 || lo < 0 || lo > hi) return undefined;
+  return TIERS[Math.min(hi, Math.max(lo, r))];
+}
+
+/** The whole tier ladder as a range: rangedTier over it is hooks.ts clampTier. */
+const LADDER: ModelRange = { floor: TIERS[0], ceiling: TIERS[TIERS.length - 1] as Tier };
+
+/**
+ * The tier a non-ranged agent's advice names: `tier` clamped to apply.floor..ceiling (a floor
+ * above the ceiling wins), the same tier hooks.ts onPreAgent's note names (clampTier), so a plan
+ * line, the Agent note and follow detection (savings.ts advisedPick) agree. Undefined when `tier`
+ * is not on the ladder.
+ */
+export function appliedTier(
+  tier: string | undefined,
+  floor: Tier,
+  ceiling: Tier,
+): Tier | undefined {
+  return rangedTier(tier, LADDER, floor, ceiling);
+}
+
+/** A ranged pick changes the model: it is a tier, and not the fallback's. */
+export function rangedPasses(pick: Tier | undefined, fallback: string): pick is Tier {
+  return !!pick && pick !== tierOf(fallback);
+}
+
+/**
+ * The model part of a ranged agent's line or note: "model haiku (range haiku–opus, fallback
+ * sonnet)" when the pick moves the model, else the kept fallback and why.
+ */
+export function rangedPart(range: PlanRange, pick: Tier | undefined): string {
+  const span = `range ${range.floor}–${range.ceiling}`;
+  if (rangedPasses(pick, range.fallback))
+    return `model ${pick} (${span}, fallback ${range.fallback})`;
+  return pick
+    ? `fallback ${range.fallback} (${span}; matches the adjudicator's pick)`
+    : `fallback ${range.fallback} (${span}; no pick inside apply.floor..ceiling)`;
 }
 
 /** The row flag (savings.ts KeptModel) of a rule whose model the advice does not name. */
@@ -111,6 +192,16 @@ export interface PlanPin {
   source?: AgentPin["source"];
 }
 
+/**
+ * A ranged agent's model range (resolveAgentPin status ranged) as plan advice respects it: the
+ * role's tiers and the fallback its agent file pins. Absent under FORCE or with
+ * apply.respectFrontmatter off.
+ */
+export interface PlanRange extends ModelRange {
+  fallback: string;
+  source?: AgentPin["source"];
+}
+
 export interface PlanAdvice {
   taskId: number;
   /** The planned role, if any. */
@@ -119,7 +210,11 @@ export interface PlanAdvice {
   suggestedRole?: string | undefined;
   /** subagent_type to spawn: the planned role's agent, else the suggested role's. */
   agentType?: string | undefined;
-  /** Always one of the Agent `model` values (haiku | sonnet | opus | fable), or undefined. */
+  /**
+   * Always one of the Agent `model` values (haiku | sonnet | opus | fable), or undefined: the
+   * verdict clamped to apply.floor..ceiling (appliedTier), with `range` the pick inside it too
+   * (rangedTier). The plan row's raw verdict stays in its `tier`.
+   */
   model?: Tier | undefined;
   effort: string;
   complexity: number;
@@ -127,8 +222,19 @@ export interface PlanAdvice {
   rowId?: number | undefined;
   /** Set when the agent's model pin is respected: the line then names it instead of `model`. */
   pin?: PlanPin | undefined;
+  /** Set for a ranged agent: `model` is passed only when its tier differs from the fallback's. */
+  range?: PlanRange | undefined;
   /** CLAUDE_CODE_SUBAGENT_MODEL_FORCE was on: the model is informational and no pin is named. */
   forced?: boolean | undefined;
+  /** The role table's confidence: the role note shows from ROLE_NOTE_MIN (none when unknown). */
+  roleConfidence?: number | undefined;
+  /** The brief sums past the 0..4 clamp (units.ts): its effort is informational. */
+  saturated?: boolean | undefined;
+  /**
+   * Every role of the swarm pins a model without a range (pins respected, FORCE off), so the
+   * adjudicator cannot change any worker: the same on every suggestion of one plan.
+   */
+  allRolesPinned?: boolean | undefined;
 }
 
 export interface PlanOptions {
@@ -189,13 +295,45 @@ export function respectedPin(
   return undefined;
 }
 
+/** The model range plan advice respects for `agentType`, or undefined (no range / not respected). */
+export function respectedRange(
+  agentType: string | undefined,
+  respectFrontmatter: boolean,
+  lookup: (type: string) => AgentPin,
+): PlanRange | undefined {
+  if (!agentType || !respectFrontmatter) return undefined;
+  const pin = lookup(agentType);
+  if (pin.status !== "ranged" || !pin.range || !isPinned(pin.model)) return undefined;
+  return {
+    floor: pin.range.floor,
+    ceiling: pin.range.ceiling,
+    fallback: pin.model,
+    source: pin.source,
+  };
+}
+
+/** A ranged suggestion that passes a model (its pick is not the fallback's tier). */
+const rangedPass = (a: PlanAdvice): boolean => !!a.range && rangedPasses(a.model, a.range.fallback);
+
+/** The dispatchRule facts of one suggestion; a ranged agent that passes nothing keeps its pin. */
+function adviceFacts(a: PlanAdvice, forced: boolean, effortSet: boolean): DispatchFacts {
+  const ranged = rangedPass(a);
+  return {
+    forced: forced || !!a.forced,
+    ranged,
+    pin: !!a.pin || (!!a.range && !ranged),
+    effortSet,
+    saturated: !!a.saturated,
+  };
+}
+
 function adviceOf(a: Adjudication, task: TaskRow, swarm: SwarmSpec): PlanAdvice {
   const v = a.verdict;
   const roles = new Map(swarm.roles.map((r) => [r.role, r]));
   const suggested = roles.has(v.role.choice) ? v.role.choice : undefined;
   const planned = task.role ?? undefined;
   const agentType = roles.get(planned ?? suggested ?? "")?.agentType;
-  return {
+  const advice: PlanAdvice = {
     taskId: task.id,
     role: planned,
     suggestedRole: suggested,
@@ -205,7 +343,10 @@ function adviceOf(a: Adjudication, task: TaskRow, swarm: SwarmSpec): PlanAdvice 
     complexity: v.complexity,
     confidence: v.tier.confidence,
     rowId: a.rowId,
+    roleConfidence: v.role.confidence,
   };
+  if (a.units?.saturated) advice.saturated = true;
+  return advice;
 }
 
 /**
@@ -259,13 +400,30 @@ export async function adjudicatePlan(
     };
     // Under FORCE Claude Code ignores the agents' `model` too: no pin to name (dispatchRule).
     const forced = modelForced(env);
+    const respect = cfg.apply.respectFrontmatter;
+    // Every role keeps a plain pin: no suggestion can change a worker's model (the head says so).
+    const allRolesPinned =
+      !forced &&
+      respect &&
+      swarm.roles.length > 0 &&
+      swarm.roles.every((r) => lookup(r.agentType).status === "pinned");
     return out.map((a, i) => {
       const advice = adviceOf(a, tasks[i] as TaskRow, swarm);
+      const verdict = advice.model;
+      // The tier the Agent note names (forced and pinned lines included): clamped to the apply bounds.
+      advice.model = appliedTier(verdict, cfg.apply.floor, cfg.apply.ceiling);
       if (forced) advice.forced = true;
       else {
-        const pin = respectedPin(advice.agentType, cfg.apply.respectFrontmatter, lookup);
-        if (pin) advice.pin = pin;
+        const range = respectedRange(advice.agentType, respect, lookup);
+        if (range) {
+          advice.range = range;
+          advice.model = rangedTier(verdict, range, cfg.apply.floor, cfg.apply.ceiling);
+        } else {
+          const pin = respectedPin(advice.agentType, respect, lookup);
+          if (pin) advice.pin = pin;
+        }
       }
+      if (allRolesPinned) advice.allRolesPinned = true;
       markPlanRow(db, advice);
       return advice;
     });
@@ -278,18 +436,35 @@ export async function adjudicatePlan(
 
 /**
  * Store the KeptModel flag on the task's plan row (and the pin under `pin`), so a plan row that no
- * agent row tracks is counted like a dispatch: no follow, no credit, not in the matrix.
+ * agent row tracks is counted like a dispatch: no follow, no credit, not in the matrix. A ranged
+ * agent's row also gets the ranged flag and its fallback pin (savings.ts rangedFallback), with
+ * that fallback as the baseline. Every row stores the tier its line names (`model`: the ranged
+ * pick, else the verdict clamped to the apply bounds) as savings.ts advisedPick, what follow
+ * detection compares the call with.
  */
 function markPlanRow(db: StorageAdapter, a: PlanAdvice): void {
-  const kept = keptModelOf(dispatchRule({ forced: !!a.forced, pin: !!a.pin, effortSet: false }));
-  if (!kept || a.rowId === undefined) return;
+  const kept = keptModelOf(dispatchRule(adviceFacts(a, false, false)));
+  if ((!kept && !a.range && !a.model) || a.rowId === undefined) return;
+  const pick = a.model ? { [ADVISED_PICK_FIELD]: a.model } : {};
   try {
-    const scores = withKeptModel(
-      db.adjudicator.get(a.rowId)?.scores,
-      kept,
-      a.pin ? { pin: a.pin } : {},
-    );
-    if (scores !== undefined) db.adjudicator.update(a.rowId, { scores });
+    const r = a.range;
+    const extra: Record<string, unknown> = r
+      ? {
+          // the AgentPin shape, so keptPin compares the run with the fallback
+          pin: {
+            status: "ranged",
+            model: r.fallback,
+            range: { floor: r.floor, ceiling: r.ceiling },
+            source: r.source,
+          },
+          [RANGED_FLAG]: true,
+          [FALLBACK_PIN_FIELD]: r.fallback,
+          ...pick,
+        }
+      : { ...(a.pin ? { pin: a.pin } : {}), ...pick };
+    const scores = withKeptModel(db.adjudicator.get(a.rowId)?.scores, kept, extra);
+    if (scores === undefined) return;
+    db.adjudicator.update(a.rowId, r ? { scores, baselineModel: r.fallback } : { scores });
   } catch {
     // the row keeps its verdict without the flag
   }
@@ -316,27 +491,37 @@ export function pinnedPart(pin: PlanPin, model: Tier | undefined, fix = pinHome(
 
 /**
  * One line per task, e.g. "#5 → swarm-feature-coder · model haiku · effort low (complexity 1,
- * conf 0.82)", or "#5 → swarm-feature-coder · pinned opus (adjudicator would pick haiku; …) ·
- * effort low (…)" for an agent whose pin is respected.
+ * conf 0.82)", "#5 → swarm-feature-coder · pinned opus (adjudicator would pick haiku; …) ·
+ * effort low (…)" for an agent whose pin is respected, or "#5 → swarm-feature-coder · model haiku
+ * (range haiku–opus, fallback sonnet) · effort low (…)" for a ranged one. A saturated brief's
+ * effort reads "effort high: informational (brief saturated; complexity 4, …)"; the role note
+ * needs a role confidence of ROLE_NOTE_MIN.
  */
 export function planLines(advice: readonly PlanAdvice[]): string[] {
   return advice.map((a) => {
     const parts = [
       a.agentType ?? "any role",
-      ...(a.pin
-        ? [pinnedPart(a.pin, a.model)]
-        : a.model
-          ? [a.forced ? `model ${a.model} (informational)` : `model ${a.model}`]
-          : []),
-      `effort ${a.effort}`,
+      ...(a.range
+        ? [rangedPart(a.range, a.model)]
+        : a.pin
+          ? [pinnedPart(a.pin, a.model)]
+          : a.model
+            ? [a.forced ? `model ${a.model} (informational)` : `model ${a.model}`]
+            : []),
+      a.saturated ? `effort ${a.effort}: informational` : `effort ${a.effort}`,
     ];
-    let line = `#${a.taskId} → ${parts.join(" · ")} (complexity ${complexityBucket(a.complexity)}, conf ${r2(a.confidence)})`;
-    if (a.suggestedRole && a.role && a.suggestedRole !== a.role)
+    let line = `#${a.taskId} → ${parts.join(" · ")} (${a.saturated ? "brief saturated; " : ""}complexity ${complexityBucket(a.complexity)}, conf ${r2(a.confidence)})`;
+    const noted = a.suggestedRole && (a.roleConfidence ?? 0) >= ROLE_NOTE_MIN;
+    if (noted && a.role && a.suggestedRole !== a.role)
       line += `; role suggested: ${a.suggestedRole} (planned: ${a.role})`;
-    else if (a.suggestedRole && !a.role) line += `; role suggested: ${a.suggestedRole}`;
+    else if (noted && !a.role) line += `; role suggested: ${a.suggestedRole}`;
     return line;
   });
 }
+
+/** The head's nudge when no suggestion can change a worker (every role pins a model). */
+export const ALL_PINNED_NOTE =
+  "every role pins a model: the adjudicator cannot change any worker (add model_range in swarm.yaml)";
 
 /** The advice block `em_swarm plan` appends; "" when there is no advice. */
 export function planAdviceBlock(
@@ -344,7 +529,8 @@ export function planAdviceBlock(
   env: NodeJS.ProcessEnv = process.env,
 ): string {
   if (!advice.length) return "";
-  return [planAdviceHead(advice, env), ...planLines(advice)].join("\n");
+  const nudge = advice.every((a) => a.allRolesPinned) ? [ALL_PINNED_NOTE] : [];
+  return [planAdviceHead(advice, env), ...nudge, ...planLines(advice)].join("\n");
 }
 
 /** CLAUDE_CODE_EFFORT_LEVEL outranks the Agent call's `effort` (and the agent file's). */
@@ -356,14 +542,16 @@ export function effortForced(env: NodeJS.ProcessEnv = process.env): boolean {
 /**
  * What a plan's suggestions, taken together, tell the coordinator to pass (dispatchRule per task):
  * `model` when some task's model is to be passed, `effort` unless it is informational, and whether
- * some agents keep their pin or FORCE sets the model. The block head and the "Next:" line both
- * read it, so they never disagree.
+ * some agents keep their pin (a ranged agent whose pick is its fallback included) or FORCE sets
+ * the model. The block head and the "Next:" line both read it, so they never disagree.
  */
 export interface PlanPassing {
   model: boolean;
   effort: boolean;
   pinned: boolean;
   forced: boolean;
+  /** Some brief is saturated while CLAUDE_CODE_EFFORT_LEVEL is unset: its effort is informational. */
+  saturated: boolean;
 }
 
 export function planPassing(
@@ -372,18 +560,21 @@ export function planPassing(
 ): PlanPassing {
   const forced = modelForced(env);
   const effortSet = effortForced(env);
-  const rules = advice.map((a) =>
-    dispatchRule({ forced: forced || !!a.forced, pin: !!a.pin, effortSet }),
-  );
+  const rules = advice.map((a) => dispatchRule(adviceFacts(a, forced, effortSet)));
   return {
-    model: rules.some((r, i) => r.model === "pass" && !!advice[i]?.model),
+    model: rules.some((r, i) => (r.model === "pass" || r.model === "ranged") && !!advice[i]?.model),
     effort: rules.some((r) => r.effort === "pass"),
     pinned: rules.some((r) => r.model === "pin"),
     forced: rules.some((r) => r.model === "forced"),
+    saturated: !effortSet && advice.some((a) => a.saturated),
   };
 }
 
 const EFFORT_NOTE = "CLAUDE_CODE_EFFORT_LEVEL is set and outranks `effort`";
+const SATURATED_NOTE =
+  "every brief is saturated, naming more work than its hardest statement scores";
+/** Why no effort is to be passed: the env, else every brief is saturated. */
+const noEffortWhy = (p: PlanPassing) => (p.saturated ? SATURATED_NOTE : EFFORT_NOTE);
 const FORCE_NOTE =
   "CLAUDE_CODE_SUBAGENT_MODEL_FORCE is on, so Claude Code ignores `model` on the Agent call and the agents' model pins";
 
@@ -394,19 +585,24 @@ export function planAdviceHead(
 ): string {
   const p = planPassing(advice, env);
   const effortPass = `pass the effort as \`effort\` (Claude Code ${AGENT_EFFORT_SINCE} or later)`;
+  // Some briefs saturated, others not: their lines say "informational", the head says why.
+  const saturated =
+    p.effort && p.saturated
+      ? "; a saturated brief's effort is informational: pass no `effort`"
+      : "";
   if (p.forced)
     return `Adjudicator suggestions (${FORCE_NOTE}; the model is informational; ${
-      p.effort ? effortPass : `${EFFORT_NOTE}, so effort is too`
-    }):`;
+      p.effort ? effortPass : `${noEffortWhy(p)}, so effort is too`
+    }${saturated}):`;
   const pins = p.pinned ? "; a pinned agent keeps its model: pass no `model`" : "";
   let pass: string;
   if (p.model && p.effort)
     pass = `pass the model as \`model\` and the effort as \`effort\` on each Agent call (\`effort\` needs Claude Code ${AGENT_EFFORT_SINCE} or later)`;
   else if (p.model)
-    pass = `pass the model as \`model\` on each Agent call (effort is informational: ${EFFORT_NOTE})`;
+    pass = `pass the model as \`model\` on each Agent call (effort is informational: ${noEffortWhy(p)})`;
   else if (p.effort) pass = `${effortPass} on each Agent call`;
-  else pass = `informational only (effort: ${EFFORT_NOTE})`;
-  return `Adjudicator suggestions: ${pass}${pins}:`;
+  else pass = `informational only (effort: ${noEffortWhy(p)})`;
+  return `Adjudicator suggestions: ${pass}${pins}${saturated}:`;
 }
 
 /**
@@ -426,6 +622,6 @@ export function planNextHint(
       : "";
   const pass = [p.model ? "`model`" : "", p.effort ? "`effort`" : ""].filter(Boolean).join(" and ");
   if (!pass)
-    return `; the suggestions below are informational: ${keep ? `${keep} and ` : ""}pass no \`effort\` (${EFFORT_NOTE})`;
+    return `; the suggestions below are informational: ${keep ? `${keep} and ` : ""}pass no \`effort\` (${noEffortWhy(p)})`;
   return `, passing ${pass} as each suggestion below says${keep ? `; ${keep}` : ""}`;
 }

@@ -121,7 +121,11 @@ const FAMILIES: ReadonlyArray<readonly [pattern: string, price: ModelPrice]> = [
   ["3-5-haiku", HAIKU_3_5],
 ];
 
-/** Last resort for ids that carry no version digits at all ("opus", "sonnet"). */
+/**
+ * Last resort for ids that carry no version digits at all ("opus", "sonnet"), also with Claude
+ * Code's context suffix ("sonnet[1m]", "opus[1m]": the `1m` is no version). The long-context
+ * surcharge stays token-based (ModelPrice.longContext), not keyed to the suffix.
+ */
 const ALIASES: ReadonlyArray<readonly [pattern: string, price: ModelPrice]> = [
   ["fable", FABLE_5_1],
   ["mythos", FABLE_5_1],
@@ -132,7 +136,7 @@ const ALIASES: ReadonlyArray<readonly [pattern: string, price: ModelPrice]> = [
 
 function bundledPrice(id: string): ModelPrice | undefined {
   for (const [pattern, p] of FAMILIES) if (id.includes(pattern)) return p;
-  if (/\d/.test(id)) return undefined;
+  if (/\d/.test(id.replace(/\[[^\]]*\]$/, ""))) return undefined;
   for (const [pattern, p] of ALIASES) if (id.includes(pattern)) return p;
   return undefined;
 }

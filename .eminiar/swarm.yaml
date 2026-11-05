@@ -78,7 +78,7 @@ swarms:
         description: Implements one backend/CLI/hook task at a time with the smallest diff that works.
         model: opus
         effort: high
-        count: 3                 # at most three coders at once
+        count: 4                 # at most four coders at once
         color: blue
         scope: ["src/**", "bin/**", "scripts/**", "hooks/**", "skills/**", "docs/**"]
         hooks:

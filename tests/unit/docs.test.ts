@@ -1,4 +1,13 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,8 +19,13 @@ import { categoryInfo, docCategory } from "../../src/docs/category.js";
 import { discoverDocs, rootDomain } from "../../src/docs/discover.js";
 import {
   docsTag,
+  MANIFEST_MAX_BYTES,
+  ManifestRefusedError,
   makeSource,
+  manifestPath,
+  probeManifestAt,
   readManifest,
+  readManifestAt,
   removeSource,
   upsertSources,
 } from "../../src/docs/manifest.js";
@@ -752,5 +766,181 @@ describe("resolution", () => {
     expect(miss.via).toBe("none");
     expect(miss.notes).toContain("pass urls");
     expect((await resolveProvider("env:PAYGATE")).via).toBe("none");
+  });
+});
+
+describe("manifest read bound (review #109 F5)", () => {
+  const source = { name: "zod", kind: "url", urls: ["https://zod.dev/"], addedAt: "2026-01-01" };
+  const valid = JSON.stringify({ version: 1, sources: [source] });
+  let dir: string;
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "eminiar-manifest-bound-"));
+  });
+  afterAll(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("reads a regular manifest, also through a symlink to one", () => {
+    const file = join(dir, "ok.json");
+    writeFileSync(file, valid);
+    expect(readManifestAt(file).sources.map((s) => s.name)).toEqual(["zod"]);
+    const link = join(dir, "ok-link.json");
+    symlinkSync(file, link);
+    expect(readManifestAt(link).sources.map((s) => s.name)).toEqual(["zod"]);
+  });
+
+  it("reads a missing manifest as empty", () => {
+    expect(readManifestAt(join(dir, "absent.json"))).toEqual({ version: 1, sources: [] });
+  });
+
+  it("reads a manifest over MANIFEST_MAX_BYTES as empty, and one at the bound normally", () => {
+    // Valid JSON either way: only the size decides.
+    const pad = (n: number) =>
+      `{"version":1,"sources":[${JSON.stringify(source)}],"pad":"${"x".repeat(n)}"}`;
+    const at = pad(0);
+    const fill = MANIFEST_MAX_BYTES - Buffer.byteLength(at);
+    const atBound = join(dir, "at-bound.json");
+    writeFileSync(atBound, pad(fill));
+    expect(readFileSync(atBound).length).toBe(MANIFEST_MAX_BYTES);
+    expect(readManifestAt(atBound).sources).toHaveLength(1);
+    const over = join(dir, "over.json");
+    writeFileSync(over, pad(fill + 1));
+    expect(readManifestAt(over).sources).toEqual([]);
+    const overLink = join(dir, "over-link.json");
+    symlinkSync(over, overLink);
+    expect(readManifestAt(overLink).sources).toEqual([]);
+  });
+
+  it("reads a directory, or a symlink to one, as empty", () => {
+    const sub = join(dir, "a-dir");
+    mkdirSync(sub);
+    expect(readManifestAt(sub).sources).toEqual([]);
+    const link = join(dir, "dir-link.json");
+    symlinkSync(sub, link);
+    expect(readManifestAt(link).sources).toEqual([]);
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "reads a device or a FIFO as empty without blocking",
+    () => {
+      const dev = join(dir, "zero-link.json");
+      symlinkSync("/dev/zero", dev);
+      expect(readManifestAt(dev).sources).toEqual([]);
+      const fifo = join(dir, "pipe.json");
+      execFileSync("mkfifo", [fifo]);
+      // Opening a FIFO with no writer for reading would block the hook forever.
+      expect(readManifestAt(fifo).sources).toEqual([]);
+    },
+  );
+
+  it("bounds the PreToolUse docs lookup in routing.ts too", () => {
+    const proj = join(dir, "proj");
+    mkdirSync(join(proj, ".eminiar"), { recursive: true });
+    const file = join(proj, ".eminiar", "docs.json");
+    writeFileSync(file, valid);
+    expect(docsSourceFor("https://zod.dev/api", proj)).toBe("zod");
+    writeFileSync(file, `${valid}${" ".repeat(MANIFEST_MAX_BYTES)}`);
+    expect(docsSourceFor("https://zod.dev/api", proj)).toBeUndefined();
+  });
+});
+
+describe("manifest writes refuse a manifest they could not read (task #134)", () => {
+  const source = { name: "zod", kind: "url", urls: ["https://zod.dev/"], addedAt: "2026-01-01" };
+  const valid = JSON.stringify({ version: 1, sources: [source] });
+  const add = { name: "vitest", kind: "url" as const, urls: ["https://vitest.dev/"] };
+  let proj: string;
+  let pctx: ProjectContext;
+  let file: string;
+  beforeAll(() => {
+    proj = mkdtempSync(join(tmpdir(), "eminiar-manifest-refuse-"));
+    mkdirSync(join(proj, ".eminiar"), { recursive: true });
+    pctx = getContext(proj);
+    // The context resolves the root (macOS tmpdir is a symlink to /private/var).
+    file = manifestPath(pctx);
+  });
+  afterAll(() => {
+    rmSync(proj, { recursive: true, force: true });
+  });
+  const reset = () => rmSync(file, { recursive: true, force: true });
+  const refusal = (fn: () => unknown): ManifestRefusedError => {
+    try {
+      fn();
+    } catch (err) {
+      expect(err).toBeInstanceOf(ManifestRefusedError);
+      return err as ManifestRefusedError;
+    }
+    throw new Error("expected a ManifestRefusedError");
+  };
+
+  it("creates a missing manifest and edits a readable one", () => {
+    reset();
+    expect(probeManifestAt(file)).toEqual({ state: "missing" });
+    expect(upsertSources(pctx, [add]).added).toEqual(["vitest"]);
+    writeFileSync(file, valid);
+    expect(upsertSources(pctx, [add]).added).toEqual(["vitest"]);
+    expect(readManifest(pctx).sources.map((s) => s.name)).toEqual(["vitest", "zod"]);
+    expect(removeSource(pctx, "zod")).toBe(true);
+    expect(readManifest(pctx).sources.map((s) => s.name)).toEqual(["vitest"]);
+  });
+
+  it("refuses add and remove on an oversized manifest, naming the path and the limit", () => {
+    reset();
+    const big = `${valid}${" ".repeat(MANIFEST_MAX_BYTES)}`;
+    writeFileSync(file, big);
+    // Readers still fail open.
+    expect(readManifest(pctx).sources).toEqual([]);
+    expect(probeManifestAt(file).state).toBe("refused");
+    const e = refusal(() => upsertSources(pctx, [add]));
+    expect(e.file).toBe(file);
+    expect(e.message).toContain(file);
+    expect(e.message).toContain(`${MANIFEST_MAX_BYTES}-byte limit`);
+    refusal(() => removeSource(pctx, "zod"));
+    expect(readFileSync(file, "utf8")).toBe(big);
+  });
+
+  it("refuses a manifest that is not valid JSON or not an object (a merge conflict)", () => {
+    reset();
+    const conflict = `<<<<<<< HEAD\n${valid}\n=======\n{}\n>>>>>>> other\n`;
+    writeFileSync(file, conflict);
+    expect(refusal(() => upsertSources(pctx, [add])).reason).toBe("it is not valid JSON");
+    expect(readFileSync(file, "utf8")).toBe(conflict);
+    writeFileSync(file, "[]");
+    expect(refusal(() => removeSource(pctx, "zod")).reason).toBe("it is not a JSON object");
+    expect(readFileSync(file, "utf8")).toBe("[]");
+  });
+
+  it("refuses a directory and a dangling symlink without creating anything", () => {
+    reset();
+    mkdirSync(file);
+    expect(refusal(() => upsertSources(pctx, [add])).reason).toBe("it is not a regular file");
+    reset();
+    const target = join(pctx.root, "elsewhere.json");
+    symlinkSync(target, file);
+    expect(refusal(() => upsertSources(pctx, [add])).reason).toBe(
+      "it is a symlink to a missing file",
+    );
+    expect(existsSync(target)).toBe(false);
+    reset();
+  });
+
+  it("surfaces the refusal through addDocSources, removeDocSource and em_docs", async () => {
+    reset();
+    const big = `${valid}${" ".repeat(MANIFEST_MAX_BYTES)}`;
+    writeFileSync(file, big);
+    const pdb = getStorage(pctx);
+    await expect(addDocSources(pctx, pdb, [add], { sync: false })).rejects.toBeInstanceOf(
+      ManifestRefusedError,
+    );
+    expect(() => removeDocSource(pctx, pdb, "zod")).toThrow(ManifestRefusedError);
+    const r = await emDocs.handler(
+      { action: "add", name: "vitest", url: "https://vitest.dev/", sync: false },
+      pctx,
+    );
+    expect(r.isError).toBe(true);
+    expect(textOf(r)).toContain(file);
+    const rm = await emDocs.handler({ action: "remove", name: "zod" }, pctx);
+    expect(rm.isError).toBe(true);
+    expect(textOf(rm)).toContain("refusing to write the docs manifest");
+    expect(readFileSync(file, "utf8")).toBe(big);
   });
 });

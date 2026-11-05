@@ -1,9 +1,9 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { FORK_AGENT, isFork, resolveAgentPin } from "../../src/adjudicator/agent-pin.js";
 import type { AsyncJob } from "../../src/adjudicator/async.js";
 import { resolveAdjudicator } from "../../src/adjudicator/config.js";
@@ -22,12 +22,15 @@ import type { HookInput, HookOutput } from "../../src/hooks/types.js";
 import { closeAllStorage, getStorage } from "../../src/storage/index.js";
 import type { ApiCallInput } from "../../src/storage/types.js";
 
-// The adjudicator's hook module, wrapped in spies; `loaded` proves it is imported lazily.
-const seen = vi.hoisted(() => ({ loaded: false }));
+// The adjudicator's hook module, wrapped in spies. `loaded` records that the module was
+// evaluated at all (the registry caches it, so it only ever flips once per file); `used` records
+// that some caller read an export of it, and is reset for every test, so "the disabled path never
+// touches the module" can be asserted in any test order.
+const seen = vi.hoisted(() => ({ loaded: false, used: false }));
 vi.mock("../../src/adjudicator/hooks.js", async (importOriginal) => {
   seen.loaded = true;
   const actual = await importOriginal<typeof import("../../src/adjudicator/hooks.js")>();
-  return {
+  const wrapped = {
     ...actual,
     onPrompt: vi.fn(actual.onPrompt),
     afterRouting: vi.fn(actual.afterRouting),
@@ -37,6 +40,12 @@ vi.mock("../../src/adjudicator/hooks.js", async (importOriginal) => {
     onSessionEnd: vi.fn(actual.onSessionEnd),
     onPostAgent: vi.fn(actual.onPostAgent),
   };
+  return new Proxy(wrapped, {
+    get(target, key, receiver) {
+      if (typeof key === "string" && key !== "then" && key !== "__esModule") seen.used = true;
+      return Reflect.get(target, key, receiver);
+    },
+  });
 });
 
 const hooksModule = () => import("../../src/adjudicator/hooks.js");
@@ -61,14 +70,6 @@ const ENV_KEYS = [
 
 beforeAll(() => {
   for (const k of ENV_KEYS) saved[k] = process.env[k];
-  for (const k of ENV_KEYS) delete process.env[k];
-  process.env.EMINIAR_HOME = mkdtempSync(join(tmpdir(), "em-adj-hooks-home-"));
-  // User-level and plugin agents are read from HOME: keep the real ~/.claude out of the tests.
-  process.env.HOME = mkdtempSync(join(tmpdir(), "em-adj-hooks-user-"));
-  root = mkdtempSync(join(tmpdir(), "em-adj-hooks-root-"));
-  writeFileSync(join(root, "package.json"), "{}");
-  // Swarm enforcement and roots follow the session's project dir: keep them on this project.
-  process.env.CLAUDE_PROJECT_DIR = root;
 });
 afterAll(() => {
   closeAllStorage();
@@ -79,10 +80,33 @@ afterAll(() => {
 });
 
 let sid: string;
+let scratch: string[] = [];
+// Every test gets its own project root, EMINIAR_HOME (database, personal config, caches) and
+// user HOME, so no test can see another's rows, verdict cache, pending markers, breaker state
+// or config, and the file passes under --sequence.shuffle.
 beforeEach(() => {
   sid = `S${++session}`;
+  seen.used = false;
   vi.clearAllMocks();
-  delete process.env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE;
+  closeAllStorage();
+  for (const k of ENV_KEYS) delete process.env[k];
+  const home = mkdtempSync(join(tmpdir(), "em-adj-hooks-home-"));
+  const user = mkdtempSync(join(tmpdir(), "em-adj-hooks-user-"));
+  root = mkdtempSync(join(tmpdir(), "em-adj-hooks-root-"));
+  scratch = [home, user, root];
+  process.env.EMINIAR_HOME = home;
+  // User-level and plugin agents are read from HOME: keep the real ~/.claude out of the tests.
+  process.env.HOME = user;
+  writeFileSync(join(root, "package.json"), "{}");
+  // Swarm enforcement and roots follow the session's project dir: keep them on this project.
+  process.env.CLAUDE_PROJECT_DIR = root;
+  resetContextCache();
+});
+afterEach(() => {
+  closeAllStorage();
+  resetContextCache();
+  for (const d of scratch) rmSync(d, { recursive: true, force: true });
+  scratch = [];
 });
 
 /**
@@ -119,7 +143,12 @@ const prompt = (text: string, over: Partial<HookInput> = {}) =>
   handlers.UserPromptSubmit!(base({ hook_event_name: "UserPromptSubmit", prompt: text, ...over }));
 const preTool = (tool: string, input: Record<string, unknown>, over: Partial<HookInput> = {}) =>
   handlers.PreToolUse!(
-    base({ hook_event_name: "PreToolUse", tool_name: tool, tool_input: input, ...over }),
+    base({
+      hook_event_name: "PreToolUse",
+      tool_name: tool,
+      tool_input: input,
+      ...over,
+    }),
   ) as Promise<HookOutput | undefined>;
 
 /** PostToolUse for an Agent call, with Claude Code's structured tool_response. */
@@ -217,9 +246,16 @@ describe("disabled adjudicator", () => {
     await prompt("Refactor the storage adapter so every store shares one transaction helper.");
     const pre = await preTool("Agent", { ...AGENT_INPUT });
     await preTool("Bash", { command: "pwd" });
-    await postAgent("toolu_off", { status: "async_launched", agentId: "aoff", resolvedModel: "x" });
+    await postAgent("toolu_off", {
+      status: "async_launched",
+      agentId: "aoff",
+      resolvedModel: "x",
+    });
     await handlers.SessionEnd!(base({ hook_event_name: "SessionEnd", reason: "exit" }));
-    expect(seen.loaded).toBe(false);
+    // No hook reached for any export of the module during this test. (`seen.loaded` is not
+    // usable here: the registry caches the module, so it stays true once any earlier test, in
+    // any order, imported it. `seen.used` is reset for every test.)
+    expect(seen.used).toBe(false);
     expect(rows()).toHaveLength(0);
     // Routing's own output, untouched: no model, no effort.
     const ui = pre?.hookSpecificOutput?.updatedInput;
@@ -236,7 +272,11 @@ describe("disabled adjudicator", () => {
 
 describe("UserPromptSubmit", () => {
   it("adds one advice line and a prompt row; skips short, slash and chat prompts", async () => {
-    configure({ enabled: true, promptMode: "heuristic", advice: { mainSession: "off" } });
+    configure({
+      enabled: true,
+      promptMode: "heuristic",
+      advice: { mainSession: "off" },
+    });
     const out = await prompt("Where is the function parseConfig defined in src/config.ts?");
     const ctx = out?.hookSpecificOutput?.additionalContext ?? "";
     const line = ctx.split("\n").find((l) => l.startsWith("eminiar adjudicator:"));
@@ -297,6 +337,136 @@ describe("UserPromptSubmit", () => {
     expect(rowsOf(sid2, "prompt")[0]!.source).toBe("blend");
   });
 
+  it("passes the em_docs manifest names as hints.libraries and keys the verdict on them (#125)", async () => {
+    const ctx = configure({
+      enabled: true,
+      provider: "openai-compatible",
+      openai: { preset: "ollama" },
+      promptMode: "async",
+      advice: { mainSession: "off" },
+    });
+    const { onPrompt } = await hooksModule();
+    const { cacheKeyFor } = await import("../../src/adjudicator/engine.js");
+    const r = resolveAdjudicator(ctx.config.adjudicator, { context: "hook" });
+    const jobs: AsyncJob[] = [];
+    const spawn = vi.fn((j: AsyncJob) => jobs.push(j) > 0);
+    const text = "How do I set up a discriminated union schema with refinements for our config?";
+
+    // No manifest: no hints, and the key is the hint-less one an MCP or CLI call computes.
+    await onPrompt(ctx, db(), base({ prompt: text }), sid, { spawn });
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(jobs[0]!.request.hints).toBeUndefined();
+    const plain = jobs[0]!.cacheKey;
+
+    const docs = join(root, ".eminiar", "docs.json");
+    mkdirSync(join(root, ".eminiar"), { recursive: true });
+    writeFileSync(
+      docs,
+      JSON.stringify({
+        version: 1,
+        sources: [
+          {
+            name: "zod",
+            kind: "url",
+            urls: ["https://zod.dev"],
+            provider: "npm:zod",
+          },
+          {
+            name: "aws-sdk-client-s3",
+            kind: "url",
+            urls: ["https://docs.aws.amazon.com/s3"],
+            provider: "npm:@aws-sdk/client-s3",
+          },
+          {
+            name: "readme",
+            kind: "path",
+            path: "README.md",
+            provider: "manual",
+          },
+        ],
+      }),
+    );
+    try {
+      const sid2 = `${sid}-docs`;
+      await onPrompt(ctx, db(), base({ prompt: text, session_id: sid2 }), sid2, { spawn });
+      expect(spawn).toHaveBeenCalledTimes(2);
+      const job = jobs[1]!;
+      expect([...(job.request.hints?.libraries ?? [])].sort()).toEqual(
+        ["@aws-sdk/client-s3", "aws-sdk-client-s3", "readme", "zod"].sort(),
+      );
+      // A verdict scored with the list never shares a cache entry with one scored without it.
+      expect(job.cacheKey).not.toBe(plain);
+      expect(
+        cacheKeyFor({ surface: "prompt", text }, r, {
+          config: ctx.config.adjudicator,
+        }),
+      ).toBe(plain);
+      expect(cacheKeyFor(job.request, r, { config: ctx.config.adjudicator })).toBe(job.cacheKey);
+      // Order and repeats of the list do not change the key.
+      const libs = [...(job.request.hints?.libraries ?? [])];
+      const shuffled = {
+        ...job.request,
+        hints: { libraries: [...libs.reverse(), libs[0]!] },
+      };
+      expect(cacheKeyFor(shuffled, r, { config: ctx.config.adjudicator })).toBe(job.cacheKey);
+    } finally {
+      rmSync(docs, { force: true });
+    }
+  });
+
+  it("passes hints.libraries to the agent surface too (#125)", async () => {
+    const ctx = configure({
+      enabled: true,
+      provider: "openai-compatible",
+      openai: { preset: "ollama" },
+      mode: "apply",
+      apply: { scope: "all", minConfidence: 0 },
+    });
+    const { onPreAgent } = await hooksModule();
+    const provider = fakeProvider("haiku");
+    const seenReqs: AdjudicationRequest[] = [];
+    const inner = provider.adjudicate.bind(provider);
+    provider.adjudicate = async (reqs, ...rest) => {
+      seenReqs.push(...reqs);
+      return inner(reqs, ...rest);
+    };
+    const docs = join(root, ".eminiar", "docs.json");
+    mkdirSync(join(root, ".eminiar"), { recursive: true });
+    writeFileSync(
+      docs,
+      JSON.stringify({
+        version: 1,
+        sources: [
+          {
+            name: "zod",
+            kind: "url",
+            urls: ["https://zod.dev"],
+            provider: "npm:zod",
+          },
+        ],
+      }),
+    );
+    try {
+      await onPreAgent(
+        ctx,
+        base({
+          tool_name: "Agent",
+          tool_input: {
+            ...AGENT_INPUT,
+            description: "libs",
+            prompt: "Explain zod refinements (#125).",
+          },
+        }),
+        undefined,
+        { provider },
+      );
+      expect(seenReqs).toHaveLength(1);
+      expect(seenReqs[0]!.hints?.libraries).toEqual(["zod"]);
+    } finally {
+      rmSync(docs, { force: true });
+    }
+  });
+
   it("gives the user a main-session note when the session model is 2+ tiers above, with a cooldown", async () => {
     configure({
       enabled: true,
@@ -322,10 +492,192 @@ describe("UserPromptSubmit", () => {
     const c = await prompt(`${ask} (ctx)`);
     expect(c?.systemMessage).toBeUndefined();
     expect(c?.hookSpecificOutput?.additionalContext).toMatch(/would be cheaper/);
-    configure({ enabled: true, promptMode: "heuristic", advice: { mainSession: "off" } });
+    configure({
+      enabled: true,
+      promptMode: "heuristic",
+      advice: { mainSession: "off" },
+    });
     const o = await prompt(`${ask} (off)`);
     expect(o?.systemMessage).toBeUndefined();
     expect(o?.hookSpecificOutput?.additionalContext).not.toMatch(/would be cheaper/);
+  });
+});
+
+describe("harness envelopes are not user prompts (#95)", () => {
+  const ASK = "Where is the function parseConfig defined in src/config.ts?";
+  const ENVELOPES: Record<string, string> = {
+    "agent-message hand-back":
+      '<agent-message from="aa4efb367841c99b6"> [Subagent hand-back] Found parseConfig in src/config.ts and wrote the summary you asked for.</agent-message>',
+    "leading whitespace": `\n  \t<agent-message from="x">The reviewer finished and found three issues in the module.</agent-message>`,
+    "task-notification":
+      "<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n<summary>Background command finished with exit code 0</summary>\n</task-notification>",
+    "system-reminder":
+      "<system-reminder>\n<task-notification>\n<task-id>b2</task-id>\n</task-notification>\n</system-reminder>",
+    "two closed system-reminders":
+      '<system-reminder>\nThe user opened src/auth.ts in the IDE.\n</system-reminder>\n\n<system-reminder id="r2">Worktree path: /tmp/wt</system-reminder>\n  ',
+    "ci-monitor-event":
+      '<ci-monitor-event source="github" run="123">\nWorkflow CI on feature/adjudicator finished: failure (2 jobs failed)\n</ci-monitor-event>',
+    "system-reminder then a hand-back":
+      '<system-reminder>ctx</system-reminder>\n<agent-message from="x">The reviewer finished and found three issues.</agent-message>',
+  };
+  const counter = () => db().metaGet(`adjudicator:main:${sid}`);
+
+  function setup() {
+    configure({
+      enabled: true,
+      promptMode: "heuristic",
+      tiers: ["haiku", "sonnet", "opus"],
+      advice: { mainSession: "user", cooldownPrompts: 3 },
+    });
+    db().apiCallsUpsert([call({ model: "claude-fable-1" })]);
+  }
+
+  for (const [name, text] of Object.entries(ENVELOPES)) {
+    it(`does not score ${name}: no row, no advice, cooldown and previous row untouched`, async () => {
+      setup();
+      const first = await prompt(ASK);
+      expect(first?.systemMessage).toMatch(/would be cheaper/);
+      expect(rowsOf(sid, "prompt")).toHaveLength(1);
+      const before = counter();
+      expect(before).toBeTruthy();
+      expect(rowsOf(sid, "prompt")[0]!.toolUseId).toBeNull();
+
+      const out = await prompt(text);
+      expect(out?.systemMessage).toBeUndefined();
+      expect(out?.hookSpecificOutput?.additionalContext ?? "").not.toContain(
+        "eminiar adjudicator:",
+      );
+      const r = rowsOf(sid, "prompt");
+      expect(r).toHaveLength(1);
+      expect(r[0]!.toolUseId).toBeNull();
+      expect(counter()).toBe(before);
+    });
+  }
+
+  it("a hand-back leaves the previous prompt row open for the next tool hint", async () => {
+    configure({
+      enabled: true,
+      promptMode: "heuristic",
+      surfaces: { tools: true },
+      advice: { mainSession: "off" },
+    });
+    await prompt(ASK);
+    await prompt(ENVELOPES["agent-message hand-back"]!);
+    expect(rowsOf(sid, "prompt")[0]!.toolUseId).toBeNull();
+    // Contrast: a short chat prompt does supersede it.
+    await prompt("thanks, that looks great!");
+    expect(rowsOf(sid, "prompt")[0]!.toolUseId).toBe("superseded");
+  });
+
+  it("a real prompt that mentions the tags mid-sentence is still scored", async () => {
+    setup();
+    await prompt(ASK);
+    const mentions = [
+      'Why does <agent-message from="x"> get scored as a prompt in src/adjudicator/hooks.ts?',
+      "Where is <task-notification> parsed in src/session/transcript.ts, and who emits it?",
+      "Explain how a <system-reminder> block reaches the hooks in src/hooks/index.ts please.",
+    ];
+    for (const m of mentions) await prompt(m);
+    expect(rowsOf(sid, "prompt")).toHaveLength(1 + mentions.length);
+  });
+
+  // #122 (review #98 F9): Claude Code can put harness context ahead of the typed text, e.g.
+  // "<system-reminder>\nYou are operating in a git worktree.…</system-reminder>\n\n<the ask>".
+  it("scores the typed text that follows leading closed system-reminder blocks", async () => {
+    setup();
+    await prompt(ASK);
+    const before = counter();
+    const typed = "refactor the auth layer to use PKCE across server, CLI and dashboard";
+    const out = await prompt(
+      `<system-reminder>\nThe user opened src/auth.ts in the IDE.\n</system-reminder>\n<system-reminder id="w">\nYou are operating in a git worktree.\n</system-reminder>\n\n${typed}`,
+    );
+    expect(out?.hookSpecificOutput?.additionalContext ?? "").toContain("eminiar adjudicator:");
+    const r = rowsOf(sid, "prompt");
+    expect(r).toHaveLength(2);
+    // Only the typed text is scored, not the reminders.
+    expect(r.map((x) => x.inputChars)).toContain(typed.length);
+    expect(counter()).not.toBe(before);
+  });
+
+  it("a short reply after a system-reminder is the user's turn: no row, ends the tool hint", async () => {
+    configure({
+      enabled: true,
+      promptMode: "heuristic",
+      surfaces: { tools: true },
+      advice: { mainSession: "off" },
+    });
+    await prompt(ASK);
+    await prompt("<system-reminder>The user opened src/auth.ts.</system-reminder>\nyes");
+    const r = rowsOf(sid, "prompt");
+    expect(r).toHaveLength(1);
+    expect(r[0]!.toolUseId).toBe("superseded");
+  });
+
+  it("stripLeadingReminders drops only leading closed reminder blocks", async () => {
+    const { stripLeadingReminders } = await hooksModule();
+    expect(stripLeadingReminders("<system-reminder>a</system-reminder>\n fix it ")).toBe("fix it");
+    expect(
+      stripLeadingReminders(
+        '  <system-reminder id="1">a\n</system-reminder><system-reminder\nid="2">b</system-reminder>go',
+      ),
+    ).toBe("go");
+    expect(stripLeadingReminders("<system-reminder>a</system-reminder>")).toBe("");
+    expect(stripLeadingReminders("fix <system-reminder>a</system-reminder> b")).toBe(
+      "fix <system-reminder>a</system-reminder> b",
+    );
+    expect(stripLeadingReminders("<system-reminder>unclosed fix it")).toBe(
+      "<system-reminder>unclosed fix it",
+    );
+    expect(stripLeadingReminders("<system-reminders>a</system-reminders> b")).toBe(
+      "<system-reminders>a</system-reminders> b",
+    );
+  });
+
+  it("isHarnessEnvelope accepts only a leading envelope tag", async () => {
+    const { isHarnessEnvelope } = await hooksModule();
+    const yes = [
+      '<agent-message from="aa4efb367841c99b6"> [Subagent hand-back] done',
+      "<agent-message>",
+      '<agent-message\nfrom="x">',
+      "<task-notification>\n<task-id>1</task-id>",
+      "<ci-monitor-event>\nCI failed",
+      '<ci-monitor-event source="github">',
+      "<system-reminder>a</system-reminder>\n<ci-monitor-event>\nCI passed",
+      "<system-reminder>\nhi",
+      '<system-reminder id="r1">hi',
+      '  \n\t<agent-message from="x">',
+      ' <agent-message from="x">',
+      '﻿<agent-message from="x">',
+      "<system-reminder>a</system-reminder>",
+      '<system-reminder>a</system-reminder>\n<system-reminder id="2">b</system-reminder>\n',
+      '<system-reminder>a</system-reminder><agent-message from="x">done',
+      "<system-reminder>a</system-reminder>\n<task-notification>\n<task-id>1</task-id>",
+      "<system-reminder>a</system-reminder>\n<system-reminder>unclosed ask",
+    ];
+    const no = [
+      'Why does <agent-message from="x"> get scored?',
+      "<agent-messages>",
+      "<system-reminders>",
+      "<system-reminder/>",
+      "<agent-msg>",
+      "see <task-notification",
+      "<ci-monitor-events>",
+      "<ci-monitor-event",
+      "why did the <ci-monitor-event> say CI failed on src/adjudicator/hooks.ts?",
+      "<task-notification",
+      '<Agent-Message from="x">',
+      '"<agent-message from="x">',
+      '`<agent-message from="x">`',
+      "> <agent-message>",
+      "",
+      "   ",
+      "<system-reminder>The user opened src/auth.ts in the IDE.</system-reminder>\nrefactor the auth layer to use PKCE across server, CLI and dashboard",
+      '<system-reminder id="r1">ctx</system-reminder>yes',
+    ];
+    for (const t of yes) expect(isHarnessEnvelope(t), JSON.stringify(t)).toBe(true);
+    for (const t of no) expect(isHarnessEnvelope(t), JSON.stringify(t)).toBe(false);
+    for (const t of [undefined, null, 42, {}, ["<agent-message>"]])
+      expect(isHarnessEnvelope(t), String(t)).toBe(false);
   });
 });
 
@@ -398,7 +750,10 @@ describe("PreToolUse Agent, apply mode", () => {
     const forced = await preTool("Agent", { ...AGENT_INPUT });
     expect(forced?.hookSpecificOutput?.updatedInput).toBeUndefined();
     process.env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE = "0";
-    const notForced = await preTool("Agent", { ...AGENT_INPUT, description: "zero means off" });
+    const notForced = await preTool("Agent", {
+      ...AGENT_INPUT,
+      description: "zero means off",
+    });
     expect(notForced?.hookSpecificOutput?.updatedInput?.model).toBeDefined();
     delete process.env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE;
 
@@ -411,9 +766,15 @@ describe("PreToolUse Agent, apply mode", () => {
       join(root, ".claude", "agents", "inherits.md"),
       "---\nname: inherits\nmodel: inherit\n---\nbody\n",
     );
-    const pinned = await preTool("Agent", { ...AGENT_INPUT, subagent_type: "pinned" });
+    const pinned = await preTool("Agent", {
+      ...AGENT_INPUT,
+      subagent_type: "pinned",
+    });
     expect(pinned?.hookSpecificOutput?.updatedInput).toBeUndefined();
-    const inherits = await preTool("Agent", { ...AGENT_INPUT, subagent_type: "inherits" });
+    const inherits = await preTool("Agent", {
+      ...AGENT_INPUT,
+      subagent_type: "inherits",
+    });
     expect(inherits?.hookSpecificOutput?.updatedInput?.model).toBeDefined();
 
     const actions = rowsOf(sid, "agent")
@@ -448,7 +809,11 @@ describe("PreToolUse Agent, apply mode", () => {
     expect(r.baselineModel).toBe("opus");
     expect(r.modelFinal).toBe("opus");
     const pin = JSON.parse(r.scores!).pin;
-    expect(pin).toMatchObject({ status: "pinned", source: "user", model: "opus" });
+    expect(pin).toMatchObject({
+      status: "pinned",
+      source: "user",
+      model: "opus",
+    });
     expect(pin.file).toBe(join("~", ".claude", "agents", "review", "reviewer-file.md"));
   });
 
@@ -462,23 +827,35 @@ describe("PreToolUse Agent, apply mode", () => {
       join(root, ".claude", "agents", "shadowed.md"),
       "---\nname: shadowed\nmodel: inherit\n---\nb\n",
     );
-    const out = await preTool("Agent", { ...AGENT_INPUT, subagent_type: "shadowed" });
+    const out = await preTool("Agent", {
+      ...AGENT_INPUT,
+      subagent_type: "shadowed",
+    });
     expect(out?.hookSpecificOutput?.updatedInput?.model).toBeDefined();
     expect(rowsOf(sid, "agent")[0]!.action).toBe("applied");
   });
 
   it("never applies over a plugin agent whose definition cannot be read; says why", async () => {
     apply({}, "off");
-    const out = await preTool("Agent", { ...AGENT_INPUT, subagent_type: "ghost-plugin:helper" });
+    const out = await preTool("Agent", {
+      ...AGENT_INPUT,
+      subagent_type: "ghost-plugin:helper",
+    });
     expect(out?.hookSpecificOutput?.updatedInput).toBeUndefined();
     expect(out?.hookSpecificOutput?.additionalContext).toMatch(/model pin is unknown/);
     const r = rowsOf(sid, "agent")[0]!;
     expect(r.action).toBe("advised");
     expect(r.modelFinal).toBeNull();
-    expect(JSON.parse(r.scores!).pin).toMatchObject({ status: "unknown", source: "plugin" });
+    expect(JSON.parse(r.scores!).pin).toMatchObject({
+      status: "unknown",
+      source: "plugin",
+    });
 
     // An unknown bare name (a --agents session agent?) is advice only too.
-    const bare = await preTool("Agent", { ...AGENT_INPUT, subagent_type: "nowhere-agent" });
+    const bare = await preTool("Agent", {
+      ...AGENT_INPUT,
+      subagent_type: "nowhere-agent",
+    });
     expect(bare?.hookSpecificOutput?.updatedInput).toBeUndefined();
     expect(rowsOf(sid, "agent").map((x) => x.action)).toEqual(["advised", "advised"]);
   });
@@ -498,10 +875,15 @@ describe("PreToolUse Agent, apply mode", () => {
       join(plugins, "installed_plugins.json"),
       JSON.stringify({
         version: 2,
-        plugins: { "my-plugin@market": [{ scope: "user", installPath: install }] },
+        plugins: {
+          "my-plugin@market": [{ scope: "user", installPath: install }],
+        },
       }),
     );
-    const plain = await preTool("Agent", { ...AGENT_INPUT, subagent_type: "my-plugin:plain" });
+    const plain = await preTool("Agent", {
+      ...AGENT_INPUT,
+      subagent_type: "my-plugin:plain",
+    });
     expect(plain?.hookSpecificOutput?.updatedInput?.model).toBeDefined();
     const sec = await preTool("Agent", {
       ...AGENT_INPUT,
@@ -522,7 +904,10 @@ describe("PreToolUse Agent, apply mode", () => {
 
   it("respectFrontmatter false applies even over a pin it cannot read", async () => {
     apply({ apply: { scope: "all", minConfidence: 0, respectFrontmatter: false } }, "off");
-    const out = await preTool("Agent", { ...AGENT_INPUT, subagent_type: "ghost-plugin:helper" });
+    const out = await preTool("Agent", {
+      ...AGENT_INPUT,
+      subagent_type: "ghost-plugin:helper",
+    });
     expect(out?.hookSpecificOutput?.updatedInput?.model).toBeDefined();
   });
 
@@ -541,7 +926,10 @@ describe("PreToolUse Agent, apply mode", () => {
     ];
     for (const [i, [v, isForced]] of cases.entries()) {
       process.env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE = v;
-      const out = await preTool("Agent", { ...AGENT_INPUT, description: `force ${i}` });
+      const out = await preTool("Agent", {
+        ...AGENT_INPUT,
+        description: `force ${i}`,
+      });
       expect(out?.hookSpecificOutput?.updatedInput?.model === undefined, `FORCE=${v}`).toBe(
         isForced,
       );
@@ -588,7 +976,10 @@ describe("onPreAgent", () => {
     });
     const b = await onPreAgent(
       applyCtx,
-      base({ tool_name: "Agent", tool_input: { ...AGENT_INPUT, description: "other" } }),
+      base({
+        tool_name: "Agent",
+        tool_input: { ...AGENT_INPUT, description: "other" },
+      }),
       undefined,
       { provider, fetch },
     );
@@ -663,7 +1054,12 @@ describe("onPreAgent", () => {
         tool_name: "Agent",
         tool_input: { subagent_type: "swarm-feature-coder", prompt: "task #x" },
       }),
-      { kind: "worker", agentType: "swarm-feature-coder", runId: run.id, taskId: task.id },
+      {
+        kind: "worker",
+        agentType: "swarm-feature-coder",
+        runId: run.id,
+        taskId: task.id,
+      },
     );
     expect(a?.model).toBe("haiku");
     const r = d.adjudicator.get(a!.rowId!)!;
@@ -710,7 +1106,10 @@ describe("onPreAgent", () => {
     });
 
     it("unknown pin: no model to pass either", async () => {
-      const { a, r } = await advise({ ...LIST, subagent_type: "ghost-plugin:helper" });
+      const { a, r } = await advise({
+        ...LIST,
+        subagent_type: "ghost-plugin:helper",
+      });
       expect(a?.note).toMatch(
         /^adjudicator: model pin is unknown \(adjudicator would pick \w+; not overridden/,
       );
@@ -744,7 +1143,10 @@ describe("onPreAgent", () => {
       db().apiCallsUpsert([call({ model: "claude-opus-5-5" })]);
       const a = await onPreAgent(
         ctx,
-        base({ tool_name: "Agent", tool_input: { ...LIST, subagent_type: "ghost-plugin:helper" } }),
+        base({
+          tool_name: "Agent",
+          tool_input: { ...LIST, subagent_type: "ghost-plugin:helper" },
+        }),
         undefined,
       );
       expect(a?.note).toMatch(/pass model:'\w+'/);
@@ -759,7 +1161,10 @@ describe("onPreAgent", () => {
       const { onPreAgent } = await hooksModule();
       const own = await onPreAgent(
         ctx,
-        base({ tool_name: "Agent", tool_input: { ...LIST, description: "own", effort: "high" } }),
+        base({
+          tool_name: "Agent",
+          tool_input: { ...LIST, description: "own", effort: "high" },
+        }),
         undefined,
       );
       expect(own?.note).toMatch(/suggested effort \w+/);
@@ -768,7 +1173,10 @@ describe("onPreAgent", () => {
       try {
         const env = await onPreAgent(
           ctx,
-          base({ tool_name: "Agent", tool_input: { ...LIST, description: "env" } }),
+          base({
+            tool_name: "Agent",
+            tool_input: { ...LIST, description: "env" },
+          }),
           undefined,
         );
         expect(env?.note).toMatch(/suggested effort \w+/);
@@ -793,7 +1201,10 @@ describe("onPreAgent", () => {
       expect(a?.model).toBeUndefined();
       expect(r.action).toBe("advised");
       const sc = JSON.parse(r.scores!);
-      expect(sc).toMatchObject({ fork: true, pin: { status: "unpinned", source: "builtin" } });
+      expect(sc).toMatchObject({
+        fork: true,
+        pin: { status: "unpinned", source: "builtin" },
+      });
       expect(sc.pinDeferred).toBeUndefined();
 
       // apply mode (scope all) never sets a model on a fork, even under FORCE
@@ -809,7 +1220,10 @@ describe("onPreAgent", () => {
         try {
           const ap = await onPreAgent(
             ctx,
-            base({ tool_name: "Agent", tool_input: { ...FORK, description: `apply ${force}` } }),
+            base({
+              tool_name: "Agent",
+              tool_input: { ...FORK, description: `apply ${force}` },
+            }),
             undefined,
           );
           expect(ap?.model).toBeUndefined();
@@ -834,7 +1248,11 @@ describe("onPreAgent", () => {
       process.env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE = "1";
       process.env.CLAUDE_CODE_SUBAGENT_MODEL = "haiku";
       try {
-        const free = await advise({ ...LIST, subagent_type: "general-purpose", model: "opus" });
+        const free = await advise({
+          ...LIST,
+          subagent_type: "general-purpose",
+          model: "opus",
+        });
         expect(free.a?.note).toMatch(
           /^adjudicator: CLAUDE_CODE_SUBAGENT_MODEL_FORCE sets the model \(adjudicator would pick \w+; complexity \d, conf [\d.]+\); pass effort:'\w+' \(Claude Code 2\.1\.292\+\)/,
         );
@@ -853,7 +1271,11 @@ describe("onPreAgent", () => {
           ctx,
           base({
             tool_name: "Agent",
-            tool_input: { ...LIST, description: "pinned", subagent_type: "force-pinned" },
+            tool_input: {
+              ...LIST,
+              description: "pinned",
+              subagent_type: "force-pinned",
+            },
           }),
           undefined,
         );
@@ -901,7 +1323,11 @@ describe("PreToolUse non-Agent tools", () => {
   });
 
   it("does at most one SELECT and hints once per prompt when routing said nothing", async () => {
-    configure({ enabled: true, promptMode: "heuristic", surfaces: { tools: true } });
+    configure({
+      enabled: true,
+      promptMode: "heuristic",
+      surfaces: { tools: true },
+    });
     db().adjudicator.insert({
       surface: "prompt",
       inputHash: "h",
@@ -1007,10 +1433,17 @@ describe("PostToolUse Agent: the exact dispatch → subagent link", () => {
   });
 
   it("keeps an existing link, ignores other tools and unknown ids, and never throws", async () => {
-    const ctx = configure({ enabled: true, mode: "advise", promptMode: "heuristic" });
+    const ctx = configure({
+      enabled: true,
+      mode: "advise",
+      promptMode: "heuristic",
+    });
     await preTool("Agent", { ...AGENT_INPUT }, { tool_use_id: "toolu_keep" });
     const row = rowsOf(sid, "agent")[0]!;
-    db().adjudicator.update(row.id, { agentId: "earlier", actualModel: "claude-haiku-5" });
+    db().adjudicator.update(row.id, {
+      agentId: "earlier",
+      actualModel: "claude-haiku-5",
+    });
     const { onPostAgent } = await hooksModule();
     const post = (over: Partial<HookInput>) =>
       onPostAgent(ctx, db(), base({ hook_event_name: "PostToolUse", tool_name: "Agent", ...over }));
@@ -1023,18 +1456,29 @@ describe("PostToolUse Agent: the exact dispatch → subagent link", () => {
       post({ tool_name: "Bash", tool_use_id: "toolu_keep", tool_response: {} }),
     ).toBeUndefined();
     expect(
-      post({ tool_use_id: "toolu_keep", tool_response: "User rejected tool use" }),
+      post({
+        tool_use_id: "toolu_keep",
+        tool_response: "User rejected tool use",
+      }),
     ).toBeUndefined();
     expect(post({ tool_use_id: "toolu_keep", tool_response: null })).toBeUndefined();
     expect(db().adjudicator.get(row.id)!.actualModel).toBe("claude-haiku-5");
   });
 
   it("finds the dispatch row by tool_use_id behind more than 200 newer agent rows (#48)", async () => {
-    const ctx = configure({ enabled: true, mode: "advise", promptMode: "heuristic" });
+    const ctx = configure({
+      enabled: true,
+      mode: "advise",
+      promptMode: "heuristic",
+    });
     await preTool("Agent", { ...AGENT_INPUT }, { tool_use_id: "toolu_deep" });
     const row = rowsOf(sid, "agent")[0]!;
     for (let i = 0; i < 250; i++)
-      db().adjudicator.insert({ surface: "agent", inputHash: `busy${i}`, ts: row.ts + 1 + i });
+      db().adjudicator.insert({
+        surface: "agent",
+        inputHash: `busy${i}`,
+        ts: row.ts + 1 + i,
+      });
     const { onPostAgent } = await hooksModule();
     const out = onPostAgent(
       ctx,
@@ -1047,7 +1491,10 @@ describe("PostToolUse Agent: the exact dispatch → subagent link", () => {
       }),
     );
     expect(out).toBe(row.id);
-    expect(db().adjudicator.get(row.id)).toMatchObject({ agentId: "adeep", actualModel: SONNET });
+    expect(db().adjudicator.get(row.id)).toMatchObject({
+      agentId: "adeep",
+      actualModel: SONNET,
+    });
     // Outside the lookback the same row is no longer linked.
     db().adjudicator.update(row.id, { agentId: null });
     const late = onPostAgent(
@@ -1210,20 +1657,32 @@ describe("resolveAgentPin: Claude Code's agent lookup order", () => {
       writeFileSync(join(dir, file), text);
     };
     const look = (type: string, over: Record<string, unknown> = {}) =>
-      resolveAgentPin(type, { root: proj, env: { HOME: home }, managedDir: null, ...over });
+      resolveAgentPin(type, {
+        root: proj,
+        env: { HOME: home },
+        managedDir: null,
+        ...over,
+      });
     return { home, proj, put, look };
   }
 
   it("project (closest to the cwd first), then user, then built-ins", () => {
     const { home, proj, put, look } = world();
     put(join(home, ".claude", "agents"), "a.md", md("a", "opus"));
-    expect(look("a")).toMatchObject({ status: "pinned", source: "user", model: "opus" });
+    expect(look("a")).toMatchObject({
+      status: "pinned",
+      source: "user",
+      model: "opus",
+    });
     put(join(proj, ".claude", "agents", "deep"), "whatever.md", md("a", "inherit"));
     expect(look("a")).toMatchObject({ status: "unpinned", source: "project" });
     const sub = join(proj, "pkg", "app");
     put(join(proj, "pkg", ".claude", "agents"), "a.md", md("a", "haiku"));
     mkdirSync(sub, { recursive: true });
-    expect(look("a", { cwd: sub })).toMatchObject({ status: "pinned", model: "haiku" });
+    expect(look("a", { cwd: sub })).toMatchObject({
+      status: "pinned",
+      model: "haiku",
+    });
     // The file name does not identify an agent; only `name` does.
     put(join(proj, ".claude", "agents"), "b.md", md("not-b", "opus"));
     expect(look("b").status).toBe("unknown");
@@ -1261,11 +1720,21 @@ describe("resolveAgentPin: Claude Code's agent lookup order", () => {
     const { home, put, look } = world();
     for (const t of ["general-purpose", "Explore", "Plan"])
       expect(look(t)).toMatchObject({ status: "unpinned", source: "builtin" });
-    expect(look("claude-code-guide")).toMatchObject({ status: "pinned", model: "haiku" });
-    expect(look("statusline-setup")).toMatchObject({ status: "pinned", model: "sonnet" });
+    expect(look("claude-code-guide")).toMatchObject({
+      status: "pinned",
+      model: "haiku",
+    });
+    expect(look("statusline-setup")).toMatchObject({
+      status: "pinned",
+      model: "sonnet",
+    });
     // A user agent named Explore overrides the built-in and keeps its own model.
     put(join(home, ".claude", "agents"), "explore.md", md("Explore", "haiku"));
-    expect(look("Explore")).toMatchObject({ status: "pinned", source: "user", model: "haiku" });
+    expect(look("Explore")).toMatchObject({
+      status: "pinned",
+      source: "user",
+      model: "haiku",
+    });
     expect(look("unheard-of").status).toBe("unknown");
   });
 
@@ -1300,13 +1769,25 @@ describe("resolveAgentPin: Claude Code's agent lookup order", () => {
         },
       }),
     );
-    expect(look("pa:plain")).toMatchObject({ status: "unpinned", source: "plugin" });
-    expect(look("pa:review:security")).toMatchObject({ status: "pinned", model: "opus" });
+    expect(look("pa:plain")).toMatchObject({
+      status: "unpinned",
+      source: "plugin",
+    });
+    expect(look("pa:review:security")).toMatchObject({
+      status: "pinned",
+      model: "opus",
+    });
     expect(look("pa:security").status).toBe("unknown");
-    expect(look("pc:worker")).toMatchObject({ status: "pinned", model: "haiku" });
+    expect(look("pc:worker")).toMatchObject({
+      status: "pinned",
+      model: "haiku",
+    });
     // The manifest key replaces agents/, so that directory is not an agent source.
     expect(look("pc:ignored").status).toBe("unknown");
-    expect(look("nope:agent")).toMatchObject({ status: "unknown", source: "plugin" });
+    expect(look("nope:agent")).toMatchObject({
+      status: "unknown",
+      source: "plugin",
+    });
     expect(look("pa:../secret").status).toBe("unknown");
     expect(look("pa:").status).toBe("unknown");
 
@@ -1316,7 +1797,9 @@ describe("resolveAgentPin: Claude Code's agent lookup order", () => {
     put(
       join(home, ".claude", "plugins"),
       "installed_plugins.json",
-      JSON.stringify({ plugins: { "pa@m": [{ installPath: v1 }, { installPath: v2 }] } }),
+      JSON.stringify({
+        plugins: { "pa@m": [{ installPath: v1 }, { installPath: v2 }] },
+      }),
     );
     expect(look("pa:plain").status).toBe("unknown");
   });
@@ -1332,13 +1815,17 @@ describe("resolveAgentPin: Claude Code's agent lookup order", () => {
       JSON.stringify({ plugins: { "pz@m": [{ installPath: inst }] } }),
     );
     expect(
-      look("pz:a", { env: { HOME: "/nonexistent", CLAUDE_CODE_PLUGIN_CACHE_DIR: cache } }),
+      look("pz:a", {
+        env: { HOME: "/nonexistent", CLAUDE_CODE_PLUGIN_CACHE_DIR: cache },
+      }),
     ).toMatchObject({ status: "pinned", model: "opus" });
     const dev = mkdtempSync(join(tmpdir(), "em-pin-dev-"));
     put(join(dev, ".claude-plugin"), "plugin.json", JSON.stringify({ name: "devp" }));
     put(join(dev, "agents"), "b.md", md("b"));
     expect(
-      look("devp:b", { env: { HOME: "/nonexistent", CLAUDE_CODE_PLUGIN_DIRS: `/rel:${dev}` } }),
+      look("devp:b", {
+        env: { HOME: "/nonexistent", CLAUDE_CODE_PLUGIN_DIRS: `/rel:${dev}` },
+      }),
     ).toMatchObject({ status: "unpinned", source: "plugin" });
   });
 });
@@ -1347,7 +1834,10 @@ describe("withModel", () => {
   it("never turns a denial into an allow and merges into routing's updatedInput", async () => {
     const { withModel } = await hooksModule();
     const deny: HookOutput = {
-      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny" },
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+      },
     };
     expect(withModel(deny, { a: 1 }, "haiku")).toBe(deny);
     const routed: HookOutput = {
@@ -1474,7 +1964,10 @@ describe("a project .claude/settings.json env block cannot grant remote consent 
           },
         },
         db(),
-        base({ hook_event_name: "UserPromptSubmit", prompt: `${TEXT} async (${provider})` }),
+        base({
+          hook_event_name: "UserPromptSubmit",
+          prompt: `${TEXT} async (${provider})`,
+        }),
         sid,
         { spawn },
       );
@@ -1511,7 +2004,10 @@ describe("a project .claude/settings.json env block cannot grant remote consent 
 
   it("control: with the origin in the personal remoteConsentOrigins the same setup does send", async () => {
     hostileProject("openai-compatible", {
-      adjudicator: { remoteConsent: true, remoteConsentOrigins: ["https://api.groq.com"] },
+      adjudicator: {
+        remoteConsent: true,
+        remoteConsentOrigins: ["https://api.groq.com"],
+      },
     });
     const r = resolveAdjudicator(loadConfig(root), { context: "hook" });
     expect([r.provider, r.consentVia]).toEqual(["openai-compatible", "config"]);
@@ -1556,7 +2052,11 @@ describe("EMINIAR_HOME or HOME pointed into the project cannot grant consent (#5
       req.resume();
       req.on("end", () => {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ choices: [{ message: { content: '{"items":[]}' } }] }));
+        res.end(
+          JSON.stringify({
+            choices: [{ message: { content: '{"items":[]}' } }],
+          }),
+        );
       });
     });
     await new Promise<void>((ok) => server.listen(0, "127.0.0.1", ok));
@@ -1606,7 +2106,9 @@ describe("EMINIAR_HOME or HOME pointed into the project cannot grant consent (#5
     );
     writeFileSync(
       join(root, "eminiar.config.json"),
-      JSON.stringify({ routing: { mode: "enforce", deferToContextMode: false } }),
+      JSON.stringify({
+        routing: { mode: "enforce", deferToContextMode: false },
+      }),
     );
     closeAllStorage();
     resetContextCache();
@@ -1703,7 +2205,11 @@ describe("a __proto__ key in the committed eminiar.config.json grants nothing (#
       req.resume();
       req.on("end", () => {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ choices: [{ message: { content: '{"items":[]}' } }] }));
+        res.end(
+          JSON.stringify({
+            choices: [{ message: { content: '{"items":[]}' } }],
+          }),
+        );
       });
     });
     await new Promise<void>((ok) => server.listen(0, "127.0.0.1", ok));
@@ -1794,7 +2300,9 @@ describe("a __proto__ key in the committed eminiar.config.json grants nothing (#
 
   it("control: the same keys in the personal config are honoured and reach the stub", async () => {
     ship(
-      JSON.stringify({ routing: { mode: "enforce", deferToContextMode: false } }),
+      JSON.stringify({
+        routing: { mode: "enforce", deferToContextMode: false },
+      }),
       JSON.stringify({ adjudicator: { enabled: true, ...EVIL } }),
     );
     const r = resolveAdjudicator(loadConfig(root), { context: "hook" });
@@ -1829,7 +2337,11 @@ describe("a submodule's superproject or a relative home cannot grant consent (#6
       req.resume();
       req.on("end", () => {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ choices: [{ message: { content: '{"items":[]}' } }] }));
+        res.end(
+          JSON.stringify({
+            choices: [{ message: { content: '{"items":[]}' } }],
+          }),
+        );
       });
     });
     await new Promise<void>((ok) => server.listen(0, "127.0.0.1", ok));
@@ -1850,7 +2362,9 @@ describe("a submodule's superproject or a relative home cannot grant consent (#6
     writeFileSync(join(app, "package.json"), "{}");
     writeFileSync(
       join(app, "eminiar.config.json"),
-      JSON.stringify({ routing: { mode: "enforce", deferToContextMode: false } }),
+      JSON.stringify({
+        routing: { mode: "enforce", deferToContextMode: false },
+      }),
     );
     for (const dir of [join(sup, ".em"), join(sup, ".h", ".eminiar")]) {
       mkdirSync(dir, { recursive: true });

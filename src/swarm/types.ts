@@ -5,6 +5,8 @@
  * Spec: docs/design/agent-swarms.md.
  */
 
+import type { Tier } from "../adjudicator/types.js";
+
 export const TOPOLOGIES = ["hierarchical", "mesh", "pipeline"] as const;
 export type Topology = (typeof TOPOLOGIES)[number];
 
@@ -46,6 +48,17 @@ export interface HookMatcher {
 
 export type RoleHooks = Partial<Record<RoleHookEvent, HookMatcher[] | undefined>>;
 
+/**
+ * The tiers a role's model may move between (swarm.yaml `model_range`), on the
+ * haiku < sonnet < opus < fable ladder; floor below ceiling, and the role's `model` (the
+ * fallback the agent file pins) inside. A range of one tier is the plain pin, so it is never
+ * stored.
+ */
+export interface ModelRange {
+  floor: Tier;
+  ceiling: Tier;
+}
+
 export interface RoleSpec {
   swarm: string;
   role: string;
@@ -53,7 +66,10 @@ export interface RoleSpec {
   agentType: string;
   description: string;
   prompt: string;
+  /** The model the agent file pins; with `range`, the fallback inside it. */
   model?: string | undefined;
+  /** Set when the adjudicator may pick the model within these bounds; unset: `model` is fixed. */
+  range?: ModelRange | undefined;
   tools?: string[] | undefined;
   disallowedTools?: string[] | undefined;
   skills: string[];

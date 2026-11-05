@@ -26,6 +26,7 @@ import {
   resolvePrice,
 } from "../usage/pricing.js";
 import { FALLBACK_MODEL } from "../usage/savings.js";
+import { envFlagOn } from "./env.js";
 import { type AdjudicationRow, TIERS, type Tier } from "./types.js";
 
 // The dispatch-counting helpers (tierOf .. keptDispatch) live in src/storage/dispatch.ts so the
@@ -46,6 +47,8 @@ export const SAVINGS_ASSUMPTIONS: readonly string[] = Object.freeze([
   "List prices, with cache pricing unchanged.",
   "Credit only for dispatches that were followed or applied; a failed attempt that was redone is charged its full cost.",
   "No credit for a dispatch to an agent whose model pin the advice kept (pinned, or a pin that could not be read): the adjudicator chose nothing there.",
+  "For a role with a model range the baseline is its fallback pin (the model the agent file pins), and a ranged dispatch earns credit like any followed advice.",
+  "For an agent with no `model` line, the baseline is CLAUDE_CODE_SUBAGENT_MODEL when it is set (and FORCE is off), else the main session's model.",
   "No credit while CLAUDE_CODE_SUBAGENT_MODEL_FORCE is on, nor for a fork (it runs on the main session's model): Claude Code, not the advice, sets the model.",
   "The adjudicator's own provider spend is subtracted.",
   "No credit for tool advice: em_stats already counts context kept out by em_* tools. Only the tool-advice follow rate is reported.",
@@ -96,7 +99,67 @@ export function withKeptModel(
   }
 }
 
+/** Scores-JSON key marking a dispatch to a role with a model range (written by the dispatch hook). */
+export const RANGED_FLAG = "ranged";
+/** Scores-JSON key holding that role's fallback pin (its frontmatter model). */
+export const FALLBACK_PIN_FIELD = "fallbackPin";
+
+/**
+ * Scores-JSON key holding the tier a dispatch's line or note told the coordinator to pass: a
+ * ranged dispatch's pick (the verdict clamped to the role's range ∩ apply.floor..ceiling,
+ * swarm.ts rangedTier), else the verdict clamped to apply.floor..ceiling (hooks.ts clampTier).
+ * Follow detection compares the call's model with it, not with the raw verdict tier; a row
+ * written without it falls back to the raw tier.
+ */
+export const ADVISED_PICK_FIELD = "advisedPick";
+
+/** A row's scores JSON as a record, or undefined when it is not an object. */
+function scoresRecord(row: Pick<AdjudicationRow, "scores">): Record<string, unknown> | undefined {
+  const raw: unknown = row.scores;
+  let o: unknown = raw;
+  if (typeof raw === "string") {
+    try {
+      o = JSON.parse(raw);
+    } catch {
+      return undefined;
+    }
+  }
+  if (!o || typeof o !== "object" || Array.isArray(o)) return undefined;
+  return o as Record<string, unknown>;
+}
+
+/** The fallback pin of a ranged row, or undefined when the row is not ranged. */
+export function rangedFallback(row: Pick<AdjudicationRow, "scores">): string | undefined {
+  const rec = scoresRecord(row);
+  const pin = rec?.[RANGED_FLAG] === true ? rec[FALLBACK_PIN_FIELD] : undefined;
+  return typeof pin === "string" && isPinned(pin) ? pin.trim() : undefined;
+}
+
+/** The tier a row's advice named (ADVISED_PICK_FIELD), or undefined when it stored none. */
+export function advisedPick(row: Pick<AdjudicationRow, "scores">): Tier | undefined {
+  const pick = scoresRecord(row)?.[ADVISED_PICK_FIELD];
+  return typeof pick === "string" && tierRank(pick) >= 0 ? (pick as Tier) : undefined;
+}
+
+/**
+ * CLAUDE_CODE_SUBAGENT_MODEL when it is set and FORCE is off by Claude Code's on/off rule
+ * (env.ts envFlagOn; FORCE rows get no credit).
+ */
+function envSubagentModel(env: NodeJS.ProcessEnv): string | undefined {
+  if (envFlagOn(env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE)) return undefined;
+  const m = env.CLAUDE_CODE_SUBAGENT_MODEL;
+  return isPinned(m) ? m.trim() : undefined;
+}
+
 export interface BaselineQuery {
+  /** A ranged role's fallback pin (see rangedFallback); wins over everything else. */
+  fallbackPin?: string | null | undefined;
+  /**
+   * Opt-in: the dispatch's environment to read CLAUDE_CODE_SUBAGENT_MODEL from. Omitted means no
+   * env baseline (process.env is never read: reconcile runs in another process, and a
+   * main-session baseline must ignore the subagent variable).
+   */
+  env?: NodeJS.ProcessEnv | undefined;
   /** The role's or agent's frontmatter model, when known. */
   pinned?: string | null | undefined;
   sessionId?: string | null | undefined;
@@ -108,16 +171,20 @@ export interface BaselineQuery {
 
 export interface Baseline {
   model: string;
-  source: "pinned" | "session" | "fallback";
+  source: "ranged" | "pinned" | "env" | "session" | "fallback";
 }
 
 /**
- * What would have run without the adjudicator, in order: the pinned frontmatter model, the
- * main-session model at `ts` (the latest main-thread api_calls row before it), usage's
- * fallback model.
+ * What would have run without the adjudicator, in order: a ranged role's fallback pin, the
+ * pinned frontmatter model, CLAUDE_CODE_SUBAGENT_MODEL from `q.env` only (FORCE off), the
+ * main-session model at `ts` (the latest main-thread api_calls row before it), usage's fallback
+ * model.
  */
 export function resolveBaseline(db: StorageAdapter | undefined, q: BaselineQuery): Baseline {
+  if (isPinned(q.fallbackPin)) return { model: q.fallbackPin.trim(), source: "ranged" };
   if (isPinned(q.pinned)) return { model: q.pinned.trim(), source: "pinned" };
+  const envModel = q.env ? envSubagentModel(q.env) : undefined;
+  if (envModel) return { model: envModel, source: "env" };
   if (q.sessionId) {
     const calls =
       q.calls ??

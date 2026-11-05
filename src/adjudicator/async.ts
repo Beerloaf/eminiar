@@ -172,6 +172,7 @@ export async function runAsyncJob(raw: string, deps: RunDeps = {}): Promise<RunR
           const { latencyMs: _childLatency, ...cols } = verdictColumns(v, {
             features: out.features,
             providerModel: out.providerModel,
+            units: out.units,
           });
           res.rowUpdated = store.update(job.rowId, cols);
         } else {

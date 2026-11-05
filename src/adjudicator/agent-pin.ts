@@ -15,21 +15,38 @@
  * `plugin:sub:agent` for agents/sub/agent.md. Apply mode must never override a pin it cannot see,
  * so whenever the definition cannot be read with certainty the answer is `unknown`, never
  * `unpinned`. Read-only, synchronous and bounded; never throws.
+ *
+ * A swarm role with a model range (swarm.yaml `model_range`) is `ranged`: `eminiar swarm sync`
+ * wrote its file with `model: <fallback>` and `range=<floor>..<ceiling>` in the marker. The range
+ * counts only while the file is untouched (its hash verifies) and the fallback lies inside it;
+ * anything else is the plain pin of the frontmatter `model`.
  */
 
 import { type Dirent, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { isPinned } from "./savings.js";
+import { agentFileRange } from "../swarm/agents.js";
+import type { ModelRange } from "../swarm/types.js";
+import { isPinned, tierOf, tierRank } from "./savings.js";
 
-export type PinStatus = "pinned" | "unpinned" | "unknown";
+export type PinStatus = "pinned" | "ranged" | "unpinned" | "unknown";
 export type PinSource = "managed" | "project" | "user" | "plugin" | "builtin";
 
 export interface AgentPin {
-  /** pinned: a `model` other than inherit; unpinned: found without one; unknown: cannot tell. */
+  /**
+   * pinned: a `model` other than inherit; ranged: a generated swarm agent whose `model` is the
+   * fallback inside a model range; unpinned: found without one; unknown: cannot tell.
+   */
   status: PinStatus;
-  /** The pinned model (status pinned only). */
+  /** The pinned model (pinned), or the fallback the agent runs on unless the adjudicator picks (ranged). */
   model?: string;
+  /** The tiers a ranged agent's model may move between, floor below ceiling (ranged only). */
+  range?: ModelRange;
+  /**
+   * unpinned only: the definition says `model: inherit`, so it runs on the main session's model
+   * even when CLAUDE_CODE_SUBAGENT_MODEL is set (no `model` line falls back to that variable).
+   */
+  inherit?: boolean;
   source?: PinSource;
   /** The definition file, with the home directory shown as `~`. */
   file?: string;
@@ -81,6 +98,8 @@ interface Def {
   file: string;
   name?: string | undefined;
   model?: string | undefined;
+  /** The marker's model range, when sync wrote the file and nobody edited it since. */
+  range?: ModelRange | undefined;
 }
 
 interface Found {
@@ -125,10 +144,28 @@ function readDef(file: string): Def | undefined {
     const text = readFileSync(file, "utf8");
     const fm = /^\uFEFF?---\r?\n([\s\S]*?)\r?\n---/.exec(text)?.[1];
     if (!fm) return { file };
-    return { file, name: scalar(fm, "name"), model: scalar(fm, "model") };
+    const def: Def = { file, name: scalar(fm, "name"), model: scalar(fm, "model") };
+    // Only a marker that names a range is hashed (agentFileRange verifies the whole file).
+    if (text.includes(" range=")) def.range = agentFileRange(text);
+    return def;
   } catch {
     return undefined;
   }
+}
+
+/**
+ * The range every definition at one location agrees on, when it is a real range around their
+ * fallback `model`: two tiers or more, and the fallback's tier inside. opusplan has no one tier.
+ */
+function rangeOf(defs: Def[], model: string): ModelRange | undefined {
+  const r = defs[0]?.range;
+  if (!r || defs.some((d) => d.range?.floor !== r.floor || d.range?.ceiling !== r.ceiling))
+    return undefined;
+  const tier = model.toLowerCase() === "opusplan" ? undefined : tierOf(model);
+  const [lo, hi, at] = [tierRank(r.floor), tierRank(r.ceiling), tierRank(tier)];
+  return lo >= 0 && lo < hi && at >= lo && at <= hi
+    ? { floor: r.floor, ceiling: r.ceiling }
+    : undefined;
 }
 
 /** Every *.md under `dir`, recursively, within the scan bounds. */
@@ -193,9 +230,27 @@ function decide(defs: Def[], source: PinSource, home: string): AgentPin {
       reason: `${defs.length} ${source} definitions disagree on the model`,
     };
   const model = [...pins][0];
-  return model
-    ? { status: "pinned", model, source, file, reason: `${source} agent pins model ${model}` }
-    : { status: "unpinned", source, file, reason: `${source} agent has no model pin` };
+  if (!model) {
+    const out: AgentPin = {
+      status: "unpinned",
+      source,
+      file,
+      reason: `${source} agent has no model pin`,
+    };
+    if (defs.every((d) => d.model?.trim().toLowerCase() === "inherit")) out.inherit = true;
+    return out;
+  }
+  const range = rangeOf(defs, model);
+  return range
+    ? {
+        status: "ranged",
+        model,
+        range,
+        source,
+        file,
+        reason: `${source} agent ranges ${range.floor}..${range.ceiling} (fallback ${model})`,
+      }
+    : { status: "pinned", model, source, file, reason: `${source} agent pins model ${model}` };
 }
 
 /** The .claude/agents dirs from the cwd up to the repository root, closest first. */

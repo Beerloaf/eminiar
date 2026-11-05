@@ -26,8 +26,10 @@ import type { ProjectContext } from "../context.js";
 import { paths } from "../paths.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import { getStorage } from "../storage/index.js";
+import { activeSwarmConfig } from "../swarm/config.js";
 import { formatStats } from "../tools/em_adjudicate.js";
 import { parseSince } from "../tools/em_usage.js";
+import { resolveAgentPin } from "./agent-pin.js";
 import { callsToday, p95, spendToday } from "./breaker.js";
 import {
   consentedOrigins,
@@ -797,6 +799,11 @@ export interface StatusReport {
   } | null;
   apply: { checked: number; ineffective: number } | null;
   modelForced: boolean;
+  /**
+   * Apply mode only (null otherwise): the swarms whose every role pins a model without a range,
+   * so apply mode cannot change any of their workers (pinnedSwarms).
+   */
+  pinnedSwarms: string[] | null;
 }
 
 export interface CliDeps {
@@ -817,6 +824,33 @@ async function storage(ctx: ProjectContext, deps: CliDeps): Promise<StorageAdapt
 
 /** CLAUDE_CODE_SUBAGENT_MODEL_FORCE with Claude Code's on/off rule, as the hook reads it. */
 const forced = (env: NodeJS.ProcessEnv) => subagentModelForced(env);
+
+/**
+ * The opted-in swarms whose every role keeps a plain model pin (resolveAgentPin status pinned:
+ * no model_range, or a ranged agent file edited by hand), read like em_swarm plan's all-pinned
+ * nudge (swarm.ts ALL_PINNED_NOTE). Apply mode respects those pins, so it cannot change any of
+ * their workers. [] with apply.respectFrontmatter off, under FORCE (warned about on its own) and
+ * without swarms. Read-only; never throws.
+ */
+export function pinnedSwarms(root: string, config: Config, env: NodeJS.ProcessEnv): string[] {
+  if (!config.adjudicator.apply.respectFrontmatter || forced(env)) return [];
+  const swarms = safe(() => activeSwarmConfig(root))?.swarms ?? [];
+  return swarms
+    .filter(
+      (s) =>
+        s.roles.length > 0 &&
+        s.roles.every(
+          (r) => resolveAgentPin(r.agentType, { root, cwd: root, env }).status === "pinned",
+        ),
+    )
+    .map((s) => s.name);
+}
+
+/** The status warning and doctor detail for pinnedSwarms. */
+export function pinnedSwarmsNote(names: readonly string[]): string {
+  const which = `${names.length === 1 ? "swarm" : "swarms"} ${names.map((n) => `"${n}"`).join(", ")}`;
+  return `every role of ${which} pins a model, so apply mode cannot change any worker (add model_range in swarm.yaml, then \`eminiar swarm sync\`)`;
+}
 
 export async function statusReport(
   ctx: ProjectContext,
@@ -873,6 +907,7 @@ export async function statusReport(
     last24h,
     apply,
     modelForced: forced(io.env),
+    pinnedSwarms: a.mode === "apply" ? pinnedSwarms(ctx.root, config, io.env) : null,
   };
 }
 
@@ -973,6 +1008,8 @@ export function formatStatus(s: StatusReport): string {
     lines.push(
       "warning: CLAUDE_CODE_SUBAGENT_MODEL_FORCE is on, so Claude Code ignores the applied `model`",
     );
+  if (s.mode === "apply" && s.pinnedSwarms?.length)
+    lines.push(`warning: ${pinnedSwarmsNote(s.pinnedSwarms)}`);
   if (!s.enabled) lines.push("turn it on with `eminiar adjudicator enable`");
   return lines.join("\n");
 }
@@ -1111,6 +1148,10 @@ export function adjudicatorDoctorChecks(
       detail:
         "CLAUDE_CODE_SUBAGENT_MODEL_FORCE is on, so Claude Code ignores the `model` apply mode sets; unset it or use mode advise",
     });
+  // Information, not a failure: the pins are respected by design (apply.respectFrontmatter).
+  const pinned = a.mode === "apply" ? pinnedSwarms(o.root, config, env) : [];
+  if (pinned.length)
+    checks.push({ name: "adjudicator swarm pins", ok: true, detail: pinnedSwarmsNote(pinned) });
   if (r0.configured === "embedding") {
     let cached = false;
     try {

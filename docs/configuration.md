@@ -165,7 +165,7 @@ only:
 |---|---|---|
 | `enabled` | `false` | Turn the adjudicator on. `EMINIAR_ADJUDICATOR=0` is the kill switch |
 | `provider` | `"heuristic"` | `heuristic`, `embedding`, `typesafe` (Jev) or `openai-compatible` |
-| `mode` | `"advise"` | `advise` only suggests; `apply` may set the Agent `model` (best effort) |
+| `mode` | `"advise"` | `advise` only suggests; `apply` sets the Agent `model` on the dispatches `apply.scope` covers. See [Advise and apply](adjudicator.md#advise-and-apply) |
 | `surfaces.prompt` | `true` | Score prompts (UserPromptSubmit) |
 | `surfaces.agent` | `true` | Score subagent dispatches (PreToolUse on `Agent`) |
 | `surfaces.plan` | `true` | Add suggestions to `em_swarm plan` |
@@ -200,7 +200,7 @@ only:
 | `apply.minConfidence` | `0.7` | Apply only at or above this tier confidence |
 | `apply.floor` | `"haiku"` | Smallest tier apply mode sets |
 | `apply.ceiling` | `"opus"` | Largest tier apply mode sets |
-| `apply.respectFrontmatter` | `true` | Leave a dispatch alone when its agent file pins a `model` (`inherit` is not a pin) |
+| `apply.respectFrontmatter` | `true` | Leave a dispatch alone when its agent file pins a `model` (`inherit` is not a pin). A swarm role with a `model_range` still moves inside its range ([Model ranges](swarms.md#model-ranges)). `false` ignores pins and ranges alike: a pinned or ranged agent is advised and set like one with no `model` line, between `apply.floor` and `apply.ceiling` |
 | `advice.mainSession` | `"user"` | Main-session `/model` note: `user` (shown to you), `context` (to Claude) or `off` |
 | `advice.cooldownPrompts` | `8` | At most one main-session note per this many prompts |
 | `learning.enabled` | `true` | Learn a bias from outcomes and feedback |
