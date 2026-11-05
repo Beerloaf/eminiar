@@ -930,6 +930,10 @@
             "storeHead": {
               "default": true,
               "type": "boolean"
+            },
+            "captureExchanges": {
+              "default": false,
+              "type": "boolean"
             }
           }
         }

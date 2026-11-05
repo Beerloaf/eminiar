@@ -293,8 +293,7 @@ function jevReply(
       // Like the live API: the score is on the criteria's levels, echoed in `legend`.
       const legend = Object.fromEntries((q.criteria as string[]).map((c, i) => [String(i), c]));
       answers[id] = { type: "score", score: o.score ?? 2, confidence: 0.8, legend };
-    }
-    else if (q.type === "noul")
+    } else if (q.type === "noul")
       answers[id] = { type: "noul", noul: id.endsWith(".risky") ? 0.9 : 0.2 };
     else {
       const opts = Object.keys(q.criteria as Record<string, string>);

@@ -196,13 +196,112 @@ export interface ProviderResult {
   model: string;
 }
 
+/** How one captured HTTP exchange ended; "pending" only while the call is still in flight. */
+export type ExchangeOutcome =
+  | "pending"
+  | "ok"
+  | "timeout"
+  | "http_error"
+  | "rate_limited"
+  | "invalid"
+  | "no_key";
+
+/** A request or answer body as stored: scrubbed, capped, never a header or a key. */
+export interface CapturedBody {
+  text: string;
+  /** text is JSON (structurally scrubbed); false for a raw text body. */
+  json: boolean;
+  /** Length of the scrubbed body before the cap. */
+  bytes: number;
+  truncated: boolean;
+}
+
+/**
+ * One provider HTTP call, filled IN PLACE by http.ts while it runs (so a call the engine gives up
+ * on is still readable as "pending"). Times are ms; sentAt is epoch ms.
+ */
+export interface HttpExchange {
+  method: "GET" | "POST";
+  /** Host and path only (no query string, no userinfo). */
+  target: string;
+  sentAt: number;
+  deadlineMs: number;
+  attempts: number;
+  retryWaitMs: number;
+  /** Final attempt: from its send to the response headers. */
+  ttfbMs: number | null;
+  /** From sentAt to the end, retries included. */
+  durationMs: number | null;
+  status: number | null;
+  outcome: ExchangeOutcome;
+  request: CapturedBody;
+  response: CapturedBody | null;
+  /** The scrubbed ProviderError message. */
+  error: string | null;
+}
+
+/** An HttpExchange plus what the provider knows about the batch it carried. */
+export interface ProviderExchange {
+  http: HttpExchange;
+  provider: ProviderId;
+  model: string;
+  /** Request index within the adjudicate() call (0 or 1). */
+  batch: number;
+  /** AdjudicationRequest.key per item, in request order. The engine maps them to row ids; never stored. */
+  itemKeys: string[];
+  tokensIn: number | null;
+  tokensOut: number | null;
+  costUsd: number | null;
+}
+
+/** A stored exchange without bodies or error text (GET /api/adjudicator/jev/exchanges). */
+export interface ExchangeSummary {
+  id: number;
+  ts: number;
+  callId: string;
+  batch: number;
+  surface: string | null;
+  context: string | null;
+  model: string | null;
+  target: string;
+  outcome: Exclude<ExchangeOutcome, "pending">;
+  status: number | null;
+  timedOut: boolean;
+  attempts: number;
+  waitMs: number | null;
+  jobWaitMs: number | null;
+  ttfbMs: number | null;
+  durationMs: number | null;
+  retryWaitMs: number;
+  deadlineMs: number;
+  budgetMs: number | null;
+  items: number;
+  /** adjudications.id of the decisions this request served. */
+  rowIds: number[];
+  tokensIn: number | null;
+  tokensOut: number | null;
+  costUsd: number | null;
+  requestBytes: number;
+  requestTruncated: boolean;
+  responseBytes: number | null;
+  responseTruncated: boolean;
+}
+
+/** One stored exchange with its bodies (GET /api/adjudicator/jev/exchange). */
+export interface ExchangeDetail extends ExchangeSummary {
+  request: CapturedBody;
+  response: CapturedBody | null;
+  error: string | null;
+}
+
 export interface AdjudicatorProvider {
   id: ProviderId;
   remote: boolean;
   dims: Array<"complexity" | "tier" | "role" | "tool">;
   adjudicate(
     reqs: AdjudicationRequest[],
-    o: { signal: AbortSignal; deadlineMs: number },
+    /** capture: a per-call sink; a provider that supports it pushes one entry per HTTP call. */
+    o: { signal: AbortSignal; deadlineMs: number; capture?: ProviderExchange[] | undefined },
   ): Promise<ProviderResult>;
   probe(o: { signal: AbortSignal }): Promise<{ ok: boolean; latencyMs: number; detail: string }>;
 }

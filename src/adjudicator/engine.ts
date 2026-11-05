@@ -27,11 +27,20 @@
  * Call modes: "inline" calls the provider within the budget; "async" leaves the heuristic in
  * place and spawns one detached job per uncached request (async.ts), which later writes the
  * cache and updates the row; "never" makes no network call at all (advise-mode agent dispatch).
+ *
+ * Exchange log: with privacy.captureExchanges on, Jev the provider and rows to link to (persisted,
+ * or the async job's linkRowIds), each HTTP request of the call is stored after its rows
+ * (writeExchanges). Off, the provider gets no sink and nothing else runs.
  */
 
 import { createHash } from "node:crypto";
 import type { AdjudicatorConfig } from "../config.js";
-import type { AdjudicationInput, AdjudicationPatch, AdjudicatorStore } from "../storage/types.js";
+import type {
+  AdjudicationInput,
+  AdjudicationPatch,
+  AdjudicatorStore,
+  ExchangeInput,
+} from "../storage/types.js";
 import type { AsyncJob } from "./async.js";
 import { blend } from "./blend.js";
 import {
@@ -57,6 +66,7 @@ import {
   type AdjudicatorProvider,
   type Features,
   type ProviderAnswer,
+  type ProviderExchange,
   type ProviderId,
   type ProviderResult,
   type ProviderStatus,
@@ -130,6 +140,19 @@ export interface EngineOptions {
   spawn?: ((job: AsyncJob) => boolean) | undefined;
   /** call "async": the project root the child opens its DB under. */
   projectRoot?: string | undefined;
+  /**
+   * Row ids of the requests' decisions when this call inserts none itself (the async job's
+   * job.rowId), by index: lets a captured Jev exchange name the rows it served.
+   */
+  linkRowIds?: ReadonlyArray<number | undefined> | undefined;
+  /** The async job's queue time (child start − queuedAt), stored with a captured exchange. */
+  jobWaitMs?: number | undefined;
+  /**
+   * The async job's re-check of the CURRENT capture setting (it outlives the config it was queued
+   * with). Asked before the provider gets a sink and again right before the exchange is stored;
+   * false drops the capture and nothing else.
+   */
+  captureStillOn?: (() => boolean) | undefined;
   /** Run even when `enabled` is false (the CLI's `test`); nothing is persisted then unless persist is true. */
   ignoreEnabled?: boolean | undefined;
   now?: (() => number) | undefined;
@@ -151,8 +174,8 @@ export interface Adjudication {
   /** The model the provider reported, when it answered. */
   providerModel?: string;
   /**
-   * How a plan or agent brief was scored per statement, with `saturated` (the whole text sums
-   * past the 0..4 clamp) and the heuristic's role confidence; also stored as `units` in the row's
+   * How a plan or agent brief was scored per statement, with `saturated` (the kept statements
+   * sum past the 0..4 clamp) and the heuristic's role confidence; also stored as `units` in the row's
    * scores JSON (units.briefUnitsOf reads it back). Absent for one-text scoring.
    */
   units?: BriefUnits;
@@ -461,11 +484,22 @@ export async function adjudicate(
     // 3. Provider, raced against the remaining budget.
     const remaining = budgetMs - (now() - start);
     if (remaining <= 0) return fallback("timeout");
+    // Jev exchange log (privacy.captureExchanges, personal config only): a sink only when on,
+    // and only when the decisions it serves have rows to link to.
+    const sink =
+      cfg.privacy.captureExchanges === true &&
+      r.provider === "typesafe" &&
+      store &&
+      (persist || !!opts.linkRowIds) &&
+      (opts.captureStillOn?.() ?? true)
+        ? ([] as ProviderExchange[])
+        : undefined;
     const callStart = now();
     const outcome = await callWithin(
       provider,
       misses.map((it) => it.req),
       remaining,
+      sink,
     );
     const providerLatencyMs = now() - callStart;
     // Warm-up and test/probe calls (surface "test": cold model loads, CLI test, try-it) say
@@ -493,7 +527,9 @@ export async function adjudicate(
         it.verdict = heuristicVerdict(it, r.provider, "fallback", kind);
         it.verdict.providerLatencyMs = providerLatencyMs;
       }
-      return finish(items, opts, start, now, persist, locks);
+      const failed = finish(items, opts, start, now, persist, locks);
+      if (sink && store) writeExchanges(store, sink, misses, failed, opts, start, budgetMs, locks);
+      return failed;
     }
 
     // 4. Blend each answered request; missing answers keep the heuristic (per key).
@@ -556,7 +592,9 @@ export async function adjudicate(
           ),
         log,
       );
-    return finish(items, opts, start, now, persist, locks);
+    const out = finish(items, opts, start, now, persist, locks);
+    if (sink && store) writeExchanges(store, sink, misses, out, opts, start, budgetMs, locks);
+    return out;
   } catch (err) {
     // Last resort: whatever went wrong, every request still gets a heuristic verdict.
     log(`adjudicator: engine error ${(err as Error)?.message ?? String(err)}`);
@@ -598,7 +636,7 @@ function prepare(req: AdjudicationRequest, index: number, opts: EngineOptions): 
   const roles = req.hints?.roles ?? opts.roles;
   if (roles?.length) catalogue.roles = roles;
   const weights = { tierCenters: cfg.weights.tierCenters, features: cfg.weights.features };
-  // A brief per statement (units.ts); `features` stay the whole text's either way.
+  // A brief per statement (units.ts); its `features` are the kept statements', not the boilerplate's.
   const brief = byUnits(req.surface, opts.units)
     ? scoreUnits(req.text, req.hints, weights, catalogue)
     : undefined;
@@ -703,6 +741,7 @@ async function callWithin(
   provider: AdjudicatorProvider,
   reqs: AdjudicationRequest[],
   ms: number,
+  capture?: ProviderExchange[],
 ): Promise<CallOutcome> {
   const ac = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -715,7 +754,12 @@ async function callWithin(
   });
   const attempt = (async (): Promise<CallOutcome> => {
     try {
-      const result = await provider.adjudicate(reqs, { signal: ac.signal, deadlineMs: ms });
+      const result = await provider.adjudicate(
+        reqs,
+        capture
+          ? { signal: ac.signal, deadlineMs: ms, capture }
+          : { signal: ac.signal, deadlineMs: ms },
+      );
       return { ok: true, result };
     } catch (err) {
       if (err instanceof ProviderError) {
@@ -774,7 +818,86 @@ function buildJob(
   const tools = toolsOf(opts);
   if (tools) job.tools = [...tools];
   if (opts.roles) job.roles = opts.roles.map((r) => ({ ...r }));
+  // Only a captured exchange reads it (its job wait).
+  if (cfg.privacy.captureExchanges === true) job.queuedAt = (opts.now ?? Date.now)();
   return job;
+}
+
+/**
+ * Stores the Jev exchanges of one provider call (privacy.captureExchanges), after finish() so
+ * each can name the rows it served. A record still "pending" is the call the engine's timer cut
+ * off: it is stored as a timeout with no response. No lock wait and fail open: a busy or
+ * read-only database loses the exchanges and never delays or changes a verdict.
+ */
+function writeExchanges(
+  store: AdjudicatorStore,
+  sink: readonly ProviderExchange[],
+  misses: readonly Item[],
+  out: readonly Adjudication[],
+  opts: EngineOptions,
+  start: number,
+  budgetMs: number,
+  locks: LockBudget,
+): void {
+  if (!sink.length) return;
+  const now = opts.now ?? Date.now;
+  const log = opts.log ?? (() => {});
+  try {
+    if (opts.captureStillOn && !opts.captureStillOn()) return;
+    const rowsByKey = new Map<string, number[]>();
+    for (const it of misses) {
+      const id = out[it.index]?.rowId ?? opts.linkRowIds?.[it.index];
+      if (id === undefined) continue;
+      const ids = rowsByKey.get(it.req.key);
+      if (ids) ids.push(id);
+      else rowsByKey.set(it.req.key, [id]);
+    }
+    const callId = `${start.toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+    const t = now();
+    const xs: ExchangeInput[] = sink.map((pe) => {
+      const x = pe.http;
+      const pending = x.outcome === "pending";
+      const outcome = pending ? "timeout" : x.outcome;
+      const res = pending ? null : x.response;
+      return {
+        ts: x.sentAt,
+        callId,
+        batch: pe.batch,
+        provider: pe.provider,
+        model: pe.model,
+        surface: misses[0]?.req.surface ?? null,
+        context: opts.context ?? "hook",
+        method: x.method,
+        target: x.target,
+        rowIds: [...new Set(pe.itemKeys.flatMap((k) => rowsByKey.get(k) ?? []))],
+        items: pe.itemKeys.length,
+        outcome,
+        httpStatus: x.status,
+        timedOut: outcome === "timeout",
+        attempts: x.attempts,
+        waitMs: Math.max(0, x.sentAt - start),
+        jobWaitMs: opts.jobWaitMs ?? null,
+        ttfbMs: x.ttfbMs,
+        durationMs: pending ? Math.max(0, t - x.sentAt) : x.durationMs,
+        retryWaitMs: x.retryWaitMs,
+        deadlineMs: x.deadlineMs,
+        budgetMs,
+        tokensIn: pe.tokensIn,
+        tokensOut: pe.tokensOut,
+        costUsd: pe.costUsd,
+        requestBody: x.request.text,
+        requestBytes: x.request.bytes,
+        requestTruncated: x.request.truncated,
+        responseBody: res ? res.text : null,
+        responseBytes: res ? res.bytes : null,
+        responseTruncated: res ? res.truncated : false,
+        error: x.error,
+      };
+    });
+    locks.run(store, 0, () => store.exchangeInsert(xs));
+  } catch (err) {
+    log(`adjudicator: exchange capture skipped (${(err as Error)?.message ?? String(err)})`);
+  }
 }
 
 /**

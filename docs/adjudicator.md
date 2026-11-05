@@ -43,11 +43,17 @@ redone, which costs more than a model one size too large. When the final tier is
 Swarm tasks and subagent dispatches are scored **per statement**. The brief is split into its
 first line (the task title, or the dispatch description) and its sentences or lines, up to 40 of
 them. Routine checks ("run the tests", "keep lint green") and hand-in protocol ("report back",
-"post it to the blackboard") are left out, and a repeated statement counts once. The hardest
-statement sets the complexity, the tier and the effort; the role and the tool are votes over all
-of them. So boilerplate or a repeated detail does not push a brief up a tier. A brief that,
-scored as one text, would land past the top of the scale is **saturated**: it names more work
-than its hardest statement shows, so its suggested effort is only informational. Prompts and
+"post it to the blackboard") are left out, and a repeated statement counts once. Commands such as
+`npx vitest run` are routine too, and so is what follows a check label ("Verification: ...",
+"Done when ...") when every item in it is a routine check: "Done when the new retry tests pass"
+stays work. Only a closed set of routine follow-ups ("fix any failures") is
+dropped, so a specific object at the end of a clause ("fix the retry path") is kept as work. The
+hardest statement sets the complexity, the tier and the effort; the role and the tool are votes
+over all of them. A brief's features and top intents are computed from the statements that are
+kept, not the boilerplate, so appended boilerplate changes neither the verdict nor the intent the
+learned bias reads. Rows written before this keep the features of their whole text. A brief that,
+scored as one text of its kept work, would land past the top of the scale is **saturated**: it
+names more work than its hardest statement shows, so its suggested effort is only informational. Prompts and
 `em_adjudicate` text are scored as one text.
 
 ## What it does not do
@@ -200,11 +206,53 @@ it.
 eminiar never follows an HTTP redirect from a provider: a 3xx answer is an error, so a server
 cannot forward your text or key to another host. Set the base URL to the final endpoint.
 
-**What is stored locally**, in the project database: a hash of the input, the scores and
-reasons, the provider status, latency and tokens, and at most 80 redacted characters of the
-input (`privacy.storeHead: false` stores none). Prompts and keys are never stored.
-`eminiar purge adjudicator --yes` deletes the decisions, the verdict cache, the provider state
-and the learned bias.
+**What is stored locally**, in this project's database under `~/.eminiar/projects/` (never in
+the repository): a hash of the input, the scores and reasons, the provider status, latency and
+tokens, and at most 80 redacted characters of the input (`privacy.storeHead: false` stores
+none). Keys are never stored. Prompt text beyond those 80 characters is stored only if you turn
+on Jev request capture (below). `eminiar purge adjudicator --yes` deletes the decisions, the
+verdict cache, the provider state, the learned bias and any captured Jev requests.
+
+### Jev request capture
+
+Off by default. `eminiar adjudicator exchanges on` keeps each request eminiar sends to TypeSafe
+Jev and the answer that comes back, with its timing: the wait before sending, the time to the
+first byte, the total duration, any retry wait, the attempts, the deadline and whether it was
+missed, the HTTP status and the tokens. The Jev section of the dashboard lists them.
+
+A captured request contains your prompt text as it was sent: redacted and cut to
+`privacy.maxChars` characters per item, up to 10 items per request. It is kept in this project's
+local database, redacted once more, and capped at 65,536 characters per request or answer (a cut
+body is marked truncated). With 100 requests kept that is at most 200 bodies, about 13 million
+characters per project; text in a script that takes several bytes per character is larger on
+disk (a body of Chinese text is about three times as many bytes as characters). The key and the
+`Authorization` header are never stored. Only the newest 100 requests are kept; older ones are
+deleted as new ones arrive. `redact()` is best effort, so treat captured requests like the
+prompts themselves.
+
+How a body is scrubbed before it is stored: your TypeSafe key is replaced wherever it appears,
+including when an echo hides it with zero-width characters or fullwidth forms. In a JSON body,
+the value of any field named like a secret (`client_secret`, `token`, `password`, `cookie`,
+`authorization`) is masked. A response body longer than 131,072 characters is not parsed: its
+first 131,072 characters are scrubbed, the first 65,536 of those are stored, and it is marked
+truncated.
+
+Only `~/.eminiar/config.json` can turn capture on (`privacy.captureExchanges`). An
+`eminiar.config.json` in a repository, or an environment variable, cannot.
+`EMINIAR_ADJUDICATOR_CAPTURE=0` turns it off. `eminiar adjudicator exchanges off` turns it off
+and deletes this project's captured requests. `eminiar adjudicator exchanges purge --yes`
+deletes them and leaves capture on. Requests from `adjudicator test`, `adjudicator eval` and the
+dashboard's try-it box are never captured.
+
+Turning capture off takes effect at once, also for a background scoring job that is already
+running: it re-reads the setting before it writes, so it stores nothing after `exchanges off`,
+the environment switch or a purge.
+
+`exchanges off`, `exchanges purge` and `eminiar purge adjudicator|all` erase the stored text from
+the database file and its write-ahead log, not only from the table: freed pages are zeroed
+(secure delete) and the log is checkpointed and cut. That last step is best effort: when another
+process (the MCP server, the dashboard) holds the database busy, the log is left as it is until
+it next checkpoints. Pruning the oldest requests as new ones arrive zeroes their pages too.
 
 ### Setting up each provider
 
@@ -503,6 +551,49 @@ their reasons, the features, the blend weights, the provider status, the cost an
 health, a call log with a detail drawer, savings with their assumptions, a try-it box and the
 last eval report. See [Dashboard](dashboard.md#adjudicator).
 
+### Jev impact
+
+With the adjudicator on and TypeSafe Jev as the provider, the tab adds a **Jev impact** panel.
+With no key or consent it still shows, with a banner that every decision falls back. It asks whether Jev changed what the heuristic would have chosen, and whether that helped. The
+report itself reads only what the adjudicator already recorded: nothing is re-scored, no prompt
+text is read, and no request goes to Jev. The heuristic's pick is rebuilt from each stored blend
+table. Each load of the panel first runs the same outcome reconcile as the other dashboard reads,
+which does write: it settles pending outcomes and updates the learned bias. If that fails, the
+panel still loads and the response says so in its `reconcile` field.
+
+The verdict is *helping* when the 90% lower Wilson bound of help ÷ (help + hurt), over the
+dispatches Jev changed, is above 50%, and *hindering* when the upper bound is below 50%. It says
+**not enough data** below 10 labelled outcomes, below 30 compared plan or agent decisions that
+Jev answered inline (prompts and cache hits are not counted), or when the labelled outcomes come
+from fewer than 3 different swarm runs or sessions, or when the evidence is split. A downgrade that finished is help and one that failed is hurt. An upgrade counts only
+through your feedback (good, too small, too big), since finishing on the bigger model cannot show
+the smaller one would have failed; the panel states how many upgrades were left out. Warnings
+(Jev failing often, a degraded provider, an open breaker, negative net) never change the label.
+
+Left out, and why:
+
+- **Advice not followed.** A dispatch that ignored the advice, or passed no model, did not run
+  Jev's tier, so its outcome says nothing about Jev. Your feedback on it is left out too: it
+  judges the model that ran, not Jev's. Feedback counts only on dispatches that ran the advised
+  tier, like outcomes.
+- **Outcomes not final yet.** A dispatch that ran the advised tier but whose outcome may still
+  change is left out until it is final.
+- **Apply bounds.** The floor and ceiling a dispatch ran under are not stored. When today's
+  `apply.floor`/`apply.ceiling`, or the defaults (haiku to opus), would clamp the heuristic's
+  tier, the dispatch is left out, because the panel cannot tell whether Jev's advice or the
+  bound set the model. Known limitation: a dispatch that ran under a narrower ceiling that has
+  since been removed can still be read as changed.- **Deferred and async answers.** A prompt whose Jev answer arrived after the heuristic's advice
+  was shown only counts as "would have changed", never as an outcome.
+- **Uncertain near-ties.** Blend tables are stored rounded, so when the heuristic's top two tiers
+  were within 0.03, or its confidence sat next to the round-up threshold, the rebuilt pick is not
+  trusted and the decision is not counted as a change.
+- **Other providers and older rows.** Only Jev decisions inside the chosen range count; rows from
+  another provider, or from before the range, are ignored, and so are dispatches that kept the
+  agent's own model.
+
+Spend and savings use list prices and are estimates. The panel sees a decision's outcome once
+eminiar has linked it; it settles pending outcomes, up to 500 rows, each time it loads. See [Dashboard](dashboard.md#jev-impact) for the tiles.
+
 ## Learning
 
 eminiar links each decision to what happened afterwards: the swarm task's status, the subagent
@@ -670,8 +761,9 @@ provider, the one that actually runs, and why they differ.
   and consent are kept; `eminiar adjudicator key clear` removes the keys.
 - **Kill switch:** `EMINIAR_ADJUDICATOR=0` overrides every config file. Hooks see it on the next
   call; the MCP server needs a restart (`/mcp reconnect`).
-- `eminiar purge adjudicator --yes` deletes the recorded decisions, cache, provider state and
-  learned bias.
+- `eminiar purge adjudicator --yes` deletes the recorded decisions, cache, provider state,
+  learned bias and captured Jev requests. It erases the captured text from the database file and
+  the write-ahead log too (best effort for the log while another process holds the database).
 
 Every key is listed in [Configuration](configuration.md#adjudicator) and every command in
 [CLI](cli.md#adjudicator).

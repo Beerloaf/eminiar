@@ -10,6 +10,9 @@ import type {
   AdjudicatorCacheEntry,
   AdjudicatorProviderState,
   AdjudicatorStore,
+  ExchangeInput,
+  ExchangeRow,
+  ExchangeSummaryRow,
   LatencyStats,
 } from "../types.js";
 import { healAdjudicatorColumns } from "./schema.js";
@@ -73,6 +76,104 @@ const COLUMNS: ReadonlyArray<readonly [Exclude<keyof AdjudicationRow, "id">, str
 const LATENCY_RING = 50;
 const MAX_LIST = 500;
 
+/** How many exchanges the log keeps (the newest by id). A constant, not a setting. */
+export const EXCHANGE_KEEP = 100;
+
+/** The adjudicator_exchanges columns exchangeList reads: everything but the bodies and error. */
+const EXCHANGE_SUMMARY_COLUMNS = `id, ts, call_id, batch, provider, model, surface, context, method,
+  target, row_ids, items, outcome, http_status, timed_out, attempts, wait_ms, job_wait_ms, ttfb_ms,
+  duration_ms, retry_wait_ms, deadline_ms, budget_ms, tokens_in, tokens_out, cost_usd,
+  request_bytes, request_truncated, response_bytes, response_truncated`;
+
+/** Insert order of adjudicator_exchanges (id is assigned by SQLite). */
+const EXCHANGE_INSERT_COLUMNS = [
+  "ts",
+  "call_id",
+  "batch",
+  "provider",
+  "model",
+  "surface",
+  "context",
+  "method",
+  "target",
+  "row_ids",
+  "items",
+  "outcome",
+  "http_status",
+  "timed_out",
+  "attempts",
+  "wait_ms",
+  "job_wait_ms",
+  "ttfb_ms",
+  "duration_ms",
+  "retry_wait_ms",
+  "deadline_ms",
+  "budget_ms",
+  "tokens_in",
+  "tokens_out",
+  "cost_usd",
+  "request_body",
+  "request_bytes",
+  "request_truncated",
+  "response_body",
+  "response_bytes",
+  "response_truncated",
+  "error",
+] as const;
+
+function numOrNull(v: unknown): number | null {
+  return v == null ? null : Number(v);
+}
+
+function strOrNull(v: unknown): string | null {
+  return typeof v === "string" ? v : null;
+}
+
+function parseRowIds(raw: unknown): number[] {
+  if (typeof raw !== "string" || !raw) return [];
+  try {
+    const v = JSON.parse(raw) as unknown;
+    return Array.isArray(v) ? v.filter((n): n is number => Number.isInteger(n)) : [];
+  } catch {
+    return [];
+  }
+}
+
+function toExchangeSummary(r: Row): ExchangeSummaryRow {
+  return {
+    id: Number(r.id),
+    ts: Number(r.ts),
+    callId: String(r.call_id),
+    batch: Number(r.batch ?? 0),
+    provider: String(r.provider),
+    model: strOrNull(r.model),
+    surface: strOrNull(r.surface),
+    context: strOrNull(r.context),
+    method: String(r.method),
+    target: String(r.target),
+    rowIds: parseRowIds(r.row_ids),
+    items: Number(r.items),
+    outcome: String(r.outcome),
+    httpStatus: numOrNull(r.http_status),
+    timedOut: r.timed_out === 1,
+    attempts: Number(r.attempts ?? 1),
+    waitMs: numOrNull(r.wait_ms),
+    jobWaitMs: numOrNull(r.job_wait_ms),
+    ttfbMs: numOrNull(r.ttfb_ms),
+    durationMs: numOrNull(r.duration_ms),
+    retryWaitMs: Number(r.retry_wait_ms ?? 0),
+    deadlineMs: Number(r.deadline_ms),
+    budgetMs: numOrNull(r.budget_ms),
+    tokensIn: numOrNull(r.tokens_in),
+    tokensOut: numOrNull(r.tokens_out),
+    costUsd: numOrNull(r.cost_usd),
+    requestBytes: Number(r.request_bytes),
+    requestTruncated: r.request_truncated === 1,
+    responseBytes: numOrNull(r.response_bytes),
+    responseTruncated: r.response_truncated === 1,
+  };
+}
+
 /** A value as SQLite stores it: booleans become 0/1, undefined becomes NULL. */
 function toDb(v: unknown): unknown {
   if (v === undefined) return null;
@@ -117,7 +218,11 @@ function percentile(sorted: number[], p: number): number | null {
 
 function latencyStats(values: number[]): LatencyStats {
   const sorted = [...values].sort((a, b) => a - b);
-  return { n: sorted.length, p50: percentile(sorted, 50), p95: percentile(sorted, 95) };
+  return {
+    n: sorted.length,
+    p50: percentile(sorted, 50),
+    p95: percentile(sorted, 95),
+  };
 }
 
 function ratio(num: number, den: number): number | null {
@@ -201,7 +306,10 @@ export class SqliteAdjudicatorStore implements AdjudicatorStore {
     return r ? toRow(r) : undefined;
   }
 
-  list(filter: AdjudicationListFilter = {}): { rows: AdjudicationRow[]; total: number } {
+  list(filter: AdjudicationListFilter = {}): {
+    rows: AdjudicationRow[];
+    total: number;
+  } {
     const where: string[] = [];
     const params: unknown[] = [];
     if (filter.since !== undefined) {
@@ -561,9 +669,197 @@ export class SqliteAdjudicatorStore implements AdjudicatorStore {
     };
   }
 
+  // --- exchange log -----------------------------------------------------------------
+
+  exchangeInsert(xs: ExchangeInput[], keep = EXCHANGE_KEEP): number[] {
+    if (!xs.length) return [];
+    const kept = Math.max(1, Math.floor(keep));
+    const cols = EXCHANGE_INSERT_COLUMNS;
+    // Zero lock wait: a busy database throws at once (the caller fails open) instead of
+    // stalling a hook. Inside an outer transaction atomically() joins it.
+    // secure_delete covers the inserts too: a b-tree split that turns a leaf into an interior
+    // page otherwise leaves the old cells' text in the page's unused area, out of reach of
+    // the prune's own zeroing.
+    const ownTx = !this.db.inTransaction;
+    let pruned = 0;
+    const out = this.secureDelete(() =>
+      this.atomically(
+        () => {
+          const insert = this.prep(
+            `INSERT INTO adjudicator_exchanges (${cols.join(", ")}) VALUES (${cols.map(() => "?").join(", ")})`,
+          );
+          const ids: number[] = [];
+          for (const x of xs) {
+            const info = insert.run(
+              x.ts,
+              x.callId,
+              x.batch ?? 0,
+              x.provider,
+              toDb(x.model),
+              toDb(x.surface),
+              toDb(x.context),
+              x.method,
+              x.target,
+              JSON.stringify(x.rowIds ?? []),
+              x.items,
+              x.outcome,
+              toDb(x.httpStatus),
+              toDb(x.timedOut ?? false),
+              x.attempts ?? 1,
+              toDb(x.waitMs),
+              toDb(x.jobWaitMs),
+              toDb(x.ttfbMs),
+              toDb(x.durationMs),
+              x.retryWaitMs ?? 0,
+              x.deadlineMs,
+              toDb(x.budgetMs),
+              toDb(x.tokensIn),
+              toDb(x.tokensOut),
+              toDb(x.costUsd),
+              x.requestBody,
+              x.requestBytes,
+              toDb(x.requestTruncated ?? false),
+              toDb(x.responseBody),
+              toDb(x.responseBytes),
+              toDb(x.responseTruncated ?? false),
+              toDb(x.error),
+            );
+            ids.push(Number(info.lastInsertRowid));
+          }
+          // Everything older than the newest `kept` ids. A NULL subquery (fewer rows than `kept`)
+          // compares false and deletes nothing.
+          const prune = this.prep(
+            `DELETE FROM adjudicator_exchanges WHERE id < (
+             SELECT id FROM adjudicator_exchanges ORDER BY id DESC LIMIT 1 OFFSET ?)`,
+          );
+          pruned = prune.run(kept - 1).changes;
+          return ids;
+        },
+        { lockWaitMs: 0 },
+      ),
+    );
+    // A pruned body is zeroed in the database pages; its insert frames stay in the -wal until
+    // the log is truncated. Only once the transaction is ours (an outer one commits later).
+    if (pruned > 0 && ownTx) this.checkpoint();
+    return out;
+  }
+
+  /**
+   * Run `fn` with PRAGMA secure_delete=ON, so the pages a DELETE frees are zeroed rather
+   * than left with the old text in the file. Not FAST: exchange bodies sit in overflow
+   * pages, which FAST does not clear. Scoped to the exchange writes so the rest of the
+   * adjudicator writes keep the cheaper default; the previous value is restored.
+   */
+  private secureDelete<T>(fn: () => T): T {
+    let prev: number | undefined;
+    try {
+      prev = Number(this.db.pragma("secure_delete", { simple: true }));
+      if (prev !== 1) this.db.pragma("secure_delete = ON");
+    } catch {
+      prev = undefined; // the delete still runs; it just may leave free pages unzeroed
+    }
+    try {
+      return fn();
+    } finally {
+      if (prev !== undefined && prev !== 1) {
+        try {
+          this.db.pragma(`secure_delete = ${prev}`);
+        } catch {
+          // a connection left at ON is only slower, never wrong
+        }
+      }
+    }
+  }
+
+  /**
+   * Best-effort PRAGMA wal_checkpoint(TRUNCATE): copy the WAL into the database and cut the
+   * -wal file to zero bytes, so deleted exchange bodies do not linger in old log frames while
+   * another connection (the MCP server, the dashboard) keeps the log alive. Never waits for
+   * a lock and never throws: a busy database or an open reader leaves the log as it is.
+   * Skipped inside a caller's transaction, where it cannot run.
+   */
+  private checkpoint(): void {
+    if (this.db.inTransaction) return;
+    try {
+      this.withLockWait(0, () => this.db.pragma("wal_checkpoint(TRUNCATE)"));
+    } catch {
+      // fail open
+    }
+  }
+
+  /** False on a database whose schema_version claims v9 but lacks the table (another build). */
+  private hasExchangesTable(): boolean {
+    try {
+      return (
+        this.prep(
+          "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'adjudicator_exchanges'",
+        ).get() !== undefined
+      );
+    } catch {
+      return true; // let the statement that needs the table report the real error
+    }
+  }
+
+  exchangeList(filter: { limit?: number; rowId?: number } = {}): {
+    rows: ExchangeSummaryRow[];
+    total: number;
+  } {
+    const limit = Math.max(1, Math.min(Math.floor(filter.limit ?? EXCHANGE_KEEP), EXCHANGE_KEEP));
+    const byRow = filter.rowId !== undefined;
+    const clause = byRow
+      ? "WHERE EXISTS (SELECT 1 FROM json_each(adjudicator_exchanges.row_ids) WHERE value = ?)"
+      : "";
+    const params: unknown[] = byRow ? [filter.rowId] : [];
+    const total = (
+      this.prep(`SELECT COUNT(*) AS n FROM adjudicator_exchanges ${clause}`).get(...params) as {
+        n: number;
+      }
+    ).n;
+    const rows = this.prep(
+      `SELECT ${EXCHANGE_SUMMARY_COLUMNS} FROM adjudicator_exchanges ${clause}
+       ORDER BY id DESC LIMIT ?`,
+    ).all(...params, limit) as Row[];
+    return { rows: rows.map(toExchangeSummary), total };
+  }
+
+  exchangeGet(id: number): ExchangeRow | undefined {
+    const r = this.prep("SELECT * FROM adjudicator_exchanges WHERE id = ?").get(id) as
+      | Row
+      | undefined;
+    if (!r) return undefined;
+    return {
+      ...toExchangeSummary(r),
+      requestBody: String(r.request_body),
+      responseBody: strOrNull(r.response_body),
+      error: strOrNull(r.error),
+    };
+  }
+
+  exchangeCount(): number {
+    return (
+      this.prep("SELECT COUNT(*) AS n FROM adjudicator_exchanges").get() as {
+        n: number;
+      }
+    ).n;
+  }
+
+  exchangePurge(): number {
+    if (!this.hasExchangesTable()) return 0;
+    const del = this.prep("DELETE FROM adjudicator_exchanges");
+    const n = this.secureDelete(() => del.run().changes);
+    this.checkpoint();
+    return n;
+  }
+
   purge(): void {
     this.db.exec(
       "DELETE FROM adjudications; DELETE FROM adjudicator_cache; DELETE FROM adjudicator_provider_state; DELETE FROM adjudicator_bias;",
     );
+    // A database at schema_version >= 9 from another build may lack the table: skip it
+    // rather than fail after the deletes above.
+    if (!this.hasExchangesTable()) return;
+    this.secureDelete(() => this.db.exec("DELETE FROM adjudicator_exchanges"));
+    // Inside the adapter's purge transaction this is skipped (the adapter VACUUMs after).
+    this.checkpoint();
   }
 }

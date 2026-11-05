@@ -33,13 +33,14 @@
  * repeating the detail or reordering its sentences changes neither the tier, the effort nor the
  * role (tests/unit/adjudicator-units.test.ts).
  *
- * `sum` is the whole text's complexity before the 0..4 clamp (what scoring it as one text adds up
- * to) and `saturated` is sum > SATURATED_AT: the brief names more work than its hardest statement
- * scores, so a caller can present the effort as informational. `roleConfidence` is the summed
- * role table's confidence, for gating a "role suggested" note.
+ * `sum` is the complexity of the brief's work (its kept statements, boilerplate left out) before
+ * the 0..4 clamp (what scoring them as one text adds up to) and `saturated` is sum > SATURATED_AT:
+ * the brief names more work than its hardest statement scores, so a caller can present the effort
+ * as informational. `roleConfidence` is the summed role table's confidence, for gating a "role
+ * suggested" note.
  *
- * Pure and synchronous, no I/O: one whole-text feature pass plus one scoring per unit, and one
- * per statement of the last unit on a brief past the cap (bounded by UNIT_CHARS).
+ * Pure and synchronous, no I/O: one feature pass over the kept statements plus one scoring per
+ * unit, and one per statement of the last unit on a brief past the cap (bounded by UNIT_CHARS).
  */
 
 import { extractFeatures, type FeatureExtras } from "./features.js";
@@ -71,10 +72,10 @@ export const UNIT_SURFACES: readonly Surface[] = ["plan", "agent"];
 export const UNIT_MAX = 40;
 /** Text past this is not split (features.ts scans the same first 4000 characters). */
 export const UNIT_CHARS = 4000;
-/** A whole-text complexity above this before the 0..4 clamp is `saturated`. */
+/** A complexity of the kept statements above this before the 0..4 clamp is `saturated`. */
 export const SATURATED_AT = 4;
 /** Part of the cache key of unit-scored verdicts (engine.cacheKeyFor): bump when this changes. */
-export const UNITS_VERSION = "3";
+export const UNITS_VERSION = "4";
 
 /** How a brief was scored; on the engine's Adjudication and in the row's scores JSON (`units`). */
 export interface BriefUnits {
@@ -93,7 +94,7 @@ export interface BriefUnits {
   skipped: number;
   /** Index among the scorings of the one that set the complexity (0 = first line). */
   winner: number;
-  /** The whole text's complexity before the 0..4 clamp: what scoring it as one text adds up to. */
+  /** The kept work's complexity before the 0..4 clamp: what scoring it as one text adds up to. */
   sum: number;
   /** sum > SATURATED_AT: the brief names more work than its hardest statement scores. */
   saturated: boolean;
@@ -104,7 +105,11 @@ export interface BriefUnits {
 export interface UnitScore {
   /** Complexity, tier and effort of the hardest statement; role and tool summed over all. */
   set: ScoreSet;
-  /** Features of the whole text: stored on the row and read by the learned bias, as before. */
+  /**
+   * Features of the brief's work: of the whole text when it is one statement with nothing left
+   * out, else of the kept units joined, so boilerplate ("run the tests, report the counts") never
+   * becomes its top intent. Stored on the row and read by the learned bias.
+   */
   features: Features & FeatureExtras;
   units: BriefUnits;
 }
@@ -196,22 +201,68 @@ const CLAUSE_MAX = 400;
 /** "Then", "Finally,", "Before reporting," and the like ahead of the verb. */
 const LEAD_IN =
   /^(?:(?:then|finally|also|and|afterwards|after that|next|lastly|last|please|always|first|at the end|once (?:done|finished|it passes|that passes)|when (?:you(?:'re| are) )?(?:done|finished)|before (?:you )?(?:report(?:ing)?|finish(?:ing)?|clos(?:e|ing)|commit(?:ting)?|hand(?:ing)? (?:it )?(?:back|off)))[\s,:;-]+)+/;
-/** A routine check: the type checker, the linter, a test run, the build. */
-const CHECK = String.raw`(?:npm (?:run [\w:-]+|test|t|ci)|npx (?:tsc|vitest|biome|jest|eslint|prettier|mocha|playwright)|(?:pnpm|yarn)(?: run)? [\w:-]+|type-?check\w*|tsc|lint\w*|biome|eslint|prettier|vitest|jest|pytest|go (?:test|vet)|cargo (?:test|check|clippy)|tests?|specs?|test ?suites?|suites?|build|ci)`;
+/** A check by its tool or command (not a generic "tests", "build"): "npm test", "typecheck", "lint". */
+const TOOL_CHECK = String.raw`(?:npm (?:run [\w:-]+|test|t|ci)|npx (?:tsc|vitest|biome|jest|eslint|prettier|mocha|playwright)(?: run)?|(?:pnpm|yarn)(?: run)? [\w:-]+|type-?check\w*|tsc|lint\w*|biome|eslint|prettier|vitest|jest|pytest|go (?:test|vet)|cargo (?:test|check|clippy))`;
+const CHECK = `(?:${TOOL_CHECK}|tests?|specs?|test ?suites?|suites?|build|ci)`;
+/** What may follow a check: flags, paths and words like "only" or "again". */
+const CHECK_SUFFIX = String.raw`(?: (?:--?[\w-]+(?:=\S+)?|[\w@+-]*[./*:][\w./:@+*=-]*|only|again|too|first|alone|there|here|as well)){0,4}?`;
 /**
  * One check in a list: "the adjudicator unit tests", "npx vitest run tests/unit/x.test.ts". The
  * words before it name which checks (never a verb: "add tests" is work); after it come only
  * flags, paths and words like "only" or "again".
  */
-const CHECK_ITEM = String.raw`(?:(?:the|all|all the) )?(?:(?!(?:add|write|create|update|fix|cover|extend|implement|change|remove|delete|rewrite|refactor|make|keep|test)\b)[\w./:@+*-]+ ){0,2}?${CHECK}(?: (?:--?[\w-]+(?:=\S+)?|[\w@+-]*[./*:][\w./:@+*=-]*|only|again|too|first|alone|there|here|as well)){0,4}?`;
+const CHECK_ITEM = String.raw`(?:(?:the|all|all the) )?(?:(?!(?:add|write|create|update|fix|cover|extend|implement|change|remove|delete|rewrite|refactor|make|keep|test)\b)[\w./:@+*-]+ ){0,2}?${CHECK}${CHECK_SUFFIX}`;
+/**
+ * One routine check: a whole command ("npm run lint", "the full npx jest", "npx vitest run
+ * tests/unit/x.test.ts") or a generic one ("the tests", "the whole suite"). No other word may
+ * name it: a tool word used as a description ("the typechecker regression tests", "the eslint
+ * plugin specs", "the ci-workflow tests") names a deliverable (review2 R2-1).
+ */
+const ROUTINE_ITEM = `(?:(?:the|all|full|whole|entire) ){0,3}(?:${TOOL_CHECK}|test ?suites?|tests?|specs?|suites?|build|ci)`;
+/** After a label a routine check may say where it is: "Verify: the specs under tests/unit". */
+const AT_PATH = String.raw`(?: (?:in|under) [\w@+-]*[./*][\w./:@+*=-]+)?`;
 /** Nouns that make a leading "report" the subject ("Report generation is slow"). */
 const REPORT_NOUN =
   "generation|generator|rows?|pages?|builder|templates?|exports?|service|views?|endpoints?|api|jobs?|schema|module|component|card|tab|screen|quer(?:y|ies)|model|pdf|csv|ui|dashboard";
 
+const PASSES = "(?:pass(?:es)?|be green|stay green|succeed|exits? 0|exit cleanly|(?:is|are) clean)";
+const IS_GREEN = "(?:is|are) (?:all )?(?:clean|green)";
+const LIST_SEP = String.raw`\s*(?:,|\+|&&?|/|\band\b|\bor\b)\s*`;
+/** A list of checks (each an `item`), then perhaps what they must do. */
+const checkList = (item: string, verdict: string, sep = LIST_SEP) =>
+  new RegExp(
+    String.raw`^${item}(?:${sep}${item}){0,8}(?:\s+(?:must |should |all |still |both )*${verdict})?(?:\s+if [\w\s'-]{1,30})?\s*[.!]?$`,
+  );
 /** Nothing but checks: "Typecheck, lint, adjudicator tests", "npm test && npm run lint pass". */
-const CHECKS_ONLY = new RegExp(
-  String.raw`^${CHECK_ITEM}(?:\s*(?:,|\+|&&?|/|\band\b|\bor\b)\s*${CHECK_ITEM}){0,8}(?:\s+(?:must |should |all |still )*(?:pass(?:es)?|be green|stay green|succeed|exits? 0|exit cleanly|(?:is|are) clean))?(?:\s+if [\w\s'-]{1,30})?\s*[.!]?$`,
+const CHECKS_ONLY = checkList(CHECK_ITEM, PASSES);
+/**
+ * Nothing but routine checks, each one checked on its own (review2 R2-1): "Done when typecheck,
+ * lint and the tests are green". One command in the list clears no other item: "the migration
+ * tests, the rollback specs and typecheck pass" names work. The only checks after a label.
+ */
+const ROUTINE_CHECKS = checkList(
+  `${ROUTINE_ITEM}${AT_PATH}${CHECK_SUFFIX}`,
+  `(?:${PASSES}|${IS_GREEN})`,
+  String.raw`\s*(?:,\s*(?:and|or)\b|,|\+|&&?|/|\band\b|\bor\b)\s*`,
 );
+/**
+ * Without a label, only routine checks "are green": "Typecheck and lint are green" is a check,
+ * "The migration tests and the rollback specs are green" names work (review2 R2-1 c).
+ */
+const ROUTINE_GREEN = checkList(`${ROUTINE_ITEM}${CHECK_SUFFIX}`, IS_GREEN);
+
+/**
+ * A label ahead of the checks: "Verification: npm run typecheck && npm run lint", "Done when
+ * the tests pass", "Verify: npx tsc --noEmit". The noun labels need their colon. After a label
+ * only ROUTINE_CHECKS is boilerplate (review1 F3/F4, review2 R2-1/R2-3): "Acceptance: unit tests
+ * for A-E assert X", "Definition of done: the migration tests and the rollback specs", "Verify:
+ * npm test covers the new retry path" and "Verify: the tests cover the retry path" are work.
+ */
+const CHECK_LABEL =
+  /^(?:(?:verification|verify|validation|validate|confirm|acceptance(?: criteria)?|checks?|gates?|definition of done|done when|tests?)\s*:\s*|(?:done (?:when|once|if)|finished when)\s+)/;
+/** A bare heading for the checks or the hand-in: "Verify:", "Then check:" (the colon is required). */
+const LABEL_ONLY =
+  /^(?:verification|verify|validation|validate|confirm|acceptance(?: criteria)?|checks?|gates?|tests?|definition of done|done when|hand-?in|deliverables?)\s*:\s*$/;
 
 /** Steps by their lead verb. */
 const PROTOCOL: readonly RegExp[] = [
@@ -223,9 +274,10 @@ const PROTOCOL: readonly RegExp[] = [
   new RegExp(
     String.raw`^(?:verify|check|confirm|ensure|make sure|double-check|keep)\b.{0,80}?\b${CHECK}\b.{0,60}?\b(?:pass(?:es|ing)?|green|succeed\w*|clean|still (?:pass|work)\w*)\b`,
   ),
-  // verify by the checks: "Verify with npm run build", "Verify: npx tsc --noEmit"
+  // verify by the checks: "Verify with npm run build". The colon form ("Verify: npx tsc
+  // --noEmit") goes through CHECK_LABEL, where every item must be a routine check (review2 R2-3).
   new RegExp(
-    String.raw`^(?:verify|check|confirm|validate|test)(?:\s*:\s*|\s+(?:it |this |them |that |everything )?(?:with|using|by running|via)\s+)(?:the |a )?${CHECK}\b`,
+    String.raw`^(?:verify|check|confirm|validate|test)\s+(?:it |this |them |that |everything )?(?:with|using|by running|via)\s+(?:the |a )?${CHECK}\b`,
   ),
   // reporting back: "Report the exact counts", "Report back (concise):"
   new RegExp(String.raw`^report\b(?!\s+(?:${REPORT_NOUN})\b)`),
@@ -285,12 +337,28 @@ const NON_WORK_GERUND =
 /** Words ending in -ing that are not gerunds. */
 const NOT_GERUND = /thing$|^(?:string|during|pending|morning|evening|ceiling|nothing|spring)$/;
 /**
+ * Who reports the problems in a routine follow-up ("what the linter reports", "any failures the
+ * e2e suite reports", "whatever tsc reports"): a closed list, so "whatever the scanner reports"
+ * stays work (review1 F1). Never `the \w+`.
+ */
+const ROUTINE_SUBJECT =
+  "(?:it|they|you|tsc|eslint|biome|vitest|jest|lint|ci|the (?:linter|compiler|(?:type ?)?checker|tool|runner|build|ci|tsc|eslint|(?:(?:e2e|unit|integration|full|test) )?(?:tests?|specs?|suites?|test ?suites?)))";
+const REPORT_VERB =
+  "(?:reports?|reported|finds?|found|prints?|shows?|says?|flags?|returns?|emits?|outputs?|surfaces?|raises?|raised|throws?|threw|fail(?:s|ed)?|breaks?)";
+/**
+ * Problems that turn up on their own: "any failures that show up", "whatever is broken", "any
+ * tests that now fail", "whatever needs fixing" (review2 R2-2, closed lists).
+ */
+const EMERGE =
+  "(?:shows? up|comes? up|turns? up|pops? up|appears?|remains?|(?:is|are) (?:left|broken|failing|reported|flagged)|(?:get|gets|got) (?:reported|flagged)|(?:now|still) fail(?:s|ed)?|starts? failing|comes? back|you (?:see|find|hit)|needs? fixing|goes red|(?:doesn['’]t|does not|don['’]t|do not) pass)";
+/**
  * A routine object that ends the clause: "any failures", "the failing tests", "them", "the type
  * errors". Only the routine qualifiers may sit before the noun: a specific object ("the ESM
  * import errors", "the flaky concurrency failures") is real work and must not match.
  */
-const ROUTINE_OBJECT =
-  /^(?:\s+(?:up|out))?(?:\s+(?:any|all|the|every|each|those|these|its|their|your|whatever|remaining|new|resulting|reported|other))*(?:\s+(?:type|types|lint|linter|typecheck|tsc|eslint|compile|compiler|compilation|build|ci|test|unit|vitest|jest|failing|failed|broken|outstanding)){0,3}\s+(?:failures?|failing|fails|errors?|issues?|problems?|regressions?|breakages?|findings?|warnings?|complaints?|tests?|specs?|checks?|them|it|those|these|that|anything|everything|what(?:ever)?\s+\S+(?:\s+\S+)?)(?:\s+(?:if any|as needed|as necessary|you find|found|reported|first|again|too|along the way|before (?:reporting|you report|finishing|you finish|handing in|you hand in|you are done|you're done|moving on)|(?:that|which|it|they|the \w+) (?:\S+\s?){1,3}))?\s*[.!]?$/;
+const ROUTINE_OBJECT = new RegExp(
+  String.raw`^(?:\s+(?:up|out))?(?:\s+(?:any|all|the|every|each|those|these|its|their|your|whatever|remaining|new|resulting|reported|other))*(?:\s+(?:type|types|lint|linter|typecheck|tsc|eslint|compile|compiler|compilation|build|ci|test|unit|vitest|jest|failing|failed|broken|outstanding)){0,3}\s+(?:failures?|failing|fails|errors?|issues?|problems?|regressions?|breakages?|findings?|warnings?|complaints?|tests?|specs?|checks?|them|it|those|these|that|anything|everything|what(?:ever)?\s+(?:${ROUTINE_SUBJECT}\s+${REPORT_VERB}|fail(?:s|ed)?|breaks?|broke|errors?|${EMERGE}))(?:\s+(?:if any|as needed|as necessary|you find|found|reported|first|again|too|along the way|before (?:reporting|you report|finishing|you finish|handing in|you hand in|you are done|you're done|moving on)|(?:(?:that|which) (?:${ROUTINE_SUBJECT} )?|${ROUTINE_SUBJECT} )${REPORT_VERB}|(?:that|which) ${EMERGE}))?\s*[.!]?$`,
+);
 /** The object is the hand-in ("add the counts to your update", "update the task via em_swarm"). */
 const HANDIN_OBJECT =
   /\b(?:em_swarm|em_remember|blackboard)\b|\b(?:to|in|into|on|under)\s+(?:the\s+|your\s+)?(?:task\s+)?(?:update|result|results|report|final (?:message|report|answer)|reply|summary|hand-?off)\s*[.!]?$/;
@@ -312,7 +380,12 @@ function workTail(clause: string): boolean {
   return false;
 }
 
-function boilerplateClause(clause: string): boolean {
+/**
+ * Whether a clause is boilerplate, and how: "label" for checks after a label ("Done when the
+ * tests pass"), which nothing after it continues; "step" for any other routine check or hand-in
+ * step; false for work.
+ */
+function boilerplateClause(clause: string): false | "label" | "step" {
   const lead = clause
     .toLowerCase()
     .replace(/\*\*/g, "")
@@ -320,9 +393,14 @@ function boilerplateClause(clause: string): boolean {
     .replace(LEAD_IN, "");
   const c = lead.replace(/`/g, "").trim();
   if (!c || c.length > CLAUSE_MAX) return false;
-  if (CHECKS_ONLY.test(c)) return true;
+  if (LABEL_ONLY.test(c)) return "step";
+  const rest = c.replace(CHECK_LABEL, "");
+  if (rest !== c) return ROUTINE_CHECKS.test(rest) ? "label" : false;
+  if (CHECKS_ONLY.test(c) || ROUTINE_GREEN.test(c)) return "step";
   // A clause that opens on a code identifier ("`claim` → `claimTask` …") names code, not a step.
-  return !lead.startsWith("`") && PROTOCOL.some((re) => re.test(c)) && !workTail(c);
+  return !lead.startsWith("`") && PROTOCOL.some((re) => re.test(c)) && !workTail(c)
+    ? "step"
+    : false;
 }
 
 /**
@@ -336,8 +414,16 @@ const CONTINUATION =
 function trimBoilerplate(statement: string): { kept: string; removed: number } {
   const clauses = statement.split(CLAUSE);
   const drop: boolean[] = [];
-  for (const [i, c] of clauses.entries())
-    drop.push(boilerplateClause(c) || (i > 0 && !!drop[i - 1] && CONTINUATION.test(c)));
+  // A step left out takes the clauses continuing it along ("Return: a verdict, then findings");
+  // checks after a label do not: "Done when the tests pass; the cache must survive a restart"
+  // keeps the cache (review2 R2-1 d).
+  let carry = false;
+  for (const c of clauses) {
+    const kind = boilerplateClause(c);
+    const continued: boolean = !kind && carry && CONTINUATION.test(c);
+    drop.push(!!kind || continued);
+    carry = kind === "step" || continued;
+  }
   const kept = clauses.filter((_, i) => !drop[i]);
   if (kept.length === clauses.length) return { kept: statement, removed: 0 };
   return { kept: kept.join("; ").trim(), removed: clauses.length - kept.length };
@@ -407,10 +493,13 @@ export function scoreUnits(
   weights: HeuristicWeights = {},
   catalogue: Catalogue = {},
 ): UnitScore {
-  const features = extractFeatures(text, hints);
   const { units: parts, dropped, skipped, tail } = splitUnits(text);
-  if (parts.length <= 1 && dropped === 0) {
-    // One statement: the brief is that text, scored as before.
+  if (parts.length <= 1 && dropped === 0 && statements(text).length <= 1) {
+    // One statement: the brief is that text, scored as before. A statement said twice is not
+    // one statement: it takes the units path like any brief with more than one, so appended
+    // boilerplate cannot move it (review1 F5). The marker is stripped as the units path strips
+    // it, so "- Fix X." scores the same alone and with a protocol line appended (review2 R2-4).
+    const features = extractFeatures(text.replace(MARKER, ""), hints);
     const set = scoreHeuristic(features, weights, catalogue);
     const sum = sumOf(set.complexityReasons);
     return {
@@ -419,6 +508,8 @@ export function scoreUnits(
       units: briefOf(parts.length, 0, skipped, 0, sum, set.role.confidence),
     };
   }
+  // The features are the kept units', not the whole text's (boilerplate would count as work).
+  const features = extractFeatures(parts.join("\n"), hints);
   const w = { ...DEFAULT_FEATURE_WEIGHTS, ...(weights.features ?? {}) };
   const sum = sumOf(scoreComplexity(features, w).reasons);
   const risks: number[] = [];

@@ -234,6 +234,7 @@ only:
 | `budget.dailyCalls` | `2000` | Call cap per remote provider per UTC day (`0` = unlimited). Limits providers whose price is unknown |
 | `privacy.maxChars` | `2000` | Characters of redacted text a remote provider receives per item |
 | `privacy.storeHead` | `true` | Keep the first 80 redacted characters of each input in the database |
+| `privacy.captureExchanges` | `false` | Keep the newest 100 requests sent to TypeSafe Jev and its answers, with timing, for the dashboard. They contain redacted prompt text, at most 65,536 characters per request or answer. Personal `~/.eminiar/config.json` only: `eminiar.config.json` cannot set it. See [Jev request capture](adjudicator.md#jev-request-capture) |
 
 ## Environment variables
 
@@ -250,4 +251,5 @@ only:
 | `EMINIAR_ADJUDICATOR_PROVIDER` | Overrides `adjudicator.provider`. A remote provider runs only when `remoteConsentOrigins` in `~/.eminiar/config.json` lists its origin |
 | `EMINIAR_ADJUDICATOR_MODE` | Overrides `adjudicator.mode` (`advise` or `apply`) |
 | `EMINIAR_ADJUDICATOR_REMOTE=0` | Withdraws remote consent. `=1` does nothing: no environment variable can grant consent, because a project's `.claude/settings.json` can set them |
+| `EMINIAR_ADJUDICATOR_CAPTURE=0` | Turns Jev request capture off (`=1` does nothing) |
 | `EMINIAR_ADJUDICATOR_KEY` | Adjudicator provider key, checked after `keyEnv` and the provider's own variable (`TYPESAFE_API_KEY`, `GROQ_API_KEY`, `CEREBRAS_API_KEY`) and before `~/.eminiar/adjudicator.key` |

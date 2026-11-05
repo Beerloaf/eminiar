@@ -15,7 +15,9 @@ import type {
   AdjudicationRequest,
   AdjudicatorProvider,
   Dist,
+  HttpExchange,
   ProviderAnswer,
+  ProviderExchange,
   ProviderResult,
 } from "../types.js";
 import {
@@ -97,10 +99,36 @@ export function createTypesafeProvider(
     reqs: AdjudicationRequest[],
     offset: number,
     cat: Catalogue,
-    o: { signal: AbortSignal; deadlineMs: number },
+    o: { signal: AbortSignal; deadlineMs: number; capture?: ProviderExchange[] | undefined },
   ) {
     const items = buildItems(reqs, cfg.privacy.maxChars, offset);
     const k = key();
+    // Jev request capture (opt-in, per call): the sink gets one live record per HTTP call.
+    // Without o.capture nothing is built. probe() is never captured.
+    let pe: ProviderExchange | undefined;
+    const sink = o.capture;
+    const exchange = sink
+      ? (x: HttpExchange) => {
+          pe = {
+            http: x,
+            provider: "typesafe",
+            model,
+            batch: Math.floor(offset / JEV_BATCH),
+            itemKeys: reqs.map((r) => r.key),
+            tokensIn: null,
+            tokensOut: null,
+            costUsd: null,
+          };
+          sink.push(pe);
+        }
+      : undefined;
+    const invalid = (msg: string): ProviderError => {
+      if (pe) {
+        pe.http.outcome = "invalid";
+        pe.http.error = msg;
+      }
+      return new ProviderError("invalid", msg);
+    };
     const res = await postJson(
       joinUrl(baseUrl, "systemone"),
       { model, state: jevState(cat, items), questions: jevQuestions(items, cat, { askTool }) },
@@ -111,15 +139,19 @@ export function createTypesafeProvider(
         fetch: deps.fetch,
         now: deps.now,
         log: deps.log,
+        exchange,
       },
     );
     const parsed = JevResponse.safeParse(res.json);
-    if (!parsed.success)
-      throw new ProviderError("invalid", "the Jev response has an unexpected shape");
+    if (!parsed.success) throw invalid("the Jev response has an unexpected shape");
     const answers = mapAnswers(reqs, items, parsed.data.answers, cat);
-    if (answers.length === 0)
-      throw new ProviderError("invalid", "the Jev response answered no item");
+    if (answers.length === 0) throw invalid("the Jev response answered no item");
     const inTok = parsed.data.usage?.input_tokens ?? 0;
+    if (pe) {
+      pe.tokensIn = inTok;
+      pe.tokensOut = parsed.data.usage?.output_tokens ?? 0;
+      pe.costUsd = inTok * JEV_PRICE_IN;
+    }
     return {
       answers,
       inTok,

@@ -578,6 +578,92 @@ export interface AdjudicationSummary {
   applyChecked: number;
 }
 
+/**
+ * One request sent to a provider and its answer, as stored in adjudicator_exchanges (Jev
+ * exchange log). Bodies arrive already redacted and capped; the store keeps them verbatim.
+ */
+export interface ExchangeInput {
+  /** When the request was sent (epoch ms). */
+  ts: number;
+  /** Groups the parallel batches of one provider call. */
+  callId: string;
+  batch?: number;
+  provider: string;
+  model?: string | null;
+  surface?: string | null;
+  context?: string | null;
+  method: string;
+  /** Host and path only: no query string, no credentials. */
+  target: string;
+  /** adjudications.id of the items in this request. */
+  rowIds?: number[];
+  items: number;
+  /** ok | timeout | http_error | rate_limited | invalid */
+  outcome: string;
+  httpStatus?: number | null;
+  timedOut?: boolean;
+  attempts?: number;
+  waitMs?: number | null;
+  jobWaitMs?: number | null;
+  ttfbMs?: number | null;
+  durationMs?: number | null;
+  retryWaitMs?: number;
+  deadlineMs: number;
+  budgetMs?: number | null;
+  tokensIn?: number | null;
+  tokensOut?: number | null;
+  costUsd?: number | null;
+  requestBody: string;
+  requestBytes: number;
+  requestTruncated?: boolean;
+  responseBody?: string | null;
+  responseBytes?: number | null;
+  responseTruncated?: boolean;
+  /** Already-scrubbed error message. */
+  error?: string | null;
+}
+
+/** A stored exchange without its bodies or error text: what the list reads. */
+export interface ExchangeSummaryRow {
+  id: number;
+  ts: number;
+  callId: string;
+  batch: number;
+  provider: string;
+  model: string | null;
+  surface: string | null;
+  context: string | null;
+  method: string;
+  target: string;
+  rowIds: number[];
+  items: number;
+  outcome: string;
+  httpStatus: number | null;
+  timedOut: boolean;
+  attempts: number;
+  waitMs: number | null;
+  jobWaitMs: number | null;
+  ttfbMs: number | null;
+  durationMs: number | null;
+  retryWaitMs: number;
+  deadlineMs: number;
+  budgetMs: number | null;
+  tokensIn: number | null;
+  tokensOut: number | null;
+  costUsd: number | null;
+  requestBytes: number;
+  requestTruncated: boolean;
+  responseBytes: number | null;
+  responseTruncated: boolean;
+}
+
+/** A stored exchange in full. */
+export interface ExchangeRow extends ExchangeSummaryRow {
+  requestBody: string;
+  responseBody: string | null;
+  error: string | null;
+}
+
 /** Persistence of the adjudicator; synchronous, every hook write is one statement. */
 export interface AdjudicatorStore {
   insert(row: AdjudicationInput): number;
@@ -638,6 +724,27 @@ export interface AdjudicatorStore {
   biasReset(): number;
 
   summary(since?: number): AdjudicationSummary;
-  /** Clears all four adjudicator tables. */
+
+  /**
+   * Stores exchanges and, in the same transaction, deletes all but the newest `keep` (default
+   * EXCHANGE_KEEP = 100) by id. Takes no lock wait: a busy database throws SQLITE_BUSY at once
+   * and the caller (the engine) swallows it, so capture never delays or changes a verdict.
+   * Returns the new ids.
+   */
+  exchangeInsert(xs: ExchangeInput[], keep?: number): number[];
+  /**
+   * Newest first, without bodies. `limit` is clamped to 1..100; `rowId` keeps the exchanges
+   * that carried that adjudications.id; `total` counts every match.
+   */
+  exchangeList(filter?: { limit?: number; rowId?: number }): {
+    rows: ExchangeSummaryRow[];
+    total: number;
+  };
+  /** One exchange with its bodies. */
+  exchangeGet(id: number): ExchangeRow | undefined;
+  exchangeCount(): number;
+  /** Deletes every stored exchange; returns how many. */
+  exchangePurge(): number;
+  /** Clears all five adjudicator tables (the exchange log included). */
   purge(): void;
 }

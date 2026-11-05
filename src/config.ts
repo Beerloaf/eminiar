@@ -190,6 +190,12 @@ const buildAdjudicatorObject = () =>
       .object({
         maxChars: z.number().int().positive().default(2000),
         storeHead: z.boolean().default(true),
+        /**
+         * Keep the newest 100 requests sent to Jev and its answers (redacted prompt text
+         * included). Personal ~/.eminiar/config.json only; eminiar.config.json cannot set it.
+         * EMINIAR_ADJUDICATOR_CAPTURE=0 turns it off; no env var turns it on.
+         */
+        captureExchanges: z.boolean().default(false),
       })
       .prefault({}),
   });
@@ -257,7 +263,7 @@ export function adjudicatorDefaults(): AdjudicatorConfig {
     cache: { ttlHours: 24, maxEntries: 2000 },
     breaker: { failures: 2, cooldownSec: 120 },
     budget: { dailyUsd: 0.5, dailyCalls: 2000 },
-    privacy: { maxChars: 2000, storeHead: true },
+    privacy: { maxChars: 2000, storeHead: true, captureExchanges: false },
   };
 }
 
@@ -591,6 +597,8 @@ function envOverrides(): Record<string, unknown> {
   // nothing. Consent comes only from ~/.eminiar/config.json (remoteConsentOrigins, written by the
   // CLI after an explicit yes). =0 revokes every consent.
   if (process.env.EMINIAR_ADJUDICATOR_REMOTE === "0") adj.remoteConsent = false;
+  // The same rule for the Jev exchange log: =0 turns capture off, =1 grants nothing.
+  if (process.env.EMINIAR_ADJUDICATOR_CAPTURE === "0") adj.privacy = { captureExchanges: false };
   if (Object.keys(adj).length) o.adjudicator = adj;
   return o;
 }
@@ -603,6 +611,8 @@ function envOverrides(): Record<string, unknown> {
  * remoteConsentOrigins, privacy, budget, timeouts and breaker come only from ~/.eminiar/config.json
  * and EMINIAR_* env (which can withdraw remote consent but never grant it). What is
  * left only turns the adjudicator on and tunes how verdicts are scored and used locally.
+ * privacy also holds captureExchanges (storing Jev requests with prompt text), one more reason
+ * it stays out.
  */
 export const PROJECT_ADJUDICATOR_KEYS: readonly string[] = [
   "enabled",

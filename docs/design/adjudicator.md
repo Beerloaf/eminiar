@@ -92,8 +92,9 @@ It can be blended with one provider:
   consent").
 - Remote providers also need a key, which lives only in `~/.eminiar/adjudicator.key` or an env
   var.
-- We store hashes, scores and an 80-char redacted head of the input. We never store prompts or
-  keys.
+- We store hashes, scores and an 80-char redacted head of the input. We never store keys.
+  Redacted prompt text and raw Jev responses are stored only with the opt-in, personal-only Jev
+  request capture (newest 100).
 
 **P5 Explainable.**
 
@@ -592,10 +593,17 @@ surface that way).
 Outputs: `Adjudication.units` (`BriefUnits`: `scored` (scorings), `dropped`, `skipped`
 (statements past the cap, scored inside the last unit), `winner`, `sum`, `saturated`,
 `roleConfidence`), stored as `scores.units` and read back by `briefUnitsOf`. `sum`
-is the whole-text complexity before the clamp, and `saturated` means `sum` > 4
+is the complexity of the kept statements (boilerplate left out) before the clamp, and `saturated` means `sum` > 4
 (`SATURATED_AT`): the brief names more work than its hardest statement scores, so its effort is
-informational on every surface (§11). `Adjudication.features` stays the whole text's features,
-which rows and the learned bias read. Plan and agent cache keys gain `UNITS_VERSION`;
+informational on every surface (§11). `Adjudication.features` are the features of the kept
+statements (the units joined), not the boilerplate, so a brief's top intents, the learned bias
+bucket and `sum`/`saturated` count work only; a one-statement text with nothing dropped keeps the
+whole text's features, and rows written before `UNITS_VERSION` 4 keep their whole-text features.
+`ROUTINE_OBJECT` accepts only a closed set of routine phrasings, so a specific object at the end
+of a clause stays work. After a check label (`Verification:`, `Done when`) the rest is boilerplate
+only when it is routine checks item by item (a whole command such as `npx vitest run`, or generic
+tests and build), and "are green" is routine only when every item is: a named suite ("the
+migration tests") stays work. Plan and agent cache keys gain `UNITS_VERSION` (now 4);
 `SCORER_VERSION` is unchanged.
 
 Measured on the same 101 tasks: clamped 67% → 17%, opus 91% → 63%, effort max 72% → 22%, role
@@ -926,13 +934,56 @@ Hook writes are single statements (< 1 ms), so they need no deferral.
 
 Meta key `adjudicator:eval:last` holds the last eval report.
 
-Never stored: any text beyond `input_head`, keys, or raw provider responses. `input_head`
-(`privacy.storeHead`) is at most 80 chars of `redact()`ed text. `redact()` masks:
+Never stored: keys or request headers. Text beyond `input_head`, and raw provider responses,
+exist only in `adjudicator_exchanges` (migration v9), written only when
+`privacy.captureExchanges` is on in the personal config, pruned to `EXCHANGE_KEEP = 100`.
+`input_head` (`privacy.storeHead`) is at most 80 chars of `redact()`ed text. `redact()` masks:
 
 - `sk-`, `ghp_`/`gho_`, `xox*`, `AKIA…` tokens and Bearer tokens
 - secret-looking `key=value` or `key: value` pairs
 - emails
 - base64/hex runs of 32+ chars
+
+### Exchange capture (`adjudicator_exchanges`, migration v9)
+
+The Jev request log. Memory `adjudicator/jev-exchange-log-design` holds the full design.
+
+- **Gate.** The engine builds a capture sink only when `privacy.captureExchanges === true`, the
+  provider is `typesafe`, there is a store, and the decisions the call serves have rows to link
+  to (`persist`, or `linkRowIds` for the async child). Cache hits, gate fallbacks, `call:
+  "never"` and `persist: false` callers (`adjudicator test`, `adjudicator eval`, the dashboard
+  try-it) write nothing. `probe()` is never captured.
+- **Setting.** `privacy` is not in `PROJECT_ADJUDICATOR_KEYS`, so a committed
+  `eminiar.config.json` cannot turn capture on, and neither can an untrusted personal file.
+  `EMINIAR_ADJUDICATOR_CAPTURE=0` forces it off; `=1` does nothing.
+- **What a row holds.** One row per HTTP request (at most `JEV_BATCH` = 10 items): the target
+  (host and path, no query), model, surface, the decision row ids it served, the outcome, HTTP
+  status, whether it timed out, attempts, and the timings (wait before sending, job wait for
+  async prompts, time to first byte, duration, retry wait, deadline, engine budget), tokens and
+  cost, and the request and response bodies.
+- **Bodies.** A JSON body is scrubbed field by field (every string and key through the same
+  scrub as `http.ts`; the key is replaced before and after `redact()`, so a zero-width or
+  fullwidth echo of it is caught too; a string under a secret-named field, or a `cookie`,
+  `set-cookie` or `proxy-authorization` field, is masked), then stringified, so the stored text is
+  valid JSON; any other text is scrubbed whole. A raw response longer than `SCRUB_WINDOW` = 131 072
+  characters is not parsed: only its head is scrubbed, and it is stored as text, truncated. The
+  cap, `EXCHANGE_BODY_MAX` = 65 536 characters (UTF-16 code units, not bytes), applies after
+  scrubbing, with a `truncated` flag and `bytes`, which is the length in characters before the
+  cap (the field name is historical). Worst case per project: 100 rows x 2 bodies x 65 536
+  characters = 13.1 million characters, up to three times that in UTF-8 bytes for CJK text. No
+  header is ever passed to the capture code.
+- **Retention.** `exchangeInsert` keeps the newest `EXCHANGE_KEEP` = 100 rows, `exchangePurge`
+  deletes this project's rows, and `purge()` (`eminiar purge adjudicator`) deletes them with the
+  rest. The prune, `exchangePurge` and `purge()` run under `PRAGMA secure_delete = ON` and
+  `exchangePurge` and `purge()` end with a best-effort `wal_checkpoint(TRUNCATE)` (zero lock wait),
+  so the text leaves the file and the log unless another process holds the database. The async
+  child re-reads the setting (`captureStillOn`) before it writes. A capture failure never changes the verdict: the write takes no lock wait and fails open
+  with one log line.
+- **Surfaces.** `GET /api/adjudicator/jev/exchanges` (summaries, no bodies) and
+  `/jev/exchange?id=` (one row with bodies) are gated before any database read: inactive when
+  the adjudicator is off or the provider is not Jev, `{capture:false}` when capture is off. The
+  dashboard's Jev requests table and drawer use them. `eminiar adjudicator exchanges
+  [status|on|off|purge]` manages the setting and the rows. No file permissions are changed.
 
 ## 13. Outcomes, tokens and savings (`learn.ts`, `savings.ts`)
 

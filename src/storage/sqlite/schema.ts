@@ -584,6 +584,51 @@ CREATE TABLE IF NOT EXISTS adjudicator_bias (
 );
 `,
   },
+  {
+    // Jev exchange log (docs/design/adjudicator.md, task #172): the newest 100 requests sent to
+    // Jev and its answers, kept only while the personal privacy.captureExchanges setting is on.
+    // A new table, so no heal is needed and the v8 DDL stays untouched. Never stores a key, a
+    // header or the internal request keys; the bodies are redacted before they get here.
+    version: 9,
+    sql: `
+CREATE TABLE IF NOT EXISTS adjudicator_exchanges (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  call_id TEXT NOT NULL,
+  batch INTEGER NOT NULL DEFAULT 0,
+  provider TEXT NOT NULL,
+  model TEXT,
+  surface TEXT,
+  context TEXT,
+  method TEXT NOT NULL,
+  target TEXT NOT NULL,
+  row_ids TEXT NOT NULL DEFAULT '[]',
+  items INTEGER NOT NULL,
+  outcome TEXT NOT NULL,
+  http_status INTEGER,
+  timed_out INTEGER NOT NULL DEFAULT 0,
+  attempts INTEGER NOT NULL DEFAULT 1,
+  wait_ms INTEGER,
+  job_wait_ms INTEGER,
+  ttfb_ms INTEGER,
+  duration_ms INTEGER,
+  retry_wait_ms INTEGER NOT NULL DEFAULT 0,
+  deadline_ms INTEGER NOT NULL,
+  budget_ms INTEGER,
+  tokens_in INTEGER,
+  tokens_out INTEGER,
+  cost_usd REAL,
+  request_body TEXT NOT NULL,
+  request_bytes INTEGER NOT NULL,
+  request_truncated INTEGER NOT NULL DEFAULT 0,
+  response_body TEXT,
+  response_bytes INTEGER,
+  response_truncated INTEGER NOT NULL DEFAULT 0,
+  error TEXT
+);
+CREATE INDEX IF NOT EXISTS adjudicator_exchanges_ts ON adjudicator_exchanges(ts);
+`,
+  },
 ];
 
 /**

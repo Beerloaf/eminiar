@@ -63,6 +63,8 @@ import {
   tryItReason,
   usageGapNote,
 } from "./adjudicator-helpers.js";
+import { JevImpact } from "./JevImpact.js";
+import { jevActive } from "./jev-helpers.js";
 import { shortModel } from "./usage-helpers.js";
 
 // --- small bits --------------------------------------------------------------------------
@@ -1749,6 +1751,9 @@ export function Adjudicator({ params }: { params: Record<string, string> }): JSX
             ))}
           </div>
           {showHow ? <Assumptions list={sav.data?.assumptions ?? []} /> : null}
+          {jevActive(o) ? (
+            <JevImpact range={range} tick={tick} ov={o} onOpen={(n) => go({ id: n })} />
+          ) : null}
 
           <div class="grid wide">
             <div class="card">

@@ -15,7 +15,7 @@
 
 import { spawn as nodeSpawn } from "node:child_process";
 import type { AdjudicatorConfig } from "../config.js";
-import { AdjudicatorConfigSchema } from "../config.js";
+import { AdjudicatorConfigSchema, loadConfig } from "../config.js";
 // Static on purpose: hook.ts already imports both, and a dynamic import() here made each its own
 // split chunk that every hook process loaded (src/hook.ts, tsup.config.ts).
 import { getContext } from "../context.js";
@@ -44,6 +44,8 @@ export interface AsyncJob {
   bias?: Record<string, number>;
   tools?: string[];
   roles?: Array<{ name: string; description?: string }>;
+  /** When the hook queued the job (epoch ms); set only with privacy.captureExchanges on. */
+  queuedAt?: number;
 }
 
 type SpawnFn = typeof nodeSpawn;
@@ -126,6 +128,7 @@ export function parseJob(raw: string): AsyncJob | undefined {
     if (j.bias && typeof j.bias === "object") job.bias = j.bias;
     if (Array.isArray(j.tools)) job.tools = j.tools;
     if (Array.isArray(j.roles)) job.roles = j.roles;
+    if (typeof j.queuedAt === "number" && Number.isFinite(j.queuedAt)) job.queuedAt = j.queuedAt;
     return job;
   } catch {
     return undefined;
@@ -135,6 +138,7 @@ export function parseJob(raw: string): AsyncJob | undefined {
 /** The child entry: provider call → cache → row update. Never throws. */
 export async function runAsyncJob(raw: string, deps: RunDeps = {}): Promise<RunResult> {
   const log = deps.log ?? (() => {});
+  const childStart = (deps.now ?? Date.now)();
   try {
     const job = parseJob(raw);
     if (!job) return { ok: false, reason: "invalid job" };
@@ -158,6 +162,16 @@ export async function runAsyncJob(raw: string, deps: RunDeps = {}): Promise<RunR
     if (deps.now) opts.now = deps.now;
     if (deps.provider !== undefined) opts.provider = deps.provider;
     if (deps.fetch) opts.deps = { fetch: deps.fetch };
+    // The engine stores a captured Jev exchange (privacy.captureExchanges) only when it can link
+    // it to a decision: here the row the hook inserted.
+    if (job.rowId !== undefined) opts.linkRowIds = [job.rowId];
+    if (job.queuedAt !== undefined) opts.jobWaitMs = Math.max(0, childStart - job.queuedAt);
+    // The job outlives the config it was queued with: `exchanges off`, the env kill switch or a
+    // purge may have happened since. Capture runs only while the CURRENT setting is still on;
+    // nothing is read when capture was never on.
+    if (job.config.privacy.captureExchanges === true) {
+      opts.captureStillOn = () => captureStillOn(job.projectRoot);
+    }
 
     const [out] = await adjudicate([job.request], opts);
     if (!out) return { ok: false, reason: "no verdict" };
@@ -191,6 +205,18 @@ export async function runAsyncJob(raw: string, deps: RunDeps = {}): Promise<RunR
   } catch (err) {
     log(`adjudicator: async job failed: ${(err as Error)?.message ?? String(err)}`);
     return { ok: false, reason: "error" };
+  }
+}
+
+/**
+ * The effective capture setting right now (personal file, untrusted-file cut, env kill switch,
+ * all applied by loadConfig). Fails closed: a config that cannot be read means no capture.
+ */
+function captureStillOn(projectRoot: string): boolean {
+  try {
+    return loadConfig(projectRoot).adjudicator.privacy.captureExchanges === true;
+  } catch {
+    return false;
   }
 }
 

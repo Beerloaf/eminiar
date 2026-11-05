@@ -6,12 +6,20 @@
  *   GET  /api/adjudicator/decision   one row with its parsed scores
  *   GET  /api/adjudicator/savings    savings.savingsReport
  *   GET  /api/adjudicator/eval       the last eval report, or null
+ *   GET  /api/adjudicator/jev        Jev impact: what the typesafe provider changed (settles outcomes first)
+ *   GET  /api/adjudicator/jev/exchanges  the stored Jev requests, newest first, without bodies
+ *   GET  /api/adjudicator/jev/exchange   one stored Jev request with its request/response bodies
  *   POST /api/adjudicator/test       try-it: score a text; never persisted
  *
- * Every GET runs learn.reconcile (limit 500) first so outcomes and savings are current. Every
- * query value is validated (a bad since, limit, offset or enum is a 400). Payloads never carry
- * a key (not even a masked one) or request text beyond the stored, redacted input_head; the
- * try-it response does not echo its text. The server checks the loopback origin and the JSON
+ * Every GET but /jev/exchange(s) runs learn.reconcile (limit 500) first so outcomes and savings are
+ * current. /jev does it after its Jev gate (nothing is read or written when Jev is off): the panel
+ * and the overview are fetched together on a refresh, in no fixed order, so it cannot lean on the
+ * overview having reconciled.
+ * Every query value is validated (a bad since, limit, offset, id or enum is a 400). Payloads never
+ * carry a key or header (not even a masked one) or request text beyond the stored, redacted
+ * input_head; the one exception is /jev/exchange, which returns the stored (redacted) request and
+ * response bodies of a single captured Jev request, and only when privacy.captureExchanges is on.
+ * The try-it response does not echo its text. The server checks the loopback origin and the JSON
  * content type of the POST before it gets here.
  */
 
@@ -20,6 +28,11 @@ import { p95, spendToday } from "../adjudicator/breaker.js";
 import { type Resolved, resolveAdjudicator } from "../adjudicator/config.js";
 import { adjudicateOne } from "../adjudicator/engine.js";
 import { complexityBucket, topIntent } from "../adjudicator/heuristic.js";
+import {
+  type JevImpactInactive,
+  type JevImpactPayload,
+  jevImpact,
+} from "../adjudicator/jev-impact.js";
 import { biasFromRows, DEFAULT_LEARNING, reconcile } from "../adjudicator/learn.js";
 import { hasProvider, registerProvider } from "../adjudicator/providers/index.js";
 import { allRows, savingsReport } from "../adjudicator/savings.js";
@@ -28,9 +41,12 @@ import {
   type AdjudicationRow,
   type AdjudicatorProvider,
   EVAL_META_KEY,
+  type ExchangeDetail,
+  type ExchangeSummary,
   PROVIDER_IDS,
   type ProviderId,
   SURFACES,
+  type Surface,
   type Verdict,
 } from "../adjudicator/types.js";
 import type { AdjudicatorConfig, Config } from "../config.js";
@@ -38,10 +54,13 @@ import { loadConfig, projectAdjudicatorWarning } from "../config.js";
 import type { ProjectContext } from "../context.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import { getStorage } from "../storage/index.js";
+import { EXCHANGE_KEEP } from "../storage/sqlite/adjudicator.js";
 import type {
   AdjudicationSummary,
   AdjudicatorProviderState,
   AdjudicatorStore,
+  ExchangeRow,
+  ExchangeSummaryRow,
 } from "../storage/types.js";
 import { parseSince } from "../tools/em_usage.js";
 import type { PricingOverrides } from "../usage/pricing.js";
@@ -373,6 +392,273 @@ export function overviewPayload(
   };
 }
 
+// --- GET /api/adjudicator/jev -----------------------------------------------------------
+
+/** The surfaces a Jev report can be narrowed to (test rows are never in it). */
+const JEV_SURFACES = SURFACES.filter((s) => s !== "test");
+
+/** What the web client reads from /jev when Jev is configured. */
+export type JevApiPayload = JevImpactPayload<{
+  configured: string;
+  effective: string;
+  degraded: string | null;
+  model: string | null;
+  health: ProviderHealth;
+}> & {
+  /** What the reconcile before this read did, as on the other tab GETs; `error` is a fixed text. */
+  reconcile: ReturnType<typeof reconcileFirst>;
+};
+
+export type JevApiResponse = JevApiPayload | JevImpactInactive;
+
+/**
+ * Jev is shown when the adjudicator is enabled and typesafe is the configured provider. A
+ * configured Jev with no key or consent still shows (provider.degraded says why), because
+ * "configured but every call falls back" is what the panel should reveal.
+ *
+ * The config is read first: when Jev is not in play this returns before the database is
+ * opened and before any row is read. Past the gate it runs the same bounded reconcile as the
+ * other tab GETs (limit 500, fail-soft; the result is in `reconcile`, with a fixed error text) so
+ * the outcomes it reads are current, then only reads the report. A
+ * busy or missing database is a 503 with a fixed message, never a thrown error. The payload holds counts,
+ * ids, tiers and reason codes; never a key, input text or a prompt.
+ */
+export function jevPayload(
+  ctx: ProjectContext,
+  deps: AdjudicatorRouteDeps = {},
+  window: { since?: number | undefined; surface?: Surface | undefined } = {},
+): Reply {
+  const now = (deps.now ?? Date.now)();
+  const config = deps.config ?? loadConfig(ctx.root);
+  const a = config.adjudicator;
+  if (!a.enabled || a.provider !== "typesafe") {
+    const inactive: JevImpactInactive = {
+      active: false,
+      reason: a.enabled ? "provider" : "disabled",
+      provider: a.provider,
+      now,
+    };
+    return ok(inactive);
+  }
+  try {
+    const db = deps.db ?? getStorage(ctx);
+    const e: Env = { config, db, now, env: deps.env };
+    const r = resolve(e);
+    const settled = reconcileFirst(e);
+    const reconciled = "error" in settled ? { error: "the outcome reconcile failed" } : settled;
+    const state = db.adjudicator.providerState("typesafe");
+    const pricing = pricingOf(config);
+    const report = jevImpact(db, window, {
+      config: a,
+      ...(pricing ? { pricing } : {}),
+      now,
+      degraded: r.degraded ?? null,
+      breakerState: state?.state ?? null,
+    });
+    const payload: JevApiPayload = {
+      active: true,
+      provider: {
+        configured: r.configured,
+        effective: r.provider,
+        degraded: r.degraded ?? null,
+        model: r.model ?? null,
+        health: healthOf(e, "typesafe", state, r.configured),
+      },
+      ...report,
+      reconcile: reconciled,
+    };
+    return ok(payload);
+  } catch {
+    return fail(503, "the adjudication database is unavailable (busy or missing); try again");
+  }
+}
+
+// --- GET /api/adjudicator/jev/exchanges + /jev/exchange ---------------------------------
+
+/** Capture is off: the panel says how to turn it on; no exchange row was read. */
+export interface JevExchangesCaptureOff {
+  active: true;
+  capture: false;
+  keep: number;
+  now: number;
+}
+
+export interface JevExchangesPayload {
+  active: true;
+  capture: true;
+  keep: number;
+  /** Rows stored for this filter (all of them, or the ones serving `row`). */
+  total: number;
+  rows: ExchangeSummary[];
+  now: number;
+}
+
+export interface JevExchangePayload {
+  active: true;
+  capture: true;
+  exchange: ExchangeDetail;
+  now: number;
+}
+
+export type JevExchangesResponse = JevImpactInactive | JevExchangesCaptureOff | JevExchangesPayload;
+export type JevExchangeResponse = JevImpactInactive | JevExchangesCaptureOff | JevExchangePayload;
+
+const JEV_UNAVAILABLE = "the adjudication database is unavailable (busy or missing); try again";
+
+/** The same gate as jevPayload, then the capture switch; both answer before any database read. */
+function exchangeGate(
+  ctx: ProjectContext,
+  deps: AdjudicatorRouteDeps,
+  now: number,
+): { reply: Reply } | { reply?: undefined } {
+  const a = (deps.config ?? loadConfig(ctx.root)).adjudicator;
+  if (!a.enabled || a.provider !== "typesafe") {
+    const inactive: JevImpactInactive = {
+      active: false,
+      reason: a.enabled ? "provider" : "disabled",
+      provider: a.provider,
+      now,
+    };
+    return { reply: ok(inactive) };
+  }
+  if (a.privacy.captureExchanges !== true) {
+    const off: JevExchangesCaptureOff = { active: true, capture: false, keep: EXCHANGE_KEEP, now };
+    return { reply: ok(off) };
+  }
+  return {};
+}
+
+function toSummary(r: ExchangeSummaryRow): ExchangeSummary {
+  return {
+    id: r.id,
+    ts: r.ts,
+    callId: r.callId,
+    batch: r.batch,
+    surface: r.surface,
+    context: r.context,
+    model: r.model,
+    target: r.target,
+    outcome: r.outcome as ExchangeSummary["outcome"],
+    status: r.httpStatus,
+    timedOut: r.timedOut,
+    attempts: r.attempts,
+    waitMs: r.waitMs,
+    jobWaitMs: r.jobWaitMs,
+    ttfbMs: r.ttfbMs,
+    durationMs: r.durationMs,
+    retryWaitMs: r.retryWaitMs,
+    deadlineMs: r.deadlineMs,
+    budgetMs: r.budgetMs,
+    items: r.items,
+    rowIds: r.rowIds,
+    tokensIn: r.tokensIn,
+    tokensOut: r.tokensOut,
+    costUsd: r.costUsd,
+    requestBytes: r.requestBytes,
+    requestTruncated: r.requestTruncated,
+    responseBytes: r.responseBytes,
+    responseTruncated: r.responseTruncated,
+  };
+}
+
+/** A stored body is valid JSON unless it was cut at the cap; the flag tells the viewer which. */
+function bodyOf(text: string, bytes: number, truncated: boolean): ExchangeDetail["request"] {
+  let json = false;
+  if (!truncated) {
+    try {
+      JSON.parse(text);
+      json = true;
+    } catch {
+      json = false;
+    }
+  }
+  return { text, json, bytes, truncated };
+}
+
+function toDetail(r: ExchangeRow): ExchangeDetail {
+  return {
+    ...toSummary(r),
+    request: bodyOf(r.requestBody, r.requestBytes, r.requestTruncated),
+    response:
+      r.responseBody === null
+        ? null
+        : bodyOf(r.responseBody, r.responseBytes ?? r.responseBody.length, r.responseTruncated),
+    error: r.error,
+  };
+}
+
+/**
+ * The stored Jev requests, newest first, without bodies or error text. The config is read first:
+ * Jev off or not the provider answers {active:false}, capture off answers {capture:false}, and
+ * neither opens the database. Reads only; never reconciles. A busy or missing database is a 503
+ * with a fixed message.
+ */
+export function jevExchangesPayload(
+  ctx: ProjectContext,
+  deps: AdjudicatorRouteDeps = {},
+  filter: { limit?: number | undefined; row?: number | undefined } = {},
+): Reply {
+  const now = (deps.now ?? Date.now)();
+  const gate = exchangeGate(ctx, deps, now);
+  if (gate.reply) return gate.reply;
+  try {
+    const db = deps.db ?? getStorage(ctx);
+    const { rows, total } = db.adjudicator.exchangeList({
+      limit: filter.limit ?? EXCHANGE_KEEP,
+      ...(filter.row !== undefined ? { rowId: filter.row } : {}),
+    });
+    const payload: JevExchangesPayload = {
+      active: true,
+      capture: true,
+      keep: EXCHANGE_KEEP,
+      total,
+      rows: rows.map(toSummary),
+      now,
+    };
+    return ok(payload);
+  } catch {
+    return fail(503, JEV_UNAVAILABLE);
+  }
+}
+
+/** One stored Jev request with its bodies. Same gate and failure mode as jevExchangesPayload. */
+export function jevExchangePayload(
+  ctx: ProjectContext,
+  deps: AdjudicatorRouteDeps = {},
+  id: number,
+): Reply {
+  const now = (deps.now ?? Date.now)();
+  const gate = exchangeGate(ctx, deps, now);
+  if (gate.reply) return gate.reply;
+  try {
+    const db = deps.db ?? getStorage(ctx);
+    const r = db.adjudicator.exchangeGet(id);
+    if (!r) return fail(404, `request ${id} not found`);
+    const payload: JevExchangePayload = {
+      active: true,
+      capture: true,
+      exchange: toDetail(r),
+      now,
+    };
+    return ok(payload);
+  } catch {
+    return fail(503, JEV_UNAVAILABLE);
+  }
+}
+
+/** A positive integer id from a query value, or an error reply. */
+function idOf(q: URLSearchParams, key: string, required: boolean): Parsed<number | undefined> {
+  const raw = q.get(key);
+  if (raw === null || raw === "") {
+    return required
+      ? { error: fail(400, `${key} must be a positive integer`) }
+      : { value: undefined };
+  }
+  if (!/^\d{1,15}$/.test(raw) || Number(raw) < 1)
+    return { error: fail(400, `${key} must be a positive integer`) };
+  return { value: Number(raw) };
+}
+
 // --- GET /api/adjudicator/decisions + /decision -----------------------------------------
 
 /** A call-log row: everything but the scores JSON. input_head is already redacted and ≤ 80 chars. */
@@ -447,6 +733,11 @@ function tryItStore(store: AdjudicatorStore): AdjudicatorStore {
     biasUpsert: never,
     biasReset: never,
     summary: (since) => store.summary(since),
+    exchangeInsert: never,
+    exchangeList: (f) => store.exchangeList(f),
+    exchangeGet: (id) => store.exchangeGet(id),
+    exchangeCount: () => store.exchangeCount(),
+    exchangePurge: never,
     purge: never,
     // The breaker's read-modify-write must stay atomic here too: a try-it call races hooks.
     ...(atomically ? { atomically } : {}),
@@ -633,6 +924,28 @@ export async function adjudicatorRoute(
     if (!isGet) return fail(405, "GET only");
     const e = envOf(ctx, deps);
     return ok({ ...evalPayload(e.db), now: e.now });
+  }
+  if (path === "/api/adjudicator/jev") {
+    if (!isGet) return fail(405, "GET only");
+    const since = sinceOf(query, now, DEFAULT_SINCE);
+    if (since.error) return since.error;
+    const surface = enumOf(query, "surface", JEV_SURFACES);
+    if (surface.error) return surface.error;
+    return jevPayload(ctx, deps, { since: since.value, surface: surface.value });
+  }
+  if (path === "/api/adjudicator/jev/exchanges") {
+    if (!isGet) return fail(405, "GET only");
+    const limit = intOf(query, "limit", { min: 1, max: EXCHANGE_KEEP, fallback: EXCHANGE_KEEP });
+    if (limit.error) return limit.error;
+    const row = idOf(query, "row", false);
+    if (row.error) return row.error;
+    return jevExchangesPayload(ctx, deps, { limit: limit.value, row: row.value });
+  }
+  if (path === "/api/adjudicator/jev/exchange") {
+    if (!isGet) return fail(405, "GET only");
+    const id = idOf(query, "id", true);
+    if (id.error) return id.error;
+    return jevExchangePayload(ctx, deps, id.value as number);
   }
   if (path === "/api/adjudicator/test") {
     if (method !== "POST") return fail(405, "POST only");

@@ -1668,6 +1668,14 @@ export class SqliteAdapter implements StorageAdapter {
       }
     });
     this.db.exec("VACUUM");
+    // The VACUUM rewrote the file, but another open connection keeps the old frames alive in
+    // the -wal. Best-effort and fail open: zero lock wait, never throws, and a busy database
+    // or an open reader just leaves the log as it is.
+    try {
+      this.adjudicator.withLockWait(0, () => this.db.pragma("wal_checkpoint(TRUNCATE)"));
+    } catch {
+      // fail open
+    }
   }
 
   transaction<T>(fn: () => T): T {

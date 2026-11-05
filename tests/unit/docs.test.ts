@@ -846,6 +846,24 @@ describe("manifest read bound (review #109 F5)", () => {
     writeFileSync(file, `${valid}${" ".repeat(MANIFEST_MAX_BYTES)}`);
     expect(docsSourceFor("https://zod.dev/api", proj)).toBeUndefined();
   });
+
+  it("docsSourceFor reads the manifest with the project root: a docs.json outside it is not read (#157)", () => {
+    const outside = join(dir, "outside-manifest.json");
+    writeFileSync(outside, valid);
+    const proj = join(dir, "proj-linked");
+    mkdirSync(join(proj, ".eminiar"), { recursive: true });
+    const link = join(proj, ".eminiar", "docs.json");
+    symlinkSync(outside, link);
+    // The same file reads fine without a root, so only the root explains the refusal.
+    expect(readManifestAt(link).sources.map((s) => s.name)).toEqual(["zod"]);
+    expect(readManifestAt(link, proj).sources).toEqual([]);
+    expect(docsSourceFor("https://zod.dev/api", proj)).toBeUndefined();
+    // A regular manifest inside the project still answers.
+    const inside = join(dir, "proj-plain");
+    mkdirSync(join(inside, ".eminiar"), { recursive: true });
+    writeFileSync(join(inside, ".eminiar", "docs.json"), valid);
+    expect(docsSourceFor("https://zod.dev/api", inside)).toBe("zod");
+  });
 });
 
 describe("manifest writes refuse a manifest they could not read (task #134)", () => {

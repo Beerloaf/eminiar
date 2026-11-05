@@ -1,4 +1,5 @@
-import { redact } from "../redact.js";
+import type { HttpExchange } from "../types.js";
+import { captureBody, captureText, scrubHead, scrubKey } from "./capture.js";
 
 /**
  * The shared HTTP layer of the adjudicator providers (docs/design/adjudicator.md §8): plain
@@ -56,6 +57,13 @@ export interface HttpOptions {
   log?: ((line: string) => void) | undefined;
   /** Retry a 429/529 once (default true). */
   retry?: boolean | undefined;
+  /**
+   * Jev request capture: called once, right after the first fetch starts, with a LIVE record that
+   * http.ts keeps filling until the call ends (so a call the caller gives up on stays readable as
+   * "pending"). Bodies are scrubbed and capped (capture.ts); headers and the key are never in it.
+   * Without it nothing extra runs. A capture failure never changes the HTTP result.
+   */
+  exchange?: ((x: HttpExchange) => void) | undefined;
 }
 
 /** What a provider factory gets besides its config: test seams and the tool list. */
@@ -82,11 +90,13 @@ export interface HttpResult<T = unknown> {
   attempts: number;
 }
 
-/** Remove the key (verbatim) and anything token-shaped from text that may reach a log or error. */
+/**
+ * Remove the key and anything token-shaped from text that may reach a log or error. The key is
+ * also found when an echo hid it with a zero-width character or wrote it in fullwidth forms
+ * (capture.ts scrubKey, review-xchg R2).
+ */
 export function scrub(text: string, key?: string): string {
-  let out = text;
-  if (key && key.length >= 4) out = out.split(key).join("***");
-  return redact(out);
+  return scrubKey(text, key);
 }
 
 export function postJson<T = unknown>(
@@ -94,7 +104,7 @@ export function postJson<T = unknown>(
   body: unknown,
   o: HttpOptions,
 ): Promise<HttpResult<T>> {
-  return request<T>("POST", url, JSON.stringify(body), o);
+  return request<T>("POST", url, body, o);
 }
 
 export function getJson<T = unknown>(url: string, o: HttpOptions): Promise<HttpResult<T>> {
@@ -109,7 +119,7 @@ export function joinUrl(base: string, path: string): string {
 async function request<T>(
   method: "GET" | "POST",
   url: string,
-  body: string | undefined,
+  body: unknown,
   o: HttpOptions,
 ): Promise<HttpResult<T>> {
   const now = o.now ?? Date.now;
@@ -117,13 +127,32 @@ async function request<T>(
   const start = now();
   const end = start + Math.max(0, o.deadlineMs);
   const target = safeTarget(url);
+  const payload = method === "POST" ? JSON.stringify(body) : undefined;
+  // Capture state: x is the live record (undefined when o.exchange is not set).
+  let x: HttpExchange | undefined;
+  let lastText: string | undefined;
+  let lastStatus: number | undefined;
+  const settle = (outcome: HttpExchange["outcome"], status: number | null, error?: string) => {
+    if (!x) return;
+    try {
+      x.durationMs = now() - x.sentAt;
+      x.status = status;
+      if (x.response === null && lastText !== undefined) x.response = captureText(lastText, o.key);
+      if (error !== undefined) x.error = error;
+      x.outcome = outcome;
+    } catch {
+      x.outcome = outcome;
+    }
+  };
   const fail = (e: ProviderError): never => {
+    // Only with a live record: a capture-off failure pays no extra scrub.
+    if (x) settle(e.kind, e.status ?? lastStatus ?? null, scrub(e.message, o.key));
     o.log?.(scrub(`adjudicator ${method} ${target}: ${e.kind} ${e.message}`, o.key));
     throw e;
   };
 
   const headers: Record<string, string> = { accept: "application/json", ...o.headers };
-  if (body !== undefined) headers["content-type"] = "application/json";
+  if (payload !== undefined) headers["content-type"] = "application/json";
   if (o.key) headers.authorization = `Bearer ${o.key}`;
 
   for (let attempt = 1; ; attempt++) {
@@ -137,14 +166,43 @@ async function request<T>(
     o.signal?.addEventListener("abort", onAbort, { once: true });
     let res: Response;
     let text: string;
+    const attemptStart = now();
     try {
       // Never follow a redirect: a 3xx would re-send the prompt text and the key to a host the
       // user did not agree to (task #33). It is answered below as an http_error instead.
       const init: RequestInit = { method, headers, signal: ctl.signal, redirect: "manual" };
-      if (body !== undefined) init.body = body;
-      res = await doFetch(url, init);
+      if (payload !== undefined) init.body = payload;
+      const sent = doFetch(url, init);
+      if (o.exchange && !x) {
+        // After the fetch started and before its await: scrubbing overlaps the network.
+        try {
+          const rec: HttpExchange = {
+            method,
+            target,
+            sentAt: attemptStart,
+            deadlineMs: o.deadlineMs,
+            attempts: 1,
+            retryWaitMs: 0,
+            ttfbMs: null,
+            durationMs: null,
+            status: null,
+            outcome: "pending",
+            request: captureBody(body, o.key),
+            response: null,
+            error: null,
+          };
+          o.exchange(rec);
+          x = rec;
+        } catch {
+          x = undefined;
+        }
+      }
+      res = await sent;
+      if (x) x.ttfbMs = now() - attemptStart;
       // The deadline also covers reading the body.
       text = await res.text();
+      lastText = text;
+      lastStatus = res.status;
     } catch (err) {
       if (ctl.signal.aborted || o.signal?.aborted || isAbort(err))
         return fail(new ProviderError("timeout", `no answer within ${o.deadlineMs} ms`));
@@ -170,6 +228,14 @@ async function request<T>(
       const left = end - now() - wait;
       if (o.retry !== false && attempt === 1 && left >= RETRY_MIN_REMAINING_MS) {
         o.log?.(`adjudicator ${method} ${target}: ${res.status}, retrying in ${wait} ms`);
+        if (x) {
+          x.attempts = 2;
+          x.retryWaitMs = wait;
+          x.ttfbMs = null;
+        }
+        // The first answer is superseded: the record keeps the final attempt's.
+        lastText = undefined;
+        lastStatus = undefined;
         if (!(await sleep(wait, o.signal)))
           return fail(new ProviderError("timeout", "aborted while waiting to retry"));
         continue;
@@ -177,12 +243,13 @@ async function request<T>(
       return fail(
         new ProviderError("rate_limited", `HTTP ${res.status}`, {
           status: res.status,
-          body: scrub(text.slice(0, BODY_SNIPPET), o.key),
+          body: scrubHead(text, BODY_SNIPPET, o.key),
         }),
       );
     }
     if (res.status < 200 || res.status >= 300) {
-      const snippet = scrub(text.slice(0, BODY_SNIPPET), o.key);
+      // Scrubbed before it is cut, so a key straddling the cut leaves no prefix (review-xchg R3).
+      const snippet = scrubHead(text, BODY_SNIPPET, o.key);
       return fail(
         new ProviderError("http_error", `HTTP ${res.status}: ${snippet.slice(0, 160)}`, {
           status: res.status,
@@ -196,6 +263,16 @@ async function request<T>(
     } catch {
       return fail(new ProviderError("invalid", "the response is not JSON", { status: res.status }));
     }
+    if (x) {
+      try {
+        // A body over capture.ts SCRUB_WINDOW is not scrubbed whole: only its head is stored.
+        x.response = captureText(text, o.key, json);
+      } catch {
+        x.response = null;
+      }
+      lastText = undefined;
+    }
+    settle("ok", res.status);
     return { status: res.status, json, latencyMs: now() - start, attempts: attempt };
   }
 }

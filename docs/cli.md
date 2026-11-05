@@ -136,6 +136,10 @@ eminiar adjudicator key status [--json]        # where each key comes from, mask
 eminiar adjudicator test "<text>" [--provider P] [--json]   # probe + score one sample; not stored
 eminiar adjudicator eval [--provider P ...] [--providers a,b] [--fixture f.json|.js|.mjs] [--replace] [--repeat N] [--save] [--json]
 eminiar adjudicator stats [--since 7d] [--json] [--reset-learning]
+eminiar adjudicator exchanges [status] [--json]   # Jev request capture: on/off, how many are kept here
+eminiar adjudicator exchanges on [--yes]          # keep the newest 100 Jev requests (contain redacted prompt text)
+eminiar adjudicator exchanges off                 # turn off and delete this project's captured requests
+eminiar adjudicator exchanges purge [--yes]       # delete this project's captured requests
 ```
 
 - `status` is the default subcommand. It shows which layer decides `enabled` (environment,
@@ -160,6 +164,18 @@ eminiar adjudicator stats [--since 7d] [--json] [--reset-learning]
   repeats for latency percentiles, `--save` keeps the report for the dashboard.
 - `stats` summarises decisions, follow rate, spend and savings with their assumptions.
   `--reset-learning` clears the learned bias.
+- `exchanges` (default `status`) manages [Jev request capture](adjudicator.md#jev-request-capture).
+  `status` shows whether capture is on (and whether `EMINIAR_ADJUDICATOR_CAPTURE=0` is forcing it
+  off) and how many requests are stored in this project. `exchanges on` writes
+  `privacy.captureExchanges` to `~/.eminiar/config.json` only; `--project` is refused (exit 2).
+  It prints what will be kept and asks y/N; without a terminal it needs `--yes`, or it changes
+  nothing and exits 1. It warns when Jev is not the provider yet, since nothing is captured until
+  it is. `exchanges off` turns capture off and deletes this project's captured requests, with no
+  prompt; other projects keep theirs until you run `exchanges purge` in each. `exchanges purge`
+  asks y/N (or needs `--yes` without a terminal), deletes this project's captured requests and
+  leaves the setting as it is. Both erase the text from the database file and the write-ahead log
+  (secure delete plus a checkpoint, best effort for the log while another process holds the
+  database); `eminiar purge adjudicator|all` does the same.
 
 Exit codes: 2 for a usage error (unknown provider, preset or mode, a key on the command line),
 1 when consent is declined or a key or provider call fails. See [Adjudicator](adjudicator.md).

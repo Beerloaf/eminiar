@@ -4,7 +4,7 @@ kind: decision
 tags: [adjudicator, heuristic, swarm, stability, units]
 related: [file:src/adjudicator/units.ts, file:src/adjudicator/engine.ts, file:tests/unit/adjudicator-units.test.ts, file:tests/unit/adjudicator-swarm.test.ts]
 created: 2026-11-05T07:55:24.459Z
-updated: 2026-11-05T07:55:24.459Z
+updated: 2026-11-05T11:59:10.312Z
 ---
 
 Adjudicator: briefs are scored per statement (swarm run 20261104-672098, task #102; branch feature/adjudicator, 2026-11-05). The user approved this rule (researcher #99, blackboard model-switching-2/3).
@@ -26,11 +26,12 @@ Algorithm (scoreUnits):
 
 Outputs:
 - Adjudication.units: BriefUnits = {scored, dropped, skipped, winner, sum, saturated, roleConfidence}.
-  - sum is the whole-text complexity before the clamp.
+  - sum is the complexity of the kept statements (boilerplate left out) before the clamp.
   - saturated means sum > 4.
 - The row's scores JSON stores `units`; units.briefUnitsOf(scores) reads it back.
-- Adjudication.features stays the whole text's features (rows and the learned bias read them).
-- The cache key gains UNITS_VERSION for plan/agent requests. SCORER_VERSION was not bumped.
+- Adjudication.features are the features of the KEPT statements joined (run 20261105-1d96f4, task #159, UNITS_VERSION 4), so a brief's top intents, the learned role-bias bucket and sum/saturated count work only, not boilerplate. A one-statement text with nothing dropped keeps the whole text's features. Rows written before v4 keep whole-text features (only a hash and the head of the text are stored, so they cannot be recomputed). Before this, the whole-text features let "run the tests" boilerplate set a tester bias that flipped coder briefs to tester.
+- ROUTINE_OBJECT is a closed set (task #158): "what(ever)" and a trailing relative clause take a subject only from the closed ROUTINE_SUBJECT list (it/they/you, the linter/compiler/checker/tool/runner/build/ci/tsc/eslint, the [e2e|unit|...] tests/specs/suites, bare tsc/eslint/biome/vitest/jest/lint/ci) plus a report/fail verb, never "the X" ("fix whatever the scanner reports" is work), so "fix the tests the auth flow needs" is work. After a check label (`Verification:`, `Done when`, `Verify:`) the rest is dropped only if it is routine checks item by item (a whole command or generic tests/build/suite; "the migration tests and the rollback specs" stays); "are green" is routine only when every item is. `npx vitest run` is a routine command. Details: units-closed-lists-and-labels.
+- The cache key gains UNITS_VERSION for plan/agent requests (now "4"). SCORER_VERSION was not bumped.
 
 Measured (blackboard units-stats):
 - This repo's 101 tasks: clamp share 67% -> 17%, opus 91% -> 63%, effort max 72% -> 22%, role != plan 23 -> 1.

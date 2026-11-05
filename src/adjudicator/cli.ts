@@ -26,6 +26,7 @@ import type { ProjectContext } from "../context.js";
 import { paths } from "../paths.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import { getStorage } from "../storage/index.js";
+import { EXCHANGE_KEEP } from "../storage/sqlite/adjudicator.js";
 import { activeSwarmConfig } from "../swarm/config.js";
 import { formatStats } from "../tools/em_adjudicate.js";
 import { parseSince } from "../tools/em_usage.js";
@@ -804,6 +805,23 @@ export interface StatusReport {
    * so apply mode cannot change any of their workers (pinnedSwarms).
    */
   pinnedSwarms: string[] | null;
+  /**
+   * Jev request capture (adjudicator.privacy.captureExchanges, a personal setting). `stored` is
+   * null when the project database could not be read.
+   */
+  capture?: CaptureStatus;
+}
+
+export interface CaptureStatus {
+  /** The effective setting: the personal file's value unless EMINIAR_ADJUDICATOR_CAPTURE=0 forces it off. */
+  on: boolean;
+  /** EMINIAR_ADJUDICATOR_CAPTURE=0 is set, so capture is off whatever the personal file says. */
+  forcedOff: boolean;
+  /** What ~/.eminiar/config.json itself says. */
+  personal: boolean;
+  keep: number;
+  stored: number | null;
+  newestTs: number | null;
 }
 
 export interface CliDeps {
@@ -908,7 +926,53 @@ export async function statusReport(
     apply,
     modelForced: forced(io.env),
     pinnedSwarms: a.mode === "apply" ? pinnedSwarms(ctx.root, config, io.env) : null,
+    capture: captureStatus(a, db, io.env),
   };
+}
+
+// --- Jev request capture (adjudicator.privacy.captureExchanges) -----------------------
+
+/** What ~/.eminiar/config.json says about capture, ignoring the env var and the project file. */
+function personalCapture(): boolean {
+  try {
+    const a = readRaw(paths().configFile).adjudicator;
+    return isObj(a) && isObj(a.privacy) && a.privacy.captureExchanges === true;
+  } catch {
+    return false;
+  }
+}
+
+function captureStatus(
+  a: AdjudicatorConfig,
+  db: StorageAdapter | undefined,
+  env: NodeJS.ProcessEnv,
+): CaptureStatus {
+  let stored: number | null = null;
+  let newestTs: number | null = null;
+  try {
+    if (db) {
+      stored = db.adjudicator.exchangeCount();
+      newestTs = db.adjudicator.exchangeList({ limit: 1 }).rows[0]?.ts ?? null;
+    }
+  } catch {
+    stored = null;
+  }
+  return {
+    on: a.privacy.captureExchanges === true,
+    forcedOff: env.EMINIAR_ADJUDICATOR_CAPTURE === "0",
+    personal: personalCapture(),
+    keep: EXCHANGE_KEEP,
+    stored,
+    newestTs,
+  };
+}
+
+/** The one-line form shared by `status` and the doctor. */
+function captureLine(c: CaptureStatus): string {
+  const n = c.stored === null ? "" : ` · ${c.stored} stored (newest ${c.keep} kept)`;
+  if (c.forcedOff)
+    return `jev request capture: off, forced by EMINIAR_ADJUDICATOR_CAPTURE=0${c.personal ? " (the personal setting is on)" : ""}${n}`;
+  return `jev request capture: ${c.on ? "on" : "off"}${n}`;
 }
 
 async function healthOf(
@@ -1004,6 +1068,8 @@ export function formatStatus(s: StatusReport): string {
     lines.push(
       `apply: ${s.apply.checked - s.apply.ineffective} of ${s.apply.checked} applied dispatches ran the chosen model`,
     );
+  if (s.capture && (s.capture.on || s.capture.forcedOff || s.configured === "typesafe"))
+    lines.push(captureLine(s.capture));
   if (s.mode === "apply" && s.modelForced)
     lines.push(
       "warning: CLAUDE_CODE_SUBAGENT_MODEL_FORCE is on, so Claude Code ignores the applied `model`",
@@ -1141,6 +1207,23 @@ export function adjudicatorDoctorChecks(
           }`
         : "no decisions yet",
     });
+  // Information, not a failure. Shown when capture is on or forced off, or when Jev is the provider.
+  if (
+    a.privacy.captureExchanges ||
+    env.EMINIAR_ADJUDICATOR_CAPTURE === "0" ||
+    r0.configured === "typesafe"
+  )
+    checks.push({
+      name: "adjudicator jev capture",
+      ok: true,
+      detail: captureLine(
+        captureStatus(
+          a,
+          safe(() => o.db),
+          env,
+        ),
+      ).replace(/^jev request capture: /, ""),
+    });
   if (a.mode === "apply" && forced(env))
     checks.push({
       name: "adjudicator apply",
@@ -1250,6 +1333,11 @@ export const ADJUDICATOR_USAGE = `eminiar adjudicator <command>   (opt-in; off b
   eval [--provider P ...] [--providers a,b] [--fixture f.json|.js|.mjs] [--replace] [--repeat N]
        [--save] [--json]              Compare providers against the heuristic on labelled requests
   stats [--since 7d] [--json] [--reset-learning]
+  exchanges [status] [--json]         Whether Jev request capture is on, and how many requests are stored here
+  exchanges on [--yes]                Keep each request sent to Jev (redacted prompt text) and its
+                                      answer in this project's database; asks y/N, personal setting only
+  exchanges off                       Turn it off and delete this project's captured requests
+  exchanges purge [--yes]             Delete this project's captured requests, leave the setting
 Providers: heuristic (offline) · embedding (local model) · typesafe = Jev (api.typesafe.ai)
   · openai-compatible presets ${PRESET_IDS.join(", ")}`;
 
@@ -1531,6 +1619,9 @@ export async function adjudicatorCommand(
       return 0;
     }
 
+    case "exchanges":
+      return exchangesCommand(rest[0], values, ctx, load, io, deps);
+
     case "help":
       io.out(ADJUDICATOR_USAGE);
       return 0;
@@ -1542,6 +1633,139 @@ export async function adjudicatorCommand(
       io.out(ADJUDICATOR_USAGE);
       return 2;
   }
+}
+
+// --- exchanges ---------------------------------------------------------------------
+
+/**
+ * `exchanges [status|on|off|purge]`: the Jev request log (adjudicator.privacy.captureExchanges).
+ * A personal setting only: a project's eminiar.config.json cannot turn it on, so `on` refuses
+ * --project and a personal config file that sits inside the project. Captured requests hold
+ * redacted prompt text in this project's database, so `on` asks y/N first (--yes answers it, and
+ * is required without a terminal). `off` and `purge` delete this project's rows only.
+ */
+async function exchangesCommand(
+  action: string | undefined,
+  values: Record<string, unknown>,
+  ctx: ProjectContext,
+  load: () => Config,
+  io: Io,
+  deps: CliDeps,
+): Promise<number> {
+  const sub = action ?? "status";
+  const yes = values.yes === true;
+  const confirm = async (question: string, needYes: string): Promise<boolean> => {
+    if (yes) return true;
+    if (!io.isTTY) {
+      io.err(needYes);
+      return false;
+    }
+    return askNo(io, question);
+  };
+  if (sub === "status") {
+    const a = load().adjudicator;
+    let db: StorageAdapter | undefined;
+    try {
+      db = await storage(ctx, deps);
+    } catch {
+      db = undefined;
+    }
+    const c = captureStatus(a, db, io.env);
+    if (values.json) {
+      io.out(JSON.stringify({ ...c, db: ctx.dbPath }, null, 2));
+      return 0;
+    }
+    io.out(
+      `capture: ${c.on ? "on" : "off"} (personal ${tilde(paths().configFile)})${
+        c.forcedOff ? " · EMINIAR_ADJUDICATOR_CAPTURE=0 is forcing it off" : ""
+      } · stored here: ${c.stored === null ? "unknown (database unreadable)" : `${c.stored} of ${c.keep}`}${
+        c.newestTs ? ` · newest ${new Date(c.newestTs).toISOString()}` : ""
+      } · db ${tilde(ctx.dbPath)}`,
+    );
+    if (!c.on && !c.forcedOff) io.out("turn it on with `eminiar adjudicator exchanges on`");
+    return 0;
+  }
+  if (sub !== "on" && sub !== "off" && sub !== "purge") {
+    io.err(`unknown exchanges command: ${sub}\n`);
+    io.out(ADJUDICATOR_USAGE);
+    return 2;
+  }
+  if (values.project) {
+    io.err(
+      "exchanges is a personal setting: eminiar.config.json cannot set it. Run it without --project.",
+    );
+    return 2;
+  }
+
+  if (sub === "on") {
+    if (personalFileUntrusted(io, ctx.root)) return 2;
+    const a = load().adjudicator;
+    io.out(
+      `Keeps each request sent to ${hostOf(a.typesafe.baseUrl)} (your prompt text, redacted, up to ${a.privacy.maxChars} chars per item) and Jev's answer, with timing, in ${tilde(ctx.dbPath)}.`,
+    );
+    io.out(
+      "Captured requests contain redacted prompt text and are stored in this project's database. Only the newest 100 are kept. `eminiar adjudicator exchanges purge` deletes them.",
+    );
+    if (
+      !(await confirm(
+        "Turn on?",
+        "exchanges on stores redacted prompt text and needs a yes: run it in a terminal, or pass --yes. Nothing was changed.",
+      ))
+    ) {
+      io.out("Nothing was changed.");
+      return io.isTTY || yes ? 0 : 1;
+    }
+    // applyPatch merges objects, so privacy.maxChars and privacy.storeHead are kept.
+    writeAdjudicatorPatch(paths().configFile, { privacy: { captureExchanges: true } });
+    io.out(`Jev request capture is on; wrote ${tilde(paths().configFile)}.`);
+    const after = load().adjudicator;
+    if (io.env.EMINIAR_ADJUDICATOR_CAPTURE === "0")
+      io.out("warning: EMINIAR_ADJUDICATOR_CAPTURE=0 is set in this shell and keeps capture off.");
+    if (!after.enabled || after.provider !== "typesafe")
+      io.out(
+        `note: nothing is captured until Jev is the provider (now: adjudicator ${after.enabled ? "on" : "off"}, provider ${after.provider}); \`eminiar adjudicator enable --provider typesafe\`.`,
+      );
+    return 0;
+  }
+
+  if (sub === "off") {
+    writeAdjudicatorPatch(paths().configFile, { privacy: { captureExchanges: false } });
+    let n: number;
+    try {
+      n = (await storage(ctx, deps)).adjudicator.exchangePurge();
+    } catch (err) {
+      io.err(
+        `Jev request capture is off, but deleting the stored requests failed: ${(err as Error).message}. Run \`eminiar adjudicator exchanges purge --yes\` to retry.`,
+      );
+      return 1;
+    }
+    io.out(
+      `Jev request capture is off; deleted ${n} captured request${n === 1 ? "" : "s"} here. Other projects keep theirs (run \`eminiar adjudicator exchanges purge\` in each).`,
+    );
+    return 0;
+  }
+
+  // purge
+  const db = await storage(ctx, deps);
+  const count = db.adjudicator.exchangeCount();
+  if (count === 0) {
+    io.out("No captured requests in this project.");
+    return 0;
+  }
+  if (
+    !(await confirm(
+      `Delete ${count} captured request${count === 1 ? "" : "s"} from this project?`,
+      "exchanges purge deletes data and needs a yes: run it in a terminal, or pass --yes. Nothing was deleted.",
+    ))
+  ) {
+    io.out("Nothing was deleted.");
+    return io.isTTY ? 0 : 1;
+  }
+  const n = db.adjudicator.exchangePurge();
+  io.out(
+    `Deleted ${n} captured request${n === 1 ? "" : "s"} from this project; the capture setting is unchanged. Other projects keep theirs.`,
+  );
+  return 0;
 }
 
 // --- key --------------------------------------------------------------------------

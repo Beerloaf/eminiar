@@ -1,10 +1,10 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { adjudicateOne, cacheKeyFor, type EngineOptions } from "../../src/adjudicator/engine.js";
 import { extractFeatures } from "../../src/adjudicator/features.js";
-import { scoreHeuristic } from "../../src/adjudicator/heuristic.js";
+import { scoreHeuristic, topIntent } from "../../src/adjudicator/heuristic.js";
 import type { AdjudicationRequest, Features, ScoreSet } from "../../src/adjudicator/types.js";
 import {
   briefUnitsOf,
@@ -15,6 +15,7 @@ import {
   statements,
   UNIT_CHARS,
   UNIT_MAX,
+  UNITS_VERSION,
   unitScored,
   withoutBoilerplate,
 } from "../../src/adjudicator/units.js";
@@ -171,11 +172,59 @@ describe("boilerplate", () => {
     "Run the tests and fix any errors you find.",
     "Run the linter and fix what it reports.",
     "Run the build, and fix",
+    // #158: a routine object is a bare relative/qualifier, never free words naming a specific thing
+    "Run the tests and fix any failures",
+    "Run npm test and fix them",
+    "Run the build and fix any type errors",
+    "Run the linter and fix what it reports",
+    "Run the tests and fix anything you find",
+    "Run the linter and fix all remaining lint errors",
+    "Run the tests and fix whatever breaks",
     "Verify by running npm test.",
     "Run the tests after making the change.",
     "Verify CI is green after merging the PR.",
     "Report the counts and add them to your update.",
     "Report back and update the task with em_swarm.",
+    // design3: a label before the checks, a done-when phrase, a bare npx check, a heading alone
+    "Verification: npm run typecheck && npm run lint && npx vitest run tests/unit/adjudicator-*.test.ts; report counts",
+    "Done when typecheck, lint and the tests are green.",
+    "npx vitest run tests/unit/adjudicator- passes.",
+    "Verify:",
+    "Then check:",
+    // review1 F2: routine follow-ups in their usual phrasings (HEAD left these out; #158 kept them)
+    "Run the tests and fix any failures that show up",
+    "Run the build and fix any errors that remain",
+    "Run the tests and fix any issues that come up",
+    "Run the tests and fix whatever is broken",
+    "Run the tests and fix whatever comes up",
+    "Run the tests and fix any failures the e2e suite reports",
+    "Run the linter and fix any lint errors the tool reports",
+    // review1 F3/F4: a label before routine checks, a tool-led colon form, a bare heading
+    "Done when the tests pass.",
+    "Verify: typecheck, lint, the tests + npx vitest run tests/unit/adjudicator-hooks.test.ts.",
+    "Tests:",
+    // review2 R2-2: routine follow-ups HEAD left out, in closed lists (never `the \w+`)
+    "Run the tests and fix any failures that the tests report",
+    "Run tsc and fix any errors that tsc reports",
+    "Run the tests and fix any failures that are reported",
+    "Run the tests and fix any failures that you see",
+    "Run the tests and fix any tests that now fail",
+    "Run the tests and fix any tests that start failing",
+    "Run the tests and fix any failures that come back",
+    "Run the build and fix any errors that it raises",
+    "Run the tests and fix any issues that get flagged",
+    "Run tsc and fix whatever tsc reports",
+    "Run npm run lint and fix whatever eslint flags",
+    "Run the tests and fix whatever needs fixing",
+    "Run the tests and fix whatever goes red",
+    "Run the tests and fix whatever doesn't pass",
+    "Run the tests and fix whatever is reported",
+    // review2 R2-1/R2-3: after a label every item is a routine check, here or under a path
+    "Verify: the tests in tests/unit/units.test.ts",
+    "Check: the specs under tests/unit",
+    "Verify: `npx tsc --noEmit` and `npx jest --runInBand tests/a.test.ts` must both pass.",
+    "Verify: npm run typecheck, lint, and vitest tests/unit/adjudicator-*.test.ts.",
+    "Typecheck and lint are green.",
     // a third-person form after "and" is a noun, not a step
     "Return: PR number and URL, final head SHA, CI status, Copilot rounds and changes, test results, and a 3–4 line plain summary suitable for a Slack review request.",
   ])("leaves out %j", (s) => {
@@ -208,6 +257,13 @@ describe("boilerplate", () => {
     "Check that the CI build is green on all three platforms after migrating the database layer.",
     "Report which endpoints leak personal data and patch each of them.",
     "Run the load test against the staging cluster and find the cause of the p99 latency regression.",
+    // design3: a label or a done-when that carries work, a heading word that is not a heading
+    "Acceptance: unit tests for A–E assert the project value is ignored",
+    "Check the tests cover the retry path",
+    "Verify the parser handles CRLF",
+    "Low severity: verify first.",
+    "verify",
+    "Done when the cache survives a restart",
     // any work verb or gerund, and an object that does not end on a routine noun (pre-PR review F2)
     "Run the tests and fix the failing auth flow in the payment gateway",
     "Run the build and fix the errors in the distributed transaction coordinator",
@@ -221,6 +277,54 @@ describe("boilerplate", () => {
     "Run the test suite and fix the flaky concurrency failures.",
     "Run the tests and fix the auth failures.",
     "Run the build and fix the webpack config errors.",
+    // #158: a specific object at the end of the clause is work, not a routine follow-up
+    // (HEAD's units.ts drops each of these as boilerplate, so they fail without #158)
+    "Run the build and fix the failures the auth flow causes",
+    "Run the tests and fix the errors the payment service needs",
+    "Run the linter and fix the errors the new parser needs",
+    "Run the tests and fix the failures the migration causes",
+    "Run the build and fix the tests the auth flow needs",
+    "Run the tests and fix it the way the auth works",
+    // review1 F1: who reports is a closed list; "the scanner", "the profiler" name specific work
+    "Run the security tests and fix whatever the scanner reports",
+    "Run the integration tests and fix whatever the gateway returns",
+    "Run the benchmark tests and fix whatever the profiler flags",
+    "Run the load test and investigate whatever the profiler shows",
+    // review1 F3: a label before named deliverables is work, with or without a pass predicate
+    "Definition of done: the migration tests and the rollback specs.",
+    "Done when the new retry tests pass",
+    "Acceptance: the retry tests pass",
+    "Verification: the e2e checkout spec.",
+    "Acceptance criteria: auth tests and payment specs pass",
+    // review1 F4: "Verify:" / "Check:" before review work is not a check run
+    "Verify: the tests cover the retry path",
+    "Check: the tests cover every money path",
+    "Verify: tests for the retry path cover the jitter branch",
+    // review2 R2-1 a: one command in the list clears no other item
+    "Definition of done: the migration tests, the rollback specs and typecheck pass.",
+    "Done when the new retry tests and lint pass.",
+    "Acceptance: the payment webhook specs and npm test pass.",
+    "Definition of done: pnpm migrate and the rollback specs pass.",
+    // a named suite is not a routine check either (#169 left these out; when in doubt, keep)
+    "Done when typecheck, lint and the adjudicator tests are green.",
+    "Verify: typecheck, lint, the docs + adjudicator-hooks tests.",
+    // review2 R2-1 b: a tool word used as a description is not a command
+    "Acceptance: the new linter tests pass.",
+    "Verification: the typechecker regression tests pass.",
+    "Definition of done: the eslint plugin specs.",
+    "Done when the jest preset specs pass.",
+    "Done when the ci-workflow tests pass.",
+    // review2 R2-1 c: without a label only routine checks "are green"
+    "The migration tests and the rollback specs are green.",
+    // review2 R2-1 d: checks after a label take no clause along with them
+    "Done when the tests pass; the cache must survive a restart.",
+    // review2 R2-3: in the colon form what follows the tool must be checks only
+    "Verify: npm test covers the new retry path",
+    "Check: tsc rejects the unsafe cast in parseManifest",
+    "Verify: eslint flags the floating promise in src/hooks/capture.ts",
+    "Confirm: npm ci works with the new lockfile on Node 18",
+    "Verify: npm run db:migrate succeeds on a fresh database",
+    "Check: yarn install works offline with the new cache",
   ])("keeps %j", (s) => {
     expect(isBoilerplate(s)).toBe(false);
   });
@@ -237,6 +341,38 @@ describe("boilerplate", () => {
     ).toBe("Record baseline numbers for the built-in set using the eval harness");
     const work = "Refactor the store, then wire it through the CLI.";
     expect(withoutBoilerplate(work)).toBe(work);
+    // checks after a label are left out alone; the clause after them is work (review2 R2-1 d)
+    expect(withoutBoilerplate("Done when the tests pass; the cache must survive a restart.")).toBe(
+      "the cache must survive a restart.",
+    );
+  });
+
+  it("keeps the tier a routine-looking statement of real work earns (review1 F1, F3; review2)", () => {
+    const title = "Rename the config flag.";
+    const alone = scoreUnits(title, undefined, {}, {}).set.complexity;
+    for (const work of [
+      "Run the security tests and fix whatever the scanner reports.",
+      "Definition of done: the migration tests and the rollback specs.",
+      "Definition of done: the migration tests, the rollback specs and typecheck pass.",
+      "Verification: the typechecker regression tests pass.",
+      "The migration tests and the rollback specs are green.",
+      "Verify: npm test covers the new retry path.",
+    ]) {
+      const u = scoreUnits(`${title}\n${work}`, undefined, {}, {});
+      expect(u.units.dropped).toBe(0);
+      expect(u.set.complexity).toBeGreaterThan(alone);
+    }
+    // and a routine follow-up adds nothing (review1 F2, review2 R2-2)
+    for (const follow of [
+      "Run the tests and fix any failures that show up.",
+      "Run the tests and fix any failures that the tests report.",
+      "Run the tests and fix whatever needs fixing.",
+      "Run tsc and fix whatever tsc reports.",
+    ]) {
+      const routine = scoreUnits(`${title}\n${follow}`, undefined, {}, {});
+      expect(routine.units.dropped).toBe(1);
+      expect(routine.set.complexity).toBe(alone);
+    }
   });
 
   it("stays fast on long text that almost matches", () => {
@@ -245,6 +381,10 @@ describe("boilerplate", () => {
       `${"typecheck, lint, ".repeat(22)}deploy`,
       `Verify ${"the tests and ".repeat(28)}green`,
       `Post ${"x ".repeat(190)} to the blackboard`,
+      `Verify: ${"the full ".repeat(44)}x`,
+      `Done when ${"lint, and ".repeat(38)}x`,
+      `the tests ${"and the tests ".repeat(27)}are x`,
+      `Run the tests and fix any failures that${" now fail".repeat(40)} x`,
     ];
     const t0 = performance.now();
     for (const s of near) withoutBoilerplate(s);
@@ -357,6 +497,108 @@ describe("scoreUnits", () => {
         const shuffled = [titleOf(brief), ...statements(detailOf(brief)).reverse()].join("\n");
         expect(decisions(unitSet(shuffled, h).set)).toEqual(decisions(base.set));
       }
+  });
+
+  it("gives a brief the same features, sum and saturation with or without verification boilerplate (design3 T2)", () => {
+    for (const brief of [...BRIEFS, "Fix the typo in the README"])
+      for (const h of [undefined, hints("coder")]) {
+        const base = unitSet(brief, h);
+        const appended = unitSet(`${brief}\n${BOILERPLATE_TAIL}`, h);
+        expect(appended.features).toEqual(base.features);
+        expect(appended.units.sum).toBe(base.units.sum);
+        expect(appended.units.saturated).toBe(base.units.saturated);
+      }
+  });
+
+  it("counts a repeated single statement once: appended boilerplate changes neither verdict nor features (review1 F5)", () => {
+    const one = "Update src/a.ts, src/b.ts and src/c.ts to use the new logger.";
+    for (const brief of [one, "Fix the typo in the README"])
+      for (const h of [undefined, hints("coder")]) {
+        const twice = `${brief}\n${brief}`;
+        const base = unitSet(twice, h);
+        const appended = unitSet(`${twice}\n${BOILERPLATE_TAIL}`, h);
+        expect(appended.set).toEqual(base.set);
+        expect(appended.features).toEqual(base.features);
+        expect(appended.units.sum).toBe(base.units.sum);
+        expect(appended.units.saturated).toBe(base.units.saturated);
+        // the same as saying it once, with the same boilerplate
+        expect(appended.features).toEqual(unitSet(`${brief}\n${BOILERPLATE_TAIL}`, h).features);
+      }
+  });
+
+  it("scores a one-statement brief with a list marker, heading or quote as it does with boilerplate appended (review2 R2-4)", () => {
+    const statementsOf = [
+      "Migrate the cache to redis.",
+      "Fix the retry loop.",
+      "Redesign the storage layer across every adapter and migrate the schema without downtime.",
+    ];
+    for (const marker of ["- ", "* ", "1. ", "## ", "> "])
+      for (const st of statementsOf)
+        for (const h of [undefined, hints("coder")]) {
+          const alone = unitSet(`${marker}${st}`, h);
+          const appended = unitSet(`${marker}${st}\n${BOILERPLATE_TAIL}`, h);
+          expect(appended.set).toEqual(alone.set);
+          expect(appended.features).toEqual(alone.features);
+          expect(appended.units.sum).toBe(alone.units.sum);
+          // and the marker itself is not scored
+          expect(alone.set).toEqual(unitSet(st, h).set);
+        }
+  });
+
+  it("takes a brief's features from the kept statements, not the verification steps (design3 T1)", () => {
+    for (const brief of [BRIEF_95, BRIEF_100]) {
+      const h = hints("coder");
+      const { units } = splitUnits(brief);
+      expect(unitSet(brief, h).features).toEqual(extractFeatures(units.join("\n"), h));
+      // the steps it ends with saturate the "run" intent of the whole text; the kept text has less
+      const flat = extractFeatures(brief, h).intents;
+      const kept = unitSet(brief, h).features.intents;
+      expect(flat.run).toBe(1);
+      expect(kept.run ?? 0).toBeLessThan(flat.run ?? 0);
+      expect(kept.test ?? 0).toBeLessThan(flat.test ?? 0);
+    }
+    expect(topIntent(extractFeatures(BRIEF_95, hints("coder")))).toBe("run");
+    expect(topIntent(unitSet(BRIEF_95, hints("coder")).features)).not.toBe("run");
+  });
+
+  const BOIL =
+    "\nRun npm run typecheck, npm run lint and the adjudicator tests (npx vitest run tests/unit/adjudicator-*.test.ts). Report exact pass/fail counts. Claim it first with em_swarm.";
+
+  it("keeps a coder task a coder task under the verification boilerplate it ends with (design3 T3)", () => {
+    const text = `Pass project root to readManifestAt in docsSourceFor${BOIL}`;
+    const h = hints("coder");
+    const u = unitSet(text, h);
+    expect(topIntent(u.features)).not.toBe("run");
+    expect(u.set.role.choice).toBe("coder");
+    expect(u.set.complexity).toBeLessThan(1);
+    // whole text, the way a prompt reads it: the steps inflate it and flip the role
+    const flat = whole(text, h);
+    expect(flat.complexity).toBeGreaterThan(u.set.complexity);
+    expect(flat.role.choice).toBe("tester");
+  });
+
+  it("still routes a genuine tester task to the tester (design3 T4)", () => {
+    const noHint = hints();
+    for (const title of [
+      "Tests for the three fixes: add unit tests for ROUTINE_OBJECT, docsSourceFor and the plan boilerplate",
+      "Write regression tests for the brief splitter",
+    ]) {
+      const u = unitSet(`${title}${BOIL}`, noHint);
+      expect(u.set.role.choice).toBe("tester");
+      expect(topIntent(u.features)).toBe("test");
+    }
+    // the title always stays, so a task that IS a run keeps its intent
+    const run = unitSet(
+      `Run the full suite 5 times under load and list every flaky test${BOIL}`,
+      noHint,
+    );
+    expect(run.set.role.choice).toBe("tester");
+    expect(topIntent(run.features)).toBe("run");
+    const planned = unitSet(
+      `Record heuristic eval baseline before any change${BOIL}`,
+      hints("tester"),
+    );
+    expect(planned.set.role.choice).toBe("tester");
   });
 
   it("reports `saturated` when the whole text sums past the clamp its hardest statement stays under", () => {
@@ -576,7 +818,7 @@ describe("engine: briefs are scored per statement", () => {
     ...o,
   });
 
-  it("plan and agent requests carry `units`; prompts are scored as one text", async () => {
+  it("plan and agent requests carry `units` and the kept statements' features; prompts are scored as one text", async () => {
     const c = cfg();
     for (const surface of ["plan", "agent"] as const) {
       expect(unitScored(surface)).toBe(true);
@@ -592,11 +834,15 @@ describe("engine: briefs are scored per statement", () => {
       expect(a.verdict.complexity).toBe(u.set.complexity);
       expect(a.verdict.heuristicComplexity).toBe(u.set.complexity);
       expect(a.verdict.role.choice).toBe(u.set.role.choice);
-      expect(a.features).toEqual(extractFeatures(BRIEF_100, hints("coder")));
+      expect(a.features).toEqual(
+        extractFeatures(splitUnits(BRIEF_100).units.join("\n"), hints("coder")),
+      );
     }
     expect(unitScored("prompt")).toBe(false);
     const p = await adjudicateOne({ key: "k", surface: "prompt", text: BRIEF_100 }, engine(c));
     expect(p.units).toBeUndefined();
+    // a prompt's features stay the whole text's: "run the tests" is a real intent there
+    expect(p.features).toEqual(extractFeatures(BRIEF_100));
     expect(p.verdict.complexity).toBe(
       scoreHeuristic(extractFeatures(BRIEF_100), weightsOf(c), { tiers: c.tiers }).complexity,
     );
@@ -651,7 +897,15 @@ describe("engine: briefs are scored per statement", () => {
     expect(row?.complexity).toBe(a.verdict.complexity);
   });
 
-  it("feeds the learned bias the whole text's features and the brief's complexity", async () => {
+  it("keeps a prompt's top intent on a verification request (design3 T6)", async () => {
+    const p = await adjudicateOne(
+      { key: "k", surface: "prompt", text: "Run npm test, typecheck and lint" },
+      engine(cfg()),
+    );
+    expect(topIntent(p.features)).toBe("run");
+  });
+
+  it("feeds the learned bias the brief's kept-statement features and the brief's complexity", async () => {
     const c = cfg({ learning: { enabled: true } });
     let seen: { f: Features; h: ScoreSet } | undefined;
     const a = await adjudicateOne(
@@ -663,7 +917,8 @@ describe("engine: briefs are scored per statement", () => {
         },
       }),
     );
-    expect(seen?.f).toEqual(extractFeatures(BRIEF_95, hints("coder")));
+    expect(seen?.f).toEqual(extractFeatures(splitUnits(BRIEF_95).units.join("\n"), hints("coder")));
+    expect(topIntent(seen?.f as Features)).not.toBe("run");
     expect(seen?.h.complexity).toBe(a.verdict.heuristicComplexity);
     expect(a.units?.scored).toBeGreaterThan(1);
   });
@@ -677,5 +932,33 @@ describe("engine: briefs are scored per statement", () => {
     }
     const prompt = { surface: "prompt" as const, text: BRIEF_100 };
     expect(cacheKeyFor(prompt, r)).toBe(cacheKeyFor(prompt, r, { units: false }));
+  });
+
+  it("versions the unit-scored cache key: a verdict cached under the old rules is not reused (design3 T7)", async () => {
+    // engine.cacheKeyFor hashes UNITS_VERSION for plan/agent. Load the engine against a units
+    // module whose UNITS_VERSION differs, so the keys differ only if the version is in the key.
+    const r = { configured: "typesafe" as const, model: "m" };
+    const keyAt = async (version: string, surface: "plan" | "prompt") => {
+      vi.resetModules();
+      vi.doMock("../../src/adjudicator/units.js", async (orig) => ({
+        ...(await orig<typeof import("../../src/adjudicator/units.js")>()),
+        UNITS_VERSION: version,
+      }));
+      try {
+        const engine = await import("../../src/adjudicator/engine.js");
+        return engine.cacheKeyFor({ surface, text: BRIEF_100 }, r, { units: true });
+      } finally {
+        vi.doUnmock("../../src/adjudicator/units.js");
+        vi.resetModules();
+      }
+    };
+    const v4 = await keyAt("4", "plan");
+    expect(await keyAt("4", "plan")).toBe(v4);
+    expect(await keyAt("5", "plan")).not.toBe(v4);
+    // A surface that is not scored per statement never carries the version.
+    expect(await keyAt("5", "prompt")).toBe(await keyAt("4", "prompt"));
+    // The pinned value moves with the scoring rules: bump it when a brief would score differently.
+    expect(UNITS_VERSION).toBe("4");
+    expect(cacheKeyFor({ surface: "plan", text: BRIEF_100 }, r, { units: true })).toBe(v4);
   });
 });

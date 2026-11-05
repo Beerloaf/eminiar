@@ -1031,3 +1031,73 @@ export interface AdjTryIt {
   chars: number;
   persisted: false;
 }
+
+// --- Jev impact (mirror src/ui/adjudicator-api.ts jevPayload) ------------------------
+// Types come type-only from the report module, which keeps its own imports web-safe; the
+// api module of the node side pulls node code and cannot be imported here.
+
+export type AdjJevReport = import("../../adjudicator/jev-impact.js").JevImpactReport;
+export type AdjJevInactive = import("../../adjudicator/jev-impact.js").JevImpactInactive;
+/** The provider block the route adds: the configured/effective pair, why it is degraded, health. */
+export interface AdjJevProvider
+  extends Omit<import("../../adjudicator/jev-impact.js").JevProviderSummary, "health"> {
+  health: AdjHealth | null;
+}
+export type AdjJevImpact =
+  import("../../adjudicator/jev-impact.js").JevImpactPayload<AdjJevProvider>;
+/** What GET /api/adjudicator/jev answers: the report, or {active:false} when Jev is not on. */
+export type AdjJevResponse = AdjJevImpact | AdjJevInactive;
+
+/**
+ * GET /api/adjudicator/jev. Call it only when Jev is configured and the adjudicator is on
+ * (jevActive in views/jev-helpers.ts): the panel is not mounted otherwise, so no request is made.
+ */
+export const fetchJevImpact = (since: string): Promise<AdjJevResponse> =>
+  api<AdjJevResponse>("/api/adjudicator/jev", { since });
+
+// --- Jev request log (mirror src/ui/adjudicator-api.ts jevExchangesPayload / jevExchangePayload) ---
+
+export type AdjExchangeSummary = import("../../adjudicator/types.js").ExchangeSummary;
+export type AdjExchangeDetail = import("../../adjudicator/types.js").ExchangeDetail;
+export type AdjExchangeBody = import("../../adjudicator/types.js").CapturedBody;
+
+/** Capture is off: nothing was read; the panel explains how to turn it on. */
+export interface AdjExchangesCaptureOff {
+  active: true;
+  capture: false;
+  keep: number;
+  now: number;
+}
+
+export interface AdjExchangesList {
+  active: true;
+  capture: true;
+  keep: number;
+  /** Stored rows for this filter. */
+  total: number;
+  rows: AdjExchangeSummary[];
+  now: number;
+}
+
+export interface AdjExchangeOne {
+  active: true;
+  capture: true;
+  exchange: AdjExchangeDetail;
+  now: number;
+}
+
+/** What GET /api/adjudicator/jev/exchanges answers. */
+export type AdjExchangesResponse = AdjJevInactive | AdjExchangesCaptureOff | AdjExchangesList;
+/** What GET /api/adjudicator/jev/exchange answers (a missing id is a 404 error). */
+export type AdjExchangeResponse = AdjJevInactive | AdjExchangesCaptureOff | AdjExchangeOne;
+
+/**
+ * GET /api/adjudicator/jev/exchanges: the newest stored Jev requests without bodies, optionally
+ * only those that served decision `row`. Call it only when Jev is active (jevActive).
+ */
+export const fetchJevExchanges = (limit?: number, row?: number): Promise<AdjExchangesResponse> =>
+  api<AdjExchangesResponse>("/api/adjudicator/jev/exchanges", { limit, row });
+
+/** GET /api/adjudicator/jev/exchange: one stored request with its request and response bodies. */
+export const fetchJevExchange = (id: number): Promise<AdjExchangeResponse> =>
+  api<AdjExchangeResponse>("/api/adjudicator/jev/exchange", { id });

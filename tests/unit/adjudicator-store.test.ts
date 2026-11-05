@@ -1,4 +1,4 @@
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -6,13 +6,14 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import type { Verdict } from "../../src/adjudicator/types.js";
 import { SqliteAdapter } from "../../src/storage/sqlite/adapter.js";
+import { EXCHANGE_KEEP } from "../../src/storage/sqlite/adjudicator.js";
 import {
   ADJUDICATOR_LATE_COLUMNS,
   ADJUDICATOR_LATE_INDEXES,
   healAdjudicatorColumns,
   migrations,
 } from "../../src/storage/sqlite/schema.js";
-import type { AdjudicationInput } from "../../src/storage/types.js";
+import type { AdjudicationInput, ExchangeInput } from "../../src/storage/types.js";
 import { emPurge } from "../../src/tools/em_purge.js";
 
 const TABLES = [
@@ -20,6 +21,7 @@ const TABLES = [
   "adjudicator_cache",
   "adjudicator_provider_state",
   "adjudicator_bias",
+  "adjudicator_exchanges",
 ];
 
 function tmpDb(prefix: string): string {
@@ -47,7 +49,7 @@ const VERDICT = {
 describe("schema migration v8: adjudicator tables", () => {
   it("applies on top of a v7 database and is the latest version", () => {
     expect(migrations.find((m) => m.version === 8)).toBeTruthy();
-    expect(migrations[migrations.length - 1]?.version).toBe(8);
+    expect(migrations[migrations.length - 1]?.version).toBe(9);
     const path = tmpDb("em-v7-");
     const raw = new Database(path);
     for (const m of migrations) {
@@ -63,7 +65,7 @@ describe("schema migration v8: adjudicator tables", () => {
 
     const a = new SqliteAdapter(path, { vectors: false });
     try {
-      expect(a.metaGet("schema_version")).toBe("8");
+      expect(a.metaGet("schema_version")).toBe("9");
       const names = (
         a.db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','index')").all() as {
           name: string;
@@ -92,7 +94,7 @@ describe("schema migration v8: adjudicator tables", () => {
     // Reopening is a no-op.
     const again = new SqliteAdapter(path, { vectors: false });
     try {
-      expect(again.metaGet("schema_version")).toBe("8");
+      expect(again.metaGet("schema_version")).toBe("9");
       expect(count(again, "adjudications")).toBe(1);
     } finally {
       again.close();
@@ -149,7 +151,7 @@ describe("pre-release v8 databases (task #26)", () => {
     const path = oldV8Db();
     const a = new SqliteAdapter(path, { vectors: false });
     try {
-      expect(a.metaGet("schema_version")).toBe("8");
+      expect(a.metaGet("schema_version")).toBe("9");
       // Opening alone leaves the tables alone (a disabled adjudicator never touches them).
       expect(colsOf(a.db, "adjudications")).not.toContain("feedback_note");
       expect(a.adjudicator.providerState("openai")).toMatchObject({
@@ -640,6 +642,253 @@ describe("SqliteAdjudicatorStore", () => {
   });
 });
 
+function xchg(over: Partial<ExchangeInput> = {}): ExchangeInput {
+  return {
+    ts: 1_000,
+    callId: "c1",
+    provider: "typesafe",
+    method: "POST",
+    target: "api.typesafe.ai/v1/x",
+    items: 1,
+    outcome: "ok",
+    deadlineMs: 800,
+    requestBody: "{}",
+    requestBytes: 2,
+    ...over,
+  };
+}
+
+describe("exchange log (migration v9)", () => {
+  let a: SqliteAdapter;
+  beforeEach(() => {
+    a = new SqliteAdapter(tmpDb("em-adj-xchg-"), { vectors: false });
+  });
+  afterEach(() => a.close());
+
+  const ids = () =>
+    (
+      a.db.prepare("SELECT id FROM adjudicator_exchanges ORDER BY id").all() as { id: number }[]
+    ).map((r) => r.id);
+
+  it("keeps exactly the newest 100 across single and batched inserts", () => {
+    expect(EXCHANGE_KEEP).toBe(100);
+    for (let i = 0; i < 105; i++) a.adjudicator.exchangeInsert([xchg({ callId: `c${i}` })]);
+    expect(a.adjudicator.exchangeCount()).toBe(100);
+    const batch = a.adjudicator.exchangeInsert([xchg({ batch: 0 }), xchg({ batch: 1 })]);
+    expect(batch).toHaveLength(2);
+    const all = ids();
+    expect(all).toHaveLength(100);
+    expect(all[0]).toBe(Math.max(...all) - 99);
+    expect(all.every((id, i) => i === 0 || id === (all[i - 1] as number) + 1)).toBe(true);
+    expect(all).toContain(batch[0]);
+    expect(all).toContain(batch[1]);
+  });
+
+  it("honours a smaller keep and deletes nothing below it", () => {
+    a.adjudicator.exchangeInsert([xchg(), xchg()], 3);
+    expect(a.adjudicator.exchangeCount()).toBe(2);
+    a.adjudicator.exchangeInsert([xchg(), xchg()], 3);
+    expect(a.adjudicator.exchangeCount()).toBe(3);
+    expect(a.adjudicator.exchangeInsert([])).toEqual([]);
+  });
+
+  it("round-trips a row; the list leaves the bodies and error out", () => {
+    const [id] = a.adjudicator.exchangeInsert([
+      xchg({
+        rowIds: [4, 5],
+        model: "jev",
+        surface: "agent",
+        timedOut: true,
+        httpStatus: 429,
+        attempts: 2,
+        retryWaitMs: 100,
+        tokensIn: 7,
+        costUsd: 0.01,
+        requestTruncated: true,
+        responseBody: '{"a":1}',
+        responseBytes: 7,
+        error: "boom",
+      }),
+    ]) as [number];
+    const full = a.adjudicator.exchangeGet(id);
+    expect(full).toMatchObject({
+      id,
+      rowIds: [4, 5],
+      model: "jev",
+      timedOut: true,
+      httpStatus: 429,
+      attempts: 2,
+      retryWaitMs: 100,
+      tokensIn: 7,
+      tokensOut: null,
+      costUsd: 0.01,
+      requestBody: "{}",
+      requestTruncated: true,
+      responseBody: '{"a":1}',
+      responseTruncated: false,
+      error: "boom",
+    });
+    const { rows, total } = a.adjudicator.exchangeList();
+    expect(total).toBe(1);
+    expect(rows[0]).toMatchObject({ id, rowIds: [4, 5], timedOut: true });
+    expect(rows[0]).not.toHaveProperty("requestBody");
+    expect(rows[0]).not.toHaveProperty("responseBody");
+    expect(rows[0]).not.toHaveProperty("error");
+    expect(a.adjudicator.exchangeGet(id + 99)).toBeUndefined();
+  });
+
+  it("lists newest first, clamps the limit and filters by decision id", () => {
+    a.adjudicator.exchangeInsert([xchg({ rowIds: [1] }), xchg({ rowIds: [2, 3] }), xchg()]);
+    const all = a.adjudicator.exchangeList();
+    expect(all.rows.map((r) => r.id)).toEqual([...ids()].reverse());
+    expect(a.adjudicator.exchangeList({ limit: 0 }).rows).toHaveLength(1);
+    expect(a.adjudicator.exchangeList({ limit: 1000 }).rows).toHaveLength(3);
+    const byRow = a.adjudicator.exchangeList({ rowId: 3 });
+    expect(byRow.total).toBe(1);
+    expect(byRow.rows[0]?.rowIds).toEqual([2, 3]);
+    expect(a.adjudicator.exchangeList({ rowId: 9 })).toEqual({ rows: [], total: 0 });
+  });
+
+  it("exchangePurge deletes every row", () => {
+    a.adjudicator.exchangeInsert([xchg(), xchg()]);
+    expect(a.adjudicator.exchangePurge()).toBe(2);
+    expect(a.adjudicator.exchangeCount()).toBe(0);
+  });
+
+  it("fails fast on a locked database and stores nothing", () => {
+    const holder = new Database(a.db.name);
+    holder.exec("BEGIN IMMEDIATE");
+    try {
+      const t0 = Date.now();
+      expect(() => a.adjudicator.exchangeInsert([xchg()])).toThrow(/locked|busy/i);
+      expect(Date.now() - t0).toBeLessThan(500);
+    } finally {
+      holder.exec("ROLLBACK");
+      holder.close();
+    }
+    expect(a.adjudicator.exchangeCount()).toBe(0);
+    a.adjudicator.exchangeInsert([xchg()]);
+    expect(a.adjudicator.exchangeCount()).toBe(1);
+  });
+});
+
+describe("deleted exchanges leave the disk (review-xchg R1, task #195)", () => {
+  /** A request body large enough to spill into overflow pages, as real prompts do. */
+  function body(sentinel: string): Partial<ExchangeInput> {
+    const text = JSON.stringify({
+      state: { items: [{ id: "i0", text: `${sentinel} `.repeat(2000) }] },
+    });
+    return { requestBody: text, requestBytes: text.length };
+  }
+  /** Occurrences of `s` in the raw bytes of the database file and its -wal. */
+  function onDisk(path: string, s: string): { db: number; wal: number } {
+    const hits = (p: string) =>
+      existsSync(p) ? readFileSync(p).toString("latin1").split(s).length - 1 : 0;
+    return { db: hits(path), wal: hits(`${path}-wal`) };
+  }
+
+  let path: string;
+  let a: SqliteAdapter;
+  /** The long-lived second connection (MCP server, dashboard) that keeps the -wal alive. */
+  let server: SqliteAdapter;
+  beforeEach(() => {
+    path = tmpDb("em-adj-sd-");
+    a = new SqliteAdapter(path, { vectors: false });
+    server = new SqliteAdapter(path, { vectors: false });
+    server.adjudicator.exchangeCount();
+  });
+  afterEach(() => {
+    a.close();
+    server.close();
+  });
+
+  it("exchangePurge erases the bodies from the database and the -wal, with a second connection open", () => {
+    for (let i = 0; i < 5; i++) a.adjudicator.exchangeInsert([xchg(body("PURGESENTINEL"))]);
+    expect(onDisk(path, "PURGESENTINEL").wal + onDisk(path, "PURGESENTINEL").db).toBeGreaterThan(0);
+    expect(a.adjudicator.exchangePurge()).toBe(5);
+    expect(onDisk(path, "PURGESENTINEL")).toEqual({ db: 0, wal: 0 });
+    a.close();
+    expect(onDisk(path, "PURGESENTINEL")).toEqual({ db: 0, wal: 0 });
+    a = new SqliteAdapter(path, { vectors: false });
+  });
+
+  it("the newest-100 prune erases the pruned bodies, with a second connection open", () => {
+    for (let i = 0; i < EXCHANGE_KEEP + 5; i++)
+      a.adjudicator.exchangeInsert([xchg(body(i < 5 ? `OLDROW${i}X` : "NEWROWX"))]);
+    expect(a.adjudicator.exchangeCount()).toBe(EXCHANGE_KEEP);
+    for (let i = 0; i < 5; i++) expect(onDisk(path, `OLDROW${i}X`)).toEqual({ db: 0, wal: 0 });
+    // the kept rows are untouched
+    const kept = onDisk(path, "NEWROWX");
+    expect(kept.db + kept.wal).toBeGreaterThan(0);
+    server.close();
+    a.close();
+    for (let i = 0; i < 5; i++) expect(onDisk(path, `OLDROW${i}X`).db).toBe(0);
+    a = new SqliteAdapter(path, { vectors: false });
+    server = new SqliteAdapter(path, { vectors: false });
+  });
+
+  it("store purge() erases the exchange bodies when it runs outside a transaction", () => {
+    for (let i = 0; i < 3; i++) a.adjudicator.exchangeInsert([xchg(body("STOREPURGEX"))]);
+    a.adjudicator.purge();
+    expect(onDisk(path, "STOREPURGEX")).toEqual({ db: 0, wal: 0 });
+  });
+
+  it.each(["adjudicator", "all"] as const)(
+    "adapter purge('%s') erases the bodies from the database and the -wal, with a second connection open",
+    (scope) => {
+      for (let i = 0; i < 5; i++) a.adjudicator.exchangeInsert([xchg(body("ADAPTERPURGEX"))]);
+      const before = onDisk(path, "ADAPTERPURGEX");
+      expect(before.db + before.wal).toBeGreaterThan(0);
+      a.purge(scope);
+      expect(onDisk(path, "ADAPTERPURGEX")).toEqual({ db: 0, wal: 0 });
+      expect(a.adjudicator.exchangeCount()).toBe(0);
+    },
+  );
+
+  it("adapter purge fails open: an open reader neither blocks nor fails it", () => {
+    a.adjudicator.exchangeInsert([xchg(), xchg()]);
+    server.db.exec("BEGIN");
+    server.db.prepare("SELECT COUNT(*) FROM adjudicator_exchanges").get();
+    try {
+      const t0 = Date.now();
+      a.purge("adjudicator");
+      expect(Date.now() - t0).toBeLessThan(500);
+    } finally {
+      server.db.exec("COMMIT");
+    }
+    expect(a.adjudicator.exchangeCount()).toBe(0);
+  });
+
+  it("leaves secure_delete as it was for the other writes", () => {
+    const before = a.db.pragma("secure_delete", { simple: true });
+    a.adjudicator.exchangeInsert([xchg(), xchg()], 1);
+    a.adjudicator.exchangePurge();
+    a.adjudicator.insert(row());
+    expect(a.db.pragma("secure_delete", { simple: true })).toBe(before);
+  });
+
+  it("the checkpoint fails open: an open reader neither blocks nor fails the purge", () => {
+    a.adjudicator.exchangeInsert([xchg(), xchg()]);
+    server.db.exec("BEGIN");
+    server.db.prepare("SELECT COUNT(*) FROM adjudicator_exchanges").get();
+    try {
+      const t0 = Date.now();
+      expect(a.adjudicator.exchangePurge()).toBe(2);
+      expect(Date.now() - t0).toBeLessThan(500);
+    } finally {
+      server.db.exec("COMMIT");
+    }
+    expect(a.adjudicator.exchangeCount()).toBe(0);
+  });
+
+  it("the prune inside a caller's transaction defers the checkpoint and still prunes", () => {
+    a.adjudicator.atomically(() => {
+      a.adjudicator.exchangeInsert([xchg(), xchg(), xchg()], 2);
+    });
+    expect(a.adjudicator.exchangeCount()).toBe(2);
+  });
+});
+
 describe("purge", () => {
   function seed(a: SqliteAdapter): void {
     a.adjudicator.insert(row());
@@ -655,10 +904,11 @@ describe("purge", () => {
       costMedian: null,
       bias: 0,
     });
+    a.adjudicator.exchangeInsert([xchg()]);
     a.metaSet("adjudicator:eval:last", "{}");
   }
 
-  it.each(["adjudicator", "all"] as const)("purge(%s) clears the four tables", (scope) => {
+  it.each(["adjudicator", "all"] as const)("purge(%s) clears the adjudicator tables", (scope) => {
     const a = new SqliteAdapter(tmpDb("em-adj-purge-"), { vectors: false });
     try {
       seed(a);
@@ -677,6 +927,27 @@ describe("purge", () => {
       for (const scope of ["index", "sessions", "graph", "memories", "usage"] as const)
         a.purge(scope);
       for (const t of TABLES) expect(count(a, t)).toBe(1);
+    } finally {
+      a.close();
+    }
+  });
+
+  it("purge(adjudicator) survives a v9+ database without the exchanges table (review-xchg R9)", () => {
+    const path = tmpDb("em-adj-purge-");
+    new SqliteAdapter(path, { vectors: false }).close();
+    const raw = new Database(path);
+    raw.exec(
+      "DROP TABLE adjudicator_exchanges; UPDATE meta SET value = '10' WHERE key = 'schema_version'",
+    );
+    raw.close();
+    const a = new SqliteAdapter(path, { vectors: false });
+    try {
+      a.adjudicator.insert(row());
+      a.adjudicator.cachePut("k", VERDICT, "heuristic");
+      expect(() => a.purge("adjudicator")).not.toThrow();
+      for (const t of TABLES.filter((t) => t !== "adjudicator_exchanges"))
+        expect(count(a, t)).toBe(0);
+      expect(a.adjudicator.exchangePurge()).toBe(0);
     } finally {
       a.close();
     }
