@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { join } from "node:path";
-import type { AdjudicatorConfig } from "../../config.js";
+import { resolveAdjudicator } from "../../adjudicator/config.js";
+import { type AdjudicatorConfig, loadConfig } from "../../config.js";
 import type { ProjectContext } from "../../context.js";
 import type { StorageAdapter } from "../../storage/adapter.js";
 import type { SwarmEventRow, TaskRow } from "../../swarm/types.js";
@@ -9,6 +10,7 @@ import { decisionFeatureActive, decisionFeatureConfig } from "../config.js";
 import type { DecisionFeatureModule } from "../feature.js";
 import { spawnDecisionJob } from "../job.js";
 import {
+  clears,
   DECISION_USABLE,
   type Decision,
   type DecisionClient,
@@ -129,6 +131,15 @@ async function runJob(job: DecisionJob, client: DecisionClient, db: StorageAdapt
   if (!client.active()) return;
   const events = db.swarm.events(run, { limit: 1000 });
   const now = Date.now();
+  let bgMs = 3000;
+  let maxChars = 1500;
+  try {
+    const sc = loadConfig(job.projectRoot).adjudicator.features.swarm;
+    bgMs = sc.bgMs;
+    maxChars = sc.maxChars;
+  } catch {
+    // keep the defaults
+  }
   for (const id of p.tasks.filter((n) => Number.isInteger(n)).slice(0, MAX_TASKS)) {
     const t = db.swarm.taskGet(id);
     if (!t || t.run_id !== run) continue;
@@ -140,10 +151,10 @@ async function runJob(job: DecisionJob, client: DecisionClient, db: StorageAdapt
           feature: "swarm",
           subject: `run:${run}/task:${id}`,
           context: "Judge a swarm task from its title, status, result and trail.",
-          items: [{ id: `task:${id}`, text: itemText(db, t, events, now, 1500) }],
+          items: [{ id: `task:${id}`, text: itemText(db, t, events, now, maxChars) }],
           questions: qs,
           baseline: { task: id, flags: [] },
-          budgetMs: 3000,
+          budgetMs: bgMs,
           ...(job.sessionId ? { sessionId: job.sessionId } : {}),
           questionVersion: feature.questionVersion,
         },
@@ -154,8 +165,8 @@ async function runJob(job: DecisionJob, client: DecisionClient, db: StorageAdapt
             if (x?.kind !== "yes_no") return [];
             // done_claims_match_evidence flags when the claim does NOT hold.
             return q.name === "done_claims_match_evidence"
-              ? [{ q: "claim_unsupported", p: 1 - x.p }]
-              : [{ q: q.name, p: x.p }];
+              ? [{ q: "claim_unsupported", p: 1 - x.p, c: x.calibrated }]
+              : [{ q: q.name, p: x.p, c: x.calibrated }];
           });
           return { decision: { task: id, hash, flags }, changed: flags.length };
         },
@@ -239,15 +250,35 @@ export function swarmBadges(
   const fc = swarmCfg(cfg);
   if (!fc || fc.shadow) return out;
   const flagAbove = (fc as { flagAbove?: number }).flagAbove ?? 0.7;
+  // A verdict is shown only while it is the active provider's and that provider is reachable.
+  let active: string | undefined;
+  try {
+    active = resolveAdjudicator(cfg as AdjudicatorConfig, { context: "server" }).provider;
+  } catch {
+    active = cfg?.provider;
+  }
+  if (active) {
+    const ps = db.adjudicator?.providerState(active);
+    const soon = ps?.retryAt !== null && ps?.retryAt !== undefined && now < ps.retryAt;
+    if (soon && (ps?.state === "open" || ps?.state === "half_open" || ps?.state === "slow"))
+      return out;
+  }
   const seen = new Set<number>();
   for (const r of db.decisions.latestBySubject("swarm", `run:${run}/`, 100)) {
-    const d = r.decision as { task?: number; flags?: Array<{ q: string; p: number }> } | null;
+    const d = r.decision as {
+      task?: number;
+      flags?: Array<{ q: string; p: number; c?: boolean }>;
+    } | null;
     if (d?.task === undefined || seen.has(d.task)) continue;
     seen.add(d.task);
+    if (r.provider && active && r.provider !== active) continue;
     if (r.mode !== "live" || !DECISION_USABLE.includes(r.status) || now - r.ts > BADGE_MAX_AGE_MS)
       continue;
     const top = (d.flags ?? [])
-      .filter((f) => f.p >= flagAbove && LABEL[f.q])
+      .filter(
+        (f) =>
+          LABEL[f.q] && clears({ kind: "yes_no", p: f.p, calibrated: f.c === true }, flagAbove),
+      )
       .sort((a, b) => b.p - a.p)[0];
     if (top) out.set(d.task, `${LABEL[top.q]} (${top.p.toFixed(2)})`);
   }

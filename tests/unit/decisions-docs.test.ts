@@ -6,6 +6,7 @@ import { type AdjudicatorConfig, AdjudicatorConfigSchema } from "../../src/confi
 import { createDecisionClient } from "../../src/decisions/client.js";
 import { applyDocsScores, scorable, triageDiscovery } from "../../src/decisions/features/docs.js";
 import type { DecisionProvider } from "../../src/decisions/providers/types.js";
+import { pickCandidates } from "../../src/docs/add.js";
 import type { Discovery, ProviderCandidate } from "../../src/docs/discover.js";
 import { SqliteAdapter } from "../../src/storage/sqlite/adapter.js";
 import { formatDiscovery } from "../../src/tools/em_docs.js";
@@ -183,5 +184,27 @@ describe("docs triage", () => {
     const r = applyDocsScores(d, scores, 0.5);
     expect(r.discovery.providers[3]!.name).toBe("p3");
     expect(r.flagged).toBe(5);
+  });
+});
+
+describe("pickCandidates recommended flag", () => {
+  const d = (): Discovery => ({
+    root: "/p",
+    projects: ["."],
+    local: [],
+    providers: [
+      cand("rec", { recommended: true }),
+      cand("not", { recommended: false, confidence: "probe" }),
+      cand("plain", { confidence: "probe" }),
+      cand("reg"),
+    ],
+  });
+  it("honours recommended when set and keeps the old rule otherwise", () => {
+    expect(pickCandidates(d(), "recommended").map((x) => x.name)).toEqual(["rec", "plain"]);
+    const unset = {
+      ...d(),
+      providers: d().providers.map((p) => ({ ...p, recommended: undefined })),
+    };
+    expect(pickCandidates(unset, "recommended").map((x) => x.name)).toEqual(["not", "plain"]);
   });
 });

@@ -211,8 +211,8 @@ export async function triageOutput(
     const kept = (res.decision?.decision as { kept?: string[] } | undefined)?.kept;
     if (!kept?.length) return undefined;
     return responses.map((r) => {
-      const inCands = r.hits.filter((h) => cands.get(keyOf(h)) === h);
-      const rest = r.hits.filter((h) => cands.get(keyOf(h)) !== h);
+      const inCands = r.hits.filter((h) => cands.has(keyOf(h)));
+      const rest = r.hits.filter((h) => !cands.has(keyOf(h)));
       const hits = inCands
         .filter((h) => kept.includes(keyOf(h)))
         .sort((a, b) => (scores[keyOf(b)] ?? 1) - (scores[keyOf(a)] ?? 1));

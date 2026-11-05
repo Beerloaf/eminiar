@@ -46,7 +46,7 @@ const row = (over: Partial<DecisionCallRow>): DecisionCallRow =>
     mode: "live",
     status: "ok",
     subject: "run:r1/task:1",
-    decision: { task: 1, hash: "h", flags: [{ q: "stalled", p: 0.82 }] },
+    decision: { task: 1, hash: "h", flags: [{ q: "stalled", p: 0.82, c: true }] },
     ...over,
   }) as DecisionCallRow;
 
@@ -71,6 +71,24 @@ describe("swarm judge badges", () => {
     expect(swarmBadges(cfg(live), dbWith([row({ ts: Date.now() - 3_600_000 })]), "r1").size).toBe(
       0,
     );
+  });
+});
+
+describe("swarm judge badge guards", () => {
+  const live = { enabled: true, shadow: false };
+  it("needs 0.85 from an uncalibrated verdict", () => {
+    const f = (p: number) =>
+      row({ decision: { task: 1, hash: "h", flags: [{ q: "stalled", p, c: false }] } });
+    expect(swarmBadges(cfg(live), dbWith([f(0.8)]), "r1").size).toBe(0);
+    expect(swarmBadges(cfg(live), dbWith([f(0.9)]), "r1").size).toBe(1);
+  });
+  it("hides a verdict from another provider or while the breaker is open", () => {
+    expect(swarmBadges(cfg(live), dbWith([row({ provider: "other" })]), "r1").size).toBe(0);
+    const open = {
+      decisions: { latestBySubject: () => [row({})] },
+      adjudicator: { providerState: () => ({ state: "open", retryAt: Date.now() + 60_000 }) },
+    } as unknown as StorageAdapter;
+    expect(swarmBadges(cfg(live), open, "r1").size).toBe(0);
   });
 });
 
