@@ -2,7 +2,8 @@ import type { JSX } from "preact";
 import { useEffect, useMemo, useState } from "preact/hooks";
 import { categoryInfo } from "../../../docs/category.js";
 import { api, type KnowledgeNodeUi, type KnowledgeUi } from "../api.js";
-import { Empty, KindTag, Spinner, Tag, toast } from "../components.js";
+import { KindTag, Spinner, toast } from "../components.js";
+import { Badge, EmptyState, Skeleton, type Tone } from "../ds.js";
 import { EdgeList } from "../graph/EdgeList.js";
 import { EdgeGlyph, Glyph } from "../graph/Glyph.js";
 import { GraphCanvas } from "../graph/GraphCanvas.js";
@@ -18,6 +19,12 @@ import { navigate } from "../router.js";
 import { cls } from "../util.js";
 
 const STATUSES = ["proposed", "accepted", "superseded", "deprecated"];
+const STATUS_TONE: Record<string, Tone> = {
+  proposed: "warn",
+  accepted: "ok",
+  superseded: "muted",
+  deprecated: "muted",
+};
 
 /** Chip order: the view's own kinds first, then hubs, then code. */
 const KIND_ORDER = ["memory", "doc", "topic", "tag", "file", "package"];
@@ -90,7 +97,13 @@ export function KnowledgeGalaxy({
   const shown = useMemo(
     () =>
       data
-        ? applyKnowledgeFilter(data, { hiddenKinds, hiddenEdges, status, category, hideSuperseded })
+        ? applyKnowledgeFilter(data, {
+            hiddenKinds,
+            hiddenEdges,
+            status,
+            category,
+            hideSuperseded,
+          })
         : null,
     [data, hiddenKinds, hiddenEdges, status, category, hideSuperseded],
   );
@@ -116,7 +129,7 @@ export function KnowledgeGalaxy({
   const focused = focus ? byId.get(focus) : undefined;
 
   return (
-    <div class="kgalaxy">
+    <div class="kgalaxy ws">
       <div class="gtoolbar">
         {focus ? (
           <span class="row tight">
@@ -221,13 +234,15 @@ export function KnowledgeGalaxy({
       </div>
       <div
         class="kbody"
-        style={{ gridTemplateColumns: sel ? "minmax(0,1fr) 320px" : "minmax(0,1fr)" }}
+        style={{
+          gridTemplateColumns: sel ? "minmax(0,1fr) 320px" : "minmax(0,1fr)",
+        }}
       >
         <div style={{ minWidth: 0, minHeight: 0 }}>
           {!shown ? (
-            <Empty>
-              <Spinner />
-            </Empty>
+            <div class="ws-skel" aria-busy="true">
+              <Skeleton h={180} />
+            </div>
           ) : shown.nodes.length ? (
             <GraphCanvas
               nodes={shown.nodes}
@@ -242,11 +257,17 @@ export function KnowledgeGalaxy({
               labelOf={knowledgeLabelOf}
             />
           ) : data?.nodes.length ? (
-            <Empty>Nothing left after these filters.</Empty>
+            <EmptyState compact icon="∅" title="Nothing left after these filters">
+              Turn some node or edge kinds back on above.
+            </EmptyState>
           ) : scope === "docs" ? (
-            <Empty>No documentation sources yet. Add some from Discover.</Empty>
+            <EmptyState icon="❏" title="No documentation sources yet">
+              Add some from Discover and they appear here with what they cover.
+            </EmptyState>
           ) : (
-            <Empty>No memories yet.</Empty>
+            <EmptyState icon="❏" title="No memories yet">
+              Memories saved with em_remember show up here with what they are about.
+            </EmptyState>
           )}
         </div>
         {sel && (
@@ -295,12 +316,12 @@ function Selection({
         <b class="break">{node.label}</b>
       </div>
       <div class="row tight wrap" style={{ marginTop: 4 }}>
-        {node.sub && node.group === "memory" ? <Tag>{node.sub}</Tag> : null}
-        {node.status ? <span class={`tag s-${node.status}`}>{node.status}</span> : null}
-        {node.group === "doc" && node.detail ? <Tag>{node.detail}</Tag> : null}
-        {node.provider ? <Tag>{node.provider}</Tag> : null}
+        {node.sub && node.group === "memory" ? <Badge>{node.sub}</Badge> : null}
+        {node.status ? <Badge tone={STATUS_TONE[node.status]}>{node.status}</Badge> : null}
+        {node.group === "doc" && node.detail ? <Badge>{node.detail}</Badge> : null}
+        {node.provider ? <Badge>{node.provider}</Badge> : null}
         {(node.tags ?? []).map((t) => (
-          <Tag>#{t}</Tag>
+          <Badge>#{t}</Badge>
         ))}
       </div>
       {node.path && node.group === "code" && node.kind !== "file" ? (

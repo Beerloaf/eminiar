@@ -6,7 +6,6 @@ export const VIEWS = [
   "usage",
   "explore",
   "galaxy",
-  "architecture",
   "history",
   "memory",
   "docs",
@@ -33,6 +32,27 @@ export interface Route {
   params: Record<string, string>;
 }
 
+/** The tabs of the Galaxy page: its two graph layouts, then the former Architecture panels. */
+export const GALAXY_TABS = [
+  "galaxy",
+  "hierarchy",
+  "map",
+  "routes",
+  "hotspots",
+  "structure",
+  "behavior",
+] as const;
+export type GalaxyTab = (typeof GALAXY_TABS)[number];
+
+export const isGalaxyTab = (t: string | undefined): t is GalaxyTab =>
+  (GALAXY_TABS as readonly string[]).includes(t ?? "");
+
+/** An old `#/architecture?tab=x` tab → its Galaxy tab (the old "overview" is the folder map). */
+export function legacyArchitectureTab(tab: string | undefined): GalaxyTab {
+  if (tab === "overview" || !tab) return "map";
+  return isGalaxyTab(tab) ? tab : "map";
+}
+
 /** `#/explore?file=src/x.ts` → { view: "explore", sub: null, params: { file } }. */
 export function parseHash(hash: string): Route {
   const h = hash.replace(/^#\/?/, "");
@@ -40,6 +60,13 @@ export function parseHash(hash: string): Route {
   const path = q < 0 ? h : h.slice(0, q);
   const qs = q < 0 ? "" : h.slice(q + 1);
   const [v = "", s = ""] = path.split("/");
+  if (v === "architecture") {
+    // The Architecture page was folded into Galaxy: old links land on the equivalent tab.
+    const params: Record<string, string> = {};
+    for (const [k, val] of new URLSearchParams(qs)) params[k] = val;
+    params.tab = legacyArchitectureTab(params.tab);
+    return { view: "galaxy", sub: null, params };
+  }
   const view = (VIEWS as readonly string[]).includes(v) ? (v as View) : "overview";
   const sub = s && view === v && SUBS[view]?.includes(s) ? s : null;
   const params: Record<string, string> = {};

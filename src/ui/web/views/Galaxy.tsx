@@ -1,10 +1,17 @@
 import type { JSX } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { api, type GraphResult, type VisEdge, type VisNode } from "../api.js";
-import { Empty, KindTag, Spinner, Tag, toast } from "../components.js";
+import { ErrorBox, KindTag, Spinner, toast } from "../components.js";
+import { Badge, EmptyState, Segmented, Skeleton } from "../ds.js";
 import { GraphCanvas, type GraphHandle } from "../graph/GraphCanvas.js";
+import { type GalaxyTab, isGalaxyTab } from "../route.js";
 import { navigate } from "../router.js";
 import { cls, debounce, EDGE_KINDS } from "../util.js";
+import { Behavior } from "./galaxy-tabs/Behavior.js";
+import { FolderMap } from "./galaxy-tabs/FolderMap.js";
+import { Hotspots } from "./galaxy-tabs/Hotspots.js";
+import { Routes } from "./galaxy-tabs/Routes.js";
+import { Structure } from "./galaxy-tabs/Structure.js";
 
 type Direction = "both" | "in" | "out";
 interface ViewState {
@@ -12,7 +19,6 @@ interface ViewState {
   depth: number;
   direction: Direction;
   kinds: string[];
-  mode: "galaxy" | "hierarchy";
 }
 
 const DEFAULT_KINDS = [
@@ -41,7 +47,12 @@ function NodeSearch({
     debounce(async (text: string) => {
       if (text.trim().length < 2) return setRows([]);
       try {
-        setRows(await api<VisNode[]>("/api/nodes/search", { q: text.trim(), limit: 12 }));
+        setRows(
+          await api<VisNode[]>("/api/nodes/search", {
+            q: text.trim(),
+            limit: 12,
+          }),
+        );
         setOpen(true);
         setIdx(0);
       } catch {
@@ -89,20 +100,30 @@ function NodeSearch({
   );
 }
 
-export function Galaxy({ params }: { params: Record<string, string> }): JSX.Element {
+function GraphExplorer({
+  params,
+  mode,
+}: {
+  params: Record<string, string>;
+  mode: "galaxy" | "hierarchy";
+}): JSX.Element {
   const [state, setState] = useState<ViewState>({
     node: params.node ?? null,
     depth: 1,
     direction: "both",
     kinds: DEFAULT_KINDS,
-    mode: "galaxy",
   });
-  const [history, setHistory] = useState<{ back: ViewState[]; fwd: ViewState[] }>({
+  const [history, setHistory] = useState<{
+    back: ViewState[];
+    fwd: ViewState[];
+  }>({
     back: [],
     fwd: [],
   });
   const [graph, setGraph] = useState<GraphResult | null>(null);
   const [loading, setLoading] = useState(false);
+  const [graphError, setGraphError] = useState<string | null>(null);
+  const [retryTick, setRetryTick] = useState(0);
   const [selected, setSelected] = useState<string | null>(null);
   const [pathTo, setPathTo] = useState("");
   const [pathEdges, setPathEdges] = useState<Set<string> | undefined>();
@@ -122,6 +143,7 @@ export function Galaxy({ params }: { params: Record<string, string> }): JSX.Elem
   useEffect(() => {
     let alive = true;
     setLoading(true);
+    setGraphError(null);
     setPathEdges(undefined);
     // An empty param is dropped by `api()` and the server then draws every kind;
     // "none" matches no edge kind, so all chips off really means no edges.
@@ -142,12 +164,12 @@ export function Galaxy({ params }: { params: Record<string, string> }): JSX.Elem
         setGraph(g);
         setSelected(g.root ?? null);
       })
-      .catch((e: Error) => alive && toast(e.message, true))
+      .catch((e: Error) => alive && setGraphError(e.message))
       .finally(() => alive && setLoading(false));
     return () => {
       alive = false;
     };
-  }, [state]);
+  }, [state, retryTick]);
 
   const expand = (id: string) => {
     setGrow(true);
@@ -191,7 +213,7 @@ export function Galaxy({ params }: { params: Record<string, string> }): JSX.Elem
     });
 
   return (
-    <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
+    <div class="ws-graph-pane">
       <div class="gtoolbar">
         <button
           type="button"
@@ -201,7 +223,10 @@ export function Galaxy({ params }: { params: Record<string, string> }): JSX.Elem
           onClick={() => {
             const prev = history.back[history.back.length - 1];
             if (!prev) return;
-            setHistory((h) => ({ back: h.back.slice(0, -1), fwd: [state, ...h.fwd] }));
+            setHistory((h) => ({
+              back: h.back.slice(0, -1),
+              fwd: [state, ...h.fwd],
+            }));
             setState(prev);
           }}
         >
@@ -215,7 +240,10 @@ export function Galaxy({ params }: { params: Record<string, string> }): JSX.Elem
           onClick={() => {
             const next = history.fwd[0];
             if (!next) return;
-            setHistory((h) => ({ back: [...h.back, state], fwd: h.fwd.slice(1) }));
+            setHistory((h) => ({
+              back: [...h.back, state],
+              fwd: h.fwd.slice(1),
+            }));
             setState(next);
           }}
         >
@@ -235,7 +263,10 @@ export function Galaxy({ params }: { params: Record<string, string> }): JSX.Elem
           disabled={!state.node}
           title={state.node ? undefined : "pick a node to follow edges in one direction"}
           onChange={(e) =>
-            go({ ...state, direction: (e.target as HTMLSelectElement).value as Direction })
+            go({
+              ...state,
+              direction: (e.target as HTMLSelectElement).value as Direction,
+            })
           }
         >
           <option value="both">Both directions</option>
@@ -279,20 +310,6 @@ export function Galaxy({ params }: { params: Record<string, string> }): JSX.Elem
         <span class="row tight">
           <button
             type="button"
-            class={cls("chip", state.mode === "galaxy" && "on")}
-            onClick={() => setState({ ...state, mode: "galaxy" })}
-          >
-            galaxy
-          </button>
-          <button
-            type="button"
-            class={cls("chip", state.mode === "hierarchy" && "on")}
-            onClick={() => setState({ ...state, mode: "hierarchy" })}
-          >
-            hierarchy
-          </button>
-          <button
-            type="button"
             class={cls("chip", legend && "on")}
             onClick={() => setLegend(!legend)}
           >
@@ -321,21 +338,16 @@ export function Galaxy({ params }: { params: Record<string, string> }): JSX.Elem
           </button>
         ))}
       </div>
-      <div
-        style={{
-          flex: 1,
-          minHeight: 0,
-          display: "grid",
-          gridTemplateColumns: sel ? "minmax(0,1fr) 340px" : "1fr",
-        }}
-      >
+      <div class="ws-body" style={{ gridTemplateColumns: sel ? "minmax(0,1fr) 340px" : "1fr" }}>
         <div style={{ minWidth: 0 }}>
-          {graph ? (
+          {graphError ? (
+            <ErrorBox error={graphError} onRetry={() => setRetryTick((n) => n + 1)} />
+          ) : graph ? (
             graph.nodes.length ? (
               <GraphCanvas
                 nodes={graph.nodes}
                 edges={graph.edges}
-                mode={state.mode}
+                mode={mode}
                 selected={selected}
                 highlight={pathEdges}
                 onSelect={setSelected}
@@ -345,12 +357,14 @@ export function Galaxy({ params }: { params: Record<string, string> }): JSX.Elem
                 keepPositions={grow}
               />
             ) : (
-              <Empty>The graph is empty. Run a reindex from System.</Empty>
+              <EmptyState icon="✦" title="The graph is empty">
+                Run a reindex from System and the code graph shows up here.
+              </EmptyState>
             )
           ) : (
-            <Empty>
-              <Spinner />
-            </Empty>
+            <div class="ws-skel" aria-busy="true">
+              <Skeleton h={180} />
+            </div>
           )}
         </div>
         {sel && (
@@ -408,7 +422,7 @@ export function Galaxy({ params }: { params: Record<string, string> }): JSX.Elem
                     {ins.slice(0, 60).map((e) => (
                       <tr class="click" onClick={() => setSelected(e.src)}>
                         <td>
-                          <Tag>{e.kind}</Tag>
+                          <Badge>{e.kind}</Badge>
                         </td>
                         <td class="break">{label(e.src)}</td>
                       </tr>
@@ -423,7 +437,7 @@ export function Galaxy({ params }: { params: Record<string, string> }): JSX.Elem
                     {outs.slice(0, 60).map((e) => (
                       <tr class="click" onClick={() => setSelected(e.dst)}>
                         <td>
-                          <Tag>{e.kind}</Tag>
+                          <Badge>{e.kind}</Badge>
                         </td>
                         <td class="break">{label(e.dst)}</td>
                       </tr>
@@ -435,6 +449,68 @@ export function Galaxy({ params }: { params: Record<string, string> }): JSX.Elem
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+const TAB_KEY = "eminiar.galaxy.tab";
+
+const TAB_OPTIONS: Array<{ id: GalaxyTab; label: string; title: string }> = [
+  { id: "galaxy", label: "Galaxy", title: "force-directed code graph" },
+  { id: "hierarchy", label: "Hierarchy", title: "layered code graph" },
+  { id: "map", label: "Folder map", title: "treemap of the project by size or heat" },
+  { id: "routes", label: "Routes", title: "detected HTTP routes and their handlers" },
+  { id: "hotspots", label: "Hotspots", title: "files and functions that attract change" },
+  { id: "structure", label: "Structure", title: "clusters and import cycles" },
+  { id: "behavior", label: "Behavior", title: "possible call tree from one operation" },
+];
+
+/** The tab to show: the URL wins, a node link means the graph, else the last one used. */
+function pickTab(params: Record<string, string>): GalaxyTab {
+  if (isGalaxyTab(params.tab)) return params.tab;
+  if (params.node) return "galaxy";
+  try {
+    const t = localStorage.getItem(TAB_KEY) ?? undefined;
+    if (isGalaxyTab(t)) return t;
+  } catch {
+    // storage may be unavailable
+  }
+  return "galaxy";
+}
+
+export function Galaxy({ params }: { params: Record<string, string> }): JSX.Element {
+  const tab = pickTab(params);
+  useEffect(() => {
+    try {
+      localStorage.setItem(TAB_KEY, tab);
+    } catch {
+      // storage may be unavailable
+    }
+  }, [tab]);
+  const graph = tab === "galaxy" || tab === "hierarchy";
+  return (
+    <div class="ws ws-galaxy">
+      <div class="gtabs">
+        <Segmented
+          label="Galaxy views"
+          value={tab}
+          onChange={(t) => navigate("galaxy", { tab: t })}
+          options={TAB_OPTIONS}
+        />
+      </div>
+      {graph ? (
+        <GraphExplorer params={params} mode={tab} />
+      ) : (
+        <div class="gt-page">
+          <div class="page ds-page">
+            {tab === "map" && <FolderMap />}
+            {tab === "routes" && <Routes />}
+            {tab === "hotspots" && <Hotspots />}
+            {tab === "structure" && <Structure />}
+            {tab === "behavior" && <Behavior params={params} />}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

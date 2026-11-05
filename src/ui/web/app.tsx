@@ -6,7 +6,6 @@ import { rootSync } from "./route.js";
 import { confirmLeave, navigate, useRoute, type View } from "./router.js";
 import { ago, cls } from "./util.js";
 import { Adjudicator } from "./views/Adjudicator.js";
-import { Architecture } from "./views/Architecture.js";
 import { Coverage } from "./views/Coverage.js";
 import { Docs } from "./views/Docs.js";
 import { Explore } from "./views/Explore.js";
@@ -24,7 +23,6 @@ const TABS: Array<[View, string]> = [
   ["usage", "Usage"],
   ["explore", "Explore"],
   ["galaxy", "Galaxy"],
-  ["architecture", "Architecture"],
   ["history", "History"],
   ["memory", "Memory"],
   ["docs", "Docs"],
@@ -172,7 +170,6 @@ export function App(): JSX.Element {
         {view === "usage" && <Usage params={route.params} />}
         {view === "explore" && <Explore params={route.params} />}
         {view === "galaxy" && <Galaxy params={route.params} />}
-        {view === "architecture" && <Architecture params={route.params} />}
         {view === "history" && <History params={route.params} />}
         {view === "memory" && <Memory params={route.params} />}
         {view === "docs" && <Docs params={route.params} />}

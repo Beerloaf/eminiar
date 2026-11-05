@@ -3,7 +3,18 @@ import { useEffect, useMemo, useState } from "preact/hooks";
 // Shared with the node side so the dashboard and the text views print the same figures.
 import { formatUsd } from "../../../usage/pricing.js";
 import { api } from "../api.js";
-import { Empty, ErrorBox, Spinner, SubTabs, Tag, useAsync, useSort } from "../components.js";
+import { ErrorBox, useAsync, useSort } from "../components.js";
+import {
+  Badge,
+  Card,
+  EmptyState,
+  Hero,
+  Segmented,
+  Skeleton,
+  Stat,
+  StatRow,
+  type Tone,
+} from "../ds.js";
 import { useWidth } from "../history/charts.js";
 import { navigate } from "../router.js";
 import { ago, cls, fmt, pct } from "../util.js";
@@ -158,10 +169,12 @@ const RANGES: Array<["7d" | "30d" | "90d", string]> = [
   ["30d", "30 days"],
   ["90d", "90 days"],
 ];
+const RANGE_LABEL: Record<string, string> = { "7d": "7 days", "30d": "30 days", "90d": "90 days" };
 const RANGE_DAYS: Record<string, number> = { "7d": 7, "30d": 30, "90d": 90 };
 
+const SEV_TONE: Record<Insight["severity"], Tone> = { info: "accent", warn: "warn", high: "bad" };
 function SevTag({ s }: { s: Insight["severity"] }): JSX.Element {
-  return <span class={cls("tag", `sev-${s}`)}>{s}</span>;
+  return <Badge tone={SEV_TONE[s]}>{s}</Badge>;
 }
 
 function ScoreRow({ s }: { s: Score }): JSX.Element {
@@ -188,7 +201,7 @@ function ScoreRow({ s }: { s: Score }): JSX.Element {
 }
 
 function InsightList({ items, empty }: { items: Insight[]; empty: string }): JSX.Element {
-  if (!items.length) return <Empty>{empty}</Empty>;
+  if (!items.length) return <EmptyState compact title={empty} />;
   return (
     <div class="insights">
       {items.map((i) => (
@@ -398,7 +411,7 @@ function ContextChart({ points, color }: { points: TimelinePoint[]; color: Color
 function ModelsTable({ rows, color }: { rows: ModelRow[]; color: ColorFn }): JSX.Element {
   const { sorted, th } = useSort(rows, "costUsd");
   return (
-    <div class="scroll-x">
+    <div class="ds-table-wrap">
       <table>
         <thead>
           <tr>
@@ -450,7 +463,7 @@ function ModelsTable({ rows, color }: { rows: ModelRow[]; color: ColorFn }): JSX
 function ToolsTable({ rows }: { rows: ToolRow[] }): JSX.Element {
   const max = Math.max(1, ...rows.map((r) => r.chars));
   return (
-    <div class="scroll-x">
+    <div class="ds-table-wrap">
       <table>
         <thead>
           <tr>
@@ -491,7 +504,7 @@ function ToolsTable({ rows }: { rows: ToolRow[] }): JSX.Element {
 
 function BlocksTable({ rows, color }: { rows: Block[]; color: ColorFn }): JSX.Element {
   return (
-    <div class="scroll-x">
+    <div class="ds-table-wrap">
       <table>
         <thead>
           <tr>
@@ -508,7 +521,8 @@ function BlocksTable({ rows, color }: { rows: Block[]; color: ColorFn }): JSX.El
             rows.map((b) => (
               <tr>
                 <td class="nowrap">
-                  {b.id.slice(0, 16).replace("T", " ")} {b.active ? <Tag>active</Tag> : null}
+                  {b.id.slice(0, 16).replace("T", " ")}{" "}
+                  {b.active ? <Badge tone="accent">active</Badge> : null}
                 </td>
                 <td class="nowrap muted">
                   {hhmmUtc(b.firstCall)}–{hhmmUtc(b.lastCall)}
@@ -606,97 +620,117 @@ export function Usage({ params }: { params: Record<string, string> }): JSX.Eleme
 
   if (all.error)
     return (
-      <div class="page">
+      <div class="page ds-page">
         <ErrorBox error={all.error} />
       </div>
     );
   const d = all.data;
   if (!d)
     return (
-      <div class="page">
-        <Spinner />
+      <div class="page ds-page" role="status" aria-busy="true">
+        <Hero title={<Skeleton w="min(320px, 70%)" h={34} />} sub={<Skeleton w={220} h={14} />} />
+        <StatRow>
+          {[0, 1, 2, 3, 4, 5].map((k) => (
+            <div class="ds-stat" key={k}>
+              <Skeleton w={80} h={11} />
+              <Skeleton w={100} h={28} />
+              <Skeleton w={130} h={11} />
+            </div>
+          ))}
+        </StatRow>
       </div>
     );
   const s = d.summary;
   const snap = s.snapshot;
   const sessionTotals = detail.data?.totals;
-  const kpis: Array<[string, string, JSX.Element | string]> = [
-    [
-      "today",
-      usd(s.today.costUsd),
-      `${s.today.calls} calls · ${pct(s.today.cacheHitRate)} cache hits`,
-    ],
-    [
-      "last 7 days",
-      usd(s.last7d.costUsd),
-      `${s.last7d.calls} calls · 30d ${usd(s.last30d.costUsd)}`,
-    ],
-    [
-      "session",
-      usd(sessionTotals?.costUsd ?? 0),
-      sel ? `${sel.slice(0, 8)} · ${sessionTotals?.calls ?? 0} calls` : "no session selected",
-    ],
-    [
-      "cache hit rate",
-      pct(s.cache.hitRate),
-      `${fmt(s.cache.cacheReads)} read · ${fmt(s.cache.cacheWrites)} written · ${s.cache.coldCalls} cold`,
-    ],
-    [
-      "burn rate",
-      !s.block ? "idle" : s.burn.reliable ? `${usd(s.burn.usdPerHour)}/h` : "n/a",
-      !s.block
-        ? "no calls in the current 5-hour block"
-        : s.burn.reliable
-          ? `block ${usd(s.block.costUsd)} → ${usd(s.burn.projectedBlockUsd)} projected`
-          : `block ${usd(s.block.costUsd)} · too few calls or minutes to project`,
-    ],
-    [
-      "plan use",
-      snap && snap.five_hour_pct != null
-        ? snap.seven_day_pct != null
-          ? `${snap.five_hour_pct}% · ${snap.seven_day_pct}%`
-          : `${snap.five_hour_pct}%`
-        : "n/a",
-      snap && snap.five_hour_pct != null
-        ? `${snap.seven_day_pct != null ? "5h · 7d windows" : "5h window"}${snap.ctx_used_pct != null ? ` · ctx ${snap.ctx_used_pct}%` : ""} · ${ago(snap.ts)}`
-        : "statusline snapshots carry plan limits for subscribers",
-    ],
-  ];
+  const planUse =
+    snap && snap.five_hour_pct != null
+      ? snap.seven_day_pct != null
+        ? `${snap.five_hour_pct}% · ${snap.seven_day_pct}%`
+        : `${snap.five_hour_pct}%`
+      : "n/a";
   const go = (session: string | null, r = range) =>
     navigate("usage", { session: session ?? undefined, range: r });
   return (
-    <div class="page">
-      {!s.enabled ? (
-        <div class="empty warn">usage ingest is off (config.usage.enabled = false)</div>
-      ) : null}
-      <div class="row" style={{ marginBottom: 10 }}>
-        <SubTabs tabs={RANGES} value={range} onChange={(r) => go(sel, r)} />
-        <span class="spacer" />
-        <span class="muted small">
-          {s.totals.calls} calls · {usd(s.totals.costUsd)} in range
-          {s.totals.unpricedCalls ? (
-            <span class="warn">
-              {" "}
-              · {s.totals.unpricedCalls} unpriced (see config.usage.pricing)
-            </span>
-          ) : null}
-          {" · estimates at list price"}
-        </span>
-      </div>
-      <div class="grid">
-        {kpis.map(([h, v, sub]) => (
-          <div class="card">
-            <h3>{h}</h3>
-            <div class="big">{v}</div>
-            <div class="sub">{sub}</div>
-          </div>
-        ))}
-      </div>
-      <div class="grid wide">
-        <div class="card">
-          <h3>
-            cost per day by model
-            <span class="right usage-legend">
+    <div class="page ds-page us-page">
+      <Hero
+        eyebrow="Usage"
+        title={
+          <>
+            {usd(s.totals.costUsd)} <span class="us-hero-unit">in {RANGE_LABEL[range]}</span>
+          </>
+        }
+        sub={`${s.totals.calls} API calls · estimates at list price`}
+        meta={
+          <>
+            {!s.enabled ? (
+              <Badge tone="warn">usage ingest is off (config.usage.enabled = false)</Badge>
+            ) : null}
+            {s.totals.unpricedCalls ? (
+              <Badge tone="warn" title="see config.usage.pricing">
+                {s.totals.unpricedCalls} unpriced
+              </Badge>
+            ) : null}
+          </>
+        }
+        aside={
+          <Segmented<"7d" | "30d" | "90d">
+            label="range"
+            options={RANGES.map(([id, label]) => ({ id, label }))}
+            value={range}
+            onChange={(r) => go(sel, r)}
+          />
+        }
+      />
+      <StatRow>
+        <Stat
+          label="today"
+          value={usd(s.today.costUsd)}
+          sub={`${s.today.calls} calls · ${pct(s.today.cacheHitRate)} cache hits`}
+        />
+        <Stat
+          label="last 7 days"
+          value={usd(s.last7d.costUsd)}
+          sub={`${s.last7d.calls} calls · 30d ${usd(s.last30d.costUsd)}`}
+        />
+        <Stat
+          label="session"
+          value={usd(sessionTotals?.costUsd ?? 0)}
+          sub={
+            sel ? `${sel.slice(0, 8)} · ${sessionTotals?.calls ?? 0} calls` : "no session selected"
+          }
+        />
+        <Stat
+          label="cache hit rate"
+          value={pct(s.cache.hitRate)}
+          sub={`${fmt(s.cache.cacheReads)} read · ${fmt(s.cache.cacheWrites)} written · ${s.cache.coldCalls} cold`}
+        />
+        <Stat
+          label="burn rate"
+          value={!s.block ? "idle" : s.burn.reliable ? `${usd(s.burn.usdPerHour)}/h` : "n/a"}
+          sub={
+            !s.block
+              ? "no calls in the current 5-hour block"
+              : s.burn.reliable
+                ? `block ${usd(s.block.costUsd)} → ${usd(s.burn.projectedBlockUsd)} projected`
+                : `block ${usd(s.block.costUsd)} · too few calls or minutes to project`
+          }
+        />
+        <Stat
+          label="plan use"
+          value={planUse}
+          sub={
+            snap && snap.five_hour_pct != null
+              ? `${snap.seven_day_pct != null ? "5h · 7d windows" : "5h window"}${snap.ctx_used_pct != null ? ` · ctx ${snap.ctx_used_pct}%` : ""} · ${ago(snap.ts)}`
+              : "statusline snapshots carry plan limits for subscribers"
+          }
+        />
+      </StatRow>
+      <div class="ds-grid main-side">
+        <Card
+          title="Cost per day by model"
+          right={
+            <span class="usage-legend">
               {models.map((m) => (
                 <span class="kdot-lbl">
                   <i class="kdot" style={{ background: color(m) }} />
@@ -704,44 +738,44 @@ export function Usage({ params }: { params: Record<string, string> }): JSX.Eleme
                 </span>
               ))}
             </span>
-          </h3>
+          }
+        >
           {d.daily.rows.length ? (
             <DailyChart rows={dailyRows} models={models} color={color} />
           ) : (
-            <Empty>no API calls in this range</Empty>
+            <EmptyState compact icon="▁" title="No API calls in this range" />
           )}
-        </div>
-        <div class="card">
-          <h3>scores</h3>
+        </Card>
+        <Card title="Scores">
           {s.scores.length ? (
             s.scores.map((sc) => <ScoreRow s={sc} />)
           ) : (
-            <Empty>no scores yet</Empty>
+            <EmptyState compact title="No scores yet" />
           )}
-        </div>
+        </Card>
       </div>
-      <div class="grid wide">
-        <div class="card">
-          <h3>
-            context timeline
-            <span class="right">
-              <select
-                value={sel ?? ""}
-                onChange={(e) => go((e.target as HTMLSelectElement).value || null)}
-              >
-                {!sel ? <option value="">pick a session</option> : null}
-                {d.sessions.rows.map((r) => (
-                  <option value={r.session}>
-                    {r.session.slice(0, 8)} · {ago(r.lastCall)} · {usd(r.totals.costUsd)}
-                    {r.session === s.sessionId ? " · current" : ""}
-                  </option>
-                ))}
-                {sel && !d.sessions.rows.some((r) => r.session === sel) ? (
-                  <option value={sel}>{sel.slice(0, 8)}</option>
-                ) : null}
-              </select>
-            </span>
-          </h3>
+      <div class="ds-grid main-side">
+        <Card
+          title="Context timeline"
+          right={
+            <select
+              aria-label="session"
+              value={sel ?? ""}
+              onChange={(e) => go((e.target as HTMLSelectElement).value || null)}
+            >
+              {!sel ? <option value="">pick a session</option> : null}
+              {d.sessions.rows.map((r) => (
+                <option value={r.session}>
+                  {r.session.slice(0, 8)} · {ago(r.lastCall)} · {usd(r.totals.costUsd)}
+                  {r.session === s.sessionId ? " · current" : ""}
+                </option>
+              ))}
+              {sel && !d.sessions.rows.some((r) => r.session === sel) ? (
+                <option value={sel}>{sel.slice(0, 8)}</option>
+              ) : null}
+            </select>
+          }
+        >
           {detail.error ? (
             <ErrorBox error={detail.error} />
           ) : detail.data?.timeline.length ? (
@@ -755,51 +789,49 @@ export function Usage({ params }: { params: Record<string, string> }): JSX.Eleme
               </div>
             </>
           ) : sel ? (
-            <Empty>{detail.loading ? <Spinner /> : "no API calls recorded for this session"}</Empty>
+            detail.loading ? (
+              <Skeleton h={170} />
+            ) : (
+              <EmptyState compact title="No API calls recorded for this session" />
+            )
           ) : (
-            <Empty>no sessions with API calls yet</Empty>
+            <EmptyState compact title="No sessions with API calls yet" />
           )}
-        </div>
-        <div class="card">
-          <h3>session insights</h3>
+        </Card>
+        <Card title="Session insights">
           <InsightList
             items={detail.data?.insights.filter((i) => i.scope === "session") ?? []}
-            empty={sel ? "nothing to flag in this session" : "pick a session"}
+            empty={sel ? "Nothing to flag in this session" : "Pick a session"}
           />
-        </div>
+        </Card>
       </div>
-      <div class="grid two">
-        <div class="card">
-          <h3>models</h3>
+      <div class="ds-grid cols-2">
+        <Card flush title="Models">
           <ModelsTable rows={d.models.rows} color={color} />
-        </div>
-        <div class="card">
-          <h3>
-            tool results in context
-            <span class="right">{fmt(Math.ceil(d.tools.totalChars / 4))} est. tokens</span>
-          </h3>
+        </Card>
+        <Card
+          flush
+          title="Tool results in context"
+          right={`${fmt(Math.ceil(d.tools.totalChars / 4))} est. tokens`}
+        >
           <ToolsTable rows={d.tools.rows} />
-        </div>
+        </Card>
       </div>
-      <div class="grid two">
-        <div class="card">
-          <h3>
-            insights <span class="right">{d.insights.insights.length}</span>
-          </h3>
-          <InsightList items={d.insights.insights} empty="nothing to flag in this range" />
-        </div>
-        <div class="card">
-          <h3>eminiar savings</h3>
-          <div class="row" style={{ gap: 24, marginBottom: 8 }}>
+      <div class="ds-grid cols-2">
+        <Card title="Insights" right={d.insights.insights.length}>
+          <InsightList items={d.insights.insights} empty="Nothing to flag in this range" />
+        </Card>
+        <Card title="eminiar savings">
+          <div class="us-savings">
             <div>
-              <div class="big">{usd(s.savings.directUsd)}</div>
-              <div class="sub">
+              <div class="us-big">{usd(s.savings.directUsd)}</div>
+              <div class="muted small">
                 direct · {fmt(s.savings.savedTokens)} tokens never written to cache
               </div>
             </div>
             <div>
-              <div class="big">{usd(s.savings.compoundingUsd)}</div>
-              <div class="sub">
+              <div class="us-big">{usd(s.savings.compoundingUsd)}</div>
+              <div class="muted small">
                 compounding · re-read on {s.savings.laterCallsPerSession.toFixed(1)} later calls per
                 session
               </div>
@@ -810,23 +842,21 @@ export function Usage({ params }: { params: Record<string, string> }): JSX.Eleme
               <li>{a}</li>
             ))}
           </ul>
-        </div>
+        </Card>
       </div>
-      <div class="grid">
-        <div class="card" style={{ gridColumn: "1 / -1" }}>
-          <h3>
-            5-hour billing blocks
-            {d.blocks.rows.some((b) => b.active) ? (
-              <span class="right">
-                {d.blocks.burn.reliable
-                  ? `${usd(d.blocks.burn.usdPerHour)}/h · ${fmt(Math.round(d.blocks.burn.tokensPerMin))} tok/min`
-                  : "burn rate n/a"}
-              </span>
-            ) : null}
-          </h3>
-          <BlocksTable rows={d.blocks.rows} color={color} />
-        </div>
-      </div>
+      <Card
+        flush
+        title="5-hour billing blocks"
+        right={
+          d.blocks.rows.some((b) => b.active)
+            ? d.blocks.burn.reliable
+              ? `${usd(d.blocks.burn.usdPerHour)}/h · ${fmt(Math.round(d.blocks.burn.tokensPerMin))} tok/min`
+              : "burn rate n/a"
+            : undefined
+        }
+      >
+        <BlocksTable rows={d.blocks.rows} color={color} />
+      </Card>
     </div>
   );
 }

@@ -1,31 +1,31 @@
 import type { JSX } from "preact";
 import { useEffect, useMemo, useState } from "preact/hooks";
 import { api, del, type MemoryBody, type MemoryList, type MemoryRowUi, post } from "../api.js";
-import { Empty, ErrorBox, Spinner, SubTabs, Tag, toast, useAsync } from "../components.js";
+import { ErrorBox, Spinner, toast, useAsync } from "../components.js";
+import { Badge, Card, EmptyState, Hero, Segmented, type Tone } from "../ds.js";
 import { classifyHref, dashboardHref } from "../markdown/links.js";
 import { Markdown } from "../markdown/Markdown.js";
 import { navigate } from "../router.js";
 import { cls, day, fmt } from "../util.js";
 import { KnowledgeGalaxy } from "./KnowledgeGalaxy.js";
 
-const KIND_COLORS: Record<string, string> = {
-  decision: "#7c3aed",
-  constraint: "#dc2626",
-  fact: "#2563eb",
-  preference: "#0d9488",
-  todo: "#d97706",
-  note: "#6b7280",
-  onboarding: "#16a34a",
+const KIND_TONES: Record<string, Tone> = {
+  decision: "purple",
+  constraint: "bad",
+  fact: "accent",
+  preference: "ok",
+  todo: "warn",
+  note: "muted",
+  onboarding: "ok",
 };
+const STATUS_TONES: Record<string, Tone> = { proposed: "warn", rejected: "bad" };
 
 function MemTag({ m }: { m: { kind: string; status?: string | null } }): JSX.Element {
   return (
     <>
-      <span class="tag kind" style={{ color: KIND_COLORS[m.kind] ?? "#6b7280" }}>
-        {m.kind}
-      </span>
+      <Badge tone={KIND_TONES[m.kind] ?? "muted"}>{m.kind}</Badge>
       {m.status && m.status !== "accepted" ? (
-        <span class={`tag s-${m.status}`}>{m.status}</span>
+        <Badge tone={STATUS_TONES[m.status] ?? "muted"}>{m.status}</Badge>
       ) : null}
     </>
   );
@@ -368,15 +368,14 @@ function DecisionRecord({ rows }: { rows: MemoryRowUi[] }): JSX.Element {
     ).push(r);
   if (!rows.length)
     return (
-      <Empty>
-        No accepted decisions yet. Record one with kind "decision", or ask Claude to em_remember it.
-      </Empty>
+      <EmptyState compact icon="◇" title="No accepted decisions yet">
+        Record one with kind "decision", or ask Claude to em_remember it.
+      </EmptyState>
     );
   return (
     <div class="stack">
       {[...groups.entries()].sort().map(([topic, list]) => (
-        <div class="card">
-          <h3>{topic}</h3>
+        <Card title={topic}>
           {list.map((r) => (
             <div style={{ padding: "8px 0", borderBottom: "1px solid var(--line)" }}>
               <div class="row tight">
@@ -394,7 +393,7 @@ function DecisionRecord({ rows }: { rows: MemoryRowUi[] }): JSX.Element {
               </div>
             </div>
           ))}
-        </div>
+        </Card>
       ))}
     </div>
   );
@@ -460,9 +459,25 @@ export function Memory({ params }: { params: Record<string, string> }): JSX.Elem
     ["graph", "Graph"],
   ];
   return (
-    <div class="page">
-      <SubTabs
-        tabs={tabs}
+    <div class="page ds-page mem-page">
+      <Hero
+        eyebrow="Memory"
+        title="Project memory"
+        sub="Decisions, constraints and facts Claude recalls across sessions."
+        meta={
+          d ? (
+            <>
+              <Badge tone="accent">{d.memories.length} memories</Badge>
+              <Badge tone="purple">
+                {d.memories.filter((m) => m.kind === "decision").length} decisions
+              </Badge>
+            </>
+          ) : null
+        }
+      />
+      <Segmented
+        label="Memory views"
+        options={tabs.map(([id, label]) => ({ id, label }))}
         value={tab}
         onChange={(t) => {
           setTab(t);
@@ -480,7 +495,7 @@ export function Memory({ params }: { params: Record<string, string> }): JSX.Elem
         />
       ) : (
         <>
-          <div class="row" style={{ marginBottom: 12 }}>
+          <div class="row mem-toolbar" style={{ marginBottom: 12 }}>
             <button
               type="button"
               class="primary"
@@ -493,7 +508,7 @@ export function Memory({ params }: { params: Record<string, string> }): JSX.Elem
             </button>
             <input
               type="search"
-              class="grow"
+              class="grow mem-filter"
               placeholder="filter by name, tag or text…"
               value={filter}
               onInput={(e) => setFilter((e.target as HTMLInputElement).value)}
@@ -530,12 +545,12 @@ export function Memory({ params }: { params: Record<string, string> }): JSX.Elem
             class="grid wide"
             style={{ gridTemplateColumns: "minmax(280px,1fr) minmax(0,2fr)", alignItems: "start" }}
           >
-            <div class="card flush">
+            <Card flush>
               <div class="list">
                 {!d ? (
-                  <Empty>
+                  <EmptyState compact icon="…" title="Loading memories">
                     <Spinner />
-                  </Empty>
+                  </EmptyState>
                 ) : rows.length ? (
                   rows.map((m) => (
                     <div
@@ -556,11 +571,11 @@ export function Memory({ params }: { params: Record<string, string> }): JSX.Elem
                     </div>
                   ))
                 ) : (
-                  <Empty>no memories match</Empty>
+                  <EmptyState compact icon="○" title="No memories match" />
                 )}
               </div>
-            </div>
-            <div class="card">
+            </Card>
+            <Card>
               {creating || sel ? (
                 <Detail
                   name={creating ? null : sel}
@@ -577,15 +592,14 @@ export function Memory({ params }: { params: Record<string, string> }): JSX.Elem
                   }}
                 />
               ) : (
-                <Empty>Select a memory, or create a new one.</Empty>
+                <EmptyState compact icon="◇" title="Select a memory">
+                  or create a new one.
+                </EmptyState>
               )}
-            </div>
+            </Card>
           </div>
         </>
       )}
-      <div style={{ display: "none" }}>
-        <Tag>x</Tag>
-      </div>
     </div>
   );
 }

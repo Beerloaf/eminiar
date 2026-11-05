@@ -449,8 +449,8 @@ export function Overview(): JSX.Element {
           label="graph"
           value={`${fmt(s.index.graph.nodes)} nodes`}
           sub={`${fmt(s.index.graph.edges)} edges`}
-          onClick={() => navigate("architecture")}
-          title="open Architecture"
+          onClick={() => navigate("galaxy", { tab: "map" })}
+          title="open the Galaxy folder map"
         />
       </StatRow>
 

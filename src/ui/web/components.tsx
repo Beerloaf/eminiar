@@ -1,5 +1,6 @@
 import type { ComponentChildren, JSX } from "preact";
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
+import { EmptyState } from "./ds.js";
 import { cls, color } from "./util.js";
 
 // --- toasts ---------------------------------------------------------------------------
@@ -69,8 +70,28 @@ export const Spinner = (): JSX.Element => <span class="spin" />;
 export const Empty = ({ children }: { children: ComponentChildren }): JSX.Element => (
   <div class="empty">{children}</div>
 );
-export const ErrorBox = ({ error }: { error: string }): JSX.Element => (
-  <div class="empty bad">{error}</div>
+export const ErrorBox = ({
+  error,
+  onRetry,
+}: {
+  error: string;
+  onRetry?: (() => void) | undefined;
+}): JSX.Element => (
+  <EmptyState
+    compact
+    tone="bad"
+    icon="!"
+    title="Could not load this view"
+    action={
+      onRetry ? (
+        <button type="button" class="ds-empty-action" onClick={onRetry}>
+          Retry
+        </button>
+      ) : undefined
+    }
+  >
+    {error}
+  </EmptyState>
 );
 
 export function KindTag({ kind }: { kind: string }): JSX.Element {

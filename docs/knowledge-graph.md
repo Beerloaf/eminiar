@@ -73,7 +73,10 @@ Each node gets:
 
 A high hotspot score marks a place worth a careful look. It is not a quality grade.
 
-![Hotspot table: fan-in, commits in 90 days, complexity and score per file](images/dashboard-hotspots-dark.webp)
+![The Hotspots tab of the dashboard Galaxy page: fan-in, commits in 90 days, complexity and score per file](images/dashboard-hotspots-dark.webp)
+
+The dashboard shows this table on the **Hotspots** tab of the Galaxy page
+(`#/galaxy?tab=hotspots`). See [Dashboard](dashboard.md#galaxy).
 
 The graph also has **module clusters**, **import cycles** and **co-change coupling** (files that
 change together in git, even without an import between them).

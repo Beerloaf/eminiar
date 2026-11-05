@@ -9,7 +9,8 @@ import {
   type TreeFile,
 } from "../api.js";
 import { CodeView } from "../code/CodeView.js";
-import { Empty, ErrorBox, KindTag, Spinner, Split, Tag, useAsync } from "../components.js";
+import { ErrorBox, KindTag, Split, useAsync } from "../components.js";
+import { Badge, EmptyState, Skeleton } from "../ds.js";
 import { GraphCanvas } from "../graph/GraphCanvas.js";
 import { navigate } from "../router.js";
 import { basename, cls, fmt, langOf } from "../util.js";
@@ -31,7 +32,12 @@ function buildDirs(files: TreeFile[]): Dir {
     for (const p of parts.slice(0, -1)) {
       let d = cur.dirs.get(p);
       if (!d) {
-        d = { name: p, path: cur.path ? `${cur.path}/${p}` : p, dirs: new Map(), files: [] };
+        d = {
+          name: p,
+          path: cur.path ? `${cur.path}/${p}` : p,
+          dirs: new Map(),
+          files: [],
+        };
         cur.dirs.set(p, d);
       }
       cur = d;
@@ -203,7 +209,7 @@ function EdgeList({
           {rows.slice(0, 40).map((e) => (
             <tr class="click" onClick={() => onPick(e.node.id, e.node.path, e.node.line)}>
               <td>
-                <Tag>{e.kind}</Tag>
+                <Badge>{e.kind}</Badge>
               </td>
               <td class="break">
                 <KindTag kind={e.node.kind} /> {e.node.label}
@@ -238,7 +244,9 @@ function SidePanel({
   if (!file)
     return (
       <div class="panel right">
-        <Empty>Select a file to see what depends on it.</Empty>
+        <EmptyState compact icon="◇" title="No file selected">
+          Select a file to see what depends on it.
+        </EmptyState>
       </div>
     );
   return (
@@ -246,7 +254,13 @@ function SidePanel({
       <div class="head">
         {symbol ? "code details" : "file impact"} <span class="spacer" />
         <a onClick={() => navigate("history", { file })}>history</a>
-        <a onClick={() => navigate("galaxy", { node: symbol ? symbol.node.id : `file:${file}` })}>
+        <a
+          onClick={() =>
+            navigate("galaxy", {
+              node: symbol ? symbol.node.id : `file:${file}`,
+            })
+          }
+        >
           open in Galaxy →
         </a>
       </div>
@@ -265,11 +279,11 @@ function SidePanel({
               </div>
               {symbol.metrics && (
                 <div class="row small" style={{ marginTop: 6 }}>
-                  <Tag>fan-in {symbol.metrics.fan_in}</Tag>
-                  <Tag>fan-out {symbol.metrics.fan_out}</Tag>
-                  <Tag>complexity {symbol.metrics.complexity}</Tag>
-                  <Tag>{symbol.metrics.loc} loc</Tag>
-                  <Tag>heat {symbol.metrics.score.toFixed(2)}</Tag>
+                  <Badge>fan-in {symbol.metrics.fan_in}</Badge>
+                  <Badge>fan-out {symbol.metrics.fan_out}</Badge>
+                  <Badge>complexity {symbol.metrics.complexity}</Badge>
+                  <Badge>{symbol.metrics.loc} loc</Badge>
+                  <Badge>heat {symbol.metrics.score.toFixed(2)}</Badge>
                 </div>
               )}
               {symbol.routes.length ? (
@@ -302,7 +316,7 @@ function SidePanel({
                 {symbol.memories.map((m) => (
                   <div class="small">
                     <a onClick={() => navigate("memory", { name: m.name })}>{m.name}</a>{" "}
-                    <Tag>{m.kind}</Tag>
+                    <Badge>{m.kind}</Badge>
                   </div>
                 ))}
               </div>
@@ -312,12 +326,12 @@ function SidePanel({
           <>
             <div class="section">
               <div class="row small">
-                <Tag>{impact.directDependents} direct dependents</Tag>
-                <Tag>{impact.affected} affected files</Tag>
-                <Tag>
+                <Badge>{impact.directDependents} direct dependents</Badge>
+                <Badge>{impact.affected} affected files</Badge>
+                <Badge>
                   {impact.tests} test file{impact.tests === 1 ? "" : "s"}
-                </Tag>
-                <Tag>{impact.coChanged.length} co-changed</Tag>
+                </Badge>
+                <Badge>{impact.coChanged.length} co-changed</Badge>
               </div>
               <div class="muted small" style={{ marginTop: 4 }}>
                 Structural edges from the index plus git co-change history. Files outside the index
@@ -363,8 +377,10 @@ function SidePanel({
             ) : null}
           </>
         ) : (
-          <div class="section">
-            <Spinner />
+          <div class="section ws-skel" aria-busy="true">
+            <Skeleton h={14} w="60%" />
+            <Skeleton h={14} />
+            <Skeleton h={14} w="80%" />
           </div>
         )}
       </div>
@@ -393,7 +409,11 @@ export function Explore({ params }: { params: Record<string, string> }): JSX.Ele
     [symId],
   );
   const openFile = (p: string, l?: number | null, sym?: string) =>
-    navigate("explore", { file: p, line: l ? String(l) : undefined, symbol: sym });
+    navigate("explore", {
+      file: p,
+      line: l ? String(l) : undefined,
+      symbol: sym,
+    });
   const pick = (id: string, path: string | null, ln: number | null) => {
     if (id.startsWith("file:")) openFile(id.slice(5));
     else if (path) openFile(path, ln, id);
@@ -403,78 +423,96 @@ export function Explore({ params }: { params: Record<string, string> }): JSX.Ele
   const selSym: FileSymbol | undefined = data.data?.symbols.find((s) => s.id === symId);
   const d = data.data;
   return (
-    <Split
-      left={
-        tree.data ? (
-          <FileTree files={tree.data.files} selected={file} onSelect={(p) => openFile(p)} />
-        ) : (
-          <div class="panel">
-            <Empty>{tree.error ?? <Spinner />}</Empty>
+    <div class="ws ws-explore">
+      <Split
+        left={
+          tree.data ? (
+            <FileTree files={tree.data.files} selected={file} onSelect={(p) => openFile(p)} />
+          ) : (
+            <div class="panel">
+              {tree.error ? (
+                <EmptyState compact tone="bad" icon="!" title="Could not load the file tree">
+                  {tree.error}
+                </EmptyState>
+              ) : (
+                <div class="ws-skel" aria-busy="true">
+                  <Skeleton h={14} w="70%" />
+                  <Skeleton h={14} />
+                  <Skeleton h={14} w="85%" />
+                </div>
+              )}
+            </div>
+          )
+        }
+        center={
+          <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
+            <div class="crumbs">
+              {file ? (
+                file.split("/").map((seg, i, all) => (
+                  <>
+                    {i > 0 && <span class="sep">›</span>}
+                    <span class={i === all.length - 1 ? "" : "muted"}>{seg}</span>
+                  </>
+                ))
+              ) : (
+                <span class="muted">no file selected</span>
+              )}
+              <span class="spacer" />
+              {d?.status && d.status !== "indexed" ? (
+                <Badge tone="warn">
+                  {d.status}
+                  {d.reason ? ` · ${d.reason}` : ""}
+                </Badge>
+              ) : null}
+              {d ? (
+                <span class="muted small">
+                  {d.symbols.length} symbols · {fmt(d.size ?? 0)} B
+                </span>
+              ) : null}
+              {symId ? (
+                <button type="button" class="sm" onClick={() => setSymId(null)}>
+                  ← file impact
+                </button>
+              ) : null}
+            </div>
+            <div style={{ flex: 1, minHeight: 0 }}>
+              {!file ? (
+                <EmptyState icon="❯" title="Pick a file">
+                  Choose a file in the explorer. Click a line number to inspect the symbol around
+                  it.
+                </EmptyState>
+              ) : data.error ? (
+                <ErrorBox error={data.error} />
+              ) : !d ? (
+                <div class="ws-skel" aria-busy="true">
+                  <Skeleton h={14} w="40%" />
+                  <Skeleton h={14} />
+                  <Skeleton h={14} w="90%" />
+                  <Skeleton h={14} w="70%" />
+                </div>
+              ) : d.tooLarge ? (
+                <EmptyState icon="⤓" title="File too large">
+                  {d.path} is over the 1.5 MB limit and is not shown.
+                </EmptyState>
+              ) : (
+                <CodeView
+                  code={d.content ?? ""}
+                  lang={langOf(d.path)}
+                  symbols={d.symbols}
+                  highlight={
+                    selSym?.start_line && selSym.end_line
+                      ? [selSym.start_line, selSym.end_line]
+                      : null
+                  }
+                  scrollTo={line ?? selSym?.start_line ?? null}
+                  onLine={(_l, s) => setSymId(s?.id ?? null)}
+                />
+              )}
+            </div>
           </div>
-        )
-      }
-      center={
-        <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
-          <div class="crumbs">
-            {file ? (
-              file.split("/").map((seg, i, all) => (
-                <>
-                  {i > 0 && <span class="sep">›</span>}
-                  <span class={i === all.length - 1 ? "" : "muted"}>{seg}</span>
-                </>
-              ))
-            ) : (
-              <span class="muted">no file selected</span>
-            )}
-            <span class="spacer" />
-            {d?.status && d.status !== "indexed" ? (
-              <span class="warn small">
-                {d.status}
-                {d.reason ? ` · ${d.reason}` : ""}
-              </span>
-            ) : null}
-            {d ? (
-              <span class="muted small">
-                {d.symbols.length} symbols · {fmt(d.size ?? 0)} B
-              </span>
-            ) : null}
-            {symId ? (
-              <button type="button" class="sm" onClick={() => setSymId(null)}>
-                ← file impact
-              </button>
-            ) : null}
-          </div>
-          <div style={{ flex: 1, minHeight: 0 }}>
-            {!file ? (
-              <Empty>
-                Pick a file in the explorer. Click a line number to inspect the symbol around it.
-              </Empty>
-            ) : data.error ? (
-              <ErrorBox error={data.error} />
-            ) : !d ? (
-              <Empty>
-                <Spinner />
-              </Empty>
-            ) : d.tooLarge ? (
-              <Empty>{d.path} is over the 1.5 MB limit and is not shown.</Empty>
-            ) : (
-              <CodeView
-                code={d.content ?? ""}
-                lang={langOf(d.path)}
-                symbols={d.symbols}
-                highlight={
-                  selSym?.start_line && selSym.end_line
-                    ? [selSym.start_line, selSym.end_line]
-                    : null
-                }
-                scrollTo={line ?? selSym?.start_line ?? null}
-                onLine={(_l, s) => setSymId(s?.id ?? null)}
-              />
-            )}
-          </div>
-        </div>
-      }
-      right={<SidePanel file={file} impact={impact.data} symbol={current} onPick={pick} />}
-    />
+        }
+        right={<SidePanel file={file} impact={impact.data} symbol={current} onPick={pick} />}
+      />
+    </div>
   );
 }
