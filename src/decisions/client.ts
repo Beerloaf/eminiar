@@ -91,15 +91,19 @@ export function createDecisionClient(
   const mode = (): "shadow" | "live" => (fc().shadow ? "shadow" : "live");
 
   /** Redacted context and items as they would be sent. */
-  const redacted = (input: Pick<AskInput, "context" | "items">) => ({
+  const redacted = (input: Pick<AskInput, "context" | "items" | "cacheContext">) => ({
     context: forRemote(input.context ?? "", cfg.privacy.maxChars),
+    cacheContext:
+      input.cacheContext === undefined
+        ? undefined
+        : forRemote(input.cacheContext, cfg.privacy.maxChars),
     items: input.items.map((it) => ({ id: it.id, text: forRemote(it.text, maxChars()) })),
   });
 
   const keyOf = (
     input: Pick<AskInput, "questionVersion">,
     q: AskInput["questions"][number],
-    red: { context: string },
+    red: { context: string; cacheContext?: string | undefined },
     it: { id: string; text: string },
   ) =>
     decisionCacheKey({
@@ -108,7 +112,7 @@ export function createDecisionClient(
       model: modelId(),
       questionVersion: input.questionVersion ?? 1,
       question: q,
-      context: red.context,
+      context: red.cacheContext ?? red.context,
       itemId: it.id,
       itemText: it.text,
     });
@@ -179,7 +183,10 @@ export function createDecisionClient(
         model: modelId() || null,
         exchangeId: x.exchangeId ?? null,
         note: d?.note ?? null,
-        noteSession: d?.note && mode() === "live" && x.applied ? (input.sessionId ?? null) : null,
+        noteSession:
+          d?.note && d.deliver === true && mode() === "live" && x.applied
+            ? (input.sessionId ?? null)
+            : null,
       });
     } catch (err) {
       deps.log?.(`decisions: could not record a ${feature} call (${(err as Error).message})`);
@@ -191,8 +198,9 @@ export function createDecisionClient(
     input: Pick<AskInput, "feature" | "subject" | "baseline" | "sessionId"> & { items?: number },
     status: DecisionStatus,
     decision?: Decision,
+    extra?: { applied?: boolean },
   ): number | undefined {
-    const x: RowExtras = { items: input.items ?? 0 };
+    const x: RowExtras = { items: input.items ?? 0, applied: extra?.applied === true };
     if (decision) x.decision = decision;
     return insertRow(input, status, x);
   }
@@ -249,7 +257,10 @@ export function createDecisionClient(
           }
         }
         const apply =
-          mode() === "live" && DECISION_USABLE.includes(st) && (decision?.changed ?? 0) > 0;
+          !input.fillOnly &&
+          mode() === "live" &&
+          DECISION_USABLE.includes(st) &&
+          (decision?.changed ?? 0) > 0;
         const row: RowExtras = {
           ...x,
           items: input.items.length,

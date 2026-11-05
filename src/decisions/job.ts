@@ -1,4 +1,5 @@
 import { spawn as nodeSpawn } from "node:child_process";
+import { basename } from "node:path";
 import { authLockout, overBudget } from "../adjudicator/breaker.js";
 import { currentKeyFingerprint, resolveAdjudicator } from "../adjudicator/config.js";
 import type { AdjudicatorConfig } from "../config.js";
@@ -33,21 +34,6 @@ const MAX_JOBS_RUNNING = 4;
 /** A provider that said "unsupported" is not asked again by a hook for this long. */
 const UNSUPPORTED_RETRY_MS = 3_600_000;
 
-/** The job-lock and peek methods of the sqlite decision store (optional on other stores). */
-interface JobGateStore {
-  claimJob?(o: {
-    feature: DecisionFeature;
-    scope: string;
-    now: number;
-    ttlMs: number;
-    perScope: number;
-    maxRunning: number;
-  }): boolean;
-  releaseJob?(feature: DecisionFeature, scope: string): void;
-  hasUnsupported?(feature: DecisionFeature, provider: string, since: number): boolean;
-}
-const gateStore = (db: StorageAdapter) => db.decisions as unknown as JobGateStore;
-
 /** The in-flight scope of a job: the swarm run for the swarm judge, else the session. */
 export function jobScope(job: Pick<DecisionJob, "feature" | "sessionId" | "payload">): string {
   const run = (job.payload as { run?: unknown } | undefined)?.run;
@@ -75,8 +61,7 @@ export function providerAllowsJob(
     if (r.provider === "heuristic" || r.provider === "embedding") return false;
     const cap = decisionFeatureConfig(cfg, feature).maxCallsPerDay;
     if (cap > 0 && db.decisions.callsToday(feature, now) >= cap) return false;
-    if (gateStore(db).hasUnsupported?.(feature, r.provider, now - UNSUPPORTED_RETRY_MS))
-      return false;
+    if (db.decisions.hasUnsupported(feature, r.provider, now - UNSUPPORTED_RETRY_MS)) return false;
     const s = db.adjudicator.providerState(r.provider);
     const future = s?.retryAt !== null && s?.retryAt !== undefined && now < s.retryAt;
     if (s?.state === "auth_failed")
@@ -96,16 +81,14 @@ export function claimJobSlot(
   now = Date.now(),
 ): boolean {
   try {
-    return (
-      gateStore(db).claimJob?.({
-        feature: job.feature,
-        scope: jobScope(job),
-        now,
-        ttlMs: JOB_LOCK_TTL_MS,
-        perScope: MAX_JOBS_PER_SCOPE,
-        maxRunning: MAX_JOBS_RUNNING,
-      }) ?? true
-    );
+    return db.decisions.claimJob({
+      feature: job.feature,
+      scope: jobScope(job),
+      now,
+      ttlMs: JOB_LOCK_TTL_MS,
+      perScope: MAX_JOBS_PER_SCOPE,
+      maxRunning: MAX_JOBS_RUNNING,
+    });
   } catch {
     return false;
   }
@@ -116,17 +99,26 @@ export function releaseJobSlot(
   job: Pick<DecisionJob, "feature" | "sessionId" | "payload">,
 ): void {
   try {
-    gateStore(db).releaseJob?.(job.feature, jobScope(job));
+    db.decisions.releaseJob(job.feature, jobScope(job));
   } catch {
     // the lock expires on its own
   }
+}
+
+/**
+ * Only the plugin's hook entry understands `--decision`. Spawning any other script (the MCP
+ * server's dist/server.js, a test runner, the CLI) would start a second server or do nothing
+ * useful, so a wrong script is refused.
+ */
+export function isHookScript(script: string): boolean {
+  return /^hook\.(?:js|mjs|cjs)$/.test(basename(script));
 }
 
 /** Start the detached child and write the job to its stdin. Never throws; false when it could not. */
 export function spawnDecisionJob(job: DecisionJob, deps: DecisionSpawnDeps = {}): boolean {
   try {
     const script = deps.script ?? process.argv[1];
-    if (!script) return false;
+    if (!script || !isHookScript(script)) return false;
     const child = (deps.spawn ?? nodeSpawn)(
       deps.execPath ?? process.execPath,
       [script, "--decision"],

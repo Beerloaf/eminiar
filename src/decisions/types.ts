@@ -60,6 +60,14 @@ export interface AskInput {
   cacheTtlMs?: number;
   /** The feature module's questionVersion; part of the cache key (default 1). */
   questionVersion?: number;
+  /**
+   * Stands in for `context` in the cache key only (the provider still gets `context`). Lets
+   * requests that mean the same thing, such as prompts with the same search terms, share answers.
+   * Hashed, never stored.
+   */
+  cacheContext?: string;
+  /** The call only fills the cache (a detached job): its row is recorded as not applied. */
+  fillOnly?: boolean;
 }
 
 export type DecisionAnswer =
@@ -148,6 +156,11 @@ export interface Decision {
   changed: number;
   /** Built by the feature from a template and typed answers; never echoes user or provider text. */
   note?: string;
+  /**
+   * The note is advice for the model (commit): a live applied one is queued for the session's
+   * next hook. Without it the note stays on the decision_calls row for the dashboard only.
+   */
+  deliver?: boolean;
 }
 
 export interface AskResult {
@@ -170,11 +183,12 @@ export interface DecisionClient {
   ask(input: AskInput, decide: (a: Answers) => Decision): Promise<AskResult>;
   /** Sync, cache-only, no write: the only method allowed in context "hook". */
   cached(input: Omit<AskInput, "budgetMs">): Answers | undefined;
-  /** A decision_calls row without a call (hook shadow and cache hits). */
+  /** A decision_calls row without a call (hook shadow and cache hits). `applied`: it changed output. */
   record(
     input: Pick<AskInput, "feature" | "subject" | "baseline" | "sessionId"> & { items?: number },
     status: DecisionStatus,
     decision?: Decision,
+    extra?: { applied?: boolean },
   ): number | undefined;
 }
 
@@ -302,4 +316,16 @@ export interface DecisionStore {
   feedback(id: number, v: "helped" | "hurt" | null): boolean;
   /** Clears decision_calls and decision_cache. */
   purge(): void;
+  /** Takes an in-flight slot for a detached job (per scope and in all); false when none is free. */
+  claimJob(o: {
+    feature: DecisionFeature;
+    scope: string;
+    now: number;
+    ttlMs: number;
+    perScope: number;
+    maxRunning: number;
+  }): boolean;
+  releaseJob(feature: DecisionFeature, scope: string): void;
+  /** Did the provider answer "unsupported" for this feature since `since`? */
+  hasUnsupported(feature: DecisionFeature, provider: string, since: number): boolean;
 }

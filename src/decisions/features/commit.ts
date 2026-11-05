@@ -150,7 +150,7 @@ function decideCommit(minProb: number) {
     const hits = QUESTIONS.filter((q) => clears(per[q.name], minProb));
     if (!hits.length) return { decision: { advice: "none" }, changed: 0 };
     const note = `commit advice: ${hits.map((q) => q.advice).join("; ")}; take a second look before pushing`;
-    return { decision: { advice: hits.map((q) => q.name) }, changed: 1, note };
+    return { decision: { advice: hits.map((q) => q.name) }, changed: 1, note, deliver: true };
   };
 }
 

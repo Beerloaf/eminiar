@@ -135,8 +135,10 @@ async function runJob(job: DecisionJob, client: DecisionClient, db: StorageAdapt
   const now = Date.now();
   let bgMs = 3000;
   let maxChars = 1500;
+  let flagAbove = 0.7;
   try {
     const sc = loadConfig(job.projectRoot).adjudicator.features.swarm;
+    flagAbove = sc.flagAbove;
     bgMs = sc.bgMs;
     maxChars = sc.maxChars;
   } catch {
@@ -170,7 +172,12 @@ async function runJob(job: DecisionJob, client: DecisionClient, db: StorageAdapt
               ? [{ q: "claim_unsupported", p: 1 - x.p, c: x.calibrated }]
               : [{ q: q.name, p: x.p, c: x.calibrated }];
           });
-          return { decision: { task: id, hash, flags }, changed: flags.length };
+          // changed counts the flags that would show as a badge (clear flagAbove), so agreement
+          // with the baseline (no flags) and "applied" mean what the dashboard says they mean.
+          const shown = flags.filter((f) =>
+            clears({ kind: "yes_no", p: f.p, calibrated: f.c }, flagAbove),
+          ).length;
+          return { decision: { task: id, hash, flags }, changed: shown };
         },
       );
     } catch {

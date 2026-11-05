@@ -556,7 +556,7 @@ never blocks or edits anything on its own; its output is a note or a reordering.
 
 | Feature | What it does | What it sends |
 |---|---|---|
-| `recall` | Drops memories and doc pages that matched on words but do not help the prompt, and reorders the rest. Also checks whether an earlier error is the same failure. The hook serves the term-matched result now and uses the verdict on the next prompt or on `em_recall` | Prompt plus memory and doc snippets |
+| `recall` | Drops memories and doc pages that matched on words but do not help the prompt, and reorders the rest. Also checks whether an earlier error is the same failure. The hook serves the term-matched result now and queues one background job that fills the cache; a later prompt with the same search terms (not necessarily the same wording) reuses that verdict, and so does `em_recall`. The job itself changes nothing, so it is recorded as not applied | Prompt plus memory and doc snippets |
 | `memory` | On `em_remember`, compares the new memory to its nearest neighbours and says in the reply when it looks like a duplicate or supersedes one (pass `supersedes` to confirm). It never edits a memory | Memory text |
 | `commit` | One advice line before `git commit`: does the message match the staged diff, debug leftovers, unmentioned work, a possible credential. Never blocks | The staged diff (files matching `commit.exclude` left out) and the message |
 | `compaction` | Scores session-guide sections (and, with `compaction.output`, `em_execute` output sections) for the current task and keeps the most useful within the budget, instead of recency order | Session-guide and output sections |

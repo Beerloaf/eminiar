@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { loadConfig } from "../../config.js";
+import { promptTerms } from "../../session/recall.js";
 import type { DecisionFeatureModule, HookSeam } from "../feature.js";
 import {
   type Answers,
@@ -54,21 +55,47 @@ function hash12(s: string): string {
   return createHash("sha256").update(s).digest("hex").slice(0, 12);
 }
 
-/** The candidates worth asking about: those that cleared the term bar (shown or over the limit). */
+/**
+ * The candidates worth asking about: those that cleared the term bar (shown or over the limit),
+ * the shown ones first so a full pool never leaves a shown candidate unasked.
+ */
 function pool(cands: RerankCandidate[]): RerankCandidate[] {
-  return cands.filter((c) => POOL.has(c.outcome)).slice(0, MAX_ITEMS);
+  const ok = cands.filter((c) => POOL.has(c.outcome));
+  // over-limit candidates alternate between memories and docs, so neither kind crowds the other out
+  const over = ok.filter((c) => c.outcome !== "shown");
+  const mem = over.filter((c) => c.key.startsWith("memory:"));
+  const other = over.filter((c) => !c.key.startsWith("memory:"));
+  const mixed: RerankCandidate[] = [];
+  for (let i = 0; i < Math.max(mem.length, other.length); i++) {
+    if (mem[i]) mixed.push(mem[i]!);
+    if (other[i]) mixed.push(other[i]!);
+  }
+  return [...ok.filter((c) => c.outcome === "shown"), ...mixed].slice(0, MAX_ITEMS);
+}
+
+/**
+ * The cache context of a request: the sorted, de-duplicated search terms, so two prompts that
+ * mean the same thing (same terms) share one verdict. Hashed with the key, never stored or sent.
+ */
+function termsOf(query: string): string | undefined {
+  const t = [...new Set(promptTerms(query))].sort().join(" ");
+  return t || undefined;
 }
 
 interface Spec {
   path: RecallPath;
   query: string;
   items: DecisionItem[];
+  /** Every key the term match shows (the pool's and those past it). */
   baseline: string[];
+  /** Shown keys that did not fit the pool: kept, after the answered ones, never dropped. */
+  rest?: string[];
 }
 
 function specOf(path: RecallPath, query: string, cands: RerankCandidate[]): Spec | undefined {
   const p = pool(cands);
   if (!p.length) return undefined;
+  const inPool = new Set(p.map((c) => c.key));
   return {
     path,
     query,
@@ -77,7 +104,8 @@ function specOf(path: RecallPath, query: string, cands: RerankCandidate[]): Spec
       text: c.text.slice(0, ITEM_CHARS),
       label: c.label,
     })),
-    baseline: p.filter((c) => c.outcome === "shown").map((c) => c.key),
+    baseline: cands.filter((c) => c.outcome === "shown").map((c) => c.key),
+    rest: cands.filter((c) => c.outcome === "shown" && !inPool.has(c.key)).map((c) => c.key),
   };
 }
 
@@ -96,6 +124,8 @@ function inputOf(
     baseline: spec.baseline,
     questionVersion: QUESTION_VERSION,
   };
+  const cc = termsOf(spec.query);
+  if (cc) input.cacheContext = cc;
   if (sessionId) input.sessionId = sessionId;
   return input;
 }
@@ -113,15 +143,20 @@ export function decideRecall(spec: Spec, dropBelow: number): (a: Answers) => Dec
       const yn = a?.kind === "yes_no" ? a : undefined;
       return { key: it.id, i, p: yn ? yn.p : -1, drop: !!yn?.calibrated && !clears(yn, dropBelow) };
     });
-    const keys = scored
-      .filter((s) => !s.drop)
-      .sort((x, y) => y.p - x.p || x.i - y.i)
-      .map((s) => s.key);
+    const keys = [
+      ...scored
+        .filter((s) => !s.drop)
+        .sort((x, y) => y.p - x.p || x.i - y.i)
+        .map((s) => s.key),
+      ...(spec.rest ?? []),
+    ];
     const head = keys.slice(0, spec.baseline.length);
     const changed =
       head.length === spec.baseline.length && head.every((k, n) => k === spec.baseline[n]) ? 0 : 1;
     const decision: Decision = { decision: keys, changed };
-    if (changed) decision.note = `recall ${spec.path}: ${keys.length}/${spec.items.length} kept`;
+    // A dashboard line only (no `deliver`): recall's effect is the reordered recall block.
+    if (changed)
+      decision.note = `recall ${spec.path}: ${keys.length}/${spec.items.length + (spec.rest?.length ?? 0)} kept`;
     return decision;
   };
 }
@@ -167,10 +202,17 @@ export const feature: DecisionFeatureModule = {
         const answers = seam.client.cached(input);
         if (!answers) {
           // deferred: the job asks, the verdict is recorded beside the baseline
-          seam.spawn({ path, query, items: spec.items, baseline: spec.baseline });
+          seam.spawn({
+            path,
+            query,
+            items: spec.items,
+            baseline: spec.baseline,
+            rest: spec.rest,
+          });
           return undefined;
         }
         const decision = decideRecall(spec, dropBelow)(answers);
+        const live = seam.client.mode() === "live" && decision.changed > 0;
         seam.client.record(
           {
             feature: "recall",
@@ -181,8 +223,9 @@ export const feature: DecisionFeatureModule = {
           },
           "cached",
           decision,
+          { applied: live },
         );
-        return seam.client.mode() === "live" && decision.changed > 0 ? asKeys(decision) : undefined;
+        return live ? asKeys(decision) : undefined;
       } catch {
         return undefined;
       }
@@ -206,10 +249,18 @@ export const feature: DecisionFeatureModule = {
         )
         .slice(0, MAX_ITEMS);
       if (!items.length) return;
-      const spec: Spec = { path: p.path, query: p.query, items, baseline: p.baseline.map(String) };
+      const rest = Array.isArray(p.rest) ? p.rest.map(String) : [];
+      const spec: Spec = {
+        path: p.path,
+        query: p.query,
+        items,
+        baseline: p.baseline.map(String),
+        rest,
+      };
       const fc = loadConfig(job.projectRoot).adjudicator.features.recall;
+      // The job only fills the cache: it changes no output, so its row is never "applied".
       await client.ask(
-        { ...inputOf(spec, job.sessionId), budgetMs: fc.jobMs },
+        { ...inputOf(spec, job.sessionId), budgetMs: fc.jobMs, fillOnly: true },
         decideRecall(spec, fc.dropBelow),
       );
     } catch {
