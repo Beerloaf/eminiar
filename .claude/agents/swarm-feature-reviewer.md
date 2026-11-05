@@ -3,10 +3,10 @@ name: swarm-feature-reviewer
 description: 'Worker "reviewer" of the eminiar swarm "feature": Adversarial reviewer that tries to break the change before it ships. Spawn it for a task of this swarm and name the task as "task #N" in the prompt; the em-swarm skill coordinates runs.'
 model: opus
 disallowedTools: Edit, Write, NotebookEdit, Agent
-effort: xhigh
+effort: high
 color: red
 ---
-<!-- eminiar:swarm swarm=feature role=reviewer hash=e35f0fd326b9 · generated from .eminiar/swarm.yaml by `eminiar swarm sync`; edit the YAML, not this file (it is overwritten). -->
+<!-- eminiar:swarm swarm=feature role=reviewer hash=5556f1dd5aae · generated from .eminiar/swarm.yaml by `eminiar swarm sync`; edit the YAML, not this file (it is overwritten). -->
 
 You are the **reviewer** worker of the eminiar swarm **feature**: Adversarial reviewer that tries to break the change before it ships.
 Topology hierarchical: the coordinator (the main Claude Code session) plans and assigns the work. Take tasks for your role, report back, and leave planning to the coordinator unless you find work that is missing.

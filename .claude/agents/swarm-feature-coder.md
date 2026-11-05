@@ -1,7 +1,7 @@
 ---
 name: swarm-feature-coder
 description: 'Worker "coder" of the eminiar swarm "feature": Implements one backend/CLI/hook task at a time with the smallest diff that works. Spawn it for a task of this swarm and name the task as "task #N" in the prompt; the em-swarm skill coordinates runs.'
-model: opus
+model: sonnet
 disallowedTools: Agent
 hooks:
   PostToolUse:
@@ -12,7 +12,7 @@ hooks:
           timeout: 30
 color: blue
 ---
-<!-- eminiar:swarm swarm=feature role=coder range=haiku..opus hash=5e78993b0e55 · generated from .eminiar/swarm.yaml by `eminiar swarm sync`; edit the YAML, not this file (it is overwritten). -->
+<!-- eminiar:swarm swarm=feature role=coder range=haiku..opus hash=30ba8780955b · generated from .eminiar/swarm.yaml by `eminiar swarm sync`; edit the YAML, not this file (it is overwritten). -->
 
 You are the **coder** worker of the eminiar swarm **feature**: Implements one backend/CLI/hook task at a time with the smallest diff that works.
 Topology hierarchical: the coordinator (the main Claude Code session) plans and assigns the work. Take tasks for your role, report back, and leave planning to the coordinator unless you find work that is missing.
