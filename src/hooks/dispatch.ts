@@ -1,5 +1,5 @@
 import { getContext } from "../context.js";
-import { failedText, rawEnforced, swarmGate } from "../swarm/hooks.js";
+import { failedText, rawEnforced, swarmAgentReturned, swarmGate } from "../swarm/hooks.js";
 import { budgetFor, clearBudget, startBudget } from "./budget.js";
 import { cursorDir, detectClient, fromCursor, toCursor } from "./cursor.js";
 import { handlers } from "./index.js";
@@ -113,6 +113,13 @@ function failClosed(input: HookInput, err: unknown): string | undefined {
       !rawEnforced({ cwd: input.cwd })
     )
       return undefined;
+    // The handler may have reserved a spawn slot before it ran late or threw; the denied call
+    // never starts a worker, so release it or the retry the deny text invites is refused.
+    try {
+      swarmAgentReturned(getContext(input.cwd), input);
+    } catch {
+      // best effort
+    }
     return JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",

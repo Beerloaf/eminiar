@@ -61,16 +61,37 @@ is a few FTS queries against the project database.
 
 Claude Code discards the output of a hook that outlasts its `timeout` in `hooks/hooks.json`, so
 every run also has a time budget below that timeout (3.5 s for the 5 s hooks, 8 s for
-`SessionStart`, `PostToolUse` and `SubagentStart`, 12 s for `PreCompact`). Two limits enforce it:
+`SessionStart`, `PostToolUse` and `SubagentStart`, 12 s for `PreCompact`). Three rules keep a
+run inside it:
 
-- **Short lock wait.** Many processes share one project database (the main session, every
-  swarm worker, the indexer). A hook waits at most 250 ms for another process's write lock,
+- **Lock wait.** Many processes share one project database (the main session, every
+  swarm worker, the indexer). A hook waits for another process's write lock for a limited time,
   where the CLI and servers wait 2 s, because a handler's waits add up statement by statement.
-  A locked database costs the prompt hook its bookkeeping (the session row, the event log, the
-  recall statistics) and nothing else: readers are not blocked by a writer, so recall still runs.
+  Hooks whose answer comes from reads wait 250 ms (`UserPromptSubmit`, every `PreToolUse`
+  except the Agent/Task spawn check, and `PostToolUseFailure` of any tool but Agent/Task).
+  Hooks whose job is a write wait longer, because losing the write leaves a worker holding its
+  slot: 2000 ms for `SessionStart`, `PostToolUse`, `SubagentStart` and `PreCompact`, 1500 ms
+  for `SubagentStop`, `SessionEnd`, `Stop`, the `PreToolUse` Agent/Task spawn check and the
+  `PostToolUseFailure` of an Agent/Task call, which releases that spawn reservation
+  (`busyTimeoutFor` in `src/hooks/budget.ts`). That release runs first; the writes after it
+  are best effort and wait 250 ms each, so a lock held past the whole run keeps the hook near
+  2 s instead of past its 5 s timeout. Cursor's hooks wait as the Claude Code event
+  they translate to: `sessionStart` waits as `SessionStart`, `subagentStop` as `SubagentStop`,
+  `afterFileEdit` as `PostToolUse` (`lockWaitFor`, called by `src/hook.ts` before the database
+  opens).
+- **Best-effort writes.** `UserPromptSubmit`, `SessionStart` and `PostToolUseFailure` still
+  answer when the database stays locked past that wait: the session row, the event log and the
+  recall statistics are skipped, and the reads (recall, guidance) still run because a reader is
+  not blocked by a writer. In `PostToolUseFailure` the first locked write skips the rest, and a
+  write is not started with less than 1 s of the budget left. The other write-job hooks are not best effort. If their wait runs
+  out they fail open and answer `{}` without the write, except `SubagentStart`: it tries to
+  register the worker three times and then answers a short fallback brief, so the worker
+  starts unregistered but knows its role and how to claim its task.
 - **Deadline.** A run that has not answered by its budget answers `{}` (a denied swarm dispatch
   stays denied when `enforce` is on) and the process exits. The prompt hook skips recall and the
-  adjudicator when too little budget is left for them.
+  adjudicator when too little budget is left for them. A `PreToolUse` Agent/Task call denied at
+  the deadline (or by a handler error) releases the spawn reservation it made, so the retry the
+  deny text invites is not refused for lack of a slot.
 
 ### Agent swarms
 

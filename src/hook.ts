@@ -1,4 +1,4 @@
-import { HOOK_BUSY_TIMEOUT_MS } from "./hooks/budget.js";
+import { lockWaitFor } from "./hooks/budget.js";
 import { dispatch, gate, ranLate } from "./hooks/dispatch.js";
 import { hookLog } from "./hooks/log.js";
 import { setStorageBusyTimeout } from "./storage/index.js";
@@ -35,7 +35,8 @@ async function main(): Promise<void> {
   }
   // A hook run has seconds, not minutes: a locked database is skipped after a short wait
   // instead of the CLI's 2 s per statement, which a handler's statements add up (budget.ts).
-  setStorageBusyTimeout(HOOK_BUSY_TIMEOUT_MS);
+  // Hooks whose job is a write wait longer than the read-only ones, Cursor's included (budget.ts).
+  setStorageBusyTimeout(lockWaitFor(raw, process.argv.slice(2)));
   const out = await dispatch(raw, process.argv.slice(2));
   if (!ranLate()) {
     process.stdout.write(out);

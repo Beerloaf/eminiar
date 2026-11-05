@@ -13,8 +13,55 @@
  * the short lock wait is what bounds the rest.
  */
 
+import { handlerEvent } from "./cursor.js";
+
 /** Per statement; a locked database is skipped, not waited for (the default is 2000). */
 export const HOOK_BUSY_TIMEOUT_MS = 250;
+
+/**
+ * Events whose whole job is a write (a ledger row, a snapshot, a capture) wait longer for the
+ * lock: they have seconds to spare, and losing the write leaves a worker holding its slot.
+ * 1500 ms fits the 5 s hooks; the 8-12 s hooks take 2000.
+ */
+const WRITE_WAIT: Record<string, number> = {
+  SessionStart: 2000,
+  PostToolUse: 2000,
+  SubagentStart: 2000,
+  PreCompact: 2000,
+  SubagentStop: 1500,
+  SessionEnd: 1500,
+  Stop: 1500,
+};
+
+/** The lock wait for one hook run: short where the answer comes from reads, longer for writes. */
+export function busyTimeoutFor(event: string | undefined, tool?: string): number {
+  if (event && WRITE_WAIT[event]) return WRITE_WAIT[event];
+  // A spawn is reserved in the swarm ledger before it is allowed, and a failed Agent call
+  // releases it: a lost release holds the worker's slot until the reservation expires.
+  if (
+    (event === "PreToolUse" || event === "PostToolUseFailure") &&
+    (tool === "Agent" || tool === "Task")
+  )
+    return 1500;
+  return HOOK_BUSY_TIMEOUT_MS;
+}
+
+/**
+ * The lock wait for one hook process, from its raw stdin and argv: the event as the handlers
+ * will see it (a Cursor `sessionStart` waits as `SessionStart`). Bad JSON gets the short wait;
+ * `dispatch` reports it.
+ */
+export function lockWaitFor(raw: string, argv: string[]): number {
+  let parsed: Record<string, unknown> = {};
+  try {
+    const p: unknown = raw.trim() ? JSON.parse(raw) : {};
+    if (p && typeof p === "object" && !Array.isArray(p)) parsed = p as Record<string, unknown>;
+  } catch {
+    // dispatch reports the bad JSON
+  }
+  const { event, tool } = handlerEvent(parsed, argv);
+  return busyTimeoutFor(event, tool);
+}
 
 /** The default run budget: hooks with a 5 s timeout. */
 export const HOOK_BUDGET_MS = 3500;
