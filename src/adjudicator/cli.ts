@@ -1812,14 +1812,18 @@ export function featureRows(config: Config, env: NodeJS.ProcessEnv): FeatureRow[
     const f = a.features[name];
     const why = f.enabled ? decisionInactiveReason(a, name, env) : "disabled";
     const consented =
-      !r.remote ||
+      !r.configuredRemote ||
       (!!r.origin && a.featureConsent.includes(consentEntry(DATA_CLASS[name], r.origin)));
     const row: FeatureRow = {
       name,
       enabled: f.enabled,
       shadow: f.shadow,
       state: !f.enabled ? "off" : why ? "waiting" : f.shadow ? "shadow" : "live",
-      dataClass: r.remote ? DATA_CLASS[name] : "none (local provider)",
+      dataClass: r.configuredRemote
+        ? r.remote
+          ? DATA_CLASS[name]
+          : `${DATA_CLASS[name]} (not sent yet: provider degraded${r.origin ? `, would go to ${r.origin}` : ""})`
+        : "none (local provider)",
       consented,
     };
     if (f.enabled && why) {
@@ -1858,7 +1862,13 @@ async function featuresCommand(
     if (values.json) {
       io.out(
         JSON.stringify(
-          { provider: r.provider, remote: r.remote, origin: r.origin ?? null, features: rows },
+          {
+            provider: r.provider,
+            remote: r.remote,
+            configuredRemote: r.configuredRemote,
+            origin: r.configuredRemote ? (r.origin ?? null) : null,
+            features: rows,
+          },
           null,
           2,
         ),
@@ -1866,7 +1876,7 @@ async function featuresCommand(
       return 0;
     }
     io.out(
-      `provider: ${r.provider}${r.remote ? ` (remote${r.origin ? `, ${r.origin}` : ""})` : " (local)"} · adjudicator ${config.adjudicator.enabled ? "on" : "off"}`,
+      `provider: ${r.provider}${r.configuredRemote ? ` (remote${r.origin ? `, ${r.origin}` : ""}${r.remote ? "" : ", waiting: no consent or key"})` : " (local)"} · adjudicator ${config.adjudicator.enabled ? "on" : "off"}`,
     );
     for (const f of rows) {
       const mode =
@@ -1933,7 +1943,7 @@ async function featuresCommand(
   const a = config.adjudicator;
   const r = resolveAdjudicator(a, { context: "cli", env: io.env });
   const patch: Record<string, unknown> = { features: { [f]: { enabled: true } } };
-  if (r.remote) {
+  if (r.configuredRemote) {
     if (!r.origin) {
       io.err(
         "the provider has no usable origin; run `eminiar adjudicator status`. Nothing was changed.",
@@ -1957,6 +1967,10 @@ async function featuresCommand(
     }
     const entry = consentEntry(DATA_CLASS[f], r.origin);
     if (!a.featureConsent.includes(entry)) patch.featureConsent = [...a.featureConsent, entry];
+    if (!r.remote)
+      io.out(
+        `The remote provider is waiting (no provider consent or key yet), so nothing is sent now; once it runs, ${f} would send that text to ${r.origin}.`,
+      );
   } else {
     io.out(
       `${f} runs on the local provider; nothing leaves this machine, so no consent is needed.`,

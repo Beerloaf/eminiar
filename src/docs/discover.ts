@@ -47,6 +47,11 @@ export interface ProviderCandidate {
   tags?: string[] | undefined;
   registered: boolean;
   /**
+   * True when every manifest line that named this package takes it from a git, URL or path source
+   * rather than the public registry. The docs triage never sends such names.
+   */
+  nonRegistry?: boolean | undefined;
+  /**
    * Set only by the opt-in docs triage (src/decisions/features/docs.ts) when it is live: how much
    * a coding agent benefits from this package's documentation, 0..1, and whether the triage
    * recommends indexing it. Absent otherwise, so discovery is unchanged.
@@ -331,6 +336,8 @@ interface Signal {
   kind: CatalogKind;
   key: string;
   project: string;
+  /** The manifest takes this dependency from a git, URL or path source, not the registry. */
+  nonRegistry?: boolean;
 }
 
 function npmSignals(dir: string, includeDev: boolean, project: string): Signal[] {
@@ -344,7 +351,10 @@ function npmSignals(dir: string, includeDev: boolean, project: string): Signal[]
     for (const [name, ver] of Object.entries(deps as Record<string, string>)) {
       if (name.startsWith("@types/")) continue;
       if (typeof ver === "string" && /^(workspace:|file:|link:)/.test(ver)) continue;
-      out.push({ kind: "npm", key: name, project });
+      const other =
+        typeof ver === "string" &&
+        /^(git|https?:|github:|gitlab:|bitbucket:|[\w.-]+\/[\w.-]+$)/.test(ver);
+      out.push({ kind: "npm", key: name, project, ...(other ? { nonRegistry: true } : {}) });
     }
   }
   return out;
@@ -355,15 +365,27 @@ function pythonSignals(dir: string, project: string): Signal[] {
   const py = readText(join(dir, "pyproject.toml"));
   if (py) {
     const block = /dependencies\s*=\s*\[([\s\S]*?)\]/.exec(py)?.[1] ?? "";
-    for (const m of block.matchAll(/["']([A-Za-z0-9_.-]+)/g))
-      out.push({ kind: "pypi", key: m[1]!.toLowerCase(), project });
+    for (const m of block.matchAll(/["']([A-Za-z0-9_.-]+)([^"']*)/g))
+      out.push({
+        kind: "pypi",
+        key: m[1]!.toLowerCase(),
+        project,
+        ...(/@|:\/\//.test(m[2] ?? "") ? { nonRegistry: true } : {}),
+      });
   }
   const req = readText(join(dir, "requirements.txt"));
   if (req) {
+    // a private index may serve any name in the file: none of them counts as public
+    const privateIndex = /^\s*(--(extra-)?index-url|-i)\b(?!.*pypi\.org)/m.test(req);
     for (const line of req.split("\n")) {
       const name = /^\s*([A-Za-z0-9_.-]+)/.exec(line)?.[1];
       if (name && !line.trim().startsWith("#") && !line.trim().startsWith("-"))
-        out.push({ kind: "pypi", key: name.toLowerCase(), project });
+        out.push({
+          kind: "pypi",
+          key: name.toLowerCase(),
+          project,
+          ...(privateIndex || /@|:\/\//.test(line) ? { nonRegistry: true } : {}),
+        });
     }
   }
   return out;
@@ -991,10 +1013,12 @@ export function discoverDocs(ctx: ProjectContext, opts: DiscoverOptions = {}): D
     c: Omit<ProviderCandidate, "usedBy" | "evidence" | "registered"> & {
       usedBy: string;
       evidence: string;
+      nonRegistry?: boolean | undefined;
     },
   ) => {
     const cur = byName.get(c.name);
     if (cur) {
+      if (!c.nonRegistry) delete cur.nonRegistry;
       if (!cur.usedBy.includes(c.usedBy)) cur.usedBy.push(c.usedBy);
       if (!cur.evidence.includes(c.evidence)) cur.evidence.push(c.evidence);
       return;
@@ -1011,6 +1035,7 @@ export function discoverDocs(ctx: ProjectContext, opts: DiscoverOptions = {}): D
       usedBy: [c.usedBy],
       evidence: [c.evidence],
       registered: registeredNames.has(c.name) || registeredProviders.has(c.provider),
+      ...(c.nonRegistry ? { nonRegistry: true } : {}),
     });
   };
 
@@ -1045,6 +1070,7 @@ export function discoverDocs(ctx: ProjectContext, opts: DiscoverOptions = {}): D
         confidence: "registry",
         usedBy: project,
         evidence,
+        ...(s.nonRegistry ? { nonRegistry: true } : {}),
       });
     } else if (s.kind === "image" && !s.key.includes(".") && !s.key.includes("/")) {
       // official-looking image we do not know; the project's own images carry a registry host

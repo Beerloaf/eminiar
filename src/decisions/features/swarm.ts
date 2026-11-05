@@ -8,7 +8,7 @@ import type { SwarmEventRow, TaskRow } from "../../swarm/types.js";
 import { pluginRoot } from "../../version.js";
 import { decisionFeatureActive, decisionFeatureConfig } from "../config.js";
 import type { DecisionFeatureModule } from "../feature.js";
-import { spawnDecisionJob } from "../job.js";
+import { claimJobSlot, providerAllowsJob, releaseJobSlot, spawnDecisionJob } from "../job.js";
 import {
   clears,
   DECISION_USABLE,
@@ -236,11 +236,19 @@ export function kickSwarmJudge(
     })
     .slice(0, MAX_TASKS);
   if (!todo.length) return false;
+  // The same gate as the hooks: a down/capped/unsupported provider or a judge in flight spawns nothing.
+  if (!providerAllowsJob(cfg, db, "swarm", now)) return false;
   const payload: SwarmPayload = { run, tasks: todo.map((t) => t.id) };
-  const ok = spawnDecisionJob(
-    { v: 1, feature: "swarm", projectRoot: ctx.root, ...(sessionId ? { sessionId } : {}), payload },
-    { script: join(pluginRoot(), "dist", "hook.js") },
-  );
+  const job: DecisionJob = {
+    v: 1,
+    feature: "swarm",
+    projectRoot: ctx.root,
+    ...(sessionId ? { sessionId } : {}),
+    payload,
+  };
+  if (!claimJobSlot(db, job, now)) return false;
+  const ok = spawnDecisionJob(job, { script: join(pluginRoot(), "dist", "hook.js") });
+  if (!ok) releaseJobSlot(db, job);
   if (ok) for (const t of todo) inFlight.set(`${run}/${t.id}`, now);
   return ok;
 }

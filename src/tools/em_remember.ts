@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { featuresWanted } from "../config.js";
+import { suggestMemoryHygiene } from "../decisions/features/memory.js";
 import { kickEmbedding } from "../embeddings/queue.js";
 import { gitignoreHint, MEMORY_KINDS, MEMORY_STATUSES, reconcile, write } from "../memory/store.js";
 import { getCurrentSession } from "../session/current.js";
@@ -77,7 +78,6 @@ export const emRemember = defineTool({
     let suggestion: string | undefined;
     if (featuresWanted(ctx.config.adjudicator) && ctx.config.adjudicator.features.memory.enabled) {
       try {
-        const { suggestMemoryHygiene } = await import("../decisions/features/memory.js");
         suggestion = await suggestMemoryHygiene(ctx, db, {
           name: r.name,
           content: args.content,

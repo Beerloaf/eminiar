@@ -39,7 +39,7 @@ function provider(low: string[], calls: { n: number } = { n: 0 }): DecisionProvi
             kind: "score",
             value: low.some((l) => it.text.includes(`**${l}**`)) ? 0 : 1,
             confidence: 1,
-            calibrated: false,
+            calibrated: true,
           } as never,
         };
       }

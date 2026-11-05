@@ -1,5 +1,7 @@
 import { z } from "zod";
 import { featuresWanted } from "../config.js";
+import { createDecisionClient } from "../decisions/client.js";
+import { askRecallRerank } from "../decisions/features/recall.js";
 import type { RerankCandidate } from "../decisions/types.js";
 import { getProvider } from "../embeddings/provider.js";
 import { vectorRanker } from "../embeddings/queue.js";
@@ -126,10 +128,6 @@ async function rerankMemories(
 ): Promise<string[] | undefined> {
   try {
     if (!candidates.length) return undefined;
-    const [{ createDecisionClient }, { askRecallRerank }] = await Promise.all([
-      import("../decisions/client.js"),
-      import("../decisions/features/recall.js"),
-    ]);
     const cfg = ctx.config.adjudicator;
     const client = createDecisionClient("recall", {
       config: cfg,

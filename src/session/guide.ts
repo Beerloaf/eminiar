@@ -159,6 +159,13 @@ export function renderSections(sections: GuideSection[], budget: number): string
   );
 }
 
+/**
+ * The byte budget of the PreCompact snapshot (src/hooks/pre-compact.ts) and of its Jev rewrite
+ * (decisions/features/compaction.ts). Kept here, not in the hook, so server-side code can use it
+ * without reaching the hook module and its dynamic import of decisions/hooks (tsup.config.ts).
+ */
+export const SNAPSHOT_BUDGET = 2048;
+
 export function renderGuide(db: StorageAdapter, sessionId: string, budget = 2048): string {
   return renderSections(guideSections(db, sessionId), budget);
 }

@@ -84,6 +84,37 @@ export function clears(a: DecisionAnswer | undefined, min: number): boolean {
   return a.p >= (a.calibrated ? min : Math.max(min, 0.85));
 }
 
+/** The probability a choice answer claims for `option`, or undefined when it claims none. */
+function choiceProb(a: DecisionAnswer, option: string): number | undefined {
+  if (a.kind !== "choice" || a.choice !== option) return undefined;
+  const p = a.probs[option];
+  if (typeof p === "number") return p;
+  return a.calibrated ? a.confidence : undefined;
+}
+
+/**
+ * Does a choice answer pick `option` with enough probability? Same bar as clears(): calibrated
+ * is compared to `min`, uncalibrated to max(min, 0.85). An uncalibrated provider (a model that
+ * names an option) gives no probability, so its choice only counts when its honest confidence
+ * clears the bar, which a self-reported pick never does: it cannot fire on its own.
+ */
+export function choiceClears(a: DecisionAnswer | undefined, option: string, min: number): boolean {
+  if (a?.kind !== "choice" || a.choice !== option) return false;
+  const bar = a.calibrated ? min : Math.max(min, 0.85);
+  return (choiceProb(a, option) ?? (a.calibrated ? 0 : a.confidence)) >= bar;
+}
+
+/**
+ * May a score answer drop, filter or flag something? A calibrated score may. An uncalibrated one
+ * (a self-reported level index) may reorder but only acts when it is the top level (value 1).
+ * "drop": removal on a low score is calibrated-only; "flag": a top-level score may flag.
+ */
+export function scoreActs(a: DecisionAnswer | undefined, action: "drop" | "flag"): boolean {
+  if (a?.kind !== "score") return false;
+  if (a.calibrated) return true;
+  return action === "flag" && a.value >= 1;
+}
+
 /** item id → question name → answer. */
 export type Answers = Record<string, Record<string, DecisionAnswer>>;
 

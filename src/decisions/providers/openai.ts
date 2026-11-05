@@ -17,7 +17,7 @@ import type { DecisionProvider } from "./types.js";
  * Studio, llama.cpp) as a decision provider. One JSON-object completion per batch. The model
  * answers each question with a probability (yes_no), an option (choice) or a level (score); a
  * self-reported number is NOT calibrated, so every answer carries calibrated: false and the
- * features apply their conservative threshold (clears() in ../types.ts).
+ * features apply their conservative rule (clears(), choiceClears() and scoreActs() in ../types.ts).
  */
 
 const Completion = z.object({
@@ -107,7 +107,8 @@ function toAnswer(
     return {
       kind: "choice",
       choice: x.choice,
-      probs: { [x.choice]: 1 },
+      // A named option carries no probability the model can honestly claim: no synthetic 1.
+      probs: {},
       confidence: 0.5,
       calibrated: false,
     };

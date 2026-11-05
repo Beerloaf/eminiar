@@ -1,10 +1,10 @@
 import { featuresWanted } from "../config.js";
 import { getContext } from "../context.js";
-import { renderGuide } from "../session/guide.js";
+import { renderGuide, SNAPSHOT_BUDGET } from "../session/guide.js";
 import { getStorage } from "../storage/index.js";
 import type { HookHandler } from "./types.js";
 
-export const SNAPSHOT_BUDGET = 2048;
+export { SNAPSHOT_BUDGET };
 
 /**
  * PreCompact cannot inject context; it only has time to persist a snapshot.

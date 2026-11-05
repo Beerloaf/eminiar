@@ -337,7 +337,9 @@ describe("the hook path", () => {
     config: ConfigSchema.parse({
       adjudicator: {
         enabled: true,
-        provider: "embedding",
+        // a job has no embedder, so the embedding provider spawns nothing; use a local server
+        provider: "openai-compatible",
+        openai: { preset: "ollama", baseUrl: "http://127.0.0.1:9/v1", model: "m" },
         features: { commit: feat },
       },
     }),

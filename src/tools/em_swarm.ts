@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { adjudicatePlan, planAdviceBlock, planNextHint } from "../adjudicator/swarm.js";
 import { getContext, type ProjectContext } from "../context.js";
+import { kickSwarmJudge, swarmBadges } from "../decisions/features/swarm.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import { getStorage } from "../storage/index.js";
 import { planAgentSync, syncAgents } from "../swarm/agents.js";
@@ -313,7 +314,7 @@ function planned(
 }
 
 /**
- * The optional progress judge (decisions/features/swarm.ts), loaded only when the feature is on.
+ * The optional progress judge (decisions/features/swarm.ts); it does nothing unless the feature is on.
  * Fire and forget: a failure here never changes the reply.
  */
 async function kickJudge(
@@ -324,8 +325,7 @@ async function kickJudge(
   sessionId: string | undefined,
 ): Promise<void> {
   try {
-    const m = await import("../decisions/features/swarm.js");
-    m.kickSwarmJudge(ctx, db, runId, tasks, sessionId);
+    kickSwarmJudge(ctx, db, runId, tasks, sessionId);
   } catch {
     // advisory only
   }
@@ -340,9 +340,8 @@ async function judgeBadges(
   sessionId: string | undefined,
 ): Promise<Map<number, string>> {
   try {
-    const m = await import("../decisions/features/swarm.js");
-    const out = m.swarmBadges(ctx.config.adjudicator, db, runId);
-    m.kickSwarmJudge(ctx, db, runId, tasks, sessionId);
+    const out = swarmBadges(ctx.config.adjudicator, db, runId);
+    kickSwarmJudge(ctx, db, runId, tasks, sessionId);
     return out;
   } catch {
     return new Map();

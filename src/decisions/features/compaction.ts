@@ -1,18 +1,23 @@
 import { redact } from "../../adjudicator/redact.js";
 import { loadConfig } from "../../config.js";
 import type { ProjectContext } from "../../context.js";
-import { SNAPSHOT_BUDGET } from "../../hooks/pre-compact.js";
 import type { SearchResponse } from "../../search/pipeline.js";
-import { type GuideSection, guideSections, renderSections } from "../../session/guide.js";
+import {
+  type GuideSection,
+  guideSections,
+  renderSections,
+  SNAPSHOT_BUDGET,
+} from "../../session/guide.js";
 import type { StorageAdapter } from "../../storage/adapter.js";
 import { createDecisionClient } from "../client.js";
 import type { DecisionFeatureModule } from "../feature.js";
-import type {
-  Answers,
-  Decision,
-  DecisionClient,
-  DecisionJob,
-  DecisionQuestionSpec,
+import {
+  type Answers,
+  type Decision,
+  type DecisionClient,
+  type DecisionJob,
+  type DecisionQuestionSpec,
+  scoreActs,
 } from "../types.js";
 
 /**
@@ -53,6 +58,9 @@ const scoreOf = (a: Answers, id: string): number | undefined => {
   return v?.kind === "score" ? v.value : undefined;
 };
 
+/** May this item's score drop it? Uncalibrated scores reorder only. */
+const canDrop = (a: Answers, id: string): boolean => scoreActs(a[id]?.[USEFUL.name], "drop");
+
 /** Labels present in a rendered guide. */
 const labelsIn = (body: string, sections: GuideSection[]): string[] =>
   sections.filter((s) => body.includes(`**${s.label}**: `)).map((s) => s.id);
@@ -66,6 +74,8 @@ export function chooseSections(
   score: (s: GuideSection) => number,
   minKeep: number,
   budget: number,
+  /** Sections whose score may drop them below minKeep (default all). */
+  canDropSection: (s: GuideSection) => boolean = () => true,
 ): GuideSection[] {
   const chosen = new Set<GuideSection>();
   let used = 0;
@@ -76,7 +86,7 @@ export function chooseSections(
     }
   }
   const ranked = sections
-    .filter((s) => !chosen.has(s) && score(s) >= minKeep)
+    .filter((s) => !chosen.has(s) && (score(s) >= minKeep || !canDropSection(s)))
     .sort((a, b) => score(b) - score(a) || a.priority - b.priority);
   for (const s of ranked) {
     if (used + sizeOf(s) > budget) continue;
@@ -127,7 +137,14 @@ async function runCompactionJob(
         // A section the provider did not score keeps its baseline fate (1 if rendered, else 0).
         const score = (s: GuideSection) =>
           scoreOf(answers, s.id) ?? (baselineKept.includes(s.id) ? 1 : 0);
-        const chosen = chooseSections(sections, score, fc.minKeep, SNAPSHOT_BUDGET);
+        const chosen = chooseSections(
+          sections,
+          score,
+          fc.minKeep,
+          SNAPSHOT_BUDGET,
+          // an unscored section keeps its baseline fate; a scored one drops only when calibrated
+          (s) => scoreOf(answers, s.id) === undefined || canDrop(answers, s.id),
+        );
         body = renderSections(chosen, SNAPSHOT_BUDGET);
         const kept = labelsIn(body, sections);
         const dropped = sections.filter((s) => !kept.includes(s.id)).map((s) => s.id);
@@ -199,7 +216,7 @@ export async function triageOutput(
       (answers): Decision => {
         scores = Object.fromEntries(ids.map((id) => [id, scoreOf(answers, id) ?? 1]));
         const kept = ids
-          .filter((id) => (scores[id] ?? 1) >= fc.minKeep)
+          .filter((id) => (scores[id] ?? 1) >= fc.minKeep || !canDrop(answers, id))
           .sort((a, b) => (scores[b] ?? 1) - (scores[a] ?? 1));
         // Never empty the output: with nothing above minKeep the deterministic result stands.
         const same = !kept.length || kept.join() === ids.join();

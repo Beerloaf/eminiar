@@ -15,6 +15,8 @@ type Row = Record<string, unknown>;
 export const DECISION_CALLS_KEEP = 5000;
 /** decision_cache keeps at most this many rows. */
 export const DECISION_CACHE_KEEP = 2000;
+/** An "unsupported" row of the same feature and provider is recorded once per this long. */
+export const DECISION_UNSUPPORTED_DEDUPE_MS = 3_600_000;
 /** An undelivered advice note expires after this long. */
 export const DECISION_NOTE_MAX_AGE_MS = 600_000;
 
@@ -96,6 +98,17 @@ export class SqliteDecisionStore implements DecisionStore {
   }
 
   insertCall(c: DecisionCallInput, keep = DECISION_CALLS_KEEP): number {
+    // "unsupported" carries no information beyond the first row: repeating it only evicts useful
+    // rows from the 5000 cap. The existing row's id is returned.
+    if (c.status === "unsupported") {
+      const dup = this.prep(
+        `SELECT id FROM decision_calls WHERE feature = ? AND status = 'unsupported'
+           AND COALESCE(provider, '') = ? AND ts >= ? ORDER BY id DESC LIMIT 1`,
+      ).get(c.feature, c.provider ?? "", c.ts - DECISION_UNSUPPORTED_DEDUPE_MS) as
+        | { id: number }
+        | undefined;
+      if (dup) return dup.id;
+    }
     const tx = this.db.transaction(() => {
       const info = this.prep(
         `INSERT INTO decision_calls (ts, feature, context, session_id, subject, mode, status, items,
@@ -148,6 +161,55 @@ export class SqliteDecisionStore implements DecisionStore {
       "SELECT COUNT(*) AS n FROM decision_calls WHERE feature = ? AND status = ? AND ts >= ?",
     ).get(feature, status, since) as { n: number };
     return r.n;
+  }
+
+  /**
+   * Claims a slot for one detached job (lock rows in decision_cache, no schema change). Refused
+   * while a job of the same feature and scope is in flight, when `perScope` jobs of that scope run,
+   * or when `maxRunning` run in all. Locks expire after `ttlMs` (a job that died) and are released
+   * by releaseJob. One immediate transaction, so parallel hooks cannot both claim.
+   */
+  claimJob(o: {
+    feature: DecisionFeature;
+    scope: string;
+    now: number;
+    ttlMs: number;
+    perScope: number;
+    maxRunning: number;
+  }): boolean {
+    const tx = this.db.transaction(() => {
+      this.prep("DELETE FROM decision_cache WHERE key LIKE 'job:%' AND created_at < ?").run(
+        o.now - o.ttlMs,
+      );
+      const rows = this.prep(
+        "SELECT key, answers FROM decision_cache WHERE key LIKE 'job:%'",
+      ).all() as Array<{ key: string; answers: string }>;
+      const mine = `job:${o.feature}:${o.scope}`;
+      if (rows.some((r) => r.key === mine)) return false;
+      const sameScope = rows.filter(
+        (r) => (parse(r.answers) as { scope?: string } | null)?.scope === o.scope,
+      );
+      if (sameScope.length >= o.perScope || rows.length >= o.maxRunning) return false;
+      this.prep(
+        "INSERT OR REPLACE INTO decision_cache (key, feature, answers, created_at) VALUES (?, ?, ?, ?)",
+      ).run(mine, o.feature, JSON.stringify({ scope: o.scope }), o.now);
+      return true;
+    });
+    return tx.immediate();
+  }
+
+  /** Has this provider answered "unsupported" for the feature since `since`? (the hook's spawn peek) */
+  hasUnsupported(feature: DecisionFeature, provider: string, since: number): boolean {
+    return (
+      this.prep(
+        `SELECT 1 AS x FROM decision_calls WHERE feature = ? AND status = 'unsupported'
+           AND COALESCE(provider, '') = ? AND ts >= ? LIMIT 1`,
+      ).get(feature, provider, since) !== undefined
+    );
+  }
+
+  releaseJob(feature: DecisionFeature, scope: string): void {
+    this.prep("DELETE FROM decision_cache WHERE key = ?").run(`job:${feature}:${scope}`);
   }
 
   cacheGet(key: string, now: number, ttlMs: number): unknown | undefined {

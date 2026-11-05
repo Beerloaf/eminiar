@@ -1,5 +1,7 @@
 import { z } from "zod";
 import type { ProjectContext } from "../context.js";
+import { createDecisionClient } from "../decisions/client.js";
+import { triageDiscovery } from "../decisions/features/docs.js";
 import {
   type AddInput,
   addDocSources,
@@ -22,6 +24,7 @@ import {
 } from "../docs/manifest.js";
 import { resolveProvider } from "../docs/resolve.js";
 import { formatSync, syncSources } from "../docs/sync.js";
+import { getProvider } from "../embeddings/provider.js";
 import { vectorRanker } from "../embeddings/queue.js";
 import { formatResults } from "../search/format.js";
 import { type SearchResponse, search } from "../search/pipeline.js";
@@ -231,11 +234,6 @@ async function triageProviders(
   const cfg = ctx.config.adjudicator;
   if (!cfg.enabled || !cfg.features.docs.enabled) return d;
   try {
-    const [{ createDecisionClient }, { triageDiscovery }, { getProvider }] = await Promise.all([
-      import("../decisions/client.js"),
-      import("../decisions/features/docs.js"),
-      import("../embeddings/provider.js"),
-    ]);
     const client = createDecisionClient("docs", {
       config: cfg,
       db,

@@ -10,7 +10,7 @@ import { hookLog } from "./hooks/log.js";
  * user's `onFailure: "block"` entry), where any error exits 1.
  * `--adjudicate` is the adjudicator's detached async job (src/adjudicator/async.ts): the job JSON
  * arrives on stdin, nobody reads stdout, and a hard timer ends the process however the job goes.
- * `--decision` is the same for the Jev feature jobs (src/decisions/job.ts).
+ * `--decision` is the same for the Jev feature jobs (src/decisions/run-job.ts).
  */
 /** The Jev job child's hard limit; the longest feature budget stays below it. */
 const DECISION_JOB_MAX_MS = 29_000;
@@ -36,8 +36,8 @@ async function main(): Promise<void> {
     return;
   }
   if (process.argv.includes("--decision")) {
-    // The Jev feature job (src/decisions/job.ts): its own chunk, loaded only here.
-    const { runDecisionJob } = await import("./decisions/job.js");
+    // The Jev feature job (src/decisions/run-job.ts): its own chunk, loaded only here.
+    const { runDecisionJob } = await import("./decisions/run-job.js");
     setTimeout(() => process.exit(0), DECISION_JOB_MAX_MS).unref();
     await runDecisionJob(raw, { log: (line) => hookLog("info", line) });
     return;

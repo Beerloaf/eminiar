@@ -1,4 +1,5 @@
 import type { ProjectContext } from "../context.js";
+import { triageOutput } from "../decisions/features/compaction.js";
 import { kickEmbedding } from "../embeddings/queue.js";
 import { indexContent } from "../index/indexer.js";
 import { formatResults } from "../search/format.js";
@@ -17,6 +18,11 @@ export interface ProcessInput {
   /** Index even when under the threshold (batch mode needs every output searchable). */
   forceIndex?: boolean | undefined;
   maxTokens?: number | undefined;
+  /**
+   * The output is em_execute's own stdout, the only kind the opt-in compaction.output triage may
+   * send to a provider. File reads (em_execute_file) and batch commands never set it.
+   */
+  triage?: boolean | undefined;
 }
 
 export interface Processed {
@@ -77,10 +83,9 @@ export async function processOutput(
     let shown = responses;
     // Opt-in output triage (off by default): one boolean check when off.
     const tf = ctx.config.adjudicator.features.compaction;
-    if (tf.enabled && tf.output && input.intent) {
+    if (input.triage && tf.enabled && tf.output && input.intent) {
       try {
-        const m = await import("../decisions/features/compaction.js");
-        shown = (await m.triageOutput(db, ctx, input.intent, r.documentId, responses)) ?? responses;
+        shown = (await triageOutput(db, ctx, input.intent, r.documentId, responses)) ?? responses;
       } catch {
         // optional: the deterministic result stands
       }

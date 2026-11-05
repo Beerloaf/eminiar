@@ -17,7 +17,7 @@ import { isSecretName } from "../adjudicator/redact.js";
  */
 
 /** Always excluded, whatever commit.exclude says. */
-export const DIFF_DENY_FLOOR = [
+export const DIFF_DENY_FLOOR: string[] = [
   "**/.env",
   "**/.env.*",
   "**/*.env",
@@ -38,7 +38,28 @@ export const DIFF_DENY_FLOOR = [
   "**/.pypirc",
   "**/credentials*",
   "**/secrets/**",
+  "**/.secrets/**",
   "**/secret.*",
+  "**/secrets.*",
+  "**/.secrets*",
+  "**/*.secrets.*",
+  "**/*.secret",
+  "**/*.env.*",
+  "**/*.p8",
+  "**/*.ppk",
+  "**/*.gpg",
+  "**/*.key.*",
+  "**/*.pem.*",
+  "**/*.p12.*",
+  "**/*.pfx.*",
+  "**/*.tfvars",
+  "**/*service-account*",
+  "**/*service_account*",
+  "**/.pgpass",
+  "**/kubeconfig*",
+  "**/.kube/**",
+  "**/.aws/**",
+  "**/.ssh/**",
   "**/*.lock",
   "**/package-lock.json",
   "**/npm-shrinkwrap.json",
@@ -49,6 +70,27 @@ export const DIFF_DENY_FLOOR = [
   "**/*.sqlite*",
   "**/*.db",
 ];
+
+/**
+ * Secret-bearing NAMES in data/config files (config/secrets.yaml, db_password.txt, api-keys.json,
+ * auth_token.yml...). Source files named like this (token-bucket.ts) stay allowed: their values are
+ * scrubbed line by line instead.
+ */
+const SECRET_NAME_PARTS = [
+  "secret",
+  "password",
+  "passwd",
+  "credential",
+  "token",
+  "api-key",
+  "api_key",
+  "apikey",
+  "private-key",
+  "private_key",
+];
+const DATA_EXTS = ["json", "yaml", "yml", "toml", "txt", "ini", "cfg", "conf", "properties", "xml"];
+for (const part of SECRET_NAME_PARTS)
+  for (const ext of DATA_EXTS) DIFF_DENY_FLOOR.push(`**/*${part}*.${ext}`);
 
 /** Only these file kinds are sent (extension, or a well-known bare name). */
 export const DIFF_ALLOW = [
@@ -128,7 +170,8 @@ export function diffFileAllowed(path: string, exclude: readonly string[] = []): 
 }
 
 const ASSIGN =
-  /^(\s*(?:export\s+)?(?:default\s+)?(?:const\s+|let\s+|var\s+)?["']?)([A-Za-z_][\w.-]*)(["']?\s*(?:=>|:=|[:=])\s*)(.+)$/;
+  /^(\s*(?:-\s+)*(?:export\s+)?(?:default\s+)?(?:const\s+|let\s+|var\s+)?["']?)([A-Za-z_][\w.-]*)(["']?\s*(?:=>|:=|[:=])\s*)(.*)$/;
+const BLOCK_HEADER = /^[|>][+-]?\d*[+-]?\s*(?:#.*)?$/;
 
 function scrubLine(raw: string): string | undefined {
   let line = raw.replace(/\t/g, " ").trimEnd();
@@ -145,6 +188,41 @@ function scrubLine(raw: string): string | undefined {
     );
   if (line.length > MAX_LINE) line = `${line.slice(0, MAX_LINE)}…`;
   return line;
+}
+
+/**
+ * A value that carries on past its own line: lines after it belong to the secret and must not be
+ * sent. Either everything more indented than the key (block scalars `| > |- >- |2`, YAML plain or
+ * nested continuation) or everything up to and including the line that closes an open quote.
+ */
+interface Continuation {
+  indent: number;
+  quote?: string;
+}
+
+function continuation(raw: string, yaml: boolean): Continuation | undefined {
+  const line = raw.replace(/\t/g, " ").trimEnd();
+  const m = ASSIGN.exec(line);
+  if (!m || !isSecretName(m[2] as string)) return undefined;
+  const indent = (/^\s*(?:-\s+)*/.exec(line) as RegExpExecArray)[0].length;
+  const value = (m[4] as string).trim();
+  if (BLOCK_HEADER.test(value)) return { indent };
+  const q = value[0];
+  if (q === '"' || q === "'" || q === "`") {
+    const closed = q === '"' ? /^"(?:[^"\\]|\\.)*"/ : q === "'" ? /^'(?:[^']|'')*'/ : /^`[^`]*`/;
+    if (!closed.test(value)) return { indent, quote: q };
+  }
+  return yaml ? { indent } : undefined;
+}
+
+function leadingIndent(s: string): number {
+  return /^[ \t]*/.exec(s)?.[0].replace(/\t/g, " ").length ?? 0;
+}
+
+/** Does `raw` hold the quote that closes a value opened with `q`? */
+function closesQuote(raw: string, q: string): boolean {
+  if (q === '"') return /^(?:[^"\\]|\\.)*"/.test(raw);
+  return raw.includes(q);
 }
 
 export interface RedactedDiff {
@@ -189,10 +267,26 @@ export function redactDiff(
       continue;
     }
     const added: string[] = [];
+    const yaml = /\.ya?ml$/i.test(path);
+    let cont: Continuation | undefined;
     for (const l of sec.split("\n")) {
+      if (l.startsWith("@@")) {
+        cont = undefined;
+        continue;
+      }
       if (!l.startsWith("+") || l.startsWith("+++")) continue;
-      const s = scrubLine(l.slice(1));
+      const raw = l.slice(1);
+      if (cont) {
+        if (cont.quote) {
+          if (closesQuote(raw, cont.quote)) cont = undefined;
+          continue;
+        }
+        if (!raw.trim() || leadingIndent(raw) > cont.indent) continue;
+        cont = undefined;
+      }
+      const s = scrubLine(raw);
       if (s !== undefined) added.push(s);
+      cont = continuation(raw, yaml);
     }
     if (!added.length) continue;
     const block = `file ${path}\n${added.join("\n")}\n`;

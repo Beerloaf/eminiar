@@ -4,7 +4,7 @@ import type { StorageAdapter } from "../storage/adapter.js";
 import { createDecisionClient } from "./client.js";
 import { decisionFeatureActive } from "./config.js";
 import type { HookSeam } from "./feature.js";
-import { spawnDecisionJob } from "./job.js";
+import { claimJobSlot, providerAllowsJob, releaseJobSlot, spawnDecisionJob } from "./job.js";
 import { loadFeature } from "./registry.js";
 import { DECISION_FEATURES, type DecisionFeature, type RecallRerank } from "./types.js";
 
@@ -40,7 +40,12 @@ async function seams(
       client: createDecisionClient(f, { config: cfg, db, context: "hook" }),
       spawn: (payload) => {
         if (spawned) return false;
-        spawned = spawnDecisionJob({ v: 1, feature: f, projectRoot: ctx.root, sessionId, payload });
+        // Cheap local checks first; a down, capped or unsupported provider spawns nothing.
+        if (!providerAllowsJob(cfg, db, f)) return false;
+        const job = { v: 1 as const, feature: f, projectRoot: ctx.root, sessionId, payload };
+        if (!claimJobSlot(db, job)) return false;
+        spawned = spawnDecisionJob(job);
+        if (!spawned) releaseJobSlot(db, job);
         return spawned;
       },
     };

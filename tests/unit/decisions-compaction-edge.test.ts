@@ -80,7 +80,7 @@ function provider(
                 kind: "score" as const,
                 value: score(i.text),
                 confidence: 1,
-                calibrated: false,
+                calibrated: true,
               },
             },
           ]),
@@ -296,7 +296,9 @@ describe("session-guide rewrite", () => {
           config: ConfigSchema.parse({
             adjudicator: {
               enabled: true,
-              provider: "embedding",
+              // a job has no embedder, so the embedding provider spawns nothing; use a local server
+              provider: "openai-compatible",
+              openai: { preset: "ollama", baseUrl: "http://127.0.0.1:9/v1", model: "m" },
               features: { compaction: c },
             },
           }),
@@ -365,7 +367,14 @@ describe("sandbox output triage", () => {
     });
     try {
       return norm(
-        (await processOutput(d, ctx, { ...input, queries, ...(intent ? { intent } : {}) })).text,
+        (
+          await processOutput(d, ctx, {
+            ...input,
+            triage: true,
+            queries,
+            ...(intent ? { intent } : {}),
+          })
+        ).text,
       );
     } finally {
       d.db.close();
@@ -460,6 +469,7 @@ describe("output triage with several queries", () => {
       stdout: parts.join("\n"),
       title: "t",
       source: "exec",
+      triage: true,
       intent: "FAILURE",
       queries: ["assertion", "FAILURE"],
     });

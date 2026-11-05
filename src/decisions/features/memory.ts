@@ -6,7 +6,7 @@ import type { StorageAdapter } from "../../storage/adapter.js";
 import { createDecisionClient, type DecisionClientDeps } from "../client.js";
 import { decisionFeatureConfig } from "../config.js";
 import type { DecisionFeatureModule } from "../feature.js";
-import type { Answers, DecisionQuestionSpec } from "../types.js";
+import { type Answers, choiceClears, clears, type DecisionQuestionSpec } from "../types.js";
 
 /**
  * Decision feature "memory" (docs/design/jev-integration-options.md, option B): after em_remember
@@ -96,8 +96,10 @@ export async function suggestMemoryHygiene(
     }
     if (items.length === 0) return undefined;
 
-    const embeddingOnly = cfg.provider === "embedding";
-    const q = embeddingOnly ? SIM_QUESTION : CHOICE_QUESTION;
+    // Providers that cannot give a probability for a choice ask the duplicate yes/no question,
+    // whose uncalibrated number is held to the conservative bar by clears().
+    const yesNoOnly = cfg.provider === "embedding" || cfg.provider === "openai-compatible";
+    const q = yesNoOnly ? SIM_QUESTION : CHOICE_QUESTION;
     const minProb = fc.minProb;
     const decide = (answers: Answers) => {
       let best: { id: string; rel: "duplicate" | "supersedes"; score: number } | undefined;
@@ -107,20 +109,16 @@ export async function suggestMemoryHygiene(
         let rel: "duplicate" | "supersedes" | undefined;
         let score = 0;
         if (a.kind === "yes_no") {
-          const need = a.calibrated ? minProb : Math.max(minProb, 0.85);
-          if (a.p >= need) {
+          if (clears(a, minProb)) {
             rel = "duplicate";
             score = a.p;
           }
         } else if (a.kind === "choice") {
-          if (a.choice === "duplicate" || a.choice === "supersedes") {
-            const p = a.probs[a.choice] ?? a.confidence;
-            const need = a.calibrated ? minProb : Math.max(minProb, 0.85);
-            if (p >= need) {
-              rel = a.choice;
-              score = p;
+          for (const opt of ["duplicate", "supersedes"] as const)
+            if (choiceClears(a, opt, minProb)) {
+              rel = opt;
+              score = a.probs[opt] ?? a.confidence;
             }
-          }
         }
         if (rel && (!best || score > best.score)) best = { id: it.id, rel, score };
       }

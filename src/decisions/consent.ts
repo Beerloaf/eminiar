@@ -22,11 +22,11 @@ export function consentLine(c: DataClass, o: { origin: string; maxChars: number 
     case "diffs":
       return `sends the redacted staged diff (up to ${o.maxChars} chars, files matching commit.exclude left out) and the commit message to ${o.origin}`;
     case "session":
-      return `sends redacted session-guide sections and, with compaction.output on, redacted em_execute output sections to ${o.origin}`;
+      return `sends redacted session-guide sections (the latest request, intent, files, tasks and similar) and, with compaction.output on, redacted sections of em_execute command output only (never em_execute_file or em_batch_execute contents; lines that look like secrets are masked) to ${o.origin}`;
     case "swarm":
-      return `sends task titles, status changes and redacted blackboard posts of swarm runs to ${o.origin}`;
+      return `sends task titles, statuses, the first line of task results, worker roles and tool-call counts, the first line of worker final messages, spawn prompts and other trail events, and redacted blackboard posts of swarm runs to ${o.origin}`;
     case "packages":
-      return `sends dependency names and versions only to ${o.origin}`;
+      return `sends package names only (public-registry npm, PyPI and Go names; no versions, scoped npm packages, private or internal hosts, or git, URL and path sources) to ${o.origin}`;
   }
 }
 

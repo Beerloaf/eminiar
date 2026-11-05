@@ -10,6 +10,7 @@ import type {
   DecisionClient,
   DecisionQuestionSpec,
 } from "../types.js";
+import { scoreActs } from "../types.js";
 
 /**
  * Decision feature "docs" (docs/design/jev-integration-options.md, option F): score each
@@ -38,11 +39,31 @@ export const DOCS_QUESTION: DecisionQuestionSpec = {
 
 const ECOSYSTEM: Record<string, string> = { npm: "npm", pypi: "PyPI", go: "Go module" };
 
-/** The candidates worth scoring: unregistered packages, most widely used first. */
+/** Go module hosts whose modules are public by convention; any other host may be internal. */
+const PUBLIC_GO_HOSTS =
+  /^(github\.com|gitlab\.com|bitbucket\.org|golang\.org|google\.golang\.org|gopkg\.in|go\.uber\.org|k8s\.io|sigs\.k8s\.io|cloud\.google\.com|go\.opentelemetry\.io)\//;
+
+/**
+ * May this package name leave the machine? Only names a public registry plausibly serves:
+ * unscoped npm names, PyPI names and Go modules on well-known public hosts, none of them taken
+ * from a git, URL or path source. Catalogue entries (known public libraries) always pass.
+ */
+export function isPublicName(p: ProviderCandidate): boolean {
+  if (p.nonRegistry) return false;
+  if (p.confidence === "catalog") return true;
+  const [eco, ...rest] = p.provider.split(":");
+  const name = rest.join(":");
+  if (eco === "npm") return !name.startsWith("@") && !name.includes("/");
+  if (eco === "go") return PUBLIC_GO_HOSTS.test(name);
+  return eco === "pypi";
+}
+
+/** The candidates worth scoring: unregistered public packages, most widely used first. */
 export function scorable(d: Discovery): ProviderCandidate[] {
   return d.providers
     .map((p, i) => ({ p, i }))
     .filter(({ p }) => !p.registered && /^(npm|pypi|go):/.test(p.provider))
+    .filter(({ p }) => isPublicName(p))
     .filter(({ p }) => p.confidence === "registry" || (p.tier ?? "library") === "library")
     .sort((a, b) => b.p.usedBy.length - a.p.usedBy.length || a.i - b.i)
     .slice(0, DOCS_MAX_ITEMS)
@@ -63,6 +84,8 @@ export function applyDocsScores(
   d: Discovery,
   scores: Map<string, number>,
   minScore: number,
+  /** Providers whose score may flag them recommended (default all); others only reorder. */
+  flaggable: (provider: string) => boolean = () => true,
 ): { discovery: Discovery; reordered: number; flagged: number } {
   const providers = d.providers.map((p) => ({ ...p }));
   let reordered = 0;
@@ -85,7 +108,12 @@ export function applyDocsScores(
     const s = scores.get(p.provider);
     if (s === undefined) continue;
     p.docsScore = Math.round(s * 100) / 100;
-    if (p.confidence === "registry" && s >= minScore && flagged < DOCS_MAX_RECOMMENDED) {
+    if (
+      p.confidence === "registry" &&
+      s >= minScore &&
+      flaggable(p.provider) &&
+      flagged < DOCS_MAX_RECOMMENDED
+    ) {
       p.recommended = true;
       flagged++;
     }
@@ -122,7 +150,9 @@ export async function triageDiscovery(
         const v = scoreOf(answers, id);
         if (v !== undefined) scores.set(id, v);
       }
-      const r = applyDocsScores(d, scores, minScore);
+      const r = applyDocsScores(d, scores, minScore, (id) =>
+        scoreActs(answers[id]?.[QUESTION], "flag"),
+      );
       next = r.discovery;
       return {
         decision: {
