@@ -342,13 +342,7 @@ async function judgeBadges(
   try {
     const m = await import("../decisions/features/swarm.js");
     const out = m.swarmBadges(ctx.config.adjudicator, db, runId);
-    m.kickSwarmJudge(
-      ctx,
-      db,
-      runId,
-      tasks.filter((t) => t.status === "active"),
-      sessionId,
-    );
+    m.kickSwarmJudge(ctx, db, runId, tasks, sessionId);
     return out;
   } catch {
     return new Map();

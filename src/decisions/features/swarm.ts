@@ -56,8 +56,10 @@ const QUESTIONS: Record<string, DecisionQuestionSpec> = {
 const CLOSED = new Set(["done", "failed", "blocked"]);
 const MAX_TASKS = 10;
 const TRAIL_EVENTS = 8;
-/** One spawn per run per window in this process. */
+/** One spawn per task per window in this process. */
 const IN_FLIGHT_MS = 30_000;
+/** A task whose last attempt failed is not tried again for this long. */
+const RETRY_AFTER_FAIL_MS = 5 * 60_000;
 /** A verdict older than this is not shown. */
 const BADGE_MAX_AGE_MS = 30 * 60_000;
 const inFlight = new Map<string, number>();
@@ -192,7 +194,8 @@ function swarmCfg(cfg: AdjudicatorConfig | undefined) {
 
 /**
  * Start the background judge for `tasks` of `run`. Fire and forget: the caller's reply does not
- * wait. Skipped when the feature is not active or a judge for this run started a moment ago.
+ * wait. Skipped when the feature is not active; a task is skipped while a judge for it started a
+ * moment ago, after a failed attempt for a few minutes, or while it has a verdict of this mode.
  */
 export function kickSwarmJudge(
   ctx: ProjectContext,
@@ -204,20 +207,33 @@ export function kickSwarmJudge(
 ): boolean {
   const cfg = ctx.config.adjudicator;
   if (!swarmCfg(cfg) || !tasks.length) return false;
-  const last = inFlight.get(run);
-  if (last !== undefined && now - last < IN_FLIGHT_MS) return false;
+  const fc = swarmCfg(cfg)!;
+  const mode = fc.shadow ? "shadow" : "live";
   const events = db.swarm.events(run, { limit: 1000 });
-  // Active tasks are asked again only when the trail changed since their last verdict.
+  // Active and closed tasks are asked again only when the trail changed since their last verdict
+  // of the current mode (a shadow verdict does not hide the live one; the answer is cached).
   const seen = new Map<number, string>();
+  const decided = new Set<number>();
+  const failed = new Set<number>();
   for (const r of db.decisions.latestBySubject("swarm", `run:${run}/`, 100)) {
+    const m = /\/task:(\d+)$/.exec(r.subject);
+    const tid = m ? Number(m[1]) : undefined;
+    if (tid !== undefined && !decided.has(tid)) {
+      decided.add(tid);
+      if (!DECISION_USABLE.includes(r.status) && now - r.ts < RETRY_AFTER_FAIL_MS) failed.add(tid);
+    }
     const d = r.decision as { task?: number; hash?: string } | null;
-    if (d?.task !== undefined && d.hash && !seen.has(d.task)) seen.set(d.task, d.hash);
+    if (r.mode === mode && d?.task !== undefined && d.hash && !seen.has(d.task))
+      seen.set(d.task, d.hash);
   }
   const todo = tasks
-    .filter(
-      (t) =>
-        (t.status === "active" || CLOSED.has(t.status)) && seen.get(t.id) !== trailHash(t, events),
-    )
+    .filter((t) => {
+      if (t.status !== "active" && !CLOSED.has(t.status)) return false;
+      if (failed.has(t.id)) return false;
+      const last = inFlight.get(`${run}/${t.id}`);
+      if (last !== undefined && now - last < IN_FLIGHT_MS) return false;
+      return seen.get(t.id) !== trailHash(t, events);
+    })
     .slice(0, MAX_TASKS);
   if (!todo.length) return false;
   const payload: SwarmPayload = { run, tasks: todo.map((t) => t.id) };
@@ -225,7 +241,7 @@ export function kickSwarmJudge(
     { v: 1, feature: "swarm", projectRoot: ctx.root, ...(sessionId ? { sessionId } : {}), payload },
     { script: join(pluginRoot(), "dist", "hook.js") },
   );
-  if (ok) inFlight.set(run, now);
+  if (ok) for (const t of todo) inFlight.set(`${run}/${t.id}`, now);
   return ok;
 }
 

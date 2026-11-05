@@ -78,7 +78,25 @@ describe("featuresPayload", () => {
     expect(agreementText(recall.summary)).toBe("50% (1/2)");
     expect(unsupported(recall.summary)).toBe(1);
     expect(errors(recall.summary)).toBe(1);
-    expect(featureState(recall)).toMatch(/shadow|no consent/);
+    expect(featureState(recall)).toMatch(/shadow|no consent|waiting/);
     expect(featureState(r.features.find((f: Json) => f.feature === "docs"))).toBe("off");
+  });
+
+  it("shows waiting for an enabled feature blocked by something other than consent", () => {
+    const base = { enabled: true, shadow: false };
+    expect(featureState({ ...base, inactive: "disabled" })).toBe("waiting");
+    expect(featureState({ ...base, inactive: "no_consent" })).toBe("no consent");
+    expect(featureState({ ...base, inactive: null })).toBe("live");
+    expect(featureState({ ...base, shadow: true, inactive: null })).toBe("shadow");
+    expect(featureState({ enabled: false, shadow: false, inactive: null })).toBe("off");
+    const r = featuresPayload(ctx, {
+      config: cfg({ enabled: true, provider: "heuristic", features: { recall: true } }),
+      db,
+      now: () => NOW,
+      env: {},
+    }).body as Json;
+    const recall = r.features.find((f: Json) => f.feature === "recall");
+    expect(recall.inactive).toBe("disabled");
+    expect(featureState(recall)).toBe("waiting");
   });
 });

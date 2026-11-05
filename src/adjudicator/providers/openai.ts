@@ -31,7 +31,7 @@ export const MAX_TOKENS_BASE = 64;
 export const MAX_TOKENS_PER_ITEM = 48;
 
 /** A 400 that is about the structured-output request, not the prompt. */
-function rejectsSchema(err: unknown): boolean {
+export function rejectsSchema(err: unknown): boolean {
   return (
     err instanceof ProviderError &&
     err.status === 400 &&

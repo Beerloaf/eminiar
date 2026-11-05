@@ -185,9 +185,25 @@ export class SqliteDecisionStore implements DecisionStore {
     ).all(sessionId, now - maxAgeMs) as Array<{ id: number; note: string }>;
   }
 
+  /** Atomically marks the pending notes delivered and returns them, so a note goes to one claimer only. */
+  claimNotes(
+    sessionId: string,
+    now: number,
+    maxAgeMs = DECISION_NOTE_MAX_AGE_MS,
+  ): Array<{ id: number; note: string }> {
+    const rows = this.prep(
+      `UPDATE decision_calls SET delivered_at = ?
+         WHERE note IS NOT NULL AND note_session = ? AND delivered_at IS NULL AND ts >= ?
+         RETURNING id, note`,
+    ).all(now, sessionId, now - maxAgeMs) as Array<{ id: number; note: string }>;
+    return rows.sort((a, b) => a.id - b.id);
+  }
+
   markDelivered(ids: number[], now: number): void {
     if (ids.length === 0) return;
-    const mark = this.prep("UPDATE decision_calls SET delivered_at = ? WHERE id = ?");
+    const mark = this.prep(
+      "UPDATE decision_calls SET delivered_at = ? WHERE id = ? AND delivered_at IS NULL",
+    );
     this.db.transaction(() => {
       for (const id of ids) mark.run(now, id);
     })();

@@ -10,6 +10,7 @@ import {
   FEATURE_HELP,
   type FeatureState,
   featureState,
+  stateTitle,
   statusTitle,
   unsupported,
 } from "./features-helpers.js";
@@ -17,6 +18,7 @@ import {
 const TONE: Record<FeatureState, Tone> = {
   off: "muted",
   "no consent": "warn",
+  waiting: "warn",
   shadow: "accent",
   live: "ok",
 };
@@ -49,7 +51,9 @@ function Table({ r }: { r: AdjFeaturesPayload }): JSX.Element {
               <tr>
                 <td title={FEATURE_HELP[f.feature]}>{f.feature}</td>
                 <td>
-                  <Badge tone={TONE[st]}>{st}</Badge>
+                  <span title={stateTitle(f)}>
+                    <Badge tone={TONE[st]}>{st}</Badge>
+                  </span>
                 </td>
                 <td class="num" title={statusTitle(s)}>
                   {s.calls}

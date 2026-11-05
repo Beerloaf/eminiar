@@ -26,7 +26,32 @@ import {
 const QUESTION_VERSION = 1;
 const MESSAGE_CHARS = 600;
 const COMMAND_CHARS = 4000;
-const GIT_COMMIT = /(^|[;&|]\s*)git\s+commit\b/;
+/** `git [global options] commit` at the start of a command or after ; & | ( or a newline. */
+const GIT_COMMIT = /(?:^|[;&|(\n])\s*git(?:\s+(?:-[Cc]\s+\S+|--[\w-]+(?:=\S+)?|-[pP]))*\s+commit\b/;
+
+/** The command with heredoc bodies cut and quoted text emptied, so only shell syntax is left. */
+function shellSkeleton(cmd: string): string {
+  return cmd
+    .replace(/<<-?\s*(['"]?)(\w+)\1[^\n]*\n[\s\S]*?\n\s*\2\s*(?=\n|$)/g, "<<$2")
+    .replace(/"(?:[^"\\]|\\.)*"/g, '""')
+    .replace(/'[^']*'/g, "''");
+}
+
+/** Is this a `git commit` command (not text that merely mentions one)? */
+export function isGitCommit(cmd: string): boolean {
+  return GIT_COMMIT.test(shellSkeleton(cmd));
+}
+
+/** The flags of the git commit segment, quoted text removed. */
+function commitFlags(cmd: string): { all: boolean; amend: boolean } {
+  const sk = shellSkeleton(cmd);
+  const m = GIT_COMMIT.exec(sk);
+  const seg = m ? (sk.slice(m.index + m[0].length).split(/[;&|\n]/)[0] ?? "") : "";
+  return {
+    all: /(?:^|\s)(?:-[a-zA-Z]*a[a-zA-Z]*|--all)(?=\s|$)/.test(seg),
+    amend: /(?:^|\s)--amend(?=\s|$|=)/.test(seg),
+  };
+}
 
 /** Every question is worded so that "yes" is the problem. */
 const QUESTIONS: Array<DecisionQuestionSpec & { advice: string }> = [
@@ -62,6 +87,8 @@ const QUESTIONS: Array<DecisionQuestionSpec & { advice: string }> = [
 
 interface Payload {
   command: string;
+  /** When the hook queued the job (ms); gates the HEAD-commit fallback. */
+  queuedAt?: number;
 }
 
 /** The commit message from a `git commit` command line: -m / --message, or a heredoc body. */
@@ -78,10 +105,24 @@ export function commitMessage(cmd: string): string {
   return parts.join("\n\n").trim().slice(0, MESSAGE_CHARS);
 }
 
-function stagedDiff(root: string, cmd: string): string {
-  const all = /\s(-[a-zA-Z]*a[a-zA-Z]*|--all)\b/.test(cmd);
+/**
+ * The diff a commit takes: the staged one (or HEAD's with -a). The job runs detached, so the
+ * commit may have landed already and the staged diff is empty; then the HEAD commit's own diff
+ * stands in, only when it was made after the job was queued and the command was not --amend.
+ */
+function stagedDiff(root: string, cmd: string, queuedAt?: number): string {
+  const { all, amend } = commitFlags(cmd);
   const args = ["diff", "--no-color", "--no-ext-diff", "-U0", all ? "HEAD" : "--cached"];
-  return git(root, args, { allowFail: true });
+  const diff = git(root, args, { allowFail: true });
+  if (diff.trim() || amend || typeof queuedAt !== "number") return diff;
+  const ct = Number.parseInt(
+    git(root, ["log", "-1", "--format=%ct", "HEAD"], { allowFail: true }),
+    10,
+  );
+  if (!Number.isFinite(ct) || ct < Math.floor(queuedAt / 1000)) return "";
+  return git(root, ["show", "--no-color", "--no-ext-diff", "-U0", "--format=", "HEAD"], {
+    allowFail: true,
+  });
 }
 
 /** The ask input for a diff summary and a message; undefined when there is nothing to send. */
@@ -120,8 +161,8 @@ export const feature: DecisionFeatureModule = {
     try {
       if (input.tool_name !== "Bash") return undefined;
       const cmd = String(input.tool_input?.command ?? "");
-      if (!GIT_COMMIT.test(cmd)) return undefined;
-      return { command: cmd.slice(0, COMMAND_CHARS) } satisfies Payload;
+      if (!isGitCommit(cmd)) return undefined;
+      return { command: cmd.slice(0, COMMAND_CHARS), queuedAt: Date.now() } satisfies Payload;
     } catch {
       return undefined;
     }
@@ -130,9 +171,9 @@ export const feature: DecisionFeatureModule = {
   async runJob(job, client) {
     try {
       const p = job.payload as Partial<Payload> | undefined;
-      if (!p || typeof p.command !== "string" || !GIT_COMMIT.test(p.command)) return;
+      if (!p || typeof p.command !== "string" || !isGitCommit(p.command)) return;
       const fc = loadConfig(job.projectRoot).adjudicator.features.commit;
-      const red = redactDiff(stagedDiff(job.projectRoot, p.command), {
+      const red = redactDiff(stagedDiff(job.projectRoot, p.command, p.queuedAt), {
         maxChars: fc.maxChars,
         exclude: fc.exclude,
       });

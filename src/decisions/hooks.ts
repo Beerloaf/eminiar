@@ -93,12 +93,8 @@ export function decisionDrainNotes(
   now = Date.now(),
 ): string | undefined {
   try {
-    const notes = db.decisions.pendingNotes(sessionId, now);
+    const notes = db.decisions.claimNotes(sessionId, now);
     if (!notes.length) return undefined;
-    db.decisions.markDelivered(
-      notes.map((n) => n.id),
-      now,
-    );
     return notes.map((n) => n.note).join("\n");
   } catch {
     return undefined;

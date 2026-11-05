@@ -15,7 +15,7 @@ export const FEATURE_HELP: Record<string, string> = {
   docs: "triages documentation sources",
 };
 
-export type FeatureState = "off" | "no consent" | "shadow" | "live";
+export type FeatureState = "off" | "no consent" | "waiting" | "shadow" | "live";
 
 export function featureState(f: {
   enabled: boolean;
@@ -24,7 +24,17 @@ export function featureState(f: {
 }): FeatureState {
   if (!f.enabled) return "off";
   if (f.inactive === "no_consent") return "no consent";
+  // Enabled but blocked for any other reason (heuristic provider, no key, features env kill switch).
+  if (f.inactive) return "waiting";
   return f.shadow ? "shadow" : "live";
+}
+
+/** Why an enabled feature is not running, for the state badge tooltip. */
+export function stateTitle(f: { inactive: string | null }): string | undefined {
+  if (f.inactive === "no_consent") return "remote consent for this data class has not been given";
+  if (f.inactive)
+    return "enabled but not running: the provider is heuristic or has no key, or the adjudicator or its features are switched off";
+  return undefined;
 }
 
 /** Calls whose provider could not answer the question (deterministic path was used). */

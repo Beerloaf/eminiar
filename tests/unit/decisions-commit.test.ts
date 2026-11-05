@@ -150,7 +150,10 @@ describe("commit advice", () => {
   it("queues a job only for git commit", () => {
     const seam = {} as never;
     const bash = (command: string) => ({ tool_name: "Bash", tool_input: { command } }) as never;
-    expect(feature.preToolUse?.(seam, bash(CMD))).toEqual({ command: CMD });
+    expect(feature.preToolUse?.(seam, bash(CMD))).toMatchObject({
+      command: CMD,
+      queuedAt: expect.any(Number),
+    });
     expect(feature.preToolUse?.(seam, bash("git status"))).toBeUndefined();
     expect(
       feature.preToolUse?.(seam, { tool_name: "Read", tool_input: {} } as never),

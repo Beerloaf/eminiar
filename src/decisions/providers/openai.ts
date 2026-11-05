@@ -1,11 +1,13 @@
 import { z } from "zod";
 import { keyFor, type Resolved } from "../../adjudicator/config.js";
 import {
+  type HttpResult,
   joinUrl,
   type ProviderDeps,
   ProviderError,
   postJson,
 } from "../../adjudicator/providers/http.js";
+import { rejectsSchema } from "../../adjudicator/providers/openai.js";
 import type { AdjudicatorConfig } from "../../config.js";
 import type { DecisionAnswer, DecisionQuestionSpec } from "../types.js";
 import type { DecisionProvider } from "./types.js";
@@ -42,6 +44,38 @@ const Reply = z.object({
     }),
   ),
 });
+
+type Format = "schema" | "object" | "none";
+
+function responseFormat(f: Format): Record<string, unknown> | undefined {
+  if (f === "object") return { type: "json_object" };
+  if (f === "none") return undefined;
+  return {
+    type: "json_schema",
+    json_schema: {
+      name: "decisions",
+      schema: {
+        type: "object",
+        properties: {
+          answers: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                id: { type: "string" },
+                p: { type: "number" },
+                choice: { type: "string" },
+                level: { type: "number" },
+              },
+              required: ["id"],
+            },
+          },
+        },
+        required: ["answers"],
+      },
+    },
+  };
+}
 
 function parseContent(content: string): unknown {
   const t = content.trim();
@@ -89,6 +123,15 @@ export function createOpenAIDecisionProvider(
   deps: ProviderDeps = {},
 ): DecisionProvider {
   const price = r.local ? { inPerM: 0, outPerM: 0 } : (r.price ?? null);
+  // openai.json picks the response_format ladder; an endpoint that rejects a format (a 400 about
+  // response_format) is stepped down once and the working rung is remembered for the process.
+  const ladder: Format[] =
+    _cfg.openai.json === "schema"
+      ? ["schema", "none"]
+      : _cfg.openai.json === "object"
+        ? ["object", "none"]
+        : ["object", "schema", "none"]; // auto: json_object first, a schema-only server steps to json_schema
+  let rung = 0;
   return {
     id: "openai-compatible",
     remote: r.remote,
@@ -125,20 +168,40 @@ export function createOpenAIDecisionProvider(
             }),
           },
         ],
-        response_format: { type: "json_object" },
       };
       if (r.model) body.model = r.model;
       if (r.model && /gpt-oss/i.test(r.model) && body.reasoning_effort === undefined)
         body.reasoning_effort = "low";
-      const res = await postJson(joinUrl(r.baseUrl, "chat/completions"), body, {
-        deadlineMs: o.deadlineMs,
-        signal: o.signal,
-        key,
-        fetch: deps.fetch,
-        now: deps.now,
-        log: deps.log,
-        exchange: o.exchange,
-      });
+      const baseUrl = r.baseUrl;
+      const send = (f: Format): Promise<HttpResult> => {
+        const rf = responseFormat(f);
+        return postJson(
+          joinUrl(baseUrl, "chat/completions"),
+          rf ? { ...body, response_format: rf } : body,
+          {
+            deadlineMs: o.deadlineMs,
+            signal: o.signal,
+            key,
+            fetch: deps.fetch,
+            now: deps.now,
+            log: deps.log,
+            exchange: o.exchange,
+          },
+        );
+      };
+      let res: HttpResult | undefined;
+      while (!res) {
+        const f = ladder[rung] as Format;
+        try {
+          res = await send(f);
+        } catch (err) {
+          if (rung >= ladder.length - 1 || !rejectsSchema(err)) throw err;
+          rung++;
+          deps.log?.(
+            `decisions openai: response_format ${f} rejected, retrying with ${ladder[rung]}`,
+          );
+        }
+      }
       const comp = Completion.safeParse(res.json);
       const content = comp.success ? comp.data.choices[0]?.message.content : undefined;
       if (!comp.success || !content)

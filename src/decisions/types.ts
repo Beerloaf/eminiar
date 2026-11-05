@@ -254,6 +254,12 @@ export interface DecisionStore {
     now: number,
     maxAgeMs?: number,
   ): Array<{ id: number; note: string }>;
+  /** Atomically claims (marks delivered and returns) the pending notes: only one caller gets each. */
+  claimNotes(
+    sessionId: string,
+    now: number,
+    maxAgeMs?: number,
+  ): Array<{ id: number; note: string }>;
   markDelivered(ids: number[], now: number): void;
   latestBySubject(
     feature: DecisionFeature,
