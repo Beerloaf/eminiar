@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { ProjectContext } from "../context.js";
 import {
   type AddInput,
   addDocSources,
@@ -186,7 +187,8 @@ export function formatDiscovery(d: Discovery, max = 40): string {
             : "";
       const where = p.urls[0] ? ` · ${p.urls[0]}` : "";
       const ev = conf === "probe" || conf === "unknown" ? ` · ${p.evidence[0]}` : "";
-      lines.push(`- ${p.name} ← ${p.provider}${used}${where}${ev}${reg(p.registered)}`);
+      const val = p.docsScore !== undefined ? ` · docs value ${p.docsScore.toFixed(2)}` : "";
+      lines.push(`- ${p.name} ← ${p.provider}${used}${where}${ev}${val}${reg(p.registered)}`);
     }
     if (list.length > max) lines.push(`  … ${list.length - max} more`);
   }
@@ -207,7 +209,43 @@ export function formatDiscovery(d: Discovery, max = 40): string {
       ? `Next: em_docs {action:"add", pick:"recommended"} registers and indexes the local docs, third-party services and APIs above (${rec} candidates, a few pages each). Frameworks, infrastructure and registry packages stay out unless asked: pick "infra" | "catalog" | "registry" | "all", or names:[…]. Unknown ones: em_docs {action:"add", name, url}.`
       : 'Everything found is already registered. em_docs {action:"sync"} refreshes; em_docs {action:"lookup", query} answers from the index.',
   );
+  const triaged = d.providers.filter((p) => p.recommended && !p.registered);
+  if (triaged.length)
+    lines.push(
+      "",
+      `Docs triage recommends indexing: ${triaged.map((p) => p.name).join(", ")} — em_docs {action:"add", pick:"registry", names:${JSON.stringify(triaged.map((p) => p.name))}}.`,
+    );
   return lines.join("\n");
+}
+
+/**
+ * The opt-in docs triage (option F): scores and reorders registry and library candidates. A cheap
+ * config check comes first, so the feature code is not even loaded while it is off; any shortfall
+ * (shadow, unsupported, error) returns the discovery unchanged.
+ */
+async function triageProviders(
+  ctx: ProjectContext,
+  db: StorageAdapter,
+  d: Discovery,
+): Promise<Discovery> {
+  const cfg = ctx.config.adjudicator;
+  if (!cfg.enabled || !cfg.features.docs.enabled) return d;
+  try {
+    const [{ createDecisionClient }, { triageDiscovery }, { getProvider }] = await Promise.all([
+      import("../decisions/client.js"),
+      import("../decisions/features/docs.js"),
+      import("../embeddings/provider.js"),
+    ]);
+    const client = createDecisionClient("docs", {
+      config: cfg,
+      db,
+      context: "server",
+      getEmbedder: () => getProvider(ctx.config),
+    });
+    return (await triageDiscovery(client, cfg, d)).discovery;
+  } catch {
+    return d;
+  }
 }
 
 export const emDocs = defineTool({
@@ -259,10 +297,14 @@ export const emDocs = defineTool({
     try {
       switch (args.action) {
         case "discover": {
-          const d = discoverDocs(ctx, {
-            includeDev: args.include_dev,
-            subprojects: args.subprojects,
-          });
+          const d = await triageProviders(
+            ctx,
+            db,
+            discoverDocs(ctx, {
+              includeDev: args.include_dev,
+              subprojects: args.subprojects,
+            }),
+          );
           const out = formatDiscovery(d);
           const raw = JSON.stringify(d).length;
           recordStat(ctx, "em_docs", {

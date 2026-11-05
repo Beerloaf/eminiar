@@ -545,6 +545,65 @@ their reasons, the features, the blend weights, the provider status, the cost an
 `stats` summarises decisions, follow rate and savings. `feedback` (`good`, `too_small` or
 `too_big`) closes the decision and teaches the learned bias.
 
+## Features
+
+Beyond choosing a model, the adjudicator's provider can answer small typed questions for six other
+places where eminiar has a fuzzy decision. Each is a **feature**: off by default, personal config
+only, and it runs on whichever provider you set up (Jev, an OpenAI-compatible server or the
+offline embedding provider). The deterministic behaviour stays underneath: a feature adjusts it
+and falls back to it on a timeout, an open breaker, a missing key or low confidence. A feature
+never blocks or edits anything on its own; its output is a note or a reordering.
+
+| Feature | What it does | What it sends |
+|---|---|---|
+| `recall` | Drops memories and doc pages that matched on words but do not help the prompt, and reorders the rest. Also checks whether an earlier error is the same failure. The hook serves the term-matched result now and uses the verdict on the next prompt or on `em_recall` | Prompt plus memory and doc snippets |
+| `memory` | On `em_remember`, compares the new memory to its nearest neighbours and says in the reply when it looks like a duplicate or supersedes one (pass `supersedes` to confirm). It never edits a memory | Memory text |
+| `commit` | One advice line before `git commit`: does the message match the staged diff, debug leftovers, unmentioned work, a possible credential. Never blocks | The staged diff (files matching `commit.exclude` left out) and the message |
+| `compaction` | Scores session-guide sections (and, with `compaction.output`, `em_execute` output sections) for the current task and keeps the most useful within the budget, instead of recency order | Session-guide and output sections |
+| `swarm` | Flags a task as stalled, looping or needing a human on the task board and in `em_swarm status`, with its probability. A badge only | Task titles, status changes and blackboard posts |
+| `docs` | Scores the dependencies `em_docs discover` finds by how much their docs help a coding agent | Package names and versions |
+
+### Turn one on
+
+```
+eminiar adjudicator features                  # each feature: live, shadow, waiting or off
+eminiar adjudicator features on recall        # starts in shadow mode
+eminiar adjudicator features shadow recall off   # let it act
+eminiar adjudicator features off recall
+eminiar adjudicator features purge            # delete this project's recorded calls and cache
+```
+
+`status` lists each feature as `live` (acting), `shadow` (recording only), `waiting` (on, but
+blocked: the adjudicator is off, the provider is the heuristic, or consent is missing) or `off`,
+with the provider, whether it is remote and the data class the feature sends. `--json` prints the
+same. `eminiar doctor` shows the features you turned on and fails when one is waiting.
+
+**Shadow mode** is the default for every feature. The feature asks the provider and records the
+verdict next to what eminiar did anyway, but changes nothing, so you can compare before it acts.
+Shadow output is identical to the feature being off. `shadow <name> off` makes it live.
+
+### Consent
+
+A local provider (the embedding provider or a loopback Ollama, LM Studio or llama.cpp) keeps text
+on this machine, so features need no consent there. For a remote provider, `features on <name>`
+prints one line for the kind of text the feature sends, asks y/N (`--yes` answers it, and is
+required without a terminal), and records `<class>@<origin>` in `adjudicator.featureConsent`:
+
+| Class | Features | Line shown |
+|---|---|---|
+| prompts | all | covered by the adjudicator's own remote consent |
+| `memory` | `recall`, `memory` | sends the redacted prompt plus redacted memory and doc snippets |
+| `diffs` | `commit` | sends the redacted staged diff and the commit message |
+| `session` | `compaction` | sends redacted session-guide sections and, with `compaction.output`, redacted `em_execute` output |
+| `swarm` | `swarm` | sends task titles, status changes and redacted blackboard posts |
+| `packages` | `docs` | sends dependency names and versions only |
+
+Consent is per class and per origin, so changing `typesafe.baseUrl` asks again. Everything sent is
+redacted, cut to the feature's `maxChars`, counted by the budget and breaker, and shows in the
+[request capture](#jev-request-capture) when that is on. `EMINIAR_ADJUDICATOR_FEATURES=0`
+withdraws all features; no environment variable can turn one on. Settings are in
+[Configuration](configuration.md#adjudicator).
+
 ## Dashboard
 
 `eminiar ui` has an **Adjudicator** tab: decisions per day, follow and fallback rates, provider

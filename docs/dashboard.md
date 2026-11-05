@@ -334,6 +334,8 @@ to the whole tab.
   stored and the text is not sent back, but a provider call counts against the daily caps.
 - **Last eval.** The report saved by `eminiar adjudicator eval --save`.
 
+- **Features.** Shown whenever the adjudicator is on and any `adjudicator.features.*` entry is enabled, with any provider: one row per feature with its state (off, shadow, live, no consent), calls, cost, errors, unsupported (the provider cannot answer that question kind, so the deterministic path ran) and agreement (answered calls where the provider matched the deterministic baseline), plus the active provider. Counts only; nothing the feature asked about is stored.
+
 Links: `#/adjudicator?range=7d` and `#/adjudicator?id=<decision id>` (opens the drawer).
 
 API (JSON, loopback only). The GETs that read decisions first link new outcomes
@@ -349,6 +351,7 @@ stored 80-character head appears only in the two Jev request routes, and only wh
 | `GET /api/adjudicator/savings?since=` | realised, potential, spend, net, assumptions, tokens per successful task by tier, the tier matrix |
 | `GET /api/adjudicator/eval` | the last saved eval report, or `null` |
 | `GET /api/adjudicator/jev?since=&surface=` | the Jev impact report (only when the adjudicator is on with the `typesafe` provider; otherwise `{active:false, reason}` without reading the database; `surface` is `prompt`, `agent`, `plan`, `mcp` or `tool`; like the other tab reads it first settles pending outcomes, at most 500 rows, and carries on if that fails; the result is in `reconcile`) |
+| `GET /api/adjudicator/features?since=` | per-feature decision counts for the opt-in adjudicator features (`recall`, `memory`, `commit`, `compaction`, `swarm`, `docs`), whatever the provider: enabled, shadow, why inactive, calls, status counts, cost, shadow-vs-baseline agreement, latency, helped/hurt. `{active:false}` when the adjudicator is off or no feature is enabled, without reading the database. Counts only; no prompt, memory or diff text is stored |
 | `GET /api/adjudicator/jev/exchanges?limit=&row=` | the newest captured Jev requests without bodies: time, result, timing, items, tokens, decision ids (`limit` 1–100, default 100; `row` = only those that served that decision). `{active:false}` as for `/jev`, and `{capture:false}` when capture is off; neither reads the database |
 | `GET /api/adjudicator/jev/exchange?id=` | one captured request with the request and response bodies (redacted) and its error |
 | `POST /api/adjudicator/test` | `{text (1–20000 chars), useProvider?}`: a verdict that is never stored |

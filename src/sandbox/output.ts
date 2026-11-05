@@ -74,7 +74,18 @@ export async function processOutput(
         }),
       );
     }
-    lines.push(formatResults(responses, input.maxTokens ?? 1500));
+    let shown = responses;
+    // Opt-in output triage (off by default): one boolean check when off.
+    const tf = ctx.config.adjudicator.features.compaction;
+    if (tf.enabled && tf.output && input.intent) {
+      try {
+        const m = await import("../decisions/features/compaction.js");
+        shown = (await m.triageOutput(db, ctx, input.intent, r.documentId, responses)) ?? responses;
+      } catch {
+        // optional: the deterministic result stands
+      }
+    }
+    lines.push(formatResults(shown, input.maxTokens ?? 1500));
     // Vocabulary from this document's chunks only; see topTermsOf for why not fts5vocab.
     const bodies = db.chunksOfDocument(r.documentId).map((c) => c.body);
     const terms = topTermsOf(bodies, 40).map((t) => t.term);

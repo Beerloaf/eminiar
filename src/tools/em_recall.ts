@@ -1,4 +1,7 @@
 import { z } from "zod";
+import { featuresWanted } from "../config.js";
+import type { RerankCandidate } from "../decisions/types.js";
+import { getProvider } from "../embeddings/provider.js";
 import { vectorRanker } from "../embeddings/queue.js";
 import { list, MEMORY_KINDS, reconcile } from "../memory/store.js";
 import { search } from "../search/pipeline.js";
@@ -45,6 +48,9 @@ export const emRecall = defineTool({
       filters: { source: sources },
     });
     const seen = new Set<string>();
+    // Opt-in precision rerank of the memory hits (adjudicator.features.recall); off = unchanged.
+    const rerankOn = featuresWanted(ctx.config.adjudicator) && args.query.trim().length > 0;
+    const entries: Array<{ line: string; mem?: { key: string; cand: RerankCandidate } }> = [];
     for (const h of r.hits) {
       const d = h.chunk.document;
       const snippet = h.snippet.replace(/\s+/g, " ").trim();
@@ -55,15 +61,47 @@ export const emRecall = defineTool({
         if (args.kind && m.kind !== args.kind) continue;
         if (args.topic && !m.name.startsWith(`${args.topic}/`)) continue;
         seen.add(m.name);
-        lines.push(
-          `${m.name} [${m.kind}] ${new Date(m.updated_at ?? m.created_at).toISOString().slice(0, 10)} — ${snippet}`,
-        );
+        entries.push({
+          line: `${m.name} [${m.kind}] ${new Date(m.updated_at ?? m.created_at).toISOString().slice(0, 10)} — ${snippet}`,
+          mem: {
+            key: `memory:${m.name}`,
+            cand: {
+              key: `memory:${m.name}`,
+              label: `${m.name} [${m.kind}]`,
+              text: `${m.name}: ${m.content}`,
+              matched: [],
+              outcome: "shown",
+            },
+          },
+        });
       } else if (!args.kind && !args.topic) {
-        lines.push(
-          `[session ${d.title}] ${new Date(d.created_at).toISOString().slice(0, 10)} — ${snippet}`,
-        );
+        entries.push({
+          line: `[session ${d.title}] ${new Date(d.created_at).toISOString().slice(0, 10)} — ${snippet}`,
+        });
       }
+      if (!rerankOn && entries.length >= limit) break;
+    }
+    let ordered = entries;
+    if (rerankOn) {
+      const mems = entries.flatMap((e) => (e.mem ? [e.mem] : []));
+      const keys = await rerankMemories(
+        ctx,
+        db,
+        args.query,
+        mems.map((m) => m.cand),
+        limit,
+      );
+      if (keys) {
+        const byKey = new Map(entries.filter((e) => e.mem).map((e) => [e.mem!.key, e]));
+        const next = keys.flatMap((k) => (byKey.has(k) ? [byKey.get(k)!] : []));
+        let i = 0;
+        // memory slots keep their place among the session lines; the reranked order fills them
+        ordered = entries.flatMap((e) => (e.mem ? (i < next.length ? [next[i++]!] : []) : [e]));
+      }
+    }
+    for (const e of ordered) {
       if (lines.length >= limit) break;
+      lines.push(e.line);
     }
     if (r.corrections.length)
       lines.unshift(`(corrected: ${r.corrections.map((c) => `${c.from}→${c.to}`).join(", ")})`);
@@ -74,3 +112,39 @@ export const emRecall = defineTool({
     return text((lines.length ? lines.join("\n") : `nothing recalled for "${args.query}"`) + note);
   },
 });
+
+/**
+ * The memory keys in the order the decision provider prefers, or undefined to keep the hybrid
+ * order (feature off, shadow, unsupported, slow, or any error). Direct call within mcpMs.
+ */
+async function rerankMemories(
+  ctx: Parameters<NonNullable<typeof emRecall.handler>>[1],
+  db: ReturnType<typeof getStorage>,
+  query: string,
+  candidates: RerankCandidate[],
+  _limit: number,
+): Promise<string[] | undefined> {
+  try {
+    if (!candidates.length) return undefined;
+    const [{ createDecisionClient }, { askRecallRerank }] = await Promise.all([
+      import("../decisions/client.js"),
+      import("../decisions/features/recall.js"),
+    ]);
+    const cfg = ctx.config.adjudicator;
+    const client = createDecisionClient("recall", {
+      config: cfg,
+      db,
+      context: "server",
+      getEmbedder: () => getProvider(ctx.config),
+    });
+    return await askRecallRerank(client, {
+      path: "prompt",
+      query,
+      candidates,
+      dropBelow: cfg.features.recall.dropBelow,
+      budgetMs: cfg.features.recall.mcpMs,
+    });
+  } catch {
+    return undefined;
+  }
+}

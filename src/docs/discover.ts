@@ -46,6 +46,13 @@ export interface ProviderCandidate {
   evidence: string[];
   tags?: string[] | undefined;
   registered: boolean;
+  /**
+   * Set only by the opt-in docs triage (src/decisions/features/docs.ts) when it is live: how much
+   * a coding agent benefits from this package's documentation, 0..1, and whether the triage
+   * recommends indexing it. Absent otherwise, so discovery is unchanged.
+   */
+  docsScore?: number | undefined;
+  recommended?: boolean | undefined;
 }
 
 export interface Discovery {

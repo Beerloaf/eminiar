@@ -52,6 +52,12 @@ import {
 import type { AdjudicatorConfig, Config } from "../config.js";
 import { loadConfig, projectAdjudicatorWarning } from "../config.js";
 import type { ProjectContext } from "../context.js";
+import { type DecisionInactive, decisionInactiveReason } from "../decisions/config.js";
+import {
+  DECISION_FEATURES,
+  type DecisionFeature,
+  type DecisionFeatureSummary,
+} from "../decisions/types.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import { getStorage } from "../storage/index.js";
 import { EXCHANGE_KEEP } from "../storage/sqlite/adjudicator.js";
@@ -466,6 +472,80 @@ export function jevPayload(
       },
       ...report,
       reconcile: reconciled,
+    };
+    return ok(payload);
+  } catch {
+    return fail(503, "the adjudication database is unavailable (busy or missing); try again");
+  }
+}
+
+// --- GET /api/adjudicator/features ------------------------------------------------------
+
+/** One feature row: its settings and what it did in the window. Counts only; no text. */
+export interface FeatureRow {
+  feature: DecisionFeature;
+  enabled: boolean;
+  shadow: boolean;
+  /** Why an enabled feature is not running, or null when it is (or is off). */
+  inactive: DecisionInactive | null;
+  summary: DecisionFeatureSummary;
+}
+
+export interface FeaturesApiPayload {
+  active: true;
+  provider: {
+    configured: string;
+    effective: string;
+    degraded: string | null;
+    model: string | null;
+  };
+  features: FeatureRow[];
+  now: number;
+}
+export interface FeaturesInactive {
+  active: false;
+  reason: "disabled" | "no_features";
+  now: number;
+}
+export type FeaturesApiResponse = FeaturesApiPayload | FeaturesInactive;
+
+/**
+ * Per-feature decision counts. Answers {active:false} (reading nothing) when the adjudicator is
+ * off or no feature is enabled. The rows come from decision_calls aggregates: calls, statuses,
+ * cost, shadow agreement; never a prompt, memory or diff text. Any provider.
+ */
+export function featuresPayload(
+  ctx: ProjectContext,
+  deps: AdjudicatorRouteDeps = {},
+  window: { since?: number | undefined } = {},
+): Reply {
+  const now = (deps.now ?? Date.now)();
+  const config = deps.config ?? loadConfig(ctx.root);
+  const a = config.adjudicator;
+  if (!a.enabled) return ok({ active: false, reason: "disabled", now } satisfies FeaturesInactive);
+  if (!DECISION_FEATURES.some((f) => a.features[f].enabled))
+    return ok({ active: false, reason: "no_features", now } satisfies FeaturesInactive);
+  try {
+    const db = deps.db ?? getStorage(ctx);
+    const e: Env = { config, db, now, env: deps.env };
+    const r = resolve(e);
+    const sums = db.decisions.summary(window.since === undefined ? {} : { since: window.since });
+    const payload: FeaturesApiPayload = {
+      active: true,
+      provider: {
+        configured: r.configured,
+        effective: r.provider,
+        degraded: r.degraded ?? null,
+        model: r.model ?? null,
+      },
+      features: DECISION_FEATURES.map((f) => ({
+        feature: f,
+        enabled: a.features[f].enabled,
+        shadow: a.features[f].shadow,
+        inactive: a.features[f].enabled ? (decisionInactiveReason(a, f, deps.env) ?? null) : null,
+        summary: sums[f],
+      })),
+      now,
     };
     return ok(payload);
   } catch {
@@ -932,6 +1012,12 @@ export async function adjudicatorRoute(
     const surface = enumOf(query, "surface", JEV_SURFACES);
     if (surface.error) return surface.error;
     return jevPayload(ctx, deps, { since: since.value, surface: surface.value });
+  }
+  if (path === "/api/adjudicator/features") {
+    if (!isGet) return fail(405, "GET only");
+    const since = sinceOf(query, now, DEFAULT_SINCE);
+    if (since.error) return since.error;
+    return featuresPayload(ctx, deps, { since: since.value });
   }
   if (path === "/api/adjudicator/jev/exchanges") {
     if (!isGet) return fail(405, "GET only");

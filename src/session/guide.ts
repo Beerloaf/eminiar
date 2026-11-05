@@ -127,8 +127,38 @@ export function renderWithin(sections: Section[], budget: number): string {
   return out;
 }
 
-export function renderGuide(db: StorageAdapter, sessionId: string, budget = 2048): string {
-  const sections = buildSections(db, sessionId);
+/** A guide section as a scoring unit: `text` is its rendered line; the rest lets it be re-rendered. */
+export interface GuideSection {
+  id: string;
+  label: string;
+  text: string;
+  priority: number;
+  items: string[];
+}
+
+const sectionText = (s: Section) =>
+  `**${s.title}**: ${s.items.map((i) => i.replace(/\s+/g, " ")).join(" | ")}`;
+
+/** The session's guide sections, in render order (the unit the compaction feature scores). */
+export function guideSections(db: StorageAdapter, sessionId: string): GuideSection[] {
+  return buildSections(db, sessionId).map((s) => ({
+    id: s.title,
+    label: s.title,
+    text: sectionText(s),
+    priority: s.priority,
+    items: s.items,
+  }));
+}
+
+/** Render sections within a byte budget; renderGuide is guideSections + renderSections. */
+export function renderSections(sections: GuideSection[], budget: number): string {
   if (!sections.length) return "";
-  return renderWithin(sections, budget);
+  return renderWithin(
+    sections.map((s) => ({ title: s.label, priority: s.priority, items: s.items })),
+    budget,
+  );
+}
+
+export function renderGuide(db: StorageAdapter, sessionId: string, budget = 2048): string {
+  return renderSections(guideSections(db, sessionId), budget);
 }

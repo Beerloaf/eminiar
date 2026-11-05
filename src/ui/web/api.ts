@@ -1065,6 +1065,36 @@ export type AdjJevResponse = AdjJevImpact | AdjJevInactive;
 export const fetchJevImpact = (since: string): Promise<AdjJevResponse> =>
   api<AdjJevResponse>("/api/adjudicator/jev", { since });
 
+// --- Decision features (mirror src/ui/adjudicator-api.ts featuresPayload) ----------------
+
+export type AdjFeatureName = import("../../decisions/types.js").DecisionFeature;
+export type AdjFeatureSummary = import("../../decisions/types.js").DecisionFeatureSummary;
+export interface AdjFeatureRow {
+  feature: AdjFeatureName;
+  enabled: boolean;
+  shadow: boolean;
+  inactive: "disabled" | "no_consent" | null;
+  summary: AdjFeatureSummary;
+}
+export interface AdjFeaturesPayload {
+  active: true;
+  provider: {
+    configured: string;
+    effective: string;
+    degraded: string | null;
+    model: string | null;
+  };
+  features: AdjFeatureRow[];
+  now: number;
+}
+export type AdjFeaturesResponse =
+  | AdjFeaturesPayload
+  | { active: false; reason: "disabled" | "no_features"; now: number };
+
+/** GET /api/adjudicator/features: per-feature decision counts, whatever the provider. */
+export const fetchFeatures = (since: string): Promise<AdjFeaturesResponse> =>
+  api<AdjFeaturesResponse>("/api/adjudicator/features", { since });
+
 // --- Jev request log (mirror src/ui/adjudicator-api.ts jevExchangesPayload / jevExchangePayload) ---
 
 export type AdjExchangeSummary = import("../../adjudicator/types.js").ExchangeSummary;

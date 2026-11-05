@@ -176,7 +176,7 @@ only:
   `apply`, `advice`, `embedding`, `learning` and `cache` may be set in the committed
   `eminiar.config.json`. Everything that decides where text and keys go or how much is spent
   (`provider`, `typesafe`, `openai`, `keyEnv`, `remoteConsent`, `remoteConsentOrigins`,
-  `privacy`, `budget`, `timeouts`, `breaker`) comes from `~/.eminiar/config.json` only, and from
+  `privacy`, `budget`, `timeouts`, `breaker`, `features`, `featureConsent`) comes from `~/.eminiar/config.json` only, and from
   there only while that file is outside the project (see `EMINIAR_HOME` below).
 
 | Key | Default | Description |
@@ -235,6 +235,18 @@ only:
 | `privacy.maxChars` | `2000` | Characters of redacted text a remote provider receives per item |
 | `privacy.storeHead` | `true` | Keep the first 80 redacted characters of each input in the database |
 | `privacy.captureExchanges` | `false` | Keep the newest 100 requests sent to TypeSafe Jev and its answers, with timing, for the dashboard. They contain redacted prompt text, at most 65,536 characters per request or answer. Personal `~/.eminiar/config.json` only: `eminiar.config.json` cannot set it. See [Jev request capture](adjudicator.md#jev-request-capture) |
+| `features.<name>` | all off | One object per decision feature, `<name>` being `recall`, `memory`, `commit`, `compaction`, `swarm` or `docs`; `true`/`false` is shorthand for `{"enabled": …}`. Personal config only. Manage with `eminiar adjudicator features`. See [Features](adjudicator.md#features) |
+| `features.<name>.enabled` | `false` | Turn the feature on. It also needs the adjudicator on with a provider other than the heuristic, and for a remote provider the feature's data-class consent |
+| `features.<name>.shadow` | `true` | Record verdicts without acting on them. `false` lets the feature act |
+| `features.<name>.maxCallsPerDay` | per feature (recall 500, memory 100, commit 100, compaction 50, swarm 300, docs 20) | Daily call cap for this feature |
+| `features.<name>.maxChars` | per feature (recall 600, memory 1500, commit 4000, compaction 400, swarm 600) | Characters of redacted text per item sent to the provider. `docs` sends names only |
+| `features.recall` | `dropBelow` 0.25, `mcpMs` 1200, `jobMs` 2500 | Verdicts below `dropBelow` drop a recalled memory or doc page; deadlines for `em_recall` and the background job |
+| `features.memory` | `minProb` 0.6, `k` 5, `mcpMs` 1500 | Nearest memories compared on `em_remember`; the probability a duplicate or supersede note needs |
+| `features.commit` | `minProb` 0.7, `jobMs` 4000, `exclude` (globs) | Probability a pre-commit note needs; files matching `exclude` (lockfiles, secrets, binaries) are never sent |
+| `features.compaction` | `output` false, `minKeep` 0.3, `jobMs` 4000, `mcpMs` 800 | `output: true` also triages `em_execute` output sections; sections scored below `minKeep` go first |
+| `features.swarm` | `flagAbove` 0.7, `bgMs` 3000 | Probability a stalled, looping or needs-human flag needs |
+| `features.docs` | `minScore` 0.5, `mcpMs` 3000 | Dependencies scoring below this are not recommended by `em_docs discover` |
+| `featureConsent` | `[]` | `"<class>@<origin>"` lines (`memory`, `diffs`, `session`, `swarm`, `packages`) written by `features on` after you agree. Personal config only; at most 32 |
 
 ## Environment variables
 
@@ -252,4 +264,5 @@ only:
 | `EMINIAR_ADJUDICATOR_MODE` | Overrides `adjudicator.mode` (`advise` or `apply`) |
 | `EMINIAR_ADJUDICATOR_REMOTE=0` | Withdraws remote consent. `=1` does nothing: no environment variable can grant consent, because a project's `.claude/settings.json` can set them |
 | `EMINIAR_ADJUDICATOR_CAPTURE=0` | Turns Jev request capture off (`=1` does nothing) |
+| `EMINIAR_ADJUDICATOR_FEATURES=0` | Withdraws every decision feature (`=1` does nothing: no environment variable can switch one on) |
 | `EMINIAR_ADJUDICATOR_KEY` | Adjudicator provider key, checked after `keyEnv` and the provider's own variable (`TYPESAFE_API_KEY`, `GROQ_API_KEY`, `CEREBRAS_API_KEY`) and before `~/.eminiar/adjudicator.key` |
