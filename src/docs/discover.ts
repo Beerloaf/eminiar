@@ -59,6 +59,12 @@ export interface ProviderCandidate {
    */
   publicVerified?: boolean | undefined;
   /**
+   * True only when every signal for this candidate matched the BUNDLED catalogue of well-known
+   * packages. Entries a team adds under `docs.catalog` never set it (they may name private
+   * libraries), so the docs triage never sends those names.
+   */
+  builtinCatalog?: boolean | undefined;
+  /**
    * Set only by the opt-in docs triage (src/decisions/features/docs.ts) when it is live: how much
    * a coding agent benefits from this package's documentation, 0..1, and whether the triage
    * recommends indexing it. Absent otherwise, so discovery is unchanged.
@@ -1224,10 +1230,12 @@ export function discoverDocs(ctx: ProjectContext, opts: DiscoverOptions = {}): D
       evidence: string;
       nonRegistry?: boolean | undefined;
       publicVerified?: boolean | undefined;
+      builtinCatalog?: boolean | undefined;
     },
   ) => {
     const cur = byName.get(c.name);
     if (cur) {
+      if (!c.builtinCatalog) delete cur.builtinCatalog;
       if (!c.nonRegistry) delete cur.nonRegistry;
       if (!c.publicVerified) delete cur.publicVerified;
       if (!cur.usedBy.includes(c.usedBy)) cur.usedBy.push(c.usedBy);
@@ -1248,6 +1256,7 @@ export function discoverDocs(ctx: ProjectContext, opts: DiscoverOptions = {}): D
       registered: registeredNames.has(c.name) || registeredProviders.has(c.provider),
       ...(c.nonRegistry ? { nonRegistry: true } : {}),
       ...(c.publicVerified ? { publicVerified: true } : {}),
+      ...(c.builtinCatalog ? { builtinCatalog: true } : {}),
     });
   };
 
@@ -1267,6 +1276,8 @@ export function discoverDocs(ctx: ProjectContext, opts: DiscoverOptions = {}): D
         tags: entry.tags,
         usedBy: project,
         evidence,
+        // bundled catalogue only: team entries in docs.catalog may name private libraries
+        builtinCatalog: catalogLookup(s.kind, s.key) !== undefined,
       });
       // a catalogue hit is registered if any of its evidence providers is
       const c = byName.get(entry.id)!;

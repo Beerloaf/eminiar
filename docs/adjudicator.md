@@ -576,7 +576,7 @@ never blocks or edits anything on its own; its output is a note or a reordering.
 | `commit` | One advice line before `git commit`: does the message match the staged diff, debug leftovers, unmentioned work, a possible credential. Never blocks | The redacted staged diff and the commit message. Files matching `commit.exclude` and a built-in deny floor of secret-bearing paths (applied in addition to `commit.exclude`) are left out |
 | `compaction` | Scores session-guide sections (and, with `compaction.output`, `em_execute` output sections) for the current task and keeps the most useful within the budget, instead of recency order | Redacted session-guide sections (the latest request, intent, files, tasks and similar) and, with `compaction.output`, redacted sections of `em_execute` command output only (never `em_execute_file` or `em_batch_execute` contents; lines that look like secrets are masked) |
 | `swarm` | Flags a task as stalled, looping or needing a human in the `em_swarm status` text (the dashboard task board shows no badge), with its probability. A badge only | Task titles, statuses, the first line of task results, worker roles and tool-call counts, the first line of worker final messages, spawn prompts and other trail events, and redacted blackboard posts |
-| `docs` | Scores the dependencies `em_docs discover` finds by how much their docs help a coding agent | Package names only, never versions, and only for well-known catalogued packages or names your lockfile shows came from the default public registry (workspace members, scoped npm packages, git, URL and path sources, names a declared private index could serve, and anything unverified are never sent) |
+| `docs` | Scores the dependencies `em_docs discover` finds by how much their docs help a coding agent | Package names only, never versions, and only for packages in eminiar's bundled catalogue of well-known public packages (entries you add under `docs.catalog` never count) or names your lockfile shows came from the default public registry (workspace members, scoped npm packages, git, URL and path sources, names a declared private index could serve, and anything unverified are never sent) |
 
 ### Turn one on
 
@@ -618,35 +618,51 @@ the answers are cached and recorded.
 - **Commit advice arrives late.** The detached job runs while the commit command does, so the note
   reaches Claude with the next tool result or prompt, after the commit has already run. It is
   advice for the next step, never a gate.
-- **Diff scrubbing sees only the staged hunk, so it drops what it cannot place.** The scrub works
-  on `git diff -U0` (no context lines). It sends added lines only, from allowed source and text
-  files, never from the deny floor or `commit.exclude`:
+- **Diff scrubbing is best effort, and sees only the staged hunk.** It works on `git diff -U0`
+  (no context lines, paths pinned to `a/` and `b/` whatever `diff.noprefix` says) and sends added
+  lines only, from allowed source and text files, never from the deny floor or `commit.exclude`.
+  Redaction sits behind your consent and the deny floor; it is not a guarantee on its own.
   - *Deny floor* (always applies, `commit.exclude` cannot narrow it): `.env` files, keys and
     certificates, tool credential files (`.npmrc`, `.pypirc`, `.netrc`, `.git-credentials`,
     `.yarnrc*`, `.dockercfg`, `.htpasswd`, `.s3cfg`, `.boto`), Terraform `*.tfvars*` and
     `*.tfstate*`, everything under a `secret/`, `secrets/`, `credential/`, `credentials/`,
     `cred/`, `creds/`, `vault/`, `vaults/`, `private/`, `key/`, `keys/`, `.docker/`, `.gnupg/`,
-    `.ssh/`, `.aws/` or `.kube/` directory at any depth (source files there included), and data
-    files (`.json`, `.yaml`, `.toml`, `.txt`, `.ini`, `.conf`, `.properties`, `.xml` and similar)
-    named after a secret: `*secret*`, `*password*`, `*token*`, `*creds*`, `*vault*`, `*wallet*`,
-    `*keystore*`, `auth.json`, `gcp-key.json`, `db_pass.txt` and the like. Lock files, minified
-    files, source maps and databases are left out too.
+    `.ssh/`, `.aws/` or `.kube/` directory at any depth (source files there included; singular
+    and plural, any case), data files (`.json`, `.yaml`, `.toml`, `.txt`, `.ini`, `.conf`,
+    `.properties`, `.xml` and similar) named after a secret (`*secret*`, `*password*`, `*token*`,
+    `*creds*`, `*vault*`, `*wallet*`, `*keystore*`, `auth.json`, `gcp-key.json`, `db_pass.txt`),
+    and secret-store names (`secrets.*`, `credentials*`, `*service-account*`, `*kubeconfig*`,
+    `htpasswd*`, `passphrase*`). Source modules (`.ts`, `.js`, `.py`, `.go`, `.rs`, `.java` and
+    similar) are exempt from that last, name-based group only: `secrets.ts` or `credentials.py`
+    is code and is scrubbed line by line, while `secrets.json` is denied.
+    A rename or copy is checked under both its old and its new path. Lock files, minified files,
+    source maps and databases are left out too.
+  - *Kubernetes Secrets*: a YAML or JSON manifest with `kind: Secret` (or `SealedSecret`) is
+    dropped whole. In any other manifest, `data:` and `stringData:` children are masked, and a
+    `name: DB_PASSWORD` entry keeps its name while its sibling `value:` is masked.
+  - *Secret names*: a name counts as secret when its last word is a secret word, singular or
+    plural (`password`, `passwords`, `tokens`, `api_keys`), so `JWT_SIGNING_KEY` and `x-api-key`
+    are masked while `keyEnv` and `token_count` are not. A TOML table whose name is secret
+    (`[secrets]`, `[database.credentials]`) has every key in it masked.
   - *Values that run on*: a secret-named key keeps its name and loses its value, and every line
-    the value continues on is dropped as well: YAML block scalars and more-indented lines, open
-    quotes, TOML and Python triple quotes (`"""`, `'''`), backslash continuations (`.properties`,
-    shell), brackets left open (`password = (`, `"token": {`), shell heredocs and a JSON or
-    similar key whose value starts on the next line.
-  - *Lines whose key is outside the hunk*: in YAML, TOML and JSON files a hunk's leading lines are
-    dropped until one whose key is known: a YAML line at column 0, a TOML `key =` or `[table]`
-    line, a JSON `"key":` line. Editing only the body of a `db_password: |` block, a line inside a
-    TOML `"""` string or a JSON value under a key above the hunk therefore sends nothing; the cost
-    is that an edit deep inside a YAML file sends nothing either. The default `commit.exclude`
-    also leaves out Helm-style values files (`values*.yaml`, `values*.yml`, `*-values.yaml`,
-    `*_values.yaml`), which hold deployment secrets under keys that do not look secret.
-  - *What stays possible*: a secret under a key that does not look secret, in a file the lists
-    allow (`config.json` with `"bootstrap": "..."`), a multi-line string in a source file opened
-    above the hunk, and secrets in prose (`.md`, `.txt`). Long hex and base64 runs and well-known
-    token shapes are masked wherever they appear. Add such files to `commit.exclude`.
+    the value continues on is dropped as well: YAML block scalars, more-indented lines and a list
+    under the key, open quotes, TOML and Python triple quotes (`"""`, `'''`), backslash
+    continuations (`.properties`, shell), brackets left open (`password = (`, `"token": {`), shell
+    heredocs and a key whose value starts on the next line.
+  - *Hunks that start mid-file*: in YAML, TOML and JSON files a hunk's leading lines are dropped
+    until one whose key is visible: a YAML mapping key at column 0 (a `- item` does not count,
+    it belongs to a key above) or `---`, a TOML `key =` or `[table]` line, a JSON `"key":` line at
+    the top level. Until then, a JSON key, and a TOML key before a `[table]` header, keeps its name
+    and loses its value. The cost is that an indented edit deep inside a YAML file sends nothing.
+    The default `commit.exclude` also leaves out Helm-style values files (`values*.yaml`,
+    `*-values.yaml`, `*_values.yaml`), which hold deployment secrets under keys that do not look
+    secret.
+  - *Accepted limits*: a multi-line secret opened above a `-U0` hunk in a source, shell or
+    Markdown file (`.py`, `.ts`, `.sh`, `.md` and so on) cannot be seen, because there is no
+    structure to anchor on; a secret on a line that carries no secret-looking name (a bare token
+    in prose, a value under a key such as `"bootstrap":`) is only caught by its shape. Long hex
+    and base64 runs and well-known token shapes are masked wherever they appear. Add files you
+    know hold such text to `commit.exclude`.
 - **Recall verdicts are shared by search terms.** The hook, `em_recall` and later prompts reuse one
   verdict whenever the extracted search terms and the candidates match, even if the prompt wording
   differs. A verdict made for one prompt can therefore shape another with the same terms.
@@ -663,9 +679,9 @@ required without a terminal), and records `<class>@<origin>` in `adjudicator.fea
 | prompts | all | covered by the adjudicator's own remote consent |
 | `memory` | `recall`, `memory` | `recall` sends the redacted prompt plus redacted memory and doc snippets (up to `maxChars` each); `memory` sends the redacted text of the memory just saved (up to `privacy.maxChars`) and of its nearest neighbour memories (up to `maxChars` each), never the prompt |
 | `diffs` | `commit` | sends the redacted staged diff (up to `maxChars`, files matching `commit.exclude` and the built-in deny floor left out) and the commit message |
-| `session` | `compaction` | sends redacted session-guide sections (the latest request, intent, files, tasks and similar) and, with `compaction.output` on, redacted sections of `em_execute` command output only (never `em_execute_file` or `em_batch_execute` contents; lines that look like secrets are masked) |
-| `swarm` | `swarm` | sends task titles, statuses, the first line of task results, worker roles and tool-call counts, the first line of worker final messages, spawn prompts and other trail events, and redacted blackboard posts of swarm runs |
-| `packages` | `docs` | sends package names only, never versions, and only for well-known catalogued packages or names your lockfile shows came from the default public registry (registry.npmjs.org or pypi.org; Go modules on vendor-run hosts); workspace members, scoped npm packages, git, URL and path sources, names a declared private index could serve, and anything unverified are never sent |
+| `session` | `compaction` | sends redacted session-guide sections: your latest request and intent, files and tasks, constraints, errors and tool output (failed command stderr), the assistant's own replies, git commands including commit messages, and URL paths and queries you fetched and, with `compaction.output` on, redacted sections of `em_execute` command output only (never `em_execute_file` or `em_batch_execute` contents; lines that look like secrets are masked) |
+| `swarm` | `swarm` | sends task titles, statuses, the first line of task results, worker roles and tool-call counts, the first line of worker final messages, spawn prompts and other trail events of swarm runs (blackboard posts are never sent); the separate [swarm plans](#swarm-plans) surface sends each planned task's title and detail under the prompt consent alone |
+| `packages` | `docs` | sends package names only, never versions, and only for packages in eminiar's bundled catalogue of well-known public packages (entries you add under `docs.catalog` never count) or names your lockfile shows came from the default public registry (registry.npmjs.org or pypi.org; Go modules on vendor-run hosts); workspace members, scoped npm packages, git, URL and path sources, names a declared private index could serve, and anything unverified are never sent |
 
 Consent is per class and per origin, so changing `typesafe.baseUrl` asks again. Everything sent is
 redacted, cut to the feature's `maxChars`, counted by the budget and breaker, and shows in the

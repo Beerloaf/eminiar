@@ -261,16 +261,12 @@ describe("kickSwarmJudge uses the same gate", () => {
         Date.now() + 300_000,
       ),
     ).toBe(false);
-    db.decisions.insertCall(row({ feature: "swarm" }));
+    // The cap counts the UTC day of `now`: the call must carry the same instant, or the test
+    // fails whenever it runs within 400 s of UTC midnight.
+    const at = Date.now() + 400_000;
+    db.decisions.insertCall(row({ feature: "swarm", ts: at }));
     expect(
-      kickSwarmJudge(
-        ctxOf(cfg({}, { maxCallsPerDay: 1 })),
-        db,
-        runId,
-        tasks,
-        "sess",
-        Date.now() + 400_000,
-      ),
+      kickSwarmJudge(ctxOf(cfg({}, { maxCallsPerDay: 1 })), db, runId, tasks, "sess", at),
     ).toBe(false);
     expect(spawn).toHaveBeenCalledTimes(0);
   });

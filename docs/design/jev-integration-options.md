@@ -170,7 +170,7 @@ Each option names the eminiar seam it plugs into, the Jev question shape, and th
    evaluated offline from data eminiar already records. Ship each behind shadow mode: log
    Jev's verdict next to the baseline for a while, then enable the blend, as the
    `jev-blend-tuning` eval did.
-3. **E next**, once the dashboard's Jev impact panel can show per-feature help/hurt counts.
+3. **E next**, once the dashboard's Features card shows per-feature calls, errors and shadow-vs-baseline agreement (it has no help/hurt counts: nothing records them).
 4. **C and D only after** the redaction bar for diffs and tool output has its own review. F
    whenever convenient.
 
@@ -184,8 +184,9 @@ Each option names the eminiar seam it plugs into, the Jev question shape, and th
   have their own line, shown by `eminiar adjudicator features on <name>` and stored as
   `<class>@<origin>` in `adjudicator.featureConsent`. A changed `baseUrl` asks again. Local
   providers need none.
-- **D3. A new section in the impact panel.** Per-feature calls, spend and help/hurt counts show in
-  their own section of the dashboard's impact panel, next to the adjudicator's own figures.
+- **D3. A Features card.** Per-feature calls, spend, errors, unsupported and shadow-vs-baseline
+  agreement show in their own card on the dashboard's Adjudicator tab, next to the adjudicator's
+  own figures. Help/hurt counts were dropped: nothing records them.
 - **D4. Shadow is per feature and on by default.** `eminiar adjudicator features on` starts in
   shadow; `features shadow <name> off` lets the feature act.
 - **D5. All options went ahead:** the foundation, A with G, B, C, D, E and F, each behind its own

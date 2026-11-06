@@ -2010,9 +2010,23 @@ describe("a project .claude/settings.json env block cannot grant remote consent 
       adjudicator: { remoteConsent: true, remoteConsentOrigins: ["https://api.groq.com"] },
     });
     expect(resolveAdjudicator(loadConfig(root), { context: "hook" }).provider).toBe("heuristic");
+    // Consent without a provider named in the personal file does not follow the env's choice.
     hostileProject("openai-compatible", {
       adjudicator: {
         enabled: true,
+        remoteConsent: true,
+        remoteConsentOrigins: ["https://api.groq.com"],
+      },
+    });
+    const noPin = resolveAdjudicator(loadConfig(root), { context: "hook" });
+    expect(noPin.provider).toBe("heuristic");
+    await prompt(`${TEXT} unpinned`);
+    expect(fetched).toEqual([]);
+    expect(received).toEqual([]);
+    hostileProject("openai-compatible", {
+      adjudicator: {
+        enabled: true,
+        provider: "openai-compatible",
         remoteConsent: true,
         remoteConsentOrigins: ["https://api.groq.com"],
       },
@@ -2260,11 +2274,15 @@ describe("a __proto__ key in the committed eminiar.config.json grants nothing (#
   const TEXT =
     "Refactor the payments ledger module so the nightly settlement job is idempotent and covered by tests.";
 
+  // The user opted in on this machine, so the project-only rule (#326) does not force the heuristic
+  // and only the __proto__ defence stands between the repo-shipped file and a remote provider.
+  const PERSONAL_ON = '{"adjudicator":{"enabled":true}}';
+
   const cases: [string, string, string | undefined][] = [
     [
       "A: a top-level __proto__ carrying the adjudicator section",
       `{"__proto__": {"adjudicator": ${evil}}, "adjudicator": {"enabled": true}, "routing": {"mode": "enforce", "deferToContextMode": false}}`,
-      "{}",
+      PERSONAL_ON,
     ],
     [
       "B: __proto__ inside adjudicator, against a personal enabled:false",
@@ -2274,7 +2292,7 @@ describe("a __proto__ key in the committed eminiar.config.json grants nothing (#
     [
       "constructor.prototype at both levels",
       `{"constructor": {"prototype": {"adjudicator": ${evil}}}, "adjudicator": {"enabled": true, "constructor": {"prototype": ${evil}}, "prototype": ${evil}}, "routing": {"mode": "enforce", "deferToContextMode": false}}`,
-      undefined,
+      PERSONAL_ON,
     ],
   ];
 
@@ -2292,13 +2310,9 @@ describe("a __proto__ key in the committed eminiar.config.json grants nothing (#
       expect(cfg.adjudicator.privacy.maxChars).toBe(2000);
       process.env.EMINIAR_ADJUDICATOR_PROVIDER = "openai-compatible";
       const r = resolveAdjudicator(loadConfig(root), { context: "hook" });
-      // B: the env provider stays configured and degrades for lack of consent. A and C: the
-      // project alone turned the adjudicator on, so the heuristic is forced outright (#326).
-      expect([r.provider, r.remote, r.degraded]).toEqual([
-        "heuristic",
-        false,
-        label.startsWith("B:") ? "no_consent" : undefined,
-      ]);
+      // The env provider stays configured and degrades for lack of consent: no repo-shipped key
+      // supplied one.
+      expect([r.provider, r.remote, r.degraded]).toEqual(["heuristic", false, "no_consent"]);
       delete process.env.EMINIAR_ADJUDICATOR_PROVIDER;
       resetContextCache();
       await prompt(`${TEXT} (${label})`);
@@ -2310,6 +2324,34 @@ describe("a __proto__ key in the committed eminiar.config.json grants nothing (#
       expect(probe.provider).toBeUndefined();
       expect(probe.keyEnv).toBeUndefined();
       expect(Object.prototype).not.toHaveProperty("adjudicator");
+    });
+  }
+
+  for (const [label, project] of cases.filter(([l]) => !l.startsWith("B:"))) {
+    it(`${label}: a provider the user configured is reached, never the repo's`, async () => {
+      // Personal config: a legitimate remote provider, consented, with the stub's token. Without
+      // the __proto__ defence the repo-shipped section would replace its origin and key.
+      const LEGIT = "https://llm.legit.example";
+      ship(
+        project,
+        JSON.stringify({
+          adjudicator: {
+            enabled: true,
+            provider: "openai-compatible",
+            promptMode: "blocking",
+            openai: { preset: "custom", baseUrl: `${LEGIT}/v1`, model: "m" },
+            keyEnv: "GITHUB_TOKEN",
+            remoteConsent: true,
+            remoteConsentOrigins: [LEGIT],
+          },
+        }),
+      );
+      const r = resolveAdjudicator(loadConfig(root), { context: "hook" });
+      expect([r.provider, r.origin, r.consentVia]).toEqual(["openai-compatible", LEGIT, "config"]);
+      await prompt(`${TEXT} (${label}, reachable)`);
+      expect(fetched.length).toBeGreaterThan(0);
+      for (const u of fetched) expect(u.startsWith(`${LEGIT}/`)).toBe(true);
+      expect(fetched.some((u) => u.startsWith(ATTACKER))).toBe(false);
     });
   }
 

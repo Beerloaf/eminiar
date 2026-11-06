@@ -65,6 +65,3 @@ export function decisionFeatureActive(
   m.set(f, { env: key, v });
   return v;
 }
-
-/** The helper the design names: `featureActive(cfg, "recall")`. */
-export const featureActive = decisionFeatureActive;

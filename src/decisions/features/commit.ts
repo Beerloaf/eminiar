@@ -1,4 +1,3 @@
-import { inputHash } from "../../adjudicator/redact.js";
 import { loadConfig } from "../../config.js";
 import { git } from "../../history/log.js";
 import { redactDiff } from "../diff-redact.js";
@@ -10,6 +9,7 @@ import {
   type Decision,
   type DecisionQuestionSpec,
 } from "../types.js";
+import { hash12 } from "./recall.js";
 
 /**
  * Decision feature "commit" (docs/design/jev-integration-options.md, option C): before a
@@ -105,14 +105,23 @@ export function commitMessage(cmd: string): string {
   return parts.join("\n\n").trim().slice(0, MESSAGE_CHARS);
 }
 
+/** Pinned so a user's diff.noprefix, diff.mnemonicPrefix, textconv or external driver cannot change the parsed paths. */
+const DIFF_FLAGS = [
+  "--no-color",
+  "--no-ext-diff",
+  "--no-textconv",
+  "--src-prefix=a/",
+  "--dst-prefix=b/",
+];
+
 /**
  * The diff a commit takes: the staged one (or HEAD's with -a). The job runs detached, so the
  * commit may have landed already and the staged diff is empty; then the HEAD commit's own diff
  * stands in, only when it was made after the job was queued and the command was not --amend.
  */
-function stagedDiff(root: string, cmd: string, queuedAt?: number): string {
+export function stagedDiff(root: string, cmd: string, queuedAt?: number): string {
   const { all, amend } = commitFlags(cmd);
-  const args = ["diff", "--no-color", "--no-ext-diff", "-U0", all ? "HEAD" : "--cached"];
+  const args = ["diff", ...DIFF_FLAGS, "-U0", all ? "HEAD" : "--cached"];
   const diff = git(root, args, { allowFail: true });
   if (diff.trim() || amend || typeof queuedAt !== "number") return diff;
   const ct = Number.parseInt(
@@ -120,7 +129,7 @@ function stagedDiff(root: string, cmd: string, queuedAt?: number): string {
     10,
   );
   if (!Number.isFinite(ct) || ct < Math.floor(queuedAt / 1000)) return "";
-  return git(root, ["show", "--no-color", "--no-ext-diff", "-U0", "--format=", "HEAD"], {
+  return git(root, ["show", ...DIFF_FLAGS, "-U0", "--format=", "HEAD"], {
     allowFail: true,
   });
 }
@@ -134,7 +143,7 @@ function inputOf(
   if (!summary) return undefined;
   return {
     feature: "commit",
-    subject: `commit:${inputHash(`${message}\n${summary}`).slice(0, 12)}`,
+    subject: `commit:${hash12(`${message}\n${summary}`)}`,
     context: `Commit message:\n${message || "(none given on the command line)"}`,
     items: [{ id: "diff", text: summary, label: "staged diff" }],
     questions: QUESTIONS.map(({ advice: _a, ...q }) => q),

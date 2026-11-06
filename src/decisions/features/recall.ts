@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { inputHash } from "../../adjudicator/redact.js";
 import { loadConfig } from "../../config.js";
 import { promptTerms } from "../../session/recall.js";
 import type { DecisionFeatureModule, HookSeam } from "../feature.js";
@@ -51,8 +51,8 @@ function questionFor(key: string): DecisionQuestionSpec {
   return key.startsWith("err:") ? SAME_FAILURE : RELEVANT;
 }
 
-function hash12(s: string): string {
-  return createHash("sha256").update(s).digest("hex").slice(0, 12);
+export function hash12(s: string): string {
+  return inputHash(s).slice(0, 12);
 }
 
 /**

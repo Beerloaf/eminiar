@@ -60,7 +60,6 @@ function toRow(r: Row): DecisionCallRow {
     note: (r.note as string | null) ?? null,
     noteSession: (r.note_session as string | null) ?? null,
     deliveredAt: (r.delivered_at as number | null) ?? null,
-    feedback: (r.feedback as DecisionCallRow["feedback"]) ?? null,
   };
 }
 
@@ -77,8 +76,6 @@ function emptySummary(): DecisionFeatureSummary {
     costUsd: 0,
     p50Ms: null,
     p95Ms: null,
-    helped: 0,
-    hurt: 0,
   };
 }
 
@@ -291,7 +288,7 @@ export class SqliteDecisionStore implements DecisionStore {
       DecisionFeatureSummary
     >;
     const rows = this.prep(
-      `SELECT feature, status, mode, changed, applied, latency_ms, cost_usd, feedback
+      `SELECT feature, status, mode, changed, applied, latency_ms, cost_usd
          FROM decision_calls WHERE ts >= ?`,
     ).all(o.since ?? 0) as Row[];
     const lat = new Map<DecisionFeature, number[]>();
@@ -316,8 +313,6 @@ export class SqliteDecisionStore implements DecisionStore {
         l.push(r.latency_ms);
         lat.set(f, l);
       }
-      if (r.feedback === "helped") s.helped++;
-      else if (r.feedback === "hurt") s.hurt++;
     }
     for (const [f, l] of lat) {
       l.sort((a, b) => a - b);
@@ -347,10 +342,6 @@ export class SqliteDecisionStore implements DecisionStore {
            ORDER BY id DESC LIMIT ?`,
       ).all(...params, limit) as Row[]
     ).map(toRow);
-  }
-
-  feedback(id: number, v: "helped" | "hurt" | null): boolean {
-    return this.prep("UPDATE decision_calls SET feedback = ? WHERE id = ?").run(v, id).changes > 0;
   }
 
   purge(): void {

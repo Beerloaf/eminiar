@@ -264,7 +264,6 @@ export interface DecisionCallRow {
   note: string | null;
   noteSession: string | null;
   deliveredAt: number | null;
-  feedback: "helped" | "hurt" | null;
 }
 
 export interface DecisionFeatureSummary {
@@ -280,8 +279,6 @@ export interface DecisionFeatureSummary {
   costUsd: number;
   p50Ms: number | null;
   p95Ms: number | null;
-  helped: number;
-  hurt: number;
 }
 
 export interface DecisionStore {
@@ -313,7 +310,6 @@ export interface DecisionStore {
   ): DecisionCallRow[];
   summary(o?: { since?: number }): Record<DecisionFeature, DecisionFeatureSummary>;
   list(o?: { feature?: DecisionFeature; limit?: number; beforeId?: number }): DecisionCallRow[];
-  feedback(id: number, v: "helped" | "hurt" | null): boolean;
   /** Clears decision_calls and decision_cache. */
   purge(): void;
   /** Takes an in-flight slot for a detached job (per scope and in all); false when none is free. */

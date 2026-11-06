@@ -1,4 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { type AdjudicatorConfig, AdjudicatorConfigSchema } from "../../src/config.js";
 import { swarmBadges, trailHash } from "../../src/decisions/features/swarm.js";
 import type { DecisionCallRow } from "../../src/decisions/types.js";
@@ -8,6 +11,33 @@ import type { RunSnapshot } from "../../src/swarm/runtime.js";
 import type { SwarmEventRow, TaskRow } from "../../src/swarm/types.js";
 
 const ORIGIN = "https://api.typesafe.ai";
+
+// Hermetic: swarmBadges resolves the provider from the environment and the key file. Without a
+// key it degrades to the heuristic and hides every badge, so the result would depend on whether
+// the machine has ~/.eminiar/adjudicator.key. Use an empty home and a fake key from the env.
+const KEYS = [
+  "EMINIAR_HOME",
+  "TYPESAFE_API_KEY",
+  "EMINIAR_ADJUDICATOR",
+  "EMINIAR_ADJUDICATOR_PROVIDER",
+];
+const saved: Record<string, string | undefined> = {};
+let tmpHome: string;
+beforeAll(() => {
+  for (const k of KEYS) saved[k] = process.env[k];
+  tmpHome = mkdtempSync(join(tmpdir(), "em-swarm-judge-"));
+  process.env.EMINIAR_HOME = tmpHome;
+  process.env.TYPESAFE_API_KEY = "test-key-not-real";
+  delete process.env.EMINIAR_ADJUDICATOR;
+  delete process.env.EMINIAR_ADJUDICATOR_PROVIDER;
+});
+afterAll(() => {
+  for (const k of KEYS) {
+    if (saved[k] === undefined) delete process.env[k];
+    else process.env[k] = saved[k];
+  }
+  rmSync(tmpHome, { recursive: true, force: true });
+});
 
 function cfg(swarm: Record<string, unknown>): AdjudicatorConfig {
   return AdjudicatorConfigSchema.parse({

@@ -1,10 +1,10 @@
 import { spawn as nodeSpawn } from "node:child_process";
 import { lstatSync, realpathSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { authLockout, overBudget } from "../adjudicator/breaker.js";
 import { currentKeyFingerprint, resolveAdjudicator } from "../adjudicator/config.js";
-import type { AdjudicatorConfig } from "../config.js";
+import { type AdjudicatorConfig, isInside } from "../config.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import { decisionFeatureConfig } from "./config.js";
 import { DECISION_FEATURES, type DecisionFeature, type DecisionJob } from "./types.js";
@@ -116,12 +116,6 @@ export function releaseJobSlot(
 
 const HOOK_NAME = /^hook\.(?:js|mjs|cjs)$/;
 
-/** True when `p` is `root` or lies under it (both already resolved). */
-function within(p: string, root: string): boolean {
-  const rel = relative(root, p);
-  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
-}
-
 /**
  * The hook entry of the running installation: the real path of the hook.js next to this module
  * (the bundle is flat, so server.js, cli.js, hook.js and the hook-*.js chunks share dist/).
@@ -174,7 +168,7 @@ export function isHookScript(script: string, check: HookScriptCheck = {}): boole
       } catch {
         continue;
       }
-      if (within(expected, real) && !within(moduleFile, real)) return false;
+      if (isInside(expected, real) && !isInside(moduleFile, real)) return false;
     }
     return true;
   } catch {

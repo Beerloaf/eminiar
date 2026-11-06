@@ -234,15 +234,22 @@ export const HOOK_LAZY_CHUNKS = [
   "swarm",
 ];
 
+/** hook.js, the shared static chunk, the adjudicator hook handlers and the adjudicator core chunk. */
+export const HOOK_ADJUDICATOR_MAX_FILES = 4;
+
 /**
  * The problems in the hook build; empty when it is fine. dist/hook.js must load exactly one file
  * statically (the shared chunk, see oneSharedHookChunk in tsup.config.ts), and every other
  * dist/hook-*.js must be a known lazy entry.
  * @param {string} hookText dist/hook.js
+ * With `read` (file name to text), it also counts the files an adjudicator-on prompt or Bash hook
+ * loads (hook.js, its static closure, the adjudicator hook handlers and their static closure) and
+ * fails when that exceeds HOOK_ADJUDICATOR_MAX_FILES.
  * @param {string[]} files file names in dist/
+ * @param {(name: string) => string | undefined} [read]
  * @returns {string[]}
  */
-export function checkHookChunks(hookText, files) {
+export function checkHookChunks(hookText, files, read) {
   const problems = [];
   const stat = new Set();
   for (const m of hookText.matchAll(
@@ -261,6 +268,38 @@ export function checkHookChunks(hookText, files) {
     problems.push(
       `unexpected hook chunk(s) ${stray.join(", ")}: a new import() reached the hook build. Add it to HOOK_LAZY in tsup.config.ts and HOOK_LAZY_CHUNKS in scripts/check-bundle.mjs, or import it statically`,
     );
+  if (read) {
+    const imports = (t) =>
+      [...t.matchAll(/(?:\bfrom\s*|\bimport\s+)["']\.\/([^"']+)["']/g)].map(
+        (m) => m[1],
+      );
+    const closure = (starts) => {
+      const seen = new Set(["hook.js"]);
+      const walk = (f) => {
+        if (seen.has(f)) return;
+        seen.add(f);
+        for (const g of imports(read(f) ?? "")) walk(g);
+      };
+      for (const f of starts) walk(f);
+      return seen;
+    };
+    const up = imports(hookText);
+    // Two lazy entries are named "hooks": the adjudicator's and the decisions features'. The
+    // smaller static closure is what an adjudicator-on prompt loads (the decisions hooks load
+    // only when a feature is on), so that one is held to the limit.
+    const named = new Set(
+      [hookText, ...[...closure(up)].map((f) => read(f) ?? "")].flatMap((t) =>
+        [...t.matchAll(/\.\/(hook-hooks-[A-Za-z0-9_]+\.js)/g)].map((m) => m[1]),
+      ),
+    );
+    const least = [...named]
+      .map((f) => closure([...up, f]))
+      .sort((a, b) => a.size - b.size)[0];
+    if (least && least.size > HOOK_ADJUDICATOR_MAX_FILES)
+      problems.push(
+        `an adjudicator-on prompt or Bash hook loads ${least.size} files (${[...least].join(", ")}), more than ${HOOK_ADJUDICATOR_MAX_FILES}: the adjudicator's static modules must be listed in HOOK_ADJUDICATOR in tsup.config.ts so they share one chunk`,
+      );
+  }
   return problems;
 }
 
@@ -286,6 +325,13 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     ...checkHookChunks(
       readFileSync(join(dist, "hook.js"), "utf8"),
       readdirSync(dist),
+      (f) => {
+        try {
+          return readFileSync(join(dist, f), "utf8");
+        } catch {
+          return undefined;
+        }
+      },
     ),
   ];
   if (problems.length) {

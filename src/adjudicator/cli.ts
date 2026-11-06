@@ -1828,6 +1828,8 @@ export interface FeatureRow {
 export function featureRows(config: Config, env: NodeJS.ProcessEnv): FeatureRow[] {
   const a = config.adjudicator;
   const r = resolveAdjudicator(a, { context: "cli", env });
+  // A project or env `enabled: true` without a personal one runs the heuristic only (same rule as status).
+  const forcedHeuristic = a.enabled && enabledIn(paths().configFile) !== true;
   return DECISION_FEATURES.map((name) => {
     const f = a.features[name];
     const why = f.enabled ? decisionInactiveReason(a, name, env) : "disabled";
@@ -1854,7 +1856,9 @@ export function featureRows(config: Config, env: NodeJS.ProcessEnv): FeatureRow[
               env.EMINIAR_ADJUDICATOR === "0" ||
               env.EMINIAR_ADJUDICATOR_FEATURES === "0"
             ? "adjudicator off or EMINIAR_ADJUDICATOR_FEATURES=0"
-            : "provider is the heuristic";
+            : forcedHeuristic
+              ? `provider is the heuristic: a project or env enabled: true gives the heuristic only; run \`eminiar adjudicator enable\` (${tilde(paths().configFile)} needs enabled: true)`
+              : "provider is the heuristic";
     }
     return row;
   });

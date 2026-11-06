@@ -39,9 +39,13 @@ function findSecretFields(v: unknown, path: (string | number)[] = []): (string |
  */
 /**
  * The default commit-advice exclusions: lock files, minified output, anything key-shaped, the
- * secret-bearing directories and data names of the built-in floor (DIFF_DENY_FLOOR in
- * src/decisions/diff-redact.ts, which applies whatever this says) and Helm-style values files,
- * which hold deployment secrets under keys that do not look secret.
+ * secret-bearing directories, data names and app config files of the built-in floor
+ * (DIFF_DENY_FLOOR and DIFF_DENY_NAMES in src/decisions/diff-redact.ts, which apply whatever this
+ * says) and Helm-style values files, which hold deployment secrets under keys that do not look
+ * secret. A secret-store NAME is listed with its data extensions, never as `name.*` or `name*`
+ * (round 3, task #336): a source module such as secrets.ts or credentials.py holds code and is
+ * scrubbed line by line, and the floor already denies every data file of those names. User lists
+ * hold at most 64 globs; this default is kept well under that.
  */
 export const COMMIT_EXCLUDE = [
   "**/*.lock",
@@ -58,19 +62,20 @@ export const COMMIT_EXCLUDE = [
   "**/*.p8",
   "**/*.ppk",
   "**/*.env.*",
-  "**/*.env.json",
   "**/secrets/**",
-  "**/secrets.*",
   "**/.secrets*",
-  "**/*.secrets.*",
-  "**/credentials*",
+  "**/secrets.json",
+  "**/secrets.yaml",
+  "**/secrets.yml",
+  "**/credentials",
   "**/*credentials*.json",
-  "**/service-account*.json",
   "**/*service-account*.json",
+  "**/serviceAccountKey*.json",
   "**/.netrc",
   "**/.pgpass",
-  "**/kubeconfig*",
+  "**/*kubeconfig*.yaml",
   "**/.aws/**",
+  "**/.azure/**",
   "**/secret/**",
   "**/credential/**",
   "**/credentials/**",
@@ -81,10 +86,19 @@ export const COMMIT_EXCLUDE = [
   "**/key/**",
   "**/keys/**",
   "**/.docker/**",
+  "**/docker/config.json",
   "**/.gnupg/**",
-  "**/*creds*.*",
+  // Directories named for secrets in a compound name (my-secrets/, secrets-prod/,
+  // sealed-secrets/); diff-redact.ts matches every such word in code.
+  "**/*-secrets/**",
+  "**/secrets-*/**",
+  "**/*creds*.json",
+  "**/*creds*.yaml",
   "**/auth.json",
-  "**/vault.*",
+  "**/vault.yml",
+  "**/wp-config*.php",
+  "**/appsettings*.json",
+  "**/local.settings.json",
   "**/*.tfvars",
   "**/*.tfvars.*",
   "**/*.tfstate",
@@ -782,7 +796,29 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-function envOverrides(): Record<string, unknown> {
+/**
+ * Providers that never send text off the machine whatever else the config says: the env may
+ * always switch to one of these.
+ */
+const NON_REMOTE_PROVIDERS: readonly string[] = ["heuristic", "embedding"];
+
+/**
+ * The env layer. `personal` is the personal layer as loadConfig read it (after the trust cut).
+ *
+ * Provider pin (round 3 F6, task #348): the env may not re-aim the adjudicator at another origin.
+ * A cloned repo's .claude/settings.json `env` block reaches the session and its hooks, and the
+ * project file may not set provider, baseUrl or preset at all (PROJECT_ADJUDICATOR_KEYS), so the
+ * only env/project value that can change where text goes is EMINIAR_ADJUDICATOR_PROVIDER. It is
+ * honoured as is when it names the personal file's own provider (default "heuristic") or a
+ * provider that never sends text (heuristic, embedding). Any other choice still applies, so
+ * status shows it, but loses every remote consent (remoteConsent false): consent in
+ * ~/.eminiar/config.json was given for the personal provider's origin, and remoteConsentOrigins /
+ * featureConsent entries for other origins (a provider the user tried once) are never re-used
+ * on the env's say-so. A remote target then degrades to the heuristic with no_consent; a
+ * loopback target still runs, locally. The origin a remote call can reach is therefore always
+ * the one the personal file's provider, openai and typesafe sections name.
+ */
+function envOverrides(personal: Record<string, unknown> = {}): Record<string, unknown> {
   const o: Record<string, unknown> = {};
   const mode = process.env.EMINIAR_ROUTING_MODE;
   if (mode && RoutingMode.safeParse(mode).success) o.routing = { mode };
@@ -790,10 +826,13 @@ function envOverrides(): Record<string, unknown> {
   const adj: Record<string, unknown> = {};
   const on = process.env.EMINIAR_ADJUDICATOR;
   if (on === "0" || on === "1") adj.enabled = on === "1";
-  // A remote provider picked here runs only when remoteConsentOrigins in ~/.eminiar/config.json
-  // lists its origin; otherwise resolveAdjudicator() degrades it with no_consent.
   const provider = process.env.EMINIAR_ADJUDICATOR_PROVIDER;
-  if (provider && (PROVIDER_IDS as readonly string[]).includes(provider)) adj.provider = provider;
+  if (provider && (PROVIDER_IDS as readonly string[]).includes(provider)) {
+    adj.provider = provider;
+    const p = isPlainObject(personal.adjudicator) ? personal.adjudicator : {};
+    const own = typeof p.provider === "string" ? p.provider : "heuristic";
+    if (provider !== own && !NON_REMOTE_PROVIDERS.includes(provider)) adj.remoteConsent = false;
+  }
   const amode = process.env.EMINIAR_ADJUDICATOR_MODE;
   if (amode && (MODES as readonly string[]).includes(amode)) adj.mode = amode;
   // Env vars can only WITHDRAW remote consent (task #48): a cloned repo's .claude/settings.json
@@ -908,7 +947,7 @@ function samePath(a: string, b: string): boolean {
 }
 
 /** `child` is `parent` or below it (both real paths). */
-function isInside(child: string, parent: string): boolean {
+export function isInside(child: string, parent: string): boolean {
   const rel = relative(
     CASE_INSENSITIVE_FS ? parent.toLowerCase() : parent,
     CASE_INSENSITIVE_FS ? child.toLowerCase() : child,
@@ -1203,7 +1242,7 @@ export function loadConfig(projectRoot: string): Config {
           "eminiar.config.json",
         ),
       ),
-      envOverrides(),
+      envOverrides(personal),
     ),
   );
   // zod reads inherited properties: hand it a plain own-key copy, never the merged object.

@@ -48,7 +48,8 @@ const ECOSYSTEM: Record<string, string> = { npm: "npm", pypi: "PyPI", go: "Go mo
  */
 export function isPublicName(p: ProviderCandidate): boolean {
   if (p.nonRegistry) return false;
-  if (p.confidence === "catalog") return true;
+  // only the BUNDLED catalogue counts: a team's own docs.catalog entries may name private packages
+  if (p.confidence === "catalog" && p.builtinCatalog === true) return true;
   return p.publicVerified === true && /^(npm|pypi|go):/.test(p.provider);
 }
 

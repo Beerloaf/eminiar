@@ -38,6 +38,15 @@ const HOOK_OUTPUT = ["hook.js", "hook.js.map", "hook-*"];
 const SRC = resolve("src") + sep;
 /** The modules src/hook.ts imports statically: everything a hook process loads up front. */
 const HOOK_STATIC = ["src/hooks/dispatch.ts", "src/hooks/log.ts"].map((p) => resolve(p));
+/**
+ * What an adjudicator-on hook process loads on top of that: the adjudicator's hook handlers and
+ * everything they reach statically (engine, config, redaction, providers, breaker). Importing them
+ * from every lazy entry puts them in one more shared chunk instead of five, so an adjudicator-on
+ * prompt or Bash hook loads hook.js + the static chunk + that chunk (3 files, not 7).
+ */
+const HOOK_ADJUDICATOR = ["src/adjudicator/hooks.ts", "src/adjudicator/async.ts"].map((p) =>
+  resolve(p),
+);
 /** The hook build's lazy entries: every internal module reached through import(). */
 const HOOK_LAZY =
   /[\\/]src[\\/](adjudicator[\\/](hooks|async)|decisions[\\/](hooks|run-job|features[\\/][a-z-]+))\.ts$/;
@@ -66,7 +75,9 @@ function oneSharedHookChunk(): NonNullable<Options["esbuildPlugins"]>[number] {
       });
       build.onLoad({ filter: HOOK_LAZY }, (args) => {
         const src = readFileSync(args.path, "utf8");
-        const hub = HOOK_STATIC.map((p) => `import ${JSON.stringify(p)};`).join("\n");
+        const hub = [...HOOK_STATIC, ...HOOK_ADJUDICATOR]
+          .map((p) => `import ${JSON.stringify(p)};`)
+          .join("\n");
         return {
           contents: `${src}\n${hub}\n`,
           loader: "ts",

@@ -103,22 +103,67 @@ function taskOf(sections: GuideSection[]): string {
   return s ? (s.items[s.items.length - 1] ?? "") : "";
 }
 
+/** A token with a slash, delimited the way guide sections join items. */
+const PATH_TOKEN = /[^\s|,;()"'`]*[\\/][^\s|,;()"'`]*/g;
 /**
- * Keep file paths readable but safe for the remote redactor, which turns a long mixed-case path
- * with a digit into "[b64].ts": strip the project root prefix (the home directory never leaves),
- * then shorten any other long path to its last two segments.
+ * A filesystem path and nothing else: word characters, `.`, `~`, `+`, `-` and slashes, an
+ * optional drive letter and an optional `:line[:col]`. A token with `://`, `//`, `@`, `=`, `?`,
+ * `&`, `%`, `#`, `$` or a `:` elsewhere (a URL, a DSN, an assignment, a query) is not a path.
+ */
+const FS_PATH = /^(?:[A-Za-z]:)?[\w.~+\-\\/]+(?::\d+){0,2}$/;
+/** Private-use placeholders for the paths while the redactor runs (see readablePaths). */
+const PH = /(\d+)/g;
+const PH_CHARS = /[]/;
+
+/** The readable form of a path token, or the token itself when it is not one to shorten. */
+function shortPath(tok: string, root: string): string {
+  if (!FS_PATH.test(tok) || tok.includes("//")) return tok;
+  let rest: string;
+  if (root && (tok.startsWith(`${root}/`) || tok.startsWith(`${root}\\`)))
+    rest = tok.slice(root.length + 1);
+  else if (tok.length >= 28)
+    rest = tok
+      .split(/[\\/]+/)
+      .filter(Boolean)
+      .slice(-2)
+      .join("/");
+  else return tok;
+  // Each segment still goes through the redactor on its own: a key-shaped segment stays masked.
+  return rest
+    .split(/[\\/]+/)
+    .map((s) => redact(s))
+    .join("/");
+}
+
+/**
+ * Redact the text, keeping file paths readable (round 3 F1). The redactor turns a long mixed-case
+ * path with a digit into "[b64].ts", so paths get shortened: the project root prefix is stripped
+ * (the home directory never leaves) and any other long path is cut to its last two segments.
+ *
+ * Nothing is transformed ahead of the redactor: it sees the whole text as given, with each path
+ * it would mangle swapped for a placeholder of the same token position. Only a pure filesystem
+ * path is swapped (never a URL, a DSN or an assignment, whose credentials need their context);
+ * each shortened segment is redacted on its own, and a placeholder the redactor masked (a path
+ * in a secret's position) is never restored. The result is already redacted; the client's own
+ * forRemote() runs again on top.
  */
 export function readablePaths(text: string, root: string): string {
-  let out = text;
   const r = root.replace(/[\\/]+$/, "");
-  if (r) {
-    for (const sep of ["/", "\\"]) out = out.split(r + sep).join("");
-  }
-  return out.replace(/[^\s|,;()"'`]*[\\/][^\s|,;()"'`]*/g, (tok) => {
-    if (tok.length < 28) return tok;
-    const parts = tok.split(/[\\/]+/).filter(Boolean);
-    return parts.slice(-2).join("/");
-  });
+  const shorts: string[] = [];
+  const marked = PH_CHARS.test(text)
+    ? text
+    : text.replace(PATH_TOKEN, (tok) => {
+        const short = shortPath(tok, r);
+        if (short === tok) return tok;
+        shorts.push(short);
+        return `${shorts.length - 1}`;
+      });
+  let out = redact(marked)
+    .replace(PH, (_m, i: string) => shorts[Number(i)] ?? "")
+    .replace(/[]/g, "");
+  // Root prefixes the redactor left whole (inside a URL, an assignment...) go too.
+  if (r) for (const sep of ["/", "\\"]) out = out.split(r + sep).join("");
+  return out;
 }
 
 async function runCompactionJob(
