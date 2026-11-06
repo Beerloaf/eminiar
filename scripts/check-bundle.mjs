@@ -4,7 +4,7 @@
 // while bundled code loads it eagerly (the "Class2 is not a constructor" start-up crash), or
 // when the server has any lazy wrapper at all: everything it reaches imports internal modules
 // statically, so a wrapper means a dynamic import() of an internal module crept back in.
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -37,7 +37,9 @@ export function wrapperHelpers(text) {
     const [, name, a, b] = m;
     const body = text.slice(m.index + m[0].length, m.index + m[0].length + 240);
     if (
-      new RegExp(`^\\s*\\(?\\s*${esc(a)}\\s*&&\\s*\\(\\s*${esc(b)}\\s*=`).test(body) &&
+      new RegExp(`^\\s*\\(?\\s*${esc(a)}\\s*&&\\s*\\(\\s*${esc(b)}\\s*=`).test(
+        body,
+      ) &&
       new RegExp(`\\(\\s*${esc(a)}\\s*=\\s*0\\s*\\)`).test(body)
     )
       esm.add(name);
@@ -65,9 +67,13 @@ export function wrapperHelpers(text) {
 export function findWrappers(text) {
   const { esm, cjs } = wrapperHelpers(text);
   const helpers = [...esm, ...cjs].map(esc).join("|");
-  const call = new RegExp(`(?<![\\w$.])(${ID})\\s*=\\s*(${helpers})\\s*\\(`, "g");
+  const call = new RegExp(
+    `(?<![\\w$.])(${ID})\\s*=\\s*(${helpers})\\s*\\(`,
+    "g",
+  );
   // { "path"() / { async "path"() — the module path as the first (only) method name
-  const keyed = /^\s*\{\s*(?:async\s*)?(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')\s*\(/;
+  const keyed =
+    /^\s*\{\s*(?:async\s*)?(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')\s*\(/;
   // (…) => / async (…) => / function (…) — the minified forms, which carry no path
   const fn = /^\s*(?:async\s*)?(?:\([^)]*\)\s*=>|function\b)/;
   /** @type {{ kind: "esm" | "cjs", init: string, path: string | null }[]} */
@@ -76,7 +82,11 @@ export function findWrappers(text) {
     const arg = text.slice(m.index + m[0].length, m.index + m[0].length + 1024);
     const k = keyed.exec(arg);
     if (!k && !fn.test(arg)) continue; // a plain call of a shadowed minified name
-    out.push({ kind: esm.has(m[2]) ? "esm" : "cjs", init: m[1], path: k ? (k[1] ?? k[2]) : null });
+    out.push({
+      kind: esm.has(m[2]) ? "esm" : "cjs",
+      init: m[1],
+      path: k ? (k[1] ?? k[2]) : null,
+    });
   }
   return out;
 }
@@ -115,8 +125,12 @@ export function minifiedShim(text, esm) {
   const defined = new Set();
   for (const s of stmts) {
     const a =
-      new RegExp(`^(${ID})\\s*=\\s*\\(\\s*\\)\\s*=>\\s*${u}\\s*\\(\\s*import\\.meta\\.url\\s*\\)$`).exec(s) ??
-      new RegExp(`^(${ID})\\s*=\\s*\\(\\s*\\)\\s*=>\\s*${p}\\.dirname\\s*\\(\\s*(${ID})\\s*\\(\\s*\\)\\s*\\)$`).exec(s) ??
+      new RegExp(
+        `^(${ID})\\s*=\\s*\\(\\s*\\)\\s*=>\\s*${u}\\s*\\(\\s*import\\.meta\\.url\\s*\\)$`,
+      ).exec(s) ??
+      new RegExp(
+        `^(${ID})\\s*=\\s*\\(\\s*\\)\\s*=>\\s*${p}\\.dirname\\s*\\(\\s*(${ID})\\s*\\(\\s*\\)\\s*\\)$`,
+      ).exec(s) ??
       new RegExp(`^(${ID})\\s*=\\s*(${ID})\\s*\\(\\s*\\)$`).exec(s);
     // The setup only calls getters it defined itself, before the call.
     if (!a || (a[2] !== undefined && !defined.has(a[2]))) return null;
@@ -166,7 +180,9 @@ export function checkBundle(name, text, opts = {}) {
   const lazy = all.filter((w) => isLazyInternal(w, minShim));
 
   const zodInits = new Set(
-    wrappers.filter((w) => w.path !== null && ZOD.test(w.path)).map((w) => w.init),
+    wrappers
+      .filter((w) => w.path !== null && ZOD.test(w.path))
+      .map((w) => w.init),
   );
   if (zodInits.size) {
     // An unwrapped module that imports zod calls its init at the top level, unindented.
@@ -175,7 +191,9 @@ export function checkBundle(name, text, opts = {}) {
       .filter((i) => zodInits.has(i));
     // An unwrapped SDK module may reach zod through a re-export with no init call at all.
     const sdkWrapped = new Set(
-      wrappers.filter((w) => w.path !== null && SDK.test(w.path)).map((w) => tail(w.path)),
+      wrappers
+        .filter((w) => w.path !== null && SDK.test(w.path))
+        .map((w) => tail(w.path)),
     );
     const sdkEager = [...text.matchAll(/^\/\/ (\S+)$/gm)]
       .map((m) => m[1])
@@ -199,6 +217,92 @@ export function checkBundle(name, text, opts = {}) {
   return problems;
 }
 
+/**
+ * The hook build's lazy entries, as the chunk names esbuild gives them (hook-<name>-<hash>.js):
+ * one per import() target listed in HOOK_LAZY in tsup.config.ts. A new lazy entry must be added
+ * here too. Any other hook-*.js besides the shared hook-chunk-*.js is an import() nobody agreed to.
+ */
+export const HOOK_LAZY_CHUNKS = [
+  "async",
+  "commit",
+  "compaction",
+  "docs",
+  "hooks",
+  "memory",
+  "recall",
+  "run-job",
+  "swarm",
+];
+
+/** hook.js, the shared static chunk, the adjudicator hook handlers and the adjudicator core chunk. */
+export const HOOK_ADJUDICATOR_MAX_FILES = 4;
+
+/**
+ * The problems in the hook build; empty when it is fine. dist/hook.js must load exactly one file
+ * statically (the shared chunk, see oneSharedHookChunk in tsup.config.ts), and every other
+ * dist/hook-*.js must be a known lazy entry.
+ * @param {string} hookText dist/hook.js
+ * With `read` (file name to text), it also counts the files an adjudicator-on prompt or Bash hook
+ * loads (hook.js, its static closure, the adjudicator hook handlers and their static closure) and
+ * fails when that exceeds HOOK_ADJUDICATOR_MAX_FILES.
+ * @param {string[]} files file names in dist/
+ * @param {(name: string) => string | undefined} [read]
+ * @returns {string[]}
+ */
+export function checkHookChunks(hookText, files, read) {
+  const problems = [];
+  const stat = new Set();
+  for (const m of hookText.matchAll(
+    /(?:\bfrom\s*|\bimport\s+)["'](\.\/[^"']+)["']/g,
+  ))
+    stat.add(m[1]);
+  if (stat.size !== 1)
+    problems.push(
+      `dist/hook.js statically loads ${stat.size} file(s) (${[...stat].join(", ") || "none"}); it must load exactly one shared chunk, so every hook process reads two files`,
+    );
+  const known = new RegExp(
+    `^hook-(?:chunk|${HOOK_LAZY_CHUNKS.join("|")})-[A-Za-z0-9_]+\\.js$`,
+  );
+  const stray = files.filter((f) => /^hook-.*\.js$/.test(f) && !known.test(f));
+  if (stray.length)
+    problems.push(
+      `unexpected hook chunk(s) ${stray.join(", ")}: a new import() reached the hook build. Add it to HOOK_LAZY in tsup.config.ts and HOOK_LAZY_CHUNKS in scripts/check-bundle.mjs, or import it statically`,
+    );
+  if (read) {
+    const imports = (t) =>
+      [...t.matchAll(/(?:\bfrom\s*|\bimport\s+)["']\.\/([^"']+)["']/g)].map(
+        (m) => m[1],
+      );
+    const closure = (starts) => {
+      const seen = new Set(["hook.js"]);
+      const walk = (f) => {
+        if (seen.has(f)) return;
+        seen.add(f);
+        for (const g of imports(read(f) ?? "")) walk(g);
+      };
+      for (const f of starts) walk(f);
+      return seen;
+    };
+    const up = imports(hookText);
+    // Two lazy entries are named "hooks": the adjudicator's and the decisions features'. The
+    // smaller static closure is what an adjudicator-on prompt loads (the decisions hooks load
+    // only when a feature is on), so that one is held to the limit.
+    const named = new Set(
+      [hookText, ...[...closure(up)].map((f) => read(f) ?? "")].flatMap((t) =>
+        [...t.matchAll(/\.\/(hook-hooks-[A-Za-z0-9_]+\.js)/g)].map((m) => m[1]),
+      ),
+    );
+    const least = [...named]
+      .map((f) => closure([...up, f]))
+      .sort((a, b) => a.size - b.size)[0];
+    if (least && least.size > HOOK_ADJUDICATOR_MAX_FILES)
+      problems.push(
+        `an adjudicator-on prompt or Bash hook loads ${least.size} files (${[...least].join(", ")}), more than ${HOOK_ADJUDICATOR_MAX_FILES}: the adjudicator's static modules must be listed in HOOK_ADJUDICATOR in tsup.config.ts so they share one chunk`,
+      );
+  }
+  return problems;
+}
+
 /** A module path from node_modules on, or from src on, for messages and comparison. */
 function tail(p) {
   const i = p.lastIndexOf("node_modules/");
@@ -210,14 +314,31 @@ function tail(p) {
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const dist = join(dirname(dirname(fileURLToPath(import.meta.url))), "dist");
   const problems = [
-    ...checkBundle("dist/server.js", readFileSync(join(dist, "server.js"), "utf8"), {
-      noLazy: true,
-    }),
+    ...checkBundle(
+      "dist/server.js",
+      readFileSync(join(dist, "server.js"), "utf8"),
+      {
+        noLazy: true,
+      },
+    ),
     ...checkBundle("dist/cli.js", readFileSync(join(dist, "cli.js"), "utf8")),
+    ...checkHookChunks(
+      readFileSync(join(dist, "hook.js"), "utf8"),
+      readdirSync(dist),
+      (f) => {
+        try {
+          return readFileSync(join(dist, f), "utf8");
+        } catch {
+          return undefined;
+        }
+      },
+    ),
   ];
   if (problems.length) {
     for (const p of problems) console.error(`check-bundle: ${p}`);
     process.exit(1);
   }
-  console.log("check-bundle: dist/server.js and dist/cli.js are self-contained; zod loads safely");
+  console.log(
+    "check-bundle: dist/server.js and dist/cli.js are self-contained; zod loads safely; hook.js loads one shared chunk",
+  );
 }

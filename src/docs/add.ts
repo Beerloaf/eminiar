@@ -124,6 +124,7 @@ export function pickCandidates(
     const tier = p.tier ?? "library";
     switch (pick) {
       case "recommended":
+        if (p.recommended !== undefined) return p.recommended === true;
         return p.confidence === "probe" || (p.confidence === "catalog" && tier === "service");
       case "service":
         return p.confidence === "catalog" && tier === "service";

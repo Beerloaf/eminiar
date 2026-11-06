@@ -936,6 +936,339 @@
               "type": "boolean"
             }
           }
+        },
+        "features": {
+          "default": {},
+          "type": "object",
+          "properties": {
+            "recall": {
+              "default": {},
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "default": false,
+                  "type": "boolean"
+                },
+                "shadow": {
+                  "default": true,
+                  "type": "boolean"
+                },
+                "maxCallsPerDay": {
+                  "default": 500,
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "dropBelow": {
+                  "default": 0.25,
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "mcpMs": {
+                  "default": 1200,
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "jobMs": {
+                  "default": 2500,
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "maxChars": {
+                  "default": 600,
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                }
+              }
+            },
+            "memory": {
+              "default": {},
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "default": false,
+                  "type": "boolean"
+                },
+                "shadow": {
+                  "default": true,
+                  "type": "boolean"
+                },
+                "maxCallsPerDay": {
+                  "default": 100,
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "minProb": {
+                  "default": 0.6,
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "k": {
+                  "default": 5,
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "mcpMs": {
+                  "default": 1500,
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "maxChars": {
+                  "default": 1500,
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                }
+              }
+            },
+            "commit": {
+              "default": {},
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "default": false,
+                  "type": "boolean"
+                },
+                "shadow": {
+                  "default": true,
+                  "type": "boolean"
+                },
+                "maxCallsPerDay": {
+                  "default": 100,
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "minProb": {
+                  "default": 0.7,
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "jobMs": {
+                  "default": 4000,
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "maxChars": {
+                  "default": 4000,
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "exclude": {
+                  "default": [
+                    "**/*.lock",
+                    "**/package-lock.json",
+                    "**/*.min.*",
+                    "**/.env*",
+                    "**/*.pem",
+                    "**/*.key",
+                    "**/*.p12",
+                    "**/id_rsa*",
+                    "**/id_ed25519*",
+                    "**/id_ecdsa*",
+                    "**/*.pfx",
+                    "**/*.p8",
+                    "**/*.ppk",
+                    "**/*.env.*",
+                    "**/secrets/**",
+                    "**/.secrets*",
+                    "**/secrets.json",
+                    "**/secrets.yaml",
+                    "**/secrets.yml",
+                    "**/credentials",
+                    "**/*credentials*.json",
+                    "**/*service-account*.json",
+                    "**/serviceAccountKey*.json",
+                    "**/.netrc",
+                    "**/.pgpass",
+                    "**/*kubeconfig*.yaml",
+                    "**/.aws/**",
+                    "**/.azure/**",
+                    "**/secret/**",
+                    "**/credential/**",
+                    "**/credentials/**",
+                    "**/cred/**",
+                    "**/creds/**",
+                    "**/vault/**",
+                    "**/private/**",
+                    "**/key/**",
+                    "**/keys/**",
+                    "**/.docker/**",
+                    "**/docker/config.json",
+                    "**/.gnupg/**",
+                    "**/*-secrets/**",
+                    "**/secrets-*/**",
+                    "**/*creds*.json",
+                    "**/*creds*.yaml",
+                    "**/auth.json",
+                    "**/vault.yml",
+                    "**/wp-config*.php",
+                    "**/appsettings*.json",
+                    "**/local.settings.json",
+                    "**/*.tfvars",
+                    "**/*.tfvars.*",
+                    "**/*.tfstate",
+                    "**/*.tfstate.*",
+                    "**/.npmrc",
+                    "**/.pypirc",
+                    "**/.yarnrc*",
+                    "**/.git-credentials",
+                    "**/.dockercfg",
+                    "**/values*.yaml",
+                    "**/values*.yml",
+                    "**/*-values.yaml",
+                    "**/*-values.yml",
+                    "**/*_values.yaml",
+                    "**/*_values.yml"
+                  ],
+                  "maxItems": 64,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "maxLength": 256
+                  }
+                }
+              }
+            },
+            "compaction": {
+              "default": {},
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "default": false,
+                  "type": "boolean"
+                },
+                "shadow": {
+                  "default": true,
+                  "type": "boolean"
+                },
+                "maxCallsPerDay": {
+                  "default": 50,
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "output": {
+                  "default": false,
+                  "type": "boolean"
+                },
+                "minKeep": {
+                  "default": 0.3,
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "jobMs": {
+                  "default": 4000,
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "mcpMs": {
+                  "default": 800,
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "maxChars": {
+                  "default": 400,
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                }
+              }
+            },
+            "swarm": {
+              "default": {},
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "default": false,
+                  "type": "boolean"
+                },
+                "shadow": {
+                  "default": true,
+                  "type": "boolean"
+                },
+                "maxCallsPerDay": {
+                  "default": 300,
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "flagAbove": {
+                  "default": 0.7,
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "bgMs": {
+                  "default": 3000,
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "maxChars": {
+                  "default": 600,
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                }
+              }
+            },
+            "docs": {
+              "default": {},
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "default": false,
+                  "type": "boolean"
+                },
+                "shadow": {
+                  "default": true,
+                  "type": "boolean"
+                },
+                "maxCallsPerDay": {
+                  "default": 20,
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "minScore": {
+                  "default": 0.5,
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "mcpMs": {
+                  "default": 3000,
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                }
+              }
+            }
+          }
+        },
+        "featureConsent": {
+          "default": [],
+          "maxItems": 32,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 512
+          }
         }
       }
     }

@@ -1,5 +1,7 @@
 import type { AdjudicationRow, Verdict } from "../adjudicator/types.js";
 
+export type { DecisionStore } from "../decisions/types.js";
+
 export type ContentType = "prose" | "code" | "json";
 
 /** Well-known sources; any string is accepted so callers can namespace freely. */

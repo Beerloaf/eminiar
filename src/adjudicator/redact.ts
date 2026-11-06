@@ -68,7 +68,36 @@ const SECRET_QUALIFIERS = new Set([
   "data",
 ]);
 
-/** Exported for tests: is this identifier the name of a secret? */
+/**
+ * Words that make a plural secret word a count, not a list of secrets: max_tokens,
+ * prompt_tokens, num_keys. A plural with any other word before it (api_keys, tokens,
+ * db_passwords) names a list of secrets.
+ */
+const COUNT_WORDS = new Set([
+  "max",
+  "min",
+  "num",
+  "n",
+  "total",
+  "count",
+  "input",
+  "output",
+  "prompt",
+  "completion",
+  "cached",
+  "cache",
+  "reasoning",
+  "used",
+  "remaining",
+  "limit",
+  "budget",
+  "context",
+  "extra",
+]);
+
+const isSecretWord = (w: string): boolean => SECRET_WORDS.has(w) || SECRET_WORD_SUFFIX.test(w);
+
+/** Exported for tests: is this identifier the name of a secret (or a list of them)? */
 export function isSecretName(name: string): boolean {
   const words = name
     .split(/[_.-]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])/)
@@ -76,7 +105,10 @@ export function isSecretName(name: string): boolean {
     .filter(Boolean);
   for (let i = words.length - 1; i >= 0; i--) {
     const w = words[i] as string;
-    if (SECRET_WORDS.has(w) || SECRET_WORD_SUFFIX.test(w)) return true;
+    if (isSecretWord(w)) return true;
+    // Plural: tokens, passwords, api_keys, apiKeys, secret_keys (not max_tokens).
+    if (w.length > 3 && w.endsWith("s") && isSecretWord(w.slice(0, -1)))
+      return !COUNT_WORDS.has(words[i - 1] ?? "");
     if (!SECRET_QUALIFIERS.has(w) && !/^v?\d+$/.test(w)) return false;
   }
   return false;
@@ -198,7 +230,7 @@ const IGNORABLE = /\p{Default_Ignorable_Code_Point}/gu;
  * ligatures unfold). Stripped again after NFKC, which maps U+3164 / U+FFA0 to the ignorable
  * U+1160. Leaves spaces, tabs and newlines alone, so YAML indentation survives. Idempotent.
  */
-function clean(text: string): string {
+export function clean(text: string): string {
   return text.replace(IGNORABLE, "").normalize("NFKC").replace(IGNORABLE, "");
 }
 
@@ -215,6 +247,16 @@ const RULES: Rule[] = [
   ],
   // Credentials inside URLs: scheme://user:pass@host, scheme://:pass@host
   [/\b([a-z][a-z0-9+.-]{0,30}:\/\/)[^\s/:@]*:[^\s/@]+@/gi, "$1***@"],
+  // ...and a token used as the user name alone (https://<token>@github.com/…): a long user name
+  // goes, a short one (git@, deploy@) stays.
+  [/\b([a-z][a-z0-9+.-]{0,30}:\/\/)(?!\*\*\*@)[^\s/:@]{16,256}@/gi, "$1***@"],
+  // Scheme-less credentials: user:pass@host and //user:pass@host (a DSN whose scheme was cut off,
+  // a connection string in a log line). The password goes, the user and the host stay, so the
+  // email rule below never decides whether a password survives. Bounded runs keep it linear.
+  [
+    /(?<![A-Za-z0-9._%+~-])((?:\/\/)?[A-Za-z0-9._%+~-]{0,64}):(?!\*\*\*@)[^\s/@"'`]{1,128}@(?=\[[0-9A-Fa-f:]|[A-Za-z0-9])/g,
+    "$1:***@",
+  ],
   // Authorization / Proxy-Authorization headers: the scheme stays, the credentials go.
   [
     /\b((?:Proxy-)?Authorization["']?[ \t]*[:=][ \t]*["']?)(?!(?:(?:Basic|Bearer|Token|Digest|Negotiate|NTLM|ApiKey|Key)[ \t]+)?\*\*\*)(?:(Basic|Bearer|Token|Digest|Negotiate|NTLM|ApiKey|Key)[ \t]+)?[^\s"'`]+/gi,

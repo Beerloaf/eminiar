@@ -46,6 +46,7 @@ export const emExecute = defineTool({
       // Never use the intent as the title: it would match every chunk via the title boost.
       title: `${args.language}: ${args.code.split("\n")[0]?.slice(0, 60) ?? ""}`,
       source: "exec",
+      triage: true,
       intent: args.intent,
       queries: args.queries,
       maxTokens: args.max_tokens,

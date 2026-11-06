@@ -1,5 +1,14 @@
-import { z } from "zod";
 import type { AdjudicatorConfig } from "../../config.js";
+import {
+  Answer,
+  JEV_BATCH,
+  JEV_DEFAULT_BASE_URL,
+  JEV_MAX_REQUESTS,
+  JEV_PRICE_IN,
+  JevResponse,
+  pinJevModel,
+  postSystemOne,
+} from "../../decisions/providers/jev.js";
 import { keyFor, type Resolved } from "../config.js";
 import {
   buildCatalogue,
@@ -26,7 +35,6 @@ import {
   PROBE_TIMEOUT_MS,
   type ProviderDeps,
   ProviderError,
-  postJson,
   probeDetail,
 } from "./http.js";
 
@@ -36,49 +44,14 @@ import {
  * plan is split into at most 2 parallel requests.
  */
 
-/** The version thresholds were tuned against; aliases are replaced by it. */
-export const JEV_PINNED = "jev-1.14.0";
-export const JEV_DEFAULT_BASE_URL = "https://api.typesafe.ai/v1";
-/** USD per input token; output tokens are free. */
-export const JEV_PRICE_IN = 0.042 / 1_000_000;
-export const JEV_BATCH = 10;
-export const JEV_MAX_REQUESTS = 2;
-
-/** Moving aliases (jev-latest, jev-preview) are never sent: they change silently under tuned thresholds. */
-export function pinJevModel(model: string | undefined): string {
-  if (!model || /^jev-(latest|preview)$/i.test(model.trim())) return JEV_PINNED;
-  return model.trim();
-}
-
-const Probabilities = z.record(z.string(), z.number().min(0).max(1));
-const Answer = z.union([
-  z.object({
-    type: z.literal("choice"),
-    choice: z.string(),
-    confidence: z.number().min(0).max(1).optional(),
-    probabilities: Probabilities.optional(),
-  }),
-  z.object({
-    type: z.literal("score"),
-    // On the rubric's own levels (0..criteria-1), echoed in `legend`; not 0..1.
-    score: z.number().min(0),
-    confidence: z.number().min(0).max(1).optional(),
-    probabilities: Probabilities.optional(),
-    legend: z.record(z.string(), z.string()).optional(),
-  }),
-  z.object({ type: z.literal("noul"), noul: z.number().min(0).max(1) }),
-]);
-type Answer = z.infer<typeof Answer>;
-const JevResponse = z.object({
-  model: z.string().optional(),
-  answers: z.record(z.string(), z.unknown()),
-  usage: z
-    .object({
-      input_tokens: z.number().nonnegative().optional(),
-      output_tokens: z.number().nonnegative().optional(),
-    })
-    .optional(),
-});
+export {
+  JEV_BATCH,
+  JEV_DEFAULT_BASE_URL,
+  JEV_MAX_REQUESTS,
+  JEV_PINNED,
+  JEV_PRICE_IN,
+  pinJevModel,
+} from "../../decisions/providers/jev.js";
 
 export function createTypesafeProvider(
   r: Resolved,
@@ -129,13 +102,15 @@ export function createTypesafeProvider(
       }
       return new ProviderError("invalid", msg);
     };
-    const res = await postJson(
-      joinUrl(baseUrl, "systemone"),
-      { model, state: jevState(cat, items), questions: jevQuestions(items, cat, { askTool }) },
+    const res = await postSystemOne(
+      baseUrl,
+      model,
+      k,
+      jevState(cat, items),
+      jevQuestions(items, cat, { askTool }),
       {
         deadlineMs: o.deadlineMs,
         signal: o.signal,
-        key: k,
         fetch: deps.fetch,
         now: deps.now,
         log: deps.log,

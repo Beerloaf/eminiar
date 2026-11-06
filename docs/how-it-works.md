@@ -240,4 +240,7 @@ for a shared team knowledge base.
 
 eminiar uses the network only to download the embedding model, to fetch pages and documentation
 that you ask it to index, and to read package metadata from the npm, PyPI and Go registries. The
-dashboard accepts loopback connections only.
+one other path is the opt-in adjudicator: with a remote provider and the consent you gave, it sends
+redacted prompt text, and for each decision feature you turn on, the text of that feature (memory
+text, staged diffs, the session guide, the swarm trail, package names) to that provider only; see
+[consent](adjudicator.md#consent). The dashboard accepts loopback connections only.

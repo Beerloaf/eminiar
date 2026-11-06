@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { adjudicatePlan, planAdviceBlock, planNextHint } from "../adjudicator/swarm.js";
 import { getContext, type ProjectContext } from "../context.js";
+import { kickSwarmJudge, swarmBadges } from "../decisions/features/swarm.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import { getStorage } from "../storage/index.js";
 import { planAgentSync, syncAgents } from "../swarm/agents.js";
@@ -312,6 +313,41 @@ function planned(
   );
 }
 
+/**
+ * The optional progress judge (decisions/features/swarm.ts); it does nothing unless the feature is on.
+ * Fire and forget: a failure here never changes the reply.
+ */
+async function kickJudge(
+  ctx: ProjectContext,
+  db: StorageAdapter,
+  runId: string,
+  tasks: TaskRow[],
+  sessionId: string | undefined,
+): Promise<void> {
+  try {
+    kickSwarmJudge(ctx, db, runId, tasks, sessionId);
+  } catch {
+    // advisory only
+  }
+}
+
+/** Badges of fresh live verdicts, and a background judge for the tasks whose trail changed. */
+async function judgeBadges(
+  ctx: ProjectContext,
+  db: StorageAdapter,
+  runId: string,
+  tasks: TaskRow[],
+  sessionId: string | undefined,
+): Promise<Map<number, string>> {
+  try {
+    const out = swarmBadges(ctx.config.adjudicator, db, runId);
+    kickSwarmJudge(ctx, db, runId, tasks, sessionId);
+    return out;
+  } catch {
+    return new Map();
+  }
+}
+
 // --- dispatch ------------------------------------------------------------------------------
 
 async function dispatch(args: Args, callerCtx: ProjectContext): Promise<string> {
@@ -520,6 +556,9 @@ async function dispatch(args: Args, callerCtx: ProjectContext): Promise<string> 
       } catch (err) {
         return inRun(err, run, id);
       }
+      // Optional background judge of the closed task; the reply never waits for it.
+      if (ctx.config.adjudicator?.enabled && ctx.config.adjudicator.features?.swarm.enabled)
+        void kickJudge(ctx, db, run.id, [t], sessionId);
       const fresh = db.swarm.runGet(run.id) ?? run;
       const c = runSnapshot(db, fresh, 1).counts.tasks;
       const tally = `run ${run.id}${fresh.status === "active" ? "" : ` (${fresh.status})`}: ${c.pending} pending · ${c.active} active · ${c.done} done${c.failed ? ` · ${c.failed} failed` : ""}${c.blocked ? ` · ${c.blocked} blocked` : ""}`;
@@ -570,7 +609,11 @@ async function dispatch(args: Args, callerCtx: ProjectContext): Promise<string> 
             }.`,
           );
       }
-      return formatRunStatus(runSnapshot(db, run), { lead });
+      const snap = runSnapshot(db, run);
+      const adj = ctx.config.adjudicator;
+      if (!adj?.enabled || !adj.features?.swarm.enabled) return formatRunStatus(snap, { lead });
+      const badges = await judgeBadges(ctx, db, run.id, snap.tasks, sessionId);
+      return formatRunStatus(snap, badges.size ? { lead, badges } : { lead });
     }
 
     case "finish": {

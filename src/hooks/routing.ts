@@ -1,6 +1,7 @@
 import { realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { extname, join, relative, resolve } from "node:path";
+import { featuresWanted } from "../config.js";
 import type { ProjectContext } from "../context.js";
 import { getContext } from "../context.js";
 import { type DocSource, readManifestAt } from "../docs/manifest.js";
@@ -712,6 +713,16 @@ export const preToolUse: HookHandler = async (
   if (spawn?.kind === "deny") return spawn.output;
   // A swarm worker is briefed at SubagentStart; a prompt brief as well would say it twice.
   const out = await route(ctx, input as RoutedInput, spawn?.kind === "worker");
+  // Jev features (off by default): may queue a detached job for this call; never touches `out`.
+  if (featuresWanted(ctx.config.adjudicator) && input.client !== "cursor") {
+    try {
+      const sid = input.session_id || "unknown";
+      const { decisionPreToolUse } = await import("../decisions/hooks.js");
+      await decisionPreToolUse(ctx, getStorage(ctx, { vectors: false }), input, sid);
+    } catch {
+      // Jev is optional
+    }
+  }
   // The adjudicator (off by default) is loaded only when enabled, so off costs this one check.
   // It extends routing's output (the Agent model joins routing's one updatedInput); never denies.
   if (!ctx.config.adjudicator.enabled || input.client === "cursor") return out;

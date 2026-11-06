@@ -1,3 +1,4 @@
+import type { RecallRerank, RerankCandidate } from "../decisions/types.js";
 import { fileId, fileOf } from "../graph/ids.js";
 import { DEPENDENCY_KINDS } from "../graph/metrics.js";
 import { type FileRisk, readFileRisk } from "../history/model.js";
@@ -120,6 +121,11 @@ export interface RecallOptions {
   /** Collect a trace of every candidate (for recording and --explain). */
   trace?: boolean | undefined;
   path?: RecallPath | undefined;
+  /**
+   * Jev reranker (src/decisions/features/recall.ts); the type is here so the hooks can pass the seam.
+   * Returns the keys to show in order, or undefined to keep the term-matched result.
+   */
+  rerank?: RecallRerank | undefined;
 }
 
 export interface RecallResult {
@@ -302,6 +308,51 @@ export function qualifies(
   return { ok: false, why: `${matched.length}/${need} terms` };
 }
 
+/** A candidate that cleared the bar, kept until the optional rerank decides which are shown. */
+interface Entry {
+  key: string;
+  line: string;
+  text: string;
+  trace: TraceCandidate;
+}
+
+/**
+ * Ask the rerank seam (if any) which pooled entries to show and in what order. Any failure, or
+ * undefined, keeps `base` (the term-matched pick) exactly; keys the seam does not know are ignored.
+ */
+function reranked(
+  rerank: RecallRerank | undefined,
+  query: string,
+  pooled: Entry[],
+  base: Entry[],
+): Entry[] {
+  if (!rerank || !pooled.length) return base;
+  try {
+    const keys = rerank(
+      query,
+      pooled.map(
+        (e): RerankCandidate => ({
+          key: e.key,
+          label: e.trace.label,
+          text: e.text,
+          matched: e.trace.matched,
+          outcome: e.trace.outcome === "shown" ? "shown" : "over-limit",
+        }),
+      ),
+    );
+    if (!Array.isArray(keys)) return base;
+    const by = new Map(pooled.map((e) => [e.key, e]));
+    const out: Entry[] = [];
+    for (const k of keys) {
+      const e = by.get(k);
+      if (e && !out.includes(e)) out.push(e);
+    }
+    return out;
+  } catch {
+    return base;
+  }
+}
+
 /**
  * Memories and documentation pages relevant to free text (a prompt, a subagent task).
  * Returns empty text when the prompt is too vague or nothing shares enough terms.
@@ -323,8 +374,8 @@ export async function recallForText(
   if (trace) trace.need = need;
   const query = terms.join(" ");
   const seen = opts.sessionId ? shownKeys(db, opts.sessionId, opts.repeatAfter) : new Set<string>();
-  const lines: string[] = [];
-  const keys: string[] = [];
+  const entries: Entry[] = [];
+  const base: Entry[] = [];
   const note = (c: TraceCandidate) => trace?.candidates.push(c);
 
   if (maxMemories > 0) {
@@ -363,14 +414,26 @@ export async function recallForText(
         note({ key, label, matched, outcome: "seen", why: q.why });
         continue;
       }
-      if (n >= maxMemories) {
-        note({ key, label, matched, outcome: "over-limit", why: q.why });
-        continue;
+      const over = n >= maxMemories;
+      const c: TraceCandidate = {
+        key,
+        label,
+        matched,
+        outcome: over ? "over-limit" : "shown",
+        why: q.why,
+      };
+      note(c);
+      const e: Entry = {
+        key,
+        line: `- memory ${m.name} [${m.kind}]: ${gist(m)}`,
+        text: `${m.name}: ${m.content}`,
+        trace: c,
+      };
+      entries.push(e);
+      if (!over) {
+        base.push(e);
+        n++;
       }
-      note({ key, label, matched, outcome: "shown", why: q.why });
-      lines.push(`- memory ${m.name} [${m.kind}]: ${gist(m)}`);
-      keys.push(key);
-      n++;
     }
   }
 
@@ -397,17 +460,41 @@ export async function recallForText(
         note({ key, label, matched, outcome: "seen" });
         continue;
       }
-      if (n >= maxDocs) {
-        note({ key, label, matched, outcome: "over-limit" });
-        continue;
+      const over = n >= maxDocs;
+      const c: TraceCandidate = { key, label, matched, outcome: over ? "over-limit" : "shown" };
+      note(c);
+      const e: Entry = {
+        key,
+        line: `- ${d.source} › ${clip(d.title, 80)}: ${clip(h.snippet, 160)}`,
+        text: `${d.title}: ${h.chunk.body}`,
+        trace: c,
+      };
+      entries.push(e);
+      if (!over) {
+        base.push(e);
+        n++;
       }
-      note({ key, label, matched, outcome: "shown" });
-      lines.push(`- ${d.source} › ${clip(d.title, 80)}: ${clip(h.snippet, 160)}`);
-      keys.push(key);
-      n++;
     }
   }
 
+  let picked = base;
+  if (opts.rerank && entries.length) {
+    const order = reranked(opts.rerank, text, entries, base);
+    if (order !== base) {
+      const mem = order.filter((e) => e.key.startsWith("memory:")).slice(0, maxMemories);
+      const doc = order.filter((e) => e.key.startsWith("doc:")).slice(0, maxDocs);
+      picked = [...mem, ...doc];
+      for (const e of entries) {
+        if (picked.includes(e)) e.trace.outcome = "shown";
+        else if (e.trace.outcome === "shown") {
+          e.trace.outcome = "gated";
+          e.trace.why = "reranked out";
+        }
+      }
+    }
+  }
+  const lines = picked.map((e) => e.line);
+  const keys = picked.map((e) => e.key);
   if (!lines.length) return quiet();
   return {
     text: [
@@ -682,7 +769,13 @@ function resolutionAfter(
 export async function recallForError(
   db: StorageAdapter,
   error: string,
-  opts: { sessionId?: string | undefined; maxMemories?: number; repeatAfter?: number } = {},
+  opts: {
+    sessionId?: string | undefined;
+    maxMemories?: number;
+    repeatAfter?: number;
+    /** See RecallOptions.rerank. */
+    rerank?: RecallRerank | undefined;
+  } = {},
 ): Promise<RecallResult> {
   const terms = promptTerms(error.slice(0, 600)).filter((t) => !ERROR_FILLER.has(t));
   if (terms.length < 3) return { text: "", keys: [] };
@@ -690,6 +783,9 @@ export async function recallForError(
   const seen = opts.sessionId ? shownKeys(db, opts.sessionId, opts.repeatAfter) : new Set<string>();
   const past: string[] = [];
   const keys: string[] = [];
+  // Past occurrences that cleared the term bar. The line is built lazily: the resolution lookup
+  // is only worth it for the ones shown. Without a rerank the first two are shown, as ever.
+  const found: Array<{ key: string; label: string; text: string; build: () => string }> = [];
 
   const r = await search(db, terms.join(" "), {
     mode: "lexical",
@@ -697,18 +793,47 @@ export async function recallForError(
     filters: { source: "session" },
   });
   for (const h of r.hits) {
-    if (past.length >= 2) break;
+    if (!opts.rerank && found.length >= 2) break;
     const d = h.chunk.document;
     if (d.title !== "error" || h.matched.length < need) continue;
     const id = eventIdOf(d.meta);
     const key = `err:${id ?? d.id}`;
     if (seen.has(key)) continue;
     const when = new Date(d.created_at).toISOString().slice(0, 10);
-    const fix = resolutionAfter(db, d.session_id, id);
-    past.push(
-      `- ${when}: ${clip(h.chunk.body, 140)}${fix ? ` → then: ${clip(fix, 160)}` : " (no resolution recorded)"}`,
-    );
-    keys.push(key);
+    found.push({
+      key,
+      label: `error ${when}`,
+      text: h.chunk.body,
+      build: () => {
+        const fix = resolutionAfter(db, d.session_id, id);
+        return `- ${when}: ${clip(h.chunk.body, 140)}${fix ? ` → then: ${clip(fix, 160)}` : " (no resolution recorded)"}`;
+      },
+    });
+  }
+  let shownErrs = found.slice(0, 2);
+  if (opts.rerank && found.length) {
+    try {
+      const order = opts.rerank(
+        error.slice(0, 600),
+        found.map((f, i) => ({
+          key: f.key,
+          label: f.label,
+          text: f.text,
+          matched: [],
+          outcome: i < 2 ? ("shown" as const) : ("over-limit" as const),
+        })),
+      );
+      if (Array.isArray(order)) {
+        const by = new Map(found.map((f) => [f.key, f]));
+        shownErrs = [...new Set(order)].flatMap((k) => (by.has(k) ? [by.get(k)!] : [])).slice(0, 2);
+      }
+    } catch {
+      // keep the term-matched result
+    }
+  }
+  for (const f of shownErrs) {
+    past.push(f.build());
+    keys.push(f.key);
   }
 
   const mem = await recallForText(db, terms.join(" "), {

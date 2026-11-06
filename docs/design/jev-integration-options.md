@@ -1,13 +1,17 @@
 # Design: further opt-in Jev integrations
 
-Status: options for decision · 2026-11-05 · nothing here is implemented
+Status: implemented · 2026-11-05 · foundation and options A to G are built on branch feature/jev-integrations; user-facing docs are in [Features](adjudicator.md#features)
 
 Jev is TypeSafe's "System One" model. It does not write text. It answers typed questions
 (`Choice`, `Score`, `Noul` = yes/no) and returns a calibrated probability per answer, in
 about 100 ms, at $0.042 per million input tokens (output is free).
 
 eminiar uses it in one place today: the `typesafe` provider of the [adjudicator](adjudicator.md),
-which blends Jev's tier, role, complexity and risk answers onto the heuristic. This note lists
+which blends Jev's tier, role, complexity and risk answers onto the heuristic. The options below
+were first written for Jev. They are now built provider-generic: each feature asks typed
+questions through one decision client and runs on whichever adjudicator provider is configured
+(Jev, an OpenAI-compatible server or the offline embedding provider). Jev is one provider, not a
+requirement. Where the text says "Jev" in an option, read "the configured provider". This note lists
 other places where eminiar has a fuzzy decision that a Jev call could improve, what comparable
 projects do, and which ones to build first.
 
@@ -15,9 +19,10 @@ projects do, and which ones to build first.
 
 These come from the existing adjudicator and are not up for debate per option:
 
-1. **Opt-in twice.** The feature needs `adjudicator.enabled`, `provider: typesafe` and the
-   existing remote consent, plus its own flag under `adjudicator.jev.features.<name>`
-   (default `false`). Off costs one boolean check.
+1. **Opt-in twice.** The feature needs `adjudicator.enabled`, a working provider (not the
+   heuristic) and, for a remote provider, the existing remote consent plus its own data-class
+   consent, and its own flag under `adjudicator.features.<name>` (default `false`). Off costs one
+   boolean check. A local provider needs no consent.
 2. **The deterministic path stays.** Every feature has a non-Jev behaviour it falls back to on
    timeout, breaker-open, no key or low confidence. Jev adjusts, it never replaces.
 3. **Same privacy plumbing.** Text goes through `redact.ts` / `forRemote`, is cut to
@@ -159,25 +164,34 @@ Each option names the eminiar seam it plugs into, the Jev question shape, and th
 1. **Foundation first.** `createTypesafeProvider` is shaped around the adjudicator's own
    questions. Extract a small `JevClient.ask(kind, items, schema)` that reuses `http.ts`,
    `redact.ts`, budget, breaker and exchange capture, and add the
-   `adjudicator.jev.features.*` flags and a per-feature consent line. The adjudicator provider
+   `adjudicator.features.*` flags and a per-feature consent line. The adjudicator provider
    becomes the first caller, with no behaviour change.
 2. **Then A (with G), then B.** Highest value for the least data and risk, and both can be
    evaluated offline from data eminiar already records. Ship each behind shadow mode: log
    Jev's verdict next to the baseline for a while, then enable the blend, as the
    `jev-blend-tuning` eval did.
-3. **E next**, once the dashboard's Jev impact panel can show per-feature help/hurt counts.
+3. **E next**, once the dashboard's Features card shows per-feature calls, errors and shadow-vs-baseline agreement (it has no help/hurt counts: nothing records them).
 4. **C and D only after** the redaction bar for diffs and tool output has its own review. F
    whenever convenient.
 
-## Open decisions for the owner
+## Decisions taken
 
-- **D1.** Is one flag per feature right, or one `jev.features: "recall,memory"` list in the
-  personal config?
-- **D2.** Does feature consent need its own prompt, or does the existing remote consent cover
-  every Jev call? Recommendation: its own line per data class (prompts, memory text, diffs).
-- **D3.** Where does per-feature spend show: the existing Jev impact panel or a new section?
-- **D4.** Is shadow mode a global switch or per feature? Recommendation: per feature, default on.
-- **D5.** Which options go ahead? The recommendation above is foundation, A+G, B.
+- **D1. One object per feature.** `adjudicator.features.<name>` holds `enabled`, `shadow`, the
+  thresholds and the deadlines; `true` or `false` is accepted as shorthand for `{enabled}`.
+  There is no list form.
+- **D2. One consent line per data class.** Prompts are covered by the existing remote consent.
+  Memory text, diffs, session guide and tool output, the swarm task trail and package names each
+  have their own line, shown by `eminiar adjudicator features on <name>` and stored as
+  `<class>@<origin>` in `adjudicator.featureConsent`. A changed `baseUrl` asks again. Local
+  providers need none.
+- **D3. A Features card.** Per-feature calls, spend, errors, unsupported and shadow-vs-baseline
+  agreement show in their own card on the dashboard's Adjudicator tab, next to the adjudicator's
+  own figures. Help/hurt counts were dropped: nothing records them.
+- **D4. Shadow is per feature and on by default.** `eminiar adjudicator features on` starts in
+  shadow; `features shadow <name> off` lets the feature act.
+- **D5. All options went ahead:** the foundation, A with G, B, C, D, E and F, each behind its own
+  flag, all off by default. The ordering in the recommendation above still describes how to
+  evaluate them one at a time.
 
 ## Verification gaps
 

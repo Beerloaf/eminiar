@@ -140,6 +140,11 @@ eminiar adjudicator exchanges [status] [--json]   # Jev request capture: on/off,
 eminiar adjudicator exchanges on [--yes]          # keep the newest 100 Jev requests (contain redacted prompt text)
 eminiar adjudicator exchanges off                 # turn off and delete this project's captured requests
 eminiar adjudicator exchanges purge [--yes]       # delete this project's captured requests
+eminiar adjudicator features [status] [--json]    # the decision features: live, shadow, waiting or off, the provider and consent
+eminiar adjudicator features on <name> [--yes]    # turn one on (shadow first); asks y/N per data class it sends
+eminiar adjudicator features off <name>           # turn one off
+eminiar adjudicator features shadow <name> on|off # shadow records verdicts only; off lets the feature act
+eminiar adjudicator features purge [--yes]        # delete this project's recorded feature calls and cache
 ```
 
 - `status` is the default subcommand. It shows which layer decides `enabled` (environment,
@@ -164,6 +169,13 @@ eminiar adjudicator exchanges purge [--yes]       # delete this project's captur
   repeats for latency percentiles, `--save` keeps the report for the dashboard.
 - `stats` summarises decisions, follow rate, spend and savings with their assumptions.
   `--reset-learning` clears the learned bias.
+- `features` (default `status`) manages the six opt-in [decision features](adjudicator.md#features)
+  (`recall`, `memory`, `commit`, `compaction`, `swarm`, `docs`). `<name>` is one of those. They are
+  off by default, `on` starts in shadow mode, and a feature that sends text to a remote provider
+  asks for consent per data class ([consent](adjudicator.md#consent)). A feature shows `waiting`
+  while the adjudicator is off, consent is missing, or the provider is only the heuristic (for
+  example a project `enabled: true` without a personal one: run `eminiar adjudicator enable`).
+  `eminiar doctor` reports the same. `purge` deletes this project's recorded calls and cache.
 - `exchanges` (default `status`) manages [Jev request capture](adjudicator.md#jev-request-capture).
   `status` shows whether capture is on (and whether `EMINIAR_ADJUDICATOR_CAPTURE=0` is forcing it
   off) and how many requests are stored in this project. `exchanges on` writes

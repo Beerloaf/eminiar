@@ -171,6 +171,11 @@ Ollama, LM Studio, llama.cpp) or the local embedding model. Remote providers nee
 and a key, and only redacted text leaves the machine. Off by default, and it costs nothing while
 off: `eminiar adjudicator enable` ([details](docs/adjudicator.md)).
 
+On top of that, six opt-in decision features (recall precision, memory hygiene, commit advice,
+compaction triage, swarm judgment, docs triage) can ask the provider for a verdict. They are off by
+default, work with any provider, and start in shadow mode, where verdicts are recorded and nothing
+acts on them: `eminiar adjudicator features` ([details](docs/adjudicator.md#features)).
+
 ### 📊 Local dashboard
 
 `eminiar ui` opens a local web app with token savings, usage and cost, a source explorer with

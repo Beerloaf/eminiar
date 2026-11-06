@@ -13,6 +13,17 @@ eminiar merges four layers. A later layer overrides an earlier one.
 | 3 | `<project>/eminiar.config.json` | Team settings. **Commit this file** |
 | 4 | `EMINIAR_*` environment variables | One-off overrides |
 
+One exception to "later wins": for anything that can send text, a **personal `false` wins**.
+`adjudicator.enabled: false` in `~/.eminiar/config.json` beats a project `enabled: true` and
+`EMINIAR_ADJUDICATOR=1`; personal `surfaces.<x>: false` beats a project `true`; personal
+`promptMode: "heuristic"` beats the project's `async`/`blocking`; a project `minPromptChars` below the
+personal one is raised to it. A project `false` or `EMINIAR_ADJUDICATOR=0` still turns it off. A
+personal file without `adjudicator.enabled: true` lets a project `enabled: true` (or
+`EMINIAR_ADJUDICATOR=1`) turn on the local heuristic only: the provider your personal file names,
+and every decision feature, runs only once that file itself says `enabled: true`.
+`eminiar adjudicator status` and `enable` name the deciding layer. See
+[Adjudicator](adjudicator.md#turn-it-on).
+
 `eminiar.config.schema.json` is the JSON Schema for every key. The file written by
 `eminiar install --team` already points to it, so your editor completes and checks the keys:
 
@@ -176,12 +187,12 @@ only:
   `apply`, `advice`, `embedding`, `learning` and `cache` may be set in the committed
   `eminiar.config.json`. Everything that decides where text and keys go or how much is spent
   (`provider`, `typesafe`, `openai`, `keyEnv`, `remoteConsent`, `remoteConsentOrigins`,
-  `privacy`, `budget`, `timeouts`, `breaker`) comes from `~/.eminiar/config.json` only, and from
+  `privacy`, `budget`, `timeouts`, `breaker`, `features`, `featureConsent`) comes from `~/.eminiar/config.json` only, and from
   there only while that file is outside the project (see `EMINIAR_HOME` below).
 
 | Key | Default | Description |
 |---|---|---|
-| `enabled` | `false` | Turn the adjudicator on. `EMINIAR_ADJUDICATOR=0` is the kill switch |
+| `enabled` | `false` | Turn the adjudicator on. `EMINIAR_ADJUDICATOR=0` is the kill switch. A provider runs only when `~/.eminiar/config.json` itself says `true`; a project `true` or `EMINIAR_ADJUDICATOR=1` alone turns on the heuristic only |
 | `provider` | `"heuristic"` | `heuristic`, `embedding`, `typesafe` (Jev) or `openai-compatible` |
 | `mode` | `"advise"` | `advise` only suggests; `apply` sets the Agent `model` on the dispatches `apply.scope` covers. See [Advise and apply](adjudicator.md#advise-and-apply) |
 | `surfaces.prompt` | `true` | Score prompts (UserPromptSubmit) |
@@ -235,6 +246,18 @@ only:
 | `privacy.maxChars` | `2000` | Characters of redacted text a remote provider receives per item |
 | `privacy.storeHead` | `true` | Keep the first 80 redacted characters of each input in the database |
 | `privacy.captureExchanges` | `false` | Keep the newest 100 requests sent to TypeSafe Jev and its answers, with timing, for the dashboard. They contain redacted prompt text, at most 65,536 characters per request or answer. Personal `~/.eminiar/config.json` only: `eminiar.config.json` cannot set it. See [Jev request capture](adjudicator.md#jev-request-capture) |
+| `features.<name>` | all off | One object per decision feature, `<name>` being `recall`, `memory`, `commit`, `compaction`, `swarm` or `docs`; `true`/`false` is shorthand for `{"enabled": …}`. Personal config only. Manage with `eminiar adjudicator features`. See [Features](adjudicator.md#features) |
+| `features.<name>.enabled` | `false` | Turn the feature on. It also needs the adjudicator on with a provider other than the heuristic, and for a remote provider the feature's data-class consent |
+| `features.<name>.shadow` | `true` | Record verdicts without acting on them (the provider is still called, so a waiting surface can add up to its `mcpMs`/`bgMs` budget of latency). `false` lets the feature act; shadow answers are cached apart from live ones, so a flip never applies an old shadow answer |
+| `features.<name>.maxCallsPerDay` | per feature (recall 500, memory 100, commit 100, compaction 50, swarm 300, docs 20) | Daily call cap for this feature |
+| `features.<name>.maxChars` | per feature (recall 600, memory 1500, commit 4000, compaction 400, swarm 600) | Characters of redacted text per item sent to the provider. `docs` sends names only |
+| `features.recall` | `dropBelow` 0.25, `mcpMs` 1200, `jobMs` 2500 | Verdicts below `dropBelow` drop a recalled memory or doc page; deadlines for `em_recall` and the background job |
+| `features.memory` | `minProb` 0.6, `k` 5, `mcpMs` 1500 | Nearest memories compared on `em_remember`; the probability a duplicate or supersede note needs |
+| `features.commit` | `minProb` 0.7, `jobMs` 4000, `exclude` (globs) | Probability a pre-commit note needs; files matching `exclude` are never sent. The default `exclude` covers lockfiles, minified files, keys, `.env` files, secret-bearing directories (`secret/`, `secrets/`, `credentials/`, `creds/`, `vault/`, `private/`, `keys/`, `.docker/`, `.gnupg/` and the like), credential and Terraform files, and Helm-style values files (`values*.yaml`, `*-values.yaml`). A built-in deny floor applies on top whatever `exclude` says (secret-store names such as `secrets.*` are exempt for source modules like `secrets.ts`, which are scrubbed line by line instead). See [Known limits](adjudicator.md#known-limits) |
+| `features.compaction` | `output` false, `minKeep` 0.3, `jobMs` 4000, `mcpMs` 800 | `output: true` also triages `em_execute` output sections; sections scored below `minKeep` are left out of the rewritten guide (and of the triaged output), not merely moved to the end; with an uncalibrated provider only the order changes |
+| `features.swarm` | `flagAbove` 0.7, `bgMs` 3000 | Probability a stalled, looping or needs-human flag needs |
+| `features.docs` | `minScore` 0.5, `mcpMs` 3000 | Dependencies scoring below this are not recommended by `em_docs discover` |
+| `featureConsent` | `[]` | `"<class>@<origin>"` lines (`memory`, `diffs`, `session`, `swarm`, `packages`) written by `features on` after you agree. Personal config only; at most 32 |
 
 ## Environment variables
 
@@ -247,9 +270,10 @@ only:
 | `EMINIAR_PROJECT_ROOT` | Sets the project root. Otherwise `CLAUDE_PROJECT_DIR`, then the current directory |
 | `EMINIAR_DEBUG` | Prints stack traces from the CLI |
 | `EMINIAR_CLAUDE_DIR` | Where Claude Code keeps its transcripts (default `~/.claude`) |
-| `EMINIAR_ADJUDICATOR=0` / `=1` | Turns the adjudicator off (the kill switch) or on, over every config file |
-| `EMINIAR_ADJUDICATOR_PROVIDER` | Overrides `adjudicator.provider`. A remote provider runs only when `remoteConsentOrigins` in `~/.eminiar/config.json` lists its origin |
+| `EMINIAR_ADJUDICATOR=0` / `=1` | `=0` is the kill switch and turns it off over every config file. `=1` turns it on unless your personal `~/.eminiar/config.json` says `adjudicator.enabled: false` (personal off wins), and without a personal `enabled: true` it turns on the local heuristic only (see the top of this page) |
+| `EMINIAR_ADJUDICATOR_PROVIDER` | Overrides `adjudicator.provider`. A remote provider runs only when it equals the provider in your personal `~/.eminiar/config.json` (with its origin in `remoteConsentOrigins`); heuristic and embedding always work, and any other choice degrades with `no_consent` |
 | `EMINIAR_ADJUDICATOR_MODE` | Overrides `adjudicator.mode` (`advise` or `apply`) |
 | `EMINIAR_ADJUDICATOR_REMOTE=0` | Withdraws remote consent. `=1` does nothing: no environment variable can grant consent, because a project's `.claude/settings.json` can set them |
 | `EMINIAR_ADJUDICATOR_CAPTURE=0` | Turns Jev request capture off (`=1` does nothing) |
+| `EMINIAR_ADJUDICATOR_FEATURES=0` | Withdraws every decision feature (`=1` does nothing: no environment variable can switch one on) |
 | `EMINIAR_ADJUDICATOR_KEY` | Adjudicator provider key, checked after `keyEnv` and the provider's own variable (`TYPESAFE_API_KEY`, `GROQ_API_KEY`, `CEREBRAS_API_KEY`) and before `~/.eminiar/adjudicator.key` |

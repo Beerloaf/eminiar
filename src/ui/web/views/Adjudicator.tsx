@@ -75,6 +75,7 @@ import {
   tryItReason,
   usageGapNote,
 } from "./adjudicator-helpers.js";
+import { Features } from "./Features.js";
 import { JevImpact } from "./JevImpact.js";
 import { jevActive } from "./jev-helpers.js";
 import { shortModel } from "./usage-helpers.js";
@@ -1808,6 +1809,7 @@ export function Adjudicator({ params }: { params: Record<string, string> }): JSX
             ))}
           </StatRow>
           {showHow ? <Assumptions list={sav.data?.assumptions ?? []} /> : null}
+          {o.enabled ? <Features range={range} tick={tick} /> : null}
           {jevActive(o) ? (
             <JevImpact range={range} tick={tick} ov={o} onOpen={(n) => go({ id: n })} />
           ) : null}

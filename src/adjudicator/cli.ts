@@ -23,6 +23,9 @@ import {
   projectAdjudicatorWarning,
 } from "../config.js";
 import type { ProjectContext } from "../context.js";
+import { decisionFeatureConfig, decisionInactiveReason } from "../decisions/config.js";
+import { consentEntry, consentLine, DATA_CLASS } from "../decisions/consent.js";
+import { DECISION_FEATURES, type DecisionFeature } from "../decisions/types.js";
 import { paths } from "../paths.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import { getStorage } from "../storage/index.js";
@@ -229,20 +232,36 @@ const tilde = (p: string) => {
   return h && p.startsWith(h) ? `~${p.slice(h.length)}` : p;
 };
 
-/** Which layer decides `enabled`: env > project > global > default. */
+function enabledIn(file: string): boolean | undefined {
+  try {
+    const a = readRaw(file).adjudicator;
+    return isObj(a) && typeof a.enabled === "boolean" ? a.enabled : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Which layer decides `enabled`. A personal `false` wins for anything that can send text (it beats
+ * a project `true` and EMINIAR_ADJUDICATOR=1); only EMINIAR_ADJUDICATOR=0 is stronger or equal.
+ * Otherwise env > project > personal > default, except that a project `true` or
+ * EMINIAR_ADJUDICATOR=1 without a personal `enabled: true` turns on the local heuristic only
+ * (withPersonalVetoes in src/config.ts), which the returned text says.
+ */
 export function enabledSource(root: string, env: NodeJS.ProcessEnv): string {
   const e = env.EMINIAR_ADJUDICATOR;
-  if (e === "0" || e === "1") return `env EMINIAR_ADJUDICATOR=${e}`;
-  const enabledIn = (file: string) => {
-    try {
-      const a = readRaw(file).adjudicator;
-      return isObj(a) && typeof a.enabled === "boolean";
-    } catch {
-      return false;
-    }
-  };
-  if (enabledIn(projectFile(root))) return "project eminiar.config.json";
-  if (enabledIn(paths().configFile)) return `global ${tilde(paths().configFile)}`;
+  if (e === "0") return "env EMINIAR_ADJUDICATOR=0";
+  const personal = enabledIn(paths().configFile);
+  if (personal === false) return `personal ${tilde(paths().configFile)} (enabled: false wins)`;
+  const heuristicOnly = (s: string) =>
+    personal === true
+      ? s
+      : `${s} (local heuristic only: a provider runs once ${tilde(paths().configFile)} says enabled: true)`;
+  if (e === "1") return heuristicOnly("env EMINIAR_ADJUDICATOR=1");
+  const project = enabledIn(projectFile(root));
+  if (project !== undefined)
+    return project ? heuristicOnly("project eminiar.config.json") : "project eminiar.config.json";
+  if (personal !== undefined) return `global ${tilde(paths().configFile)}`;
   return "default";
 }
 
@@ -772,6 +791,8 @@ export interface StatusReport {
   consentVia: string | null;
   /** The origins ~/.eminiar/config.json records consent for. */
   consentedOrigins: string[];
+  /** EMINIAR_ADJUDICATOR_PROVIDER names a remote provider the personal file does not itself use. */
+  envProviderPinned?: string | null;
   /** projectAdjudicatorWarning(): adjudicator keys the project file sets that are ignored. */
   projectIgnored: string | null;
   key: {
@@ -908,6 +929,13 @@ export async function statusReport(
     consent: r0.configuredRemote && r0.consent,
     consentVia: r0.consentVia ?? null,
     consentedOrigins: consentedOrigins(a),
+    envProviderPinned:
+      io.env.EMINIAR_ADJUDICATOR_PROVIDER &&
+      r0.configuredRemote &&
+      !r0.consent &&
+      consentedOrigins(a).length > 0
+        ? io.env.EMINIAR_ADJUDICATOR_PROVIDER
+        : null,
     projectIgnored: safe(() => projectAdjudicatorWarning(ctx.root)) ?? null,
     key: {
       id: need?.id ?? null,
@@ -1041,6 +1069,10 @@ export function formatStatus(s: StatusReport): string {
       }`,
     );
   else lines.push("remote: no, nothing leaves this machine");
+  if (s.envProviderPinned)
+    lines.push(
+      `note: EMINIAR_ADJUDICATOR_PROVIDER=${s.envProviderPinned} selects a provider other than the one in your personal config, and an environment choice only runs when it is that provider (or heuristic/embedding). \`enable --accept-remote\` does not change that: set it in the personal config with \`eminiar adjudicator provider <name>\` instead (consent already given for ${s.consentedOrigins.join(", ")}).`,
+    );
   if (s.projectIgnored) lines.push(`warning: ${s.projectIgnored}`);
   if (s.key.id)
     lines.push(
@@ -1235,6 +1267,17 @@ export function adjudicatorDoctorChecks(
   const pinned = a.mode === "apply" ? pinnedSwarms(o.root, config, env) : [];
   if (pinned.length)
     checks.push({ name: "adjudicator swarm pins", ok: true, detail: pinnedSwarmsNote(pinned) });
+  const wanted = featureRows(config, env).filter((f) => f.enabled);
+  if (wanted.length) {
+    const stuck = wanted.filter((f) => f.state === "waiting");
+    checks.push({
+      name: "adjudicator features",
+      ok: stuck.length === 0,
+      detail: wanted
+        .map((f) => `${f.name} ${f.state === "waiting" ? `waiting (${f.reason})` : f.state}`)
+        .join(" · "),
+    });
+  }
   if (r0.configured === "embedding") {
     let cached = false;
     try {
@@ -1338,6 +1381,12 @@ export const ADJUDICATOR_USAGE = `eminiar adjudicator <command>   (opt-in; off b
                                       answer in this project's database; asks y/N, personal setting only
   exchanges off                       Turn it off and delete this project's captured requests
   exchanges purge [--yes]             Delete this project's captured requests, leave the setting
+  features [status] [--json]         The decision features (recall, memory, commit, compaction, swarm,
+                                      docs): live, shadow, waiting or off, the provider and consent
+  features on <name> [--yes]          Turn one on (shadow first); asks y/N per data class it sends
+  features off <name>                 Turn one off
+  features shadow <name> on|off       Shadow records verdicts only; off lets the feature act
+  features purge [--yes]              Delete this project's recorded feature calls and cache
 Providers: heuristic (offline) · embedding (local model) · typesafe = Jev (api.typesafe.ai)
   · openai-compatible presets ${PRESET_IDS.join(", ")}`;
 
@@ -1433,6 +1482,10 @@ export async function adjudicatorCommand(
       if (values.project) {
         writeAdjudicatorPatch(projectFile(ctx.root), { enabled: true });
         io.out(`Wrote adjudicator.enabled: true to ${projectFile(ctx.root)} (commit it to share).`);
+        if (enabledIn(paths().configFile) === false)
+          io.out(
+            `It stays off for you: ${tilde(paths().configFile)} sets adjudicator.enabled: false, and a personal off wins over the project file for anything that sends text. Run \`eminiar adjudicator enable\` without --project to turn it on for yourself.`,
+          );
         const { enabled: _e, ...personal } = patch;
         if (Object.keys(personal).length) writeAdjudicatorPatch(paths().configFile, personal);
       } else writeAdjudicatorPatch(paths().configFile, patch);
@@ -1622,6 +1675,9 @@ export async function adjudicatorCommand(
     case "exchanges":
       return exchangesCommand(rest[0], values, ctx, load, io, deps);
 
+    case "features":
+      return featuresCommand(rest, values, ctx, load, io, deps);
+
     case "help":
       io.out(ADJUDICATOR_USAGE);
       return 0;
@@ -1765,6 +1821,203 @@ async function exchangesCommand(
   io.out(
     `Deleted ${n} captured request${n === 1 ? "" : "s"} from this project; the capture setting is unchanged. Other projects keep theirs.`,
   );
+  return 0;
+}
+
+// --- features ----------------------------------------------------------------------
+
+export interface FeatureRow {
+  name: DecisionFeature;
+  enabled: boolean;
+  shadow: boolean;
+  /** live and shadow run; waiting is enabled but blocked; off is not enabled. */
+  state: "live" | "shadow" | "waiting" | "off";
+  reason?: string;
+  dataClass: string;
+  consented: boolean;
+}
+
+/** One row per decision feature, from the config and env alone (no network, no database). */
+export function featureRows(config: Config, env: NodeJS.ProcessEnv): FeatureRow[] {
+  const a = config.adjudicator;
+  const r = resolveAdjudicator(a, { context: "cli", env });
+  // A project or env `enabled: true` without a personal one runs the heuristic only (same rule as status).
+  const forcedHeuristic = a.enabled && enabledIn(paths().configFile) !== true;
+  return DECISION_FEATURES.map((name) => {
+    const f = a.features[name];
+    const why = f.enabled ? decisionInactiveReason(a, name, env) : "disabled";
+    const consented =
+      !r.configuredRemote ||
+      (!!r.origin && a.featureConsent.includes(consentEntry(DATA_CLASS[name], r.origin)));
+    const row: FeatureRow = {
+      name,
+      enabled: f.enabled,
+      shadow: f.shadow,
+      state: !f.enabled ? "off" : why ? "waiting" : f.shadow ? "shadow" : "live",
+      dataClass: r.configuredRemote
+        ? r.remote
+          ? DATA_CLASS[name]
+          : `${DATA_CLASS[name]} (not sent yet: provider degraded${r.origin ? `, would go to ${r.origin}` : ""})`
+        : "none (local provider)",
+      consented,
+    };
+    if (f.enabled && why) {
+      row.reason =
+        why === "no_consent"
+          ? "no consent for this data class at the provider's origin"
+          : !a.enabled ||
+              env.EMINIAR_ADJUDICATOR === "0" ||
+              env.EMINIAR_ADJUDICATOR_FEATURES === "0"
+            ? "adjudicator off or EMINIAR_ADJUDICATOR_FEATURES=0"
+            : forcedHeuristic
+              ? `provider is the heuristic: a project or env enabled: true gives the heuristic only; run \`eminiar adjudicator enable\` (${tilde(paths().configFile)} needs enabled: true)`
+              : "provider is the heuristic";
+    }
+    return row;
+  });
+}
+
+function parseFeatureName(s: string | undefined): DecisionFeature | undefined {
+  return DECISION_FEATURES.find((f) => f === s);
+}
+
+/** `features [status|on|off|shadow|purge]`: adjudicator.features.* in the personal config. */
+async function featuresCommand(
+  rest: string[],
+  values: Record<string, unknown>,
+  ctx: ProjectContext,
+  load: () => Config,
+  io: Io,
+  deps: CliDeps,
+): Promise<number> {
+  const [action = "status", name, arg] = rest;
+  const yes = values.yes === true;
+  if (action === "status") {
+    const config = load();
+    const r = resolveAdjudicator(config.adjudicator, { context: "cli", env: io.env });
+    const rows = featureRows(config, io.env);
+    if (values.json) {
+      io.out(
+        JSON.stringify(
+          {
+            provider: r.provider,
+            remote: r.remote,
+            configuredRemote: r.configuredRemote,
+            origin: r.configuredRemote ? (r.origin ?? null) : null,
+            features: rows,
+          },
+          null,
+          2,
+        ),
+      );
+      return 0;
+    }
+    io.out(
+      `provider: ${r.provider}${r.configuredRemote ? ` (remote${r.origin ? `, ${r.origin}` : ""}${r.remote ? "" : ", waiting: no consent or key"})` : " (local)"} · adjudicator ${config.adjudicator.enabled ? "on" : "off"}`,
+    );
+    for (const f of rows) {
+      const mode =
+        f.state === "off" ? "off" : f.state === "waiting" ? `waiting: ${f.reason}` : f.state;
+      io.out(
+        `  ${f.name.padEnd(11)} ${mode.padEnd(8)} sends: ${f.dataClass}${f.dataClass.startsWith("none") ? "" : ` · consent ${f.consented ? "given" : "missing"}`}`,
+      );
+    }
+    if (rows.every((f) => f.state === "off"))
+      io.out("all off; turn one on with `eminiar adjudicator features on <name>`");
+    return 0;
+  }
+  if (action === "purge") {
+    if (!yes && !io.isTTY) {
+      io.err("features purge deletes data and needs a yes: run it in a terminal, or pass --yes.");
+      return 1;
+    }
+    if (!yes && !(await askNo(io, "Delete this project's recorded feature calls and cache?"))) {
+      io.out("Nothing was deleted.");
+      return 0;
+    }
+    (await storage(ctx, deps)).decisions.purge();
+    io.out("Deleted this project's recorded feature calls and cache.");
+    return 0;
+  }
+  if (action !== "on" && action !== "off" && action !== "shadow") {
+    io.err(`unknown features command: ${action}\n`);
+    io.out(ADJUDICATOR_USAGE);
+    return 2;
+  }
+  const f = parseFeatureName(name);
+  if (!f) {
+    io.err(`unknown feature: ${name ?? "(none)"}; one of ${DECISION_FEATURES.join(", ")}`);
+    return 2;
+  }
+  if (values.project) {
+    io.err(
+      "features is a personal setting: eminiar.config.json cannot set it. Run it without --project.",
+    );
+    return 2;
+  }
+  if (personalFileUntrusted(io, ctx.root)) return 2;
+  const file = paths().configFile;
+  if (action === "off") {
+    writeAdjudicatorPatch(file, { features: { [f]: { enabled: false } } });
+    io.out(`${f} is off; wrote ${tilde(file)}.`);
+    return 0;
+  }
+  if (action === "shadow") {
+    if (arg !== "on" && arg !== "off") {
+      io.err("usage: features shadow <name> on|off");
+      return 2;
+    }
+    writeAdjudicatorPatch(file, { features: { [f]: { shadow: arg === "on" } } });
+    io.out(
+      arg === "on"
+        ? `${f} now only records verdicts (shadow); wrote ${tilde(file)}.`
+        : `${f} now acts on verdicts (live); wrote ${tilde(file)}.`,
+    );
+    return 0;
+  }
+  // on
+  const config = load();
+  const a = config.adjudicator;
+  const r = resolveAdjudicator(a, { context: "cli", env: io.env });
+  const patch: Record<string, unknown> = { features: { [f]: { enabled: true } } };
+  if (r.configuredRemote) {
+    if (!r.origin) {
+      io.err(
+        "the provider has no usable origin; run `eminiar adjudicator status`. Nothing was changed.",
+      );
+      return 1;
+    }
+    const maxChars = decisionFeatureConfig(a, f).maxChars ?? a.privacy.maxChars;
+    io.out(`${f} ${consentLine(DATA_CLASS[f], { origin: r.origin, maxChars })}.`);
+    io.out(`Every text is redacted first. \`eminiar adjudicator features off ${f}\` withdraws it.`);
+    if (!yes) {
+      if (!io.isTTY) {
+        io.err(
+          "features on sends text to a remote provider and needs a yes: run it in a terminal, or pass --yes. Nothing was changed.",
+        );
+        return 1;
+      }
+      if (!(await askNo(io, "Turn on?"))) {
+        io.out("Nothing was changed.");
+        return 0;
+      }
+    }
+    const entry = consentEntry(DATA_CLASS[f], r.origin);
+    if (!a.featureConsent.includes(entry)) patch.featureConsent = [...a.featureConsent, entry];
+    if (!r.remote)
+      io.out(
+        `The remote provider is waiting (no provider consent or key yet), so nothing is sent now; once it runs, ${f} would send that text to ${r.origin}.`,
+      );
+  } else {
+    io.out(
+      `${f} runs on the local provider; nothing leaves this machine, so no consent is needed.`,
+    );
+  }
+  writeAdjudicatorPatch(file, patch);
+  io.out(`${f} is on in shadow mode (verdicts recorded, none acted on); wrote ${tilde(file)}.`);
+  io.out(`Make it act with \`eminiar adjudicator features shadow ${f} off\`.`);
+  const after = featureRows(load(), io.env).find((x) => x.name === f);
+  if (after?.state === "waiting") io.out(`note: not running yet: ${after.reason}.`);
   return 0;
 }
 

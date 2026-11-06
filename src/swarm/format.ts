@@ -279,6 +279,7 @@ function taskLine(
   byId: Map<number, TaskRow>,
   workers: Map<string, WorkerView>,
   now: number,
+  badge?: string,
 ): string {
   const parts = [`#${t.id} ${clip(t.title, 120)}${t.role ? ` (${t.role})` : ""}`];
   if (t.agent_id && t.status !== "pending") parts.push(holderName(t.agent_id, workers));
@@ -296,6 +297,7 @@ function taskLine(
     line += ` · ⚠ holder quiet ${Math.max(1, Math.round((now - quiet.last_ts) / 60_000))}m — release with em_swarm {action:"release", agent:"${shortAgent(quiet.agent_id)}"} or update status:pending`;
   else if (quiet)
     line += ` · ⚠ holder stopped — reopen with em_swarm {action:"update", task:${t.id}, status:"pending"}`;
+  if (badge) line += ` · judge: ${badge}`;
   if (t.auto_closed) line += " · ⚠ auto-closed: the worker never reported; check the result";
   if (t.result && t.status !== "active" && t.status !== "pending")
     line += ` — ${clip(firstLine(t.result), 140)}`;
@@ -368,6 +370,8 @@ export function formatRunStatus(
     workers?: number;
     max?: number;
     lead?: string[];
+    /** task id → advisory text from the optional progress judge; never an action. */
+    badges?: ReadonlyMap<number, string>;
   } = {},
 ): string {
   const now = opts.now ?? Date.now();
@@ -407,7 +411,8 @@ export function formatRunStatus(
       );
     if (!group.length) continue;
     lines.push(`${TASK_GLYPH[status]} ${status}`);
-    for (const t of group.slice(0, perGroup)) lines.push(`  ${taskLine(t, byId, workers, now)}`);
+    for (const t of group.slice(0, perGroup))
+      lines.push(`  ${taskLine(t, byId, workers, now, opts.badges?.get(t.id))}`);
     if (group.length > perGroup) lines.push(`  … ${group.length - perGroup} more ${status}`);
   }
 

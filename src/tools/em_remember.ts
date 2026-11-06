@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { featuresWanted } from "../config.js";
+import { suggestMemoryHygiene } from "../decisions/features/memory.js";
 import { kickEmbedding } from "../embeddings/queue.js";
 import { gitignoreHint, MEMORY_KINDS, MEMORY_STATUSES, reconcile, write } from "../memory/store.js";
 import { getCurrentSession } from "../session/current.js";
@@ -72,8 +74,22 @@ export const emRemember = defineTool({
     });
     kickEmbedding(ctx, db);
     const hint = gitignoreHint(ctx);
+    // Opt-in hygiene suggestion (adjudicator.features.memory); off, shadow or any failure adds nothing.
+    let suggestion: string | undefined;
+    if (featuresWanted(ctx.config.adjudicator) && ctx.config.adjudicator.features.memory.enabled) {
+      try {
+        suggestion = await suggestMemoryHygiene(ctx, db, {
+          name: r.name,
+          content: args.content,
+          supersedes: args.supersedes,
+          sessionId,
+        });
+      } catch {
+        suggestion = undefined;
+      }
+    }
     return text(
-      `remembered ${r.name} (${args.kind}${args.status ? `, ${args.status}` : ""}) → ${r.path}${r.created ? "" : " (replaced)"}${r.superseded ? `; ${r.superseded} marked superseded` : ""}${hint ? `\n${hint}` : ""}`,
+      `remembered ${r.name} (${args.kind}${args.status ? `, ${args.status}` : ""}) → ${r.path}${r.created ? "" : " (replaced)"}${r.superseded ? `; ${r.superseded} marked superseded` : ""}${hint ? `\n${hint}` : ""}${suggestion ? `\n${suggestion}` : ""}`,
     );
   },
 });
