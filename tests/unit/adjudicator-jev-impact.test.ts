@@ -45,6 +45,7 @@ import {
   WILSON_Z,
   wilson,
 } from "../../src/adjudicator/jev-impact.js";
+import { appliedTier } from "../../src/adjudicator/swarm.js";
 import type {
   AdjudicationRow,
   Dist,
@@ -54,6 +55,7 @@ import type {
   ScoreTable,
   Tier,
 } from "../../src/adjudicator/types.js";
+import { TIERS } from "../../src/adjudicator/types.js";
 import { SqliteAdapter } from "../../src/storage/sqlite/adapter.js";
 import type { AdjudicationInput } from "../../src/storage/types.js";
 import { kpiRows } from "../../src/ui/web/views/jev-helpers.js";
@@ -1428,6 +1430,156 @@ describe("effective model (advisedPick and the apply bounds)", () => {
   });
 });
 
+describe("ranged stays, stored ranges and keptDisagreed", () => {
+  const scoresWith = (patch: Record<string, unknown>) =>
+    JSON.stringify({ ...parseScores(KINDS.up1()), ...patch });
+  const range = { floor: "haiku", ceiling: "opus" } as const;
+
+  it("a ranged stay (kept pin, ranged, advisedPick) is a dispatch, not excluded.kept", () => {
+    put(
+      dispatch("up1", "help_up", {
+        scores: scoresWith({
+          pinDeferred: true,
+          ranged: true,
+          advisedPick: "sonnet",
+          pin: { status: "ranged", model: "sonnet", range },
+        }),
+      }),
+    );
+    const r = report();
+    expect(r.outcomes.excluded.kept).toBe(0);
+    expect(r.influence.effective).toMatchObject({ dispatches: 1, changed: 1, unknown: 0 });
+  });
+
+  it("a stored range keeps a ranged row from being unknown", () => {
+    put(
+      dispatch("up1", "help_up", {
+        scores: scoresWith({ ranged: true, advisedPick: "sonnet", pin: { range } }),
+      }),
+    );
+    const r = report();
+    expect(r.influence.effective).toMatchObject({ dispatches: 1, changed: 1, unknown: 0 });
+  });
+
+  it("applyBounds clamp the counterfactual; without them the apply part stays inferred", () => {
+    const base = { raw: "sonnet", pick: "sonnet", cf: "haiku", ranged: true, range } as const;
+    expect(effectivePick({ ...base, bounds: { floor: "sonnet" } })).toEqual({
+      final: "sonnet",
+      cf: "sonnet",
+    });
+    expect(effectivePick({ ...base, bounds: { floor: "haiku" } })).toEqual({
+      final: "sonnet",
+      cf: "haiku",
+    });
+    expect(effectivePick({ ...base, possible: [{ floor: "sonnet" }] })).toBe("bounds");
+  });
+
+  it("counts kept pins whose advice named another tier as keptDisagreed", () => {
+    const kept = (pick: string) =>
+      scoresWith({
+        pinDeferred: true,
+        advisedPick: pick,
+        pin: { status: "pinned", model: "claude-opus-4" },
+      });
+    put(dispatch("up1", "help_up", { scores: kept("sonnet") }));
+    put(dispatch("up1", "help_up", { scores: kept("opus") }));
+    const r = report();
+    expect(r.outcomes.excluded).toMatchObject({ kept: 2, keptDisagreed: 1 });
+  });
+
+  it("leaves advised rows whose advice is the baseline tier out of followDenom", () => {
+    put(
+      dispatch("up1", "help_up", {
+        action: "advised",
+        baselineModel: "claude-sonnet-4",
+        scores: scoresWith({ advisedPick: "sonnet" }),
+      }),
+    );
+    put(
+      dispatch("up1", "help_up", {
+        action: "advised",
+        baselineModel: "claude-opus-4",
+        scores: scoresWith({ advisedPick: "sonnet" }),
+      }),
+    );
+    expect(report().outcomes.changed.followDenom).toBe(1);
+  });
+});
+
+describe("the follow rate agrees with the store summary (review-A A1-A3)", () => {
+  const scoresWith = (patch: Record<string, unknown>) =>
+    JSON.stringify({ ...parseScores(KINDS.up1()), ...patch });
+  const range = { floor: "haiku", ceiling: "opus" } as const;
+  /** The impact report's follow rate over every compared dispatch, beside the store's. */
+  const both = () => {
+    const { changed, unchanged } = report().outcomes;
+    const denom = changed.followDenom + unchanged.followDenom;
+    return {
+      impact: denom ? (changed.followed + unchanged.followed) / denom : null,
+      denom,
+      store: db.adjudicator.summary().rates.follow,
+    };
+  };
+
+  it("A1: respected explicit models that differ from the advice are deviations", () => {
+    const base = { baselineModel: "claude-opus-4", scores: scoresWith({ advisedPick: "sonnet" }) };
+    put(dispatch("up1", "help_up", { action: "followed", modelRequested: "sonnet", ...base }));
+    for (let i = 0; i < 3; i++)
+      put(dispatch("up1", "help_up", { action: "respected", modelRequested: "haiku", ...base }));
+    expect(both()).toEqual({ impact: 0.25, denom: 4, store: 0.25 });
+  });
+
+  it("A2: an ignored row on baseline advice stays in the denominator", () => {
+    put(
+      dispatch("up1", "help_up", {
+        action: "ignored",
+        baselineModel: "claude-opus-4",
+        modelRequested: "haiku",
+        scores: scoresWith({ advisedPick: "opus" }),
+      }),
+    );
+    put(
+      dispatch("up1", "help_up", {
+        action: "followed",
+        baselineModel: "claude-opus-4",
+        modelRequested: "sonnet",
+        scores: scoresWith({ advisedPick: "sonnet" }),
+      }),
+    );
+    expect(both()).toEqual({ impact: 0.5, denom: 2, store: 0.5 });
+  });
+
+  it("A3: a ranged stay never enters followDenom, whatever its baseline", () => {
+    const stay = scoresWith({
+      pinDeferred: true,
+      ranged: true,
+      advisedPick: "sonnet",
+      pin: { status: "ranged", model: "claude-sonnet-4-5", range },
+    });
+    put(
+      dispatch("up1", "help_up", { action: "advised", baselineModel: null as never, scores: stay }),
+    );
+    put(
+      dispatch("up1", "help_up", {
+        action: "advised",
+        baselineModel: "claude-opus-4",
+        scores: stay,
+      }),
+    );
+    put(
+      dispatch("up1", "help_up", {
+        action: "followed",
+        baselineModel: "claude-opus-4",
+        scores: scoresWith({ advisedPick: "sonnet" }),
+      }),
+    );
+    const r = report();
+    // the stays are still dispatches Jev decided, only the follow rate leaves them out
+    expect(r.outcomes.changed.dispatches).toBe(3);
+    expect(both()).toEqual({ impact: 1, denom: 1, store: 1 });
+  });
+});
+
 describe("effectivePick: every branch", () => {
   const bounds = { floor: "sonnet", ceiling: "sonnet" } as const;
 
@@ -2474,3 +2626,153 @@ describe("a round-up that lands on Jev's own pick is not blend-induced (review-j
 function rowOfInput(cols: AdjudicationInput): AdjudicationRow {
   return { id: 1, ts: POST, outcome: "pending", final: false, ...cols } as AdjudicationRow;
 }
+
+describe("effectivePick: stored bounds (review-A A4, A5)", () => {
+  it("resolves a heuristic tier on the far side of the pick when the bounds are stored", () => {
+    expect(
+      effectivePick({
+        raw: "opus",
+        pick: "sonnet",
+        cf: "haiku",
+        ranged: false,
+        bounds: { floor: "haiku", ceiling: "sonnet" },
+      }),
+    ).toEqual({ final: "sonnet", cf: "haiku" });
+    expect(
+      effectivePick({
+        raw: "haiku",
+        pick: "sonnet",
+        cf: "opus",
+        ranged: false,
+        bounds: { floor: "sonnet", ceiling: "opus" },
+      }),
+    ).toEqual({ final: "sonnet", cf: "opus" });
+    expect(effectivePick({ raw: "opus", pick: "sonnet", cf: "haiku", ranged: false })).toBe(
+      "unknown",
+    );
+  });
+
+  it("lets the floor win over a lower ceiling, as the hooks do", () => {
+    expect(
+      effectivePick({
+        raw: "sonnet",
+        pick: "sonnet",
+        cf: "haiku",
+        ranged: false,
+        bounds: { floor: "sonnet", ceiling: "haiku" },
+      }),
+    ).toEqual({ final: "sonnet", cf: "sonnet" });
+  });
+
+  it("agrees with appliedTier / rangedTier on every tier and bounds (brute force)", () => {
+    const known = TIERS;
+    for (const fl of known)
+      for (const ce of known)
+        for (const raw of known)
+          for (const cf of known) {
+            const bounds = { floor: fl, ceiling: ce };
+            const pick = appliedTier(raw, fl, ce);
+            const want = appliedTier(cf, fl, ce);
+            expect(effectivePick({ raw, pick, cf, ranged: false, bounds })).toEqual({
+              final: pick,
+              cf: want,
+            });
+          }
+  });
+});
+
+describe("ranged, range and bounds come from one row (review-C C2)", () => {
+  it("a ranged dispatch with apply bounds but no stored range is unknown, not clamped by the bounds", () => {
+    // If the role range was sonnet..sonnet the heuristic's opus would have run as sonnet.
+    expect(
+      effectivePick({
+        raw: "haiku",
+        pick: "sonnet",
+        cf: "opus",
+        ranged: true,
+        bounds: { floor: "sonnet", ceiling: "opus" },
+      }),
+    ).toBe("unknown");
+    // With the range stored it is determined again.
+    expect(
+      effectivePick({
+        raw: "haiku",
+        pick: "sonnet",
+        cf: "opus",
+        ranged: true,
+        range: { floor: "sonnet", ceiling: "sonnet" },
+        bounds: { floor: "sonnet", ceiling: "opus" },
+      }),
+    ).toEqual({ final: "sonnet", cf: "sonnet" });
+  });
+
+  it("an agent row that stores its bounds is read alone, not with the plan row's range", () => {
+    const swarm = { runId: "R1", taskId: 1 };
+    // The plan row ran for a ranged role opus..opus; the agent row (a stale agent file) is not
+    // ranged and stores apply bounds haiku..fable, so the heuristic's haiku is the counterfactual.
+    const planId = put(
+      patchScores(applied("up1", { surface: "plan", ...swarm }), {
+        ranged: true,
+        advisedPick: "sonnet",
+        pin: { status: "ranged", model: "opus", range: { floor: "opus", ceiling: "opus" } },
+      }),
+    );
+    put(
+      patchScores(
+        {
+          ...KINDS.agree(),
+          surface: "agent",
+          ts: POST,
+          tier: "sonnet",
+          role: "coder",
+          parentId: planId,
+          provider: "typesafe",
+          source: "fallback",
+          providerStatus: "skipped",
+          latencyMs: 3,
+          action: "applied",
+          final: true,
+          ...swarm,
+          ...labelled.help_up,
+        },
+        { applyBounds: { floor: "haiku", ceiling: "fable" } },
+      ),
+    );
+    const r = report();
+    expect(r.influence.effective).toMatchObject({ dispatches: 1, changed: 1, unknown: 0 });
+    // An upgrade haiku -> sonnet labelled too small: help (the plan row's range made it a
+    // downgrade from opus, which would read as hurt).
+    expect(r.outcomes.evidence).toMatchObject({ help: 1, hurt: 0 });
+    expect(r.outcomes.evidence.rows[0]).toMatchObject({ from: "haiku", to: "sonnet" });
+  });
+
+  it("an agent row with none of them takes all three from its plan row", () => {
+    const swarm = { runId: "R1", taskId: 1 };
+    const planId = put(
+      patchScores(applied("up1", { surface: "plan", ...swarm }), {
+        ranged: true,
+        advisedPick: "sonnet",
+        pin: { status: "ranged", model: "sonnet", range: { floor: "haiku", ceiling: "opus" } },
+      }),
+    );
+    put({
+      ...KINDS.agree(),
+      surface: "agent",
+      ts: POST,
+      tier: "sonnet",
+      role: "coder",
+      parentId: planId,
+      provider: "typesafe",
+      source: "fallback",
+      providerStatus: "skipped",
+      latencyMs: 3,
+      action: "applied",
+      final: true,
+      ...swarm,
+      ...labelled.help_up,
+    });
+    const r = report();
+    expect(r.influence.effective).toMatchObject({ dispatches: 1, changed: 1, unknown: 0 });
+    expect(r.outcomes.evidence.rows[0]).toMatchObject({ from: "haiku", to: "sonnet" });
+  });
+});

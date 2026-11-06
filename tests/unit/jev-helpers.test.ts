@@ -13,18 +13,23 @@ import { breakerInfo, ms, rate } from "../../src/ui/web/views/adjudicator-helper
 import {
   addedLatency,
   complexityLine,
+  deferredLine,
   dimLine,
   evidenceLabel,
   evidenceTone,
   excludedLine,
+  featuresHint,
+  featuresOff,
   footerFacts,
   jevActive,
+  keptLine,
   kpiRows,
   outcomeRows,
   successCell,
   surfaceRows,
   transitionGrid,
   verdictLine,
+  verdictSteps,
   verdictTone,
 } from "../../src/ui/web/views/jev-helpers.js";
 import { formatUsd } from "../../src/usage/pricing.js";
@@ -628,6 +633,7 @@ describe("excludedLine", () => {
   it("names every reason a dispatch was left out, the advice-not-run count included", () => {
     const x = {
       kept: 1,
+      keptDisagreed: 0,
       deferred: 2,
       notJev: 3,
       unreconstructable: 4,
@@ -640,5 +646,82 @@ describe("excludedLine", () => {
     expect(excludedLine(x)).toBe(
       "kept model 1 · deferred 2 · fell back 3 · uncertain 9 · unknown model 6 · apply bounds not stored 9 · advised tier not run 7 (outcome and feedback not counted) · outcome not final yet 8",
     );
+  });
+});
+
+describe("jev guidance", () => {
+  it("keptLine names the roles to give a range when Jev's pick differed", () => {
+    expect(keptLine({ kept: 0, keptDisagreed: 0 })).toBeNull();
+    expect(keptLine({ kept: 5, keptDisagreed: 0 })).toBe("5 kept their pin");
+    expect(keptLine({ kept: 5, keptDisagreed: 2 })).toBe(
+      "5 kept their pin; Jev's pick differed on 2: give those roles a model_range",
+    );
+  });
+
+  it("deferredLine names blocking and the p50, and hides when already blocking", () => {
+    const r = { cost: { deferred: 3, providerLatency: { n: 4, p50: 410, p95: 590 } } } as never;
+    expect(deferredLine(r, "async")).toContain('promptMode "blocking"');
+    expect(deferredLine(r, "async")).toContain(ms(410));
+    expect(deferredLine(r, "blocking")).toBeNull();
+    expect(
+      deferredLine({ cost: { deferred: 0, providerLatency: {} } } as never, "async"),
+    ).toBeNull();
+  });
+
+  it("featuresOff lists disabled features and tolerates a missing config", () => {
+    expect(featuresOff(undefined)).toEqual([]);
+    expect(
+      featuresOff({ features: { recall: { enabled: false }, docs: { enabled: true } } }),
+    ).toEqual(["recall"]);
+  });
+
+  it("verdictSteps lists what is missing, and nothing once there is a verdict", () => {
+    const fb = { good: 0, too_small: 0, too_big: 0 };
+    const mk = (label: string, changed: number, units: number, good = 0, compared = 99) =>
+      ({
+        verdict: { label, changed, units, minUnits: 3, compared, minCompared: 30 },
+        outcomes: { changed: { feedback: { ...fb, good } }, unchanged: { feedback: fb } },
+      }) as never;
+    const steps = verdictSteps(mk("not enough data", 0, 1, 0, 12));
+    expect(steps).toHaveLength(4);
+    expect(steps[1]).toContain("em_swarm update fit");
+    expect(steps[2]).toContain("1 runs or sessions; need 3");
+    expect(steps[3]).toBe("12 compared plan or agent decisions; need 30");
+    expect(verdictSteps(mk("not enough data", 20, 5, 1, 12))).toEqual([
+      "12 compared plan or agent decisions; need 30",
+    ]);
+    expect(verdictSteps(mk("not enough data", 2, 3, 1))).toEqual([]);
+    expect(verdictSteps(mk("helping", 0, 0))).toEqual([]);
+  });
+
+  it("verdictSteps names too few labelled outcomes and a split verdict (review-C C3)", () => {
+    const fb = { good: 0, too_small: 0, too_big: 0 };
+    const mk = (v: Record<string, unknown>) =>
+      ({
+        verdict: {
+          label: "not enough data",
+          minUnits: 3,
+          minCompared: 30,
+          minEvidence: 10,
+          ...v,
+        },
+        outcomes: { changed: { feedback: { ...fb, good: 5 } }, unchanged: { feedback: fb } },
+      }) as never;
+    expect(verdictSteps(mk({ changed: 6, n: 5, units: 3, compared: 40 }))).toEqual([
+      "5 labelled outcomes on decisions Jev changed; need 10",
+    ]);
+    expect(
+      verdictSteps(mk({ changed: 20, n: 12, help: 6, hurt: 6, units: 4, compared: 40 })),
+    ).toEqual(["Evidence is split (6 help vs 6 hurt): more labelled outcomes will settle it"]);
+    // No changed dispatch: the first step covers it, no "0 labelled outcomes" line.
+    expect(verdictSteps(mk({ changed: 0, n: 0, units: 3, compared: 40 }))).toEqual([
+      "No dispatch ran a model Jev changed yet: ranged roles let Jev move the model",
+    ]);
+  });
+
+  it("featuresHint is an optional note, null when nothing is off", () => {
+    expect(featuresHint({ features: { docs: { enabled: false } } })).toMatch(/^Optional:.*docs/);
+    expect(featuresHint({ features: { docs: { enabled: true } } })).toBeNull();
+    expect(featuresHint(undefined)).toBeNull();
   });
 });

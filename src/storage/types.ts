@@ -555,7 +555,7 @@ export interface AdjudicationSummary {
    * follow = followed / advice-mode dispatches (advised, followed or ignored), each dispatch
    * counted once (src/storage/dispatch.ts dispatchFilter: a swarm task by its agent row, by its
    * plan row only when it has none; prompt rows are no dispatches) and leaving out those whose
-   * advice named no model (a KeptModel flag: nothing to follow). apply = applied / (applied +
+   * advice named no model (a KeptModel flag: nothing to follow) or named the baseline tier. apply = applied / (applied +
    * respected) and respect = respected / (applied + respected): apply-mode dispatches. null when
    * the denominator is 0.
    */
@@ -568,6 +568,8 @@ export interface AdjudicationSummary {
    * leave the follow rate even before that.
    */
   keptModel: { pin: number; force: number; fork: number };
+  /** Rows with a parentId whose own source is fallback: agent rows that carry their plan's verdict. */
+  inherited: number;
   /** Σ cost_usd: the adjudicator's own provider spend. */
   costUsd: number;
   /** Σ savings_usd as reconcile credited it. */

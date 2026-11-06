@@ -39,19 +39,30 @@ export const KEPT_MODEL_FLAG: Readonly<Record<KeptModel, string>> = Object.freez
   fork: "fork",
 });
 
-/** The KeptModel flag stored in the row's scores JSON, if any. */
-export function keptModel(row: Pick<AdjudicationRow, "scores">): KeptModel | undefined {
-  if (!row.scores) return undefined;
+/** A row's scores JSON as a record; undefined when absent, malformed or not an object. */
+export function parseScores(src: string | null | undefined): Record<string, unknown> | undefined {
+  if (!src) return undefined;
   try {
-    const s: unknown = JSON.parse(row.scores);
-    if (!s || typeof s !== "object" || Array.isArray(s)) return undefined;
-    const o = s as Record<string, unknown>;
-    for (const k of Object.keys(KEPT_MODEL_FLAG) as KeptModel[])
-      if (o[KEPT_MODEL_FLAG[k]] === true) return k;
-    return undefined;
+    const s: unknown = JSON.parse(src);
+    return s && typeof s === "object" && !Array.isArray(s)
+      ? (s as Record<string, unknown>)
+      : undefined;
   } catch {
     return undefined;
   }
+}
+
+/** The KeptModel flag in already-parsed scores, if any. */
+export function keptModelOf(s: Record<string, unknown> | undefined): KeptModel | undefined {
+  if (!s) return undefined;
+  for (const k of Object.keys(KEPT_MODEL_FLAG) as KeptModel[])
+    if (s[KEPT_MODEL_FLAG[k]] === true) return k;
+  return undefined;
+}
+
+/** The KeptModel flag stored in the row's scores JSON, if any. */
+export function keptModel(row: Pick<AdjudicationRow, "scores">): KeptModel | undefined {
+  return keptModelOf(parseScores(row.scores));
 }
 
 /**
@@ -85,6 +96,60 @@ export function keptDispatch(
   if (!row.actualModel) return undefined;
   const kept = keptModel(row);
   return kept && (kept !== "pin" || keptPin(row)) ? kept : undefined;
+}
+
+/**
+ * An advised row whose advice names the baseline tier (scores.advisedPick tier == the tier of
+ * baselineModel): passing it changes nothing, so there is nothing to follow and the follow rate
+ * leaves the row out.
+ */
+export function adviceIsBaseline(
+  row: Pick<AdjudicationRow, "scores"> & { baselineModel?: string | null | undefined },
+  scores: Record<string, unknown> | undefined = parseScores(row.scores),
+): boolean {
+  const pick = scores?.advisedPick;
+  const base = tierOf(row.baselineModel);
+  return typeof pick === "string" && !!base && tierOf(pick) === base;
+}
+
+/** Advise-mode actions: a dispatch the advice was shown for and the coordinator chose on. */
+export const ADVISE_ACTIONS: ReadonlySet<string> = new Set(["advised", "followed", "ignored"]);
+
+/** The fields followCount reads. */
+export type FollowRow = Pick<AdjudicationRow, "scores"> & {
+  action?: string | null | undefined;
+  modelRequested?: string | null | undefined;
+  baselineModel?: string | null | undefined;
+};
+
+/**
+ * How a dispatch counts in the follow rate; the store summary and the Jev impact report both
+ * count with this, so the two views agree (review-A A1-A3):
+ *   "followed"  numerator and denominator: action followed
+ *   "deviated"  denominator only: advised (not yet reconciled) or ignored; or respected with an
+ *               explicit model that differs from the stored advice (reconcile promotes a match to
+ *               followed, learn.ts, and a match on baseline advice changes nothing)
+ *   undefined   out: not an advise action; a KeptModel row (pin, force, fork, or a ranged stay,
+ *               whose advice is "keep the fallback": nothing to pass); an advised row whose advice
+ *               names the baseline tier (nothing to pass). An ignored row stays in even then: the
+ *               coordinator passed another model.
+ * `scores` is the row's parsed scores, when the caller already has them.
+ */
+export function followCount(
+  row: FollowRow,
+  scores: Record<string, unknown> | undefined = parseScores(row.scores),
+): "followed" | "deviated" | undefined {
+  const action = row.action;
+  if (typeof action !== "string" || keptModelOf(scores) !== undefined) return undefined;
+  if (action === "respected") {
+    const pick = scores?.advisedPick;
+    if (!row.modelRequested || typeof pick !== "string") return undefined;
+    const want = tierOf(pick) ?? pick;
+    return (tierOf(row.modelRequested) ?? row.modelRequested) === want ? undefined : "deviated";
+  }
+  if (!ADVISE_ACTIONS.has(action)) return undefined;
+  if (action === "advised" && adviceIsBaseline(row, scores)) return undefined;
+  return action === "followed" ? "followed" : "deviated";
 }
 
 type DispatchKey = Pick<AdjudicationRow, "surface" | "runId" | "taskId">;

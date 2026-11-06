@@ -619,6 +619,40 @@ describe("reconcile: savings credit", () => {
     expect(db.adjudicator.get(plan)?.savingsUsd ?? null).toBeNull();
   });
 
+  it("counts an explicit model equal to the advised pick as followed; others stay respected", () => {
+    db.apiCallsUpsert([call({ ts: NOW - 40 * MIN })]);
+    const mk = (agent: string, requested: string, scores: Record<string, unknown>) => {
+      const t = swarmTask("done", agent);
+      db.apiCallsUpsert([call({ agent_id: agent, sidechain: 1, model: "claude-haiku-4-5" })]);
+      return row({
+        runId: "R1",
+        taskId: t,
+        action: "respected",
+        modelRequested: requested,
+        scores: JSON.stringify(scores),
+      });
+    };
+    const hit = mk("E1", "haiku", { advisedPick: "haiku" });
+    const miss = mk("E2", "sonnet", { advisedPick: "haiku" });
+    const pinned = mk("E3", "haiku", {
+      advisedPick: "haiku",
+      pin: { status: "pinned", model: "opus" },
+      pinDeferred: true,
+    });
+    const forced = mk("E4", "haiku", { advisedPick: "haiku", forced: true });
+    const fork = mk("E5", "haiku", { advisedPick: "haiku", fork: true });
+    reconcile(db, { now: NOW });
+    const h = db.adjudicator.get(hit);
+    expect(h?.action).toBe("followed");
+    expect(h?.savingsUsd).toBeCloseTo(OPUS - HAIKU, 10);
+    expect(db.adjudicator.get(miss)?.action).toBe("respected");
+    for (const id of [pinned, forced, fork]) {
+      const r = db.adjudicator.get(id);
+      expect(r?.action).toBe("respected");
+      expect(r?.savingsUsd ?? null).toBeNull();
+    }
+  });
+
   it("credits nothing for a dispatch whose advice kept the agent's model pin (#68)", () => {
     db.apiCallsUpsert([call({ ts: NOW - 40 * MIN })]);
     const t = swarmTask("done", "P1");
@@ -1430,5 +1464,106 @@ describe("feedback retracts exactly what was taught (task #53)", () => {
     expect(withTaught("[1]", [])).toBeUndefined();
     expect(JSON.parse(withTaught(null, []) as string)).toEqual({ taught: [] });
     expect(taughtOf({ scores: JSON.stringify({ features: {} }) })).toBeUndefined();
+  });
+});
+
+describe("feedback before reconcile finalises a swarm row (task #368)", () => {
+  const L = { ...DEFAULT_LEARNING, minSamples: 0 };
+  const opt = (dim: string, option: string) =>
+    db.adjudicator.biasAll().find((b) => b.dimension === dim && b.option === option);
+  const dispatch = (taskId: number, ts: number) =>
+    row({
+      runId: "R1",
+      taskId,
+      ts,
+      action: "advised",
+      modelRequested: "haiku",
+      scores: JSON.stringify({ features: { intents: { implement: 1 } }, advisedPick: "haiku" }),
+    });
+
+  it("a young row labelled too_small stays open; reconcile links it and keeps the label", () => {
+    const t = swarmTask("done", "A1");
+    db.apiCallsUpsert([
+      call({ ts: NOW - 30 * MIN, model: "claude-sonnet-5-5" }),
+      call({ agent_id: "A1", sidechain: 1, model: "claude-haiku-4-5", ts: NOW - 20_000 }),
+    ]);
+    const id = dispatch(t, NOW - 30_000);
+    applyFeedback(db, id, "too_small", { learning: L, now: NOW });
+    expect(db.adjudicator.get(id)).toMatchObject({
+      outcome: "failure",
+      outcomeSource: "feedback:too_small",
+      final: false,
+    });
+    // too young for reconcile yet: nothing scanned, the label is kept
+    expect(reconcile(db, { now: NOW, learning: L }).scanned).toBe(0);
+    const r = reconcile(db, { now: NOW + 5 * MIN, learning: L });
+    expect(r.finalized).toBe(1);
+    expect(db.adjudicator.get(id)).toMatchObject({
+      outcome: "failure",
+      outcomeSource: "feedback:too_small",
+      final: true,
+      agentId: "A1",
+      action: "followed",
+      baselineModel: "claude-sonnet-5-5",
+      actualModel: "claude-haiku-4-5",
+    });
+    expect(db.adjudicator.get(id)?.actualCostUsd).toBeCloseTo(HAIKU, 6);
+    // one lesson: the feedback's (haiku failed), not reconcile's success for the coder role
+    expect(opt("tier", "haiku")).toMatchObject({ n: 1, s: 0, f: 1 });
+    expect(opt("role", "coder")).toBeUndefined();
+    // idempotent afterwards
+    expect(reconcile(db, { now: NOW + 10 * MIN, learning: L }).scanned).toBe(0);
+  });
+
+  it("a row reconcile scanned but left open keeps the label until the task settles", () => {
+    const t = swarmTask("active", "A1");
+    db.apiCallsUpsert([call({ ts: NOW - 30 * MIN, model: "claude-sonnet-5-5" })]);
+    const id = dispatch(t, NOW - 10 * MIN);
+    reconcile(db, { now: NOW, learning: L });
+    expect(db.adjudicator.get(id)?.final).toBe(false);
+    applyFeedback(db, id, "good", { learning: L, now: NOW });
+    reconcile(db, { now: NOW + 1000, learning: L });
+    // the task is still running: not final, label intact
+    expect(db.adjudicator.get(id)).toMatchObject({
+      outcome: "success",
+      outcomeSource: "feedback:good",
+      final: false,
+    });
+    db.apiCallsUpsert([
+      call({ agent_id: "A1", sidechain: 1, model: "claude-haiku-4-5", ts: NOW - 5 * MIN }),
+    ]);
+    db.swarm.taskUpdate(t, { status: "done" });
+    reconcile(db, { now: NOW + 5 * MIN, learning: L });
+    expect(db.adjudicator.get(id)).toMatchObject({
+      outcome: "success",
+      outcomeSource: "feedback:good",
+      final: true,
+      agentId: "A1",
+      actualModel: "claude-haiku-4-5",
+    });
+  });
+
+  it("the lesson follows the tier that actually ran once reconcile links the agent", () => {
+    const t = swarmTask("done", "A1");
+    db.apiCallsUpsert([
+      call({ agent_id: "A1", sidechain: 1, model: "claude-sonnet-5-5", ts: NOW - 20_000 }),
+    ]);
+    const id = dispatch(t, NOW - 30_000);
+    applyFeedback(db, id, "too_small", { learning: L, now: NOW });
+    // before the link the requested tier is all that is known
+    expect(opt("tier", "haiku")).toMatchObject({ n: 1, f: 1 });
+    reconcile(db, { now: NOW + 5 * MIN, learning: L });
+    expect(opt("tier", "haiku")).toMatchObject({ n: 0, s: 0, f: 0 });
+    expect(opt("tier", "sonnet")).toMatchObject({ n: 1, s: 0, f: 1 });
+    expect(taughtOf(db.adjudicator.get(id)!)).toEqual([
+      expect.objectContaining({ dimension: "tier", option: "sonnet", success: false }),
+    ]);
+  });
+
+  it("feedback on a non-swarm row still finalises it at once", () => {
+    const id = row({ surface: "prompt", ts: NOW - 10_000 });
+    expect(applyFeedback(db, id, "good", { learning: L, now: NOW })?.final).toBe(true);
+    const agent = row({ ts: NOW - 10_000 });
+    expect(applyFeedback(db, agent, "too_small", { learning: L, now: NOW })?.final).toBe(true);
   });
 });

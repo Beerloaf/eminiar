@@ -909,6 +909,8 @@ export interface AdjSummary {
   since: number | null;
   total: number;
   keptModel?: AdjKeptModel;
+  /** Agent rows that carry their plan's verdict (parentId set, own source fallback). */
+  inherited?: number;
   bySurface: Record<string, number>;
   bySource: Record<string, number>;
   byProviderStatus: Record<string, number>;

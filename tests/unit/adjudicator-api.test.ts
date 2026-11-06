@@ -128,6 +128,30 @@ describe("GET /api/adjudicator", () => {
     expect(b.filters.surfaces).toContain("prompt");
   });
 
+  it("fallbackRate leaves out inherited rows: (fallback - inherited) / (total - inherited)", async () => {
+    const plan = row({ surface: "plan", source: "blend", provider: "typesafe" });
+    // two agent rows carrying their plan's verdict (own source fallback, parentId set)
+    row({ surface: "agent", source: "fallback", providerStatus: "skipped", parentId: plan });
+    row({ surface: "agent", source: "fallback", providerStatus: "skipped", parentId: plan });
+    // one genuine fallback (timeout), one genuine heuristic row
+    row({ surface: "prompt", source: "fallback", providerStatus: "timeout" });
+    row({ surface: "prompt", source: "heuristic" });
+    const b = (await call("/api/adjudicator")).body as Json;
+    expect(b.summary.total).toBe(5);
+    expect(b.summary.inherited).toBe(2);
+    // (3 - 2) / (5 - 2); the old formula would say 3/5
+    expect(b.fallbackRate).toBeCloseTo(1 / 3);
+  });
+
+  it("fallbackRate is null when every row is inherited (denominator 0)", async () => {
+    for (let i = 0; i < 2; i++)
+      row({ surface: "agent", source: "fallback", providerStatus: "skipped", parentId: 99_999 });
+    const b = (await call("/api/adjudicator")).body as Json;
+    expect(b.summary.total).toBe(2);
+    expect(b.summary.inherited).toBe(2);
+    expect(b.fallbackRate).toBeNull();
+  });
+
   it("reports summary, charts, provider health and apply effectiveness", async () => {
     row({ ts: NOW - 3 * DAY, complexity: 0.4, source: "heuristic" });
     row({ ts: NOW - DAY, complexity: 2.2, source: "blend", provider: "openai-compatible" });
@@ -147,6 +171,7 @@ describe("GET /api/adjudicator", () => {
     expect(b.enabled).toBe(true);
     expect(b.summary.total).toBe(3);
     expect(b.fallbackRate).toBeCloseTo(1 / 3);
+    expect(b.summary.inherited).toBe(0);
     expect(b.charts.perDay).toHaveLength(3);
     expect(b.charts.perDay[0]).toMatchObject({ heuristic: 1, total: 1 });
     expect(b.charts.perDay[1]).toMatchObject({ total: 0 });

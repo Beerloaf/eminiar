@@ -126,7 +126,7 @@ See [Knowledge graph and history](knowledge-graph.md).
 
 | Tool | Parameters | Use for |
 |---|---|---|
-| `em_swarm` | `action`, `swarm`, `goal`, `run`, `tasks`, `task`, `status`, `result`, `key`, `value`, `summary`, `remember`, `agent`, `role`, `force` | Coordinate an opt-in agent swarm: runs, a task board, workers and a shared blackboard |
+| `em_swarm` | `action`, `swarm`, `goal`, `run`, `tasks`, `task`, `status`, `result`, `fit`, `key`, `value`, `summary`, `remember`, `agent`, `role`, `force` | Coordinate an opt-in agent swarm: runs, a task board, workers and a shared blackboard |
 
 | Action | Who | Does |
 |---|---|---|
@@ -134,7 +134,7 @@ See [Knowledge graph and history](knowledge-graph.md).
 | `start` | coordinator | Opens a run of `swarm` for `goal` and returns the coordinator brief |
 | `plan` | coordinator, workers | Adds `tasks: [{key, title, detail, role, deps, files}]`; any other key is an error |
 | `claim` | workers, coordinator | Claims `task` (or the next eligible one) and returns its brief |
-| `update` | the task's holder, coordinator | Sets a task to `done`, `failed`, `blocked`, or `pending` to reopen |
+| `update` | the task's holder, coordinator | Sets a task to `done`, `failed`, `blocked`, or `pending` to reopen; optional `fit` (`good`, `too_small`, `too_big`) says whether the task's model fit and feeds the adjudicator's feedback |
 | `post` | coordinator, workers, other subagents | Writes a note to the run's shared blackboard |
 | `read` | anyone | One note by `key`, or every key followed by the values |
 | `status` | anyone | The next step, tasks by status, workers, blackboard keys, recent events |

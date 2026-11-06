@@ -632,6 +632,51 @@ describe("SqliteAdjudicatorStore", () => {
     expect(s.summary(11).rates.follow).toBeCloseTo(3 / 5);
   });
 
+  it("summary: advice equal to the baseline leaves the follow rate; inherited rows are counted", () => {
+    const s = a.adjudicator;
+    const sc = (pick: string) => JSON.stringify({ advisedPick: pick });
+    s.insert(
+      row({ ts: 1, action: "followed", baselineModel: "claude-opus-5", scores: sc("sonnet") }),
+    );
+    s.insert(row({ ts: 2, action: "advised", baselineModel: "claude-opus-5", scores: sc("opus") }));
+    s.insert(
+      row({ ts: 3, action: "advised", baselineModel: "claude-opus-5", scores: sc("haiku") }),
+    );
+    s.insert(row({ ts: 4, action: "advised" }));
+    expect(s.summary().rates.follow).toBeCloseTo(1 / 3);
+    const plan = s.insert(row({ ts: 5, surface: "plan", source: "blend" }));
+    s.insert(row({ ts: 6, source: "fallback", parentId: plan }));
+    s.insert(row({ ts: 7, source: "fallback" }));
+    s.insert(row({ ts: 8, source: "blend", parentId: plan }));
+    expect(s.summary().inherited).toBe(1);
+  });
+
+  it("summary: a respected explicit model that differs from the advice is a deviation (A1)", () => {
+    const s = a.adjudicator;
+    const sc = JSON.stringify({ advisedPick: "sonnet" });
+    const base = { baselineModel: "claude-opus-4", scores: sc };
+    s.insert(row({ ts: 1, action: "followed", modelRequested: "sonnet", ...base }));
+    for (const ts of [2, 3, 4])
+      s.insert(row({ ts, action: "respected", modelRequested: "haiku", ...base }));
+    // a respected match (not yet promoted by reconcile) and one with no model passed stay out
+    s.insert(row({ ts: 5, action: "respected", modelRequested: "claude-sonnet-4-5", ...base }));
+    s.insert(row({ ts: 6, action: "respected", ...base }));
+    expect(s.summary().rates.follow).toBeCloseTo(1 / 4);
+  });
+
+  it("summary: an ignored row stays in the follow rate even when the advice is the baseline (A2)", () => {
+    const s = a.adjudicator;
+    const sc = (pick: string) => JSON.stringify({ advisedPick: pick });
+    const base = { baselineModel: "claude-opus-4" };
+    s.insert(
+      row({ ts: 1, action: "ignored", modelRequested: "haiku", scores: sc("opus"), ...base }),
+    );
+    s.insert(
+      row({ ts: 2, action: "followed", modelRequested: "sonnet", scores: sc("sonnet"), ...base }),
+    );
+    expect(s.summary().rates.follow).toBeCloseTo(1 / 2);
+  });
+
   it("an empty table summarises to zeros and null rates", () => {
     const sum = a.adjudicator.summary();
     expect(sum.total).toBe(0);

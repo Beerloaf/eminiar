@@ -8,17 +8,21 @@ import { DEGRADED_HELP, heat } from "./adjudicator-helpers.js";
 import { JevExchanges } from "./JevExchanges.js";
 import {
   complexityLine,
+  deferredLine,
   dimLine,
   evidenceLabel,
   evidenceTone,
   excludedLine,
+  featuresHint,
   footerFacts,
   jevActive,
+  keptLine,
   kpiRows,
   outcomeRows,
   surfaceRows,
   transitionGrid,
   verdictLine,
+  verdictSteps,
   verdictTone,
 } from "./jev-helpers.js";
 
@@ -199,13 +203,47 @@ function Evidence({ r, onOpen }: { r: AdjJevImpact; onOpen: (id: number) => void
   );
 }
 
+function Guidance({ r, config }: { r: AdjJevImpact; config: unknown }): JSX.Element | null {
+  const x = r.outcomes.excluded;
+  const notes = [
+    keptLine(x),
+    deferredLine(r, (config as { promptMode?: unknown } | null)?.promptMode),
+    featuresHint(config),
+  ].filter((n): n is string => !!n);
+  const steps = verdictSteps(r);
+  if (!notes.length && !steps.length) return null;
+  return (
+    <div class="jev-guide small">
+      {notes.length ? (
+        <ul class="jev-lines">
+          {notes.map((n) => (
+            <li>{n}</li>
+          ))}
+        </ul>
+      ) : null}
+      {steps.length ? (
+        <>
+          <b>How to get a verdict</b>
+          <ul class="jev-lines">
+            {steps.map((n) => (
+              <li>{n}</li>
+            ))}
+          </ul>
+        </>
+      ) : null}
+    </div>
+  );
+}
+
 function Panel({
   range,
   tick,
+  config,
   onOpen,
 }: {
   range: string;
   tick: number;
+  config: unknown;
   onOpen: (id: number) => void;
 }): JSX.Element | null {
   const [how, setHow] = useState(false);
@@ -296,6 +334,7 @@ function Panel({
           <Evidence r={r} onOpen={onOpen} />
         </Card>
       </div>
+      <Guidance r={r} config={config} />
       <div class="muted small jev-foot">{footerFacts(r).join(" · ")}</div>
     </Card>
   );
@@ -330,7 +369,7 @@ export function JevImpact({
   if (!jevActive(ov)) return null;
   return (
     <>
-      <Panel range={range} tick={tick} onOpen={onOpen} />
+      <Panel range={range} tick={tick} config={ov.config} onOpen={onOpen} />
       <JevExchanges tick={tick} onOpen={onOpen} />
     </>
   );

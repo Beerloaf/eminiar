@@ -652,6 +652,7 @@ export async function onPreAgent(
         // stores the tier its note names (the ranged pick, else the verdict clamped to the apply
         // bounds), the model follow detection compares the call with (savings.ts advisedPick).
         ...withPin(db, a.rowId, pin, kept, {
+          applyBounds: { floor: cfg.apply.floor, ceiling: cfg.apply.ceiling },
           ...(ranged ? { [RANGED_FLAG]: true, [FALLBACK_PIN_FIELD]: ranged.fallback } : {}),
           ...(advised ? { [ADVISED_PICK_FIELD]: advised } : {}),
         }),

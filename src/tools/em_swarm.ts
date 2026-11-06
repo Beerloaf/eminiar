@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { applyFeedback, type Feedback, reconcile } from "../adjudicator/learn.js";
 import { adjudicatePlan, planAdviceBlock, planNextHint } from "../adjudicator/swarm.js";
 import { getContext, type ProjectContext } from "../context.js";
 import { kickSwarmJudge, swarmBadges } from "../decisions/features/swarm.js";
@@ -100,6 +101,10 @@ const schema = {
     .optional()
     .describe("update: done|failed|blocked|pending (reopen); finish: done|failed|cancelled"),
   result: z.string().optional().describe("update: what changed and how it was verified"),
+  fit: z
+    .enum(["good", "too_small", "too_big"])
+    .optional()
+    .describe("update (optional): was the model right for the task? Feeds the adjudicator"),
   key: z.string().optional().describe("post/read: blackboard key"),
   value: z.string().optional().describe("post: the note"),
   summary: z.string().optional().describe("finish: the outcome"),
@@ -138,6 +143,43 @@ export const emSwarm = defineTool({
 
 /** Workers: everything about tasks and notes, in any topology; never the run itself. */
 const WORKER_OK = new Set<Action>(["list", "status", "read", "post", "plan", "claim", "update"]);
+/**
+ * Label the task's newest agent-surface decision (else its plan decision) with the coordinator's
+ * fit verdict (ctx is already the coordination root, so this is the run's ledger). Feedback on a
+ * swarm row reconcile has not finished leaves it open, so a later reconcile still links the agent
+ * and prices it; reconciling first just settles rows that are ready now. Fail-open: returns the
+ * decision id or undefined, and never throws.
+ */
+function recordFit(
+  ctx: ProjectContext,
+  db: StorageAdapter,
+  runId: string,
+  taskId: number,
+  fit: Feedback,
+): number | undefined {
+  try {
+    if (!ctx.config.adjudicator?.enabled) return undefined;
+    const newest = (surface: string) =>
+      db.adjudicator
+        .forTask(runId, taskId)
+        .filter((r) => r.surface === surface)
+        .sort((a, b) => b.ts - a.ts || b.id - a.id)[0];
+    const row = newest("agent") ?? newest("plan");
+    if (!row) return undefined;
+    if (!row.final) {
+      try {
+        reconcile(db, { config: ctx.config });
+      } catch {
+        // the label still applies
+      }
+    }
+    return applyFeedback(db, row.id, fit, { config: ctx.config })?.id;
+  } catch {
+    // never fails the update
+  }
+  return undefined;
+}
+
 /** Subagents that are not swarm workers (Explore, general-purpose, …). */
 const FOREIGN_OK = new Set<Action>(["list", "status", "read", "post"]);
 /** Calls eminiar's hook did not stamp: nobody can tell who made them. */
@@ -559,6 +601,7 @@ async function dispatch(args: Args, callerCtx: ProjectContext): Promise<string> 
       // Optional background judge of the closed task; the reply never waits for it.
       if (ctx.config.adjudicator?.enabled && ctx.config.adjudicator.features?.swarm.enabled)
         void kickJudge(ctx, db, run.id, [t], sessionId);
+      const fitted = args.fit ? recordFit(ctx, db, run.id, id, args.fit) : undefined;
       const fresh = db.swarm.runGet(run.id) ?? run;
       const c = runSnapshot(db, fresh, 1).counts.tasks;
       const tally = `run ${run.id}${fresh.status === "active" ? "" : ` (${fresh.status})`}: ${c.pending} pending · ${c.active} active · ${c.done} done${c.failed ? ` · ${c.failed} failed` : ""}${c.blocked ? ` · ${c.blocked} blocked` : ""}`;
@@ -566,7 +609,7 @@ async function dispatch(args: Args, callerCtx: ProjectContext): Promise<string> 
         coordinator || t.status === "pending" || fresh.status !== "active"
           ? ""
           : ' Claim the next with em_swarm {action:"claim"}, or end with a final message for the coordinator.';
-      return `Task #${t.id} is now ${t.status}${t.status === "pending" ? " (released for any eligible worker)" : ""}. ${tally}.${next}`;
+      return `Task #${t.id} is now ${t.status}${t.status === "pending" ? " (released for any eligible worker)" : ""}. ${tally}.${next}${fitted ? ` fit recorded on decision #${fitted}` : ""}`;
     }
 
     case "post": {

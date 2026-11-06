@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
+import { reconcile } from "../../src/adjudicator/learn.js";
+import { ConfigSchema } from "../../src/config.js";
 import { getContext, type ProjectContext, resetContextCache } from "../../src/context.js";
 import type { StorageAdapter } from "../../src/storage/adapter.js";
 import { closeAllStorage, getStorage } from "../../src/storage/index.js";
@@ -266,6 +268,169 @@ describe("em_swarm tool", () => {
     expect((await call({ action: "plan", run: run.id, tasks: [{ title: "late" }] })).text).toMatch(
       /^em_swarm: run .* is done/,
     );
+  });
+
+  it("fit labels the task's newest agent decision (else its plan decision); fail-open", async () => {
+    writeSwarm(root, YAML);
+    const saved = ctx.config;
+    const enable = (on: boolean) => {
+      ctx.config = {
+        ...saved,
+        adjudicator: ConfigSchema.parse({ adjudicator: { enabled: on } }).adjudicator,
+      };
+    };
+    try {
+      await call({ action: "start", swarm: "feat", goal: "fit" });
+      const run = db.swarm.runActive("feat")!;
+      await call({
+        action: "plan",
+        tasks: [
+          { title: "a", role: "coder" },
+          { title: "b", role: "coder" },
+        ],
+      });
+      const [ta, tb] = db.swarm.tasks(run.id);
+      const base = {
+        inputHash: "h",
+        sessionId: SESSION,
+        complexity: 1,
+        tier: "sonnet",
+        runId: run.id,
+      };
+      const plan = db.adjudicator.insert({ ...base, surface: "plan", taskId: ta!.id } as never);
+      const agent = db.adjudicator.insert({ ...base, surface: "agent", taskId: ta!.id } as never);
+      const close = (task: number, fit?: "too_small") =>
+        call({ action: "update", task, status: "done", fit }, main);
+
+      // adjudicator off: no write
+      enable(false);
+      expect((await close(ta!.id, "too_small")).text).not.toContain("fit recorded");
+      expect(db.adjudicator.get(agent)?.outcomeSource ?? null).toBeNull();
+
+      // on: the agent row (not the plan row) is labelled
+      enable(true);
+      await call({ action: "update", task: ta!.id, status: "pending" }, main);
+      const r = await close(ta!.id, "too_small");
+      expect(r.text).toContain(`fit recorded on decision #${agent}`);
+      expect(db.adjudicator.get(agent)?.outcome).toBe("failure");
+      expect(db.adjudicator.get(agent)?.outcomeSource).toBe("feedback:too_small");
+      expect(db.adjudicator.get(plan)?.outcomeSource ?? null).toBeNull();
+
+      // no matching row: the update still succeeds
+      const none = await close(tb!.id, "too_small");
+      expect(none.isError).toBe(false);
+      expect(none.text).toContain(`Task #${tb!.id} is now done`);
+      expect(none.text).not.toContain("fit recorded");
+    } finally {
+      ctx.config = saved;
+      await finishAll();
+    }
+  });
+
+  it("fit reconciles the row before labelling it, so the label never freezes it unlinked", async () => {
+    writeSwarm(root, YAML);
+    const saved = ctx.config;
+    ctx.config = {
+      ...saved,
+      adjudicator: ConfigSchema.parse({ adjudicator: { enabled: true } }).adjudicator,
+    };
+    try {
+      await call({ action: "start", swarm: "feat", goal: "fit reconcile" });
+      const run = db.swarm.runActive("feat")!;
+      await call({ action: "plan", tasks: [{ title: "a", role: "coder" }] });
+      const [t] = db.swarm.tasks(run.id);
+      const ts = Date.now() - 10 * 60_000;
+      db.swarm.taskClaim(t!.id, "A-fit");
+      db.swarm.workerUpsert({
+        run_id: run.id,
+        agent_id: "A-fit",
+        agent_type: "swarm-feat-coder",
+        role: "coder",
+        session_id: SESSION,
+        task_id: t!.id,
+      } as never);
+      const id = db.adjudicator.insert({
+        surface: "agent",
+        inputHash: "h",
+        ts,
+        sessionId: SESSION,
+        complexity: 1,
+        tier: "haiku",
+        role: "coder",
+        runId: run.id,
+        taskId: t!.id,
+        action: "advised",
+        modelRequested: "haiku",
+        scores: JSON.stringify({ advisedPick: "haiku" }),
+      } as never);
+      const r = await call({ action: "update", task: t!.id, status: "done", fit: "too_small" });
+      expect(r.text).toContain(`fit recorded on decision #${id}`);
+      const row = db.adjudicator.get(id)!;
+      expect(row.outcomeSource).toBe("feedback:too_small");
+      expect(row.final).toBe(true);
+      // what reconcile links before the label makes the row final
+      expect(row.agentId).toBe("A-fit");
+      expect(row.baselineModel).toBeTruthy();
+      expect(row.action).toBe("followed");
+    } finally {
+      ctx.config = saved;
+      await finishAll();
+    }
+  });
+
+  it("fit on a row too young to reconcile keeps it open; a later reconcile links it (#368)", async () => {
+    writeSwarm(root, YAML);
+    const saved = ctx.config;
+    ctx.config = {
+      ...saved,
+      adjudicator: ConfigSchema.parse({ adjudicator: { enabled: true } }).adjudicator,
+    };
+    try {
+      await call({ action: "start", swarm: "feat", goal: "fit young" });
+      const run = db.swarm.runActive("feat")!;
+      await call({ action: "plan", tasks: [{ title: "a", role: "coder" }] });
+      const [t] = db.swarm.tasks(run.id);
+      db.swarm.taskClaim(t!.id, "A-young");
+      db.swarm.workerUpsert({
+        run_id: run.id,
+        agent_id: "A-young",
+        agent_type: "swarm-feat-coder",
+        role: "coder",
+        session_id: SESSION,
+        task_id: t!.id,
+      } as never);
+      const id = db.adjudicator.insert({
+        surface: "agent",
+        inputHash: "h",
+        ts: Date.now() - 30_000,
+        sessionId: SESSION,
+        complexity: 1,
+        tier: "haiku",
+        role: "coder",
+        runId: run.id,
+        taskId: t!.id,
+        action: "advised",
+        modelRequested: "haiku",
+        scores: JSON.stringify({ advisedPick: "haiku" }),
+      } as never);
+      const r = await call({ action: "update", task: t!.id, status: "done", fit: "too_small" });
+      expect(r.text).toContain(`fit recorded on decision #${id}`);
+      const open = db.adjudicator.get(id)!;
+      expect(open.outcomeSource).toBe("feedback:too_small");
+      expect(open.final).toBe(false);
+      expect(open.agentId ?? null).toBeNull();
+
+      reconcile(db, { now: Date.now() + 5 * 60_000, config: ctx.config });
+      const row = db.adjudicator.get(id)!;
+      expect(row.outcome).toBe("failure");
+      expect(row.outcomeSource).toBe("feedback:too_small");
+      expect(row.agentId).toBe("A-young");
+      expect(row.baselineModel).toBeTruthy();
+      expect(row.action).toBe("followed");
+    } finally {
+      ctx.config = saved;
+      await finishAll();
+    }
   });
 
   it("refuses changes from calls eminiar's hook did not stamp", async () => {

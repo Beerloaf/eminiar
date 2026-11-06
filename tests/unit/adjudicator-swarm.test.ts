@@ -511,6 +511,11 @@ describe("plan advice: model pins and the Agent call's effort (#68)", () => {
       expect(flags.map((f) => f.pinDeferred)).toEqual([true, undefined, true]);
       expect(flags[0].pin).toMatchObject({ status: "pinned", model: "opus" });
       expect(flags.every((f) => f.forced === undefined)).toBe(true);
+      // the apply bounds the plan ran under, for the Jev impact report
+      expect(flags[0].applyBounds).toEqual({
+        floor: expect.any(String),
+        ceiling: expect.any(String),
+      });
     });
 
     it("names no pin under CLAUDE_CODE_SUBAGENT_MODEL_FORCE and flags the rows forced (#75)", async () => {

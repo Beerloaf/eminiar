@@ -724,11 +724,16 @@ Left out, and why:
   tier, like outcomes.
 - **Outcomes not final yet.** A dispatch that ran the advised tier but whose outcome may still
   change is left out until it is final.
-- **Apply bounds.** The floor and ceiling a dispatch ran under are not stored. When today's
-  `apply.floor`/`apply.ceiling`, or the defaults (haiku to opus), would clamp the heuristic's
-  tier, the dispatch is left out, because the panel cannot tell whether Jev's advice or the
-  bound set the model. Known limitation: a dispatch that ran under a narrower ceiling that has
-  since been removed can still be read as changed.- **Deferred and async answers.** A prompt whose Jev answer arrived after the heuristic's advice
+- **Apply bounds.** Plan and agent rows now store the floor and ceiling they ran under
+  (`scores.applyBounds`), and a ranged role's range (`scores.pin.range`). The panel intersects the
+  two to tell whether Jev's advice or a bound set the model. Rows recorded before that carry no
+  bounds: when today's `apply.floor`/`apply.ceiling`, or the defaults (haiku to opus), would clamp
+  the heuristic's tier, such a dispatch is left out. Known limitation: an older dispatch that ran
+  under a narrower ceiling that has since been removed can still be read as changed. When the
+  bounds are stored, the heuristic's tier is clamped by them even if it lies on the far side of
+  Jev's pick, so such a dispatch is compared rather than left out. If `apply.floor` is above
+  `apply.ceiling`, the floor wins, as it does when the hook sets the model.
+- **Deferred and async answers.** A prompt whose Jev answer arrived after the heuristic's advice
   was shown only counts as "would have changed", never as an outcome.
 - **Uncertain near-ties.** Blend tables are stored rounded, so when the heuristic's top two tiers
   were within 0.03, or its confidence sat next to the round-up threshold, the rebuilt pick is not
@@ -739,6 +744,77 @@ Left out, and why:
 
 Spend and savings use list prices and are estimates. The panel sees a decision's outcome once
 eminiar has linked it; it settles pending outcomes, up to 500 rows, each time it loads. See [Dashboard](dashboard.md#jev-impact) for the tiles.
+
+### Getting the most from Jev
+
+Jev can only change what it is allowed to change, and the panel can only judge what it can see.
+If the panel says **not enough data** after real use, the cause is usually one of these.
+
+**Pins and ranges.** A role that pins a model (`model: opus` with no `model_range`) keeps it:
+Jev's pick is advice nobody can use, and the dispatch counts as *kept*, not as a Jev decision.
+`opus..opus` is a pin in effect, so validators and reviewers written that way hide Jev's effect
+by design. `model_range: { floor: sonnet, ceiling: opus }` keeps a floor and lets Jev act
+between the bounds; a role whose pick lands on its fallback tier is a *ranged stay*, which the
+panel counts as a dispatch Jev decided. Run `eminiar swarm sync` after editing `swarm.yaml` so
+the agent files carry the range. The Kept line of the panel (`excluded.keptDisagreed`) counts
+the kept dispatches where Jev's pick differed from the pin's tier: those are the roles worth
+giving a range. See [model ranges](swarms.md#model-ranges).
+
+**Passing the plan's model counts as followed.** When the coordinator passes the model a plan
+line names on a free (unpinned) dispatch, reconcile relabels the dispatch from `respected` to
+`followed` and credits the savings. A different explicit model stays `respected`, and the follow
+rate counts it as a deviation (below). Pinned, forced and forked dispatches are unchanged.
+
+**What the counts leave out.**
+
+- *Inherited rows.* An agent dispatch reuses its plan's verdict, so its own source stays
+  `fallback` (skipped). The overview's fallback rate leaves those rows out of both sides
+  (`(fallback − inherited) ÷ (total − inherited)`); the tab says how many agent rows carry
+  their plan's verdict, and the decision detail names the plan.
+- *Advice equal to the baseline.* An `advised` dispatch whose advice names the baseline
+  model's tier gives nothing to follow, so it leaves the follow rate. An `ignored` dispatch
+  stays in even then: the coordinator passed another model.
+- *Ranged stays and kept dispatches* (pin, force, fork), as above, never count: their advice is
+  "keep the model", so there is nothing to pass.
+
+**How the follow rate counts.** The dashboard summary and the Jev impact panel count with one
+rule (`followCount` in `src/storage/dispatch.ts`), so they agree. Each dispatch is:
+
+- *followed*, in the numerator and the denominator: its action is `followed` (the coordinator
+  passed the advised model, or reconcile promoted a matching explicit model);
+- *deviated*, in the denominator only: `advised` (the model passed is not yet known) or
+  `ignored`, or `respected` with an explicit model that differs from the stored advice;
+- *left out*: every other action (applied, forced, and so on), kept dispatches, `advised`
+  rows whose advice equals the baseline, and `respected` rows with no explicit model.
+
+The follow rate is followed ÷ (followed + deviated).
+
+**Prompts default to async.** `promptMode` is `async`: the heuristic answers the prompt now and
+Jev's answer arrives later, so those decisions count as deferred and never as outcome evidence.
+`blocking` makes the hook wait for Jev within `timeouts.promptMs` on every prompt. Measured
+latency is about 410 ms at p50 and 590 ms at p95, so blocking is opt-in. The verdict does not
+need it: prompts are never counted as outcome evidence or as compared decisions.
+
+**Features.** Six `adjudicator.features.*` opt-ins use the same provider, all off by default:
+`recall`, `memory`, `commit`, `compaction`, `swarm` and `docs` (see [Features](#features)).
+`eminiar adjudicator features on <name>` starts one in shadow mode; `features shadow <name> off`
+lets it act. A remote provider also needs `featureConsent`.
+
+**Fit labels.** `em_swarm update` takes an optional `fit` (`good`, `too_small` or `too_big`).
+With the adjudicator on, it records the label as feedback on the task's newest agent decision in
+that run (its plan decision if there is no agent row), in the coordination root's ledger. The
+decision is reconciled first, so the label keeps its agent link, baseline, follow detection and
+cost. It never fails the update; the reply adds "fit recorded on decision #id". An upgrade counts as
+evidence only through feedback, so fit labels are how upgrades become evidence.
+
+**How to get a verdict.** The panel says **not enough data** until all of these hold:
+
+1. at least 10 labelled outcomes on dispatches Jev changed and that ran the advised tier;
+2. those outcomes come from at least 3 different swarm runs or sessions;
+3. at least 30 compared plan or agent decisions that Jev answered inline.
+
+To get there: give roles a range instead of a pin, pass the plan's model on dispatch, label
+finished tasks with `fit`, and run a few separate swarm runs.
 
 ## Learning
 

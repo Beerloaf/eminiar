@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import type { AdjudicationRow, Surface, Verdict } from "../../adjudicator/types.js";
-import { dispatchFilter, keptDispatch, keptModel } from "../dispatch.js";
+import { dispatchFilter, followCount, keptDispatch } from "../dispatch.js";
 import type {
   AdjudicationInput,
   AdjudicationListFilter,
@@ -22,10 +22,7 @@ type Row = Record<string, unknown>;
 /** The columns summary() reads. */
 const SUMMARY_COLUMNS = `surface, source, provider_status, action, outcome, latency_ms,
   provider_latency_ms, cost_usd, savings_usd, model_final, actual_model, run_id, task_id,
-  model_requested, scores`;
-
-/** Advise-mode actions: the follow rate's denominator. */
-const ADVISE_ACTIONS = new Set(["advised", "followed", "ignored"]);
+  model_requested, scores, parent_id, baseline_model`;
 
 /** Every `adjudications` column except id, as [camelCase field, snake_case column]. */
 const COLUMNS: ReadonlyArray<readonly [Exclude<keyof AdjudicationRow, "id">, string]> = [
@@ -600,6 +597,8 @@ export class SqliteAdjudicatorStore implements AdjudicatorStore {
       scores: (r.scores as string | null) ?? null,
       modelRequested: (r.model_requested as string | null) ?? null,
       actualModel: (r.actual_model as string | null) ?? null,
+      baselineModel: (r.baseline_model as string | null) ?? null,
+      action: (r.action as string | null) ?? null,
     }));
     const isDispatch = dispatchFilter(fields);
     const bySurface: Record<string, number> = {};
@@ -616,19 +615,23 @@ export class SqliteAdjudicatorStore implements AdjudicatorStore {
     const kept = { pin: 0, force: 0, fork: 0 };
     let followed = 0;
     let adviseDispatches = 0;
+    let inherited = 0;
     rows.forEach((r, i) => {
       const f = fields[i] as (typeof fields)[number];
       if (isDispatch(f)) {
         // Dispatches that ran on a model Claude Code chose: the savings report's keptModel.
         const k = keptDispatch(f);
         if (k) kept[k] += 1;
-        // A dispatch whose advice named no model has nothing to follow (reconcile never marks
-        // it followed), whether or not it has run yet: out of the follow rate.
-        if (typeof r.action === "string" && ADVISE_ACTIONS.has(r.action) && !keptModel(f)) {
+        // The follow rate counts by the Jev impact report's rule (dispatch.ts followCount): a
+        // dispatch whose advice named no model has nothing to follow, whether or not it has run.
+        const fc = followCount(f);
+        if (fc) {
           adviseDispatches += 1;
-          if (r.action === "followed") followed += 1;
+          if (fc === "followed") followed += 1;
         }
       }
+      // An agent row that carries its plan's verdict: its own source stays fallback/skipped.
+      if (r.parent_id != null && r.source === "fallback") inherited += 1;
       bump(bySurface, r.surface);
       bump(bySource, r.source);
       bump(byProviderStatus, r.provider_status);
@@ -661,6 +664,7 @@ export class SqliteAdjudicatorStore implements AdjudicatorStore {
         respect: ratio(a("respected"), a("applied") + a("respected")),
       },
       keptModel: kept,
+      inherited,
       costUsd,
       savingsUsd,
       netUsd: savingsUsd - costUsd,

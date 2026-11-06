@@ -44,6 +44,7 @@ import {
 } from "../../src/adjudicator/types.js";
 import { ConfigSchema } from "../../src/config.js";
 import type { StorageAdapter } from "../../src/storage/adapter.js";
+import { ADVISE_ACTIONS as STORE_ADVISE_ACTIONS } from "../../src/storage/dispatch.js";
 import { CHART_ROWS_MAX } from "../../src/ui/adjudicator-api.js";
 
 const NOW = Date.UTC(2026, 10, 10, 12, 0, 0);
@@ -418,15 +419,10 @@ function unionMembers(text: string, name: string): string[] {
   return [...m[1].matchAll(/"([^"]+)"/g)].map((x) => x[1] as string);
 }
 
-describe("ADVISE_ACTIONS mirrors the store summary's", () => {
-  it("has the same members as the Set in storage/sqlite/adjudicator.ts", () => {
-    const m = /const ADVISE_ACTIONS = new Set\(\[([^\]]*)\]\)/.exec(
-      source("storage/sqlite/adjudicator.ts"),
-    );
-    expect(m, "ADVISE_ACTIONS literal in storage/sqlite/adjudicator.ts").not.toBeNull();
-    const store = [...(m?.[1] ?? "").matchAll(/"([^"]+)"/g)].map((x) => x[1]);
-    expect(store.length).toBeGreaterThan(0);
-    expect([...ADVISE_ACTIONS].sort()).toEqual([...store].sort());
+describe("ADVISE_ACTIONS is the store summary's", () => {
+  it("is the one Set in storage/dispatch.ts (no copy left in the store)", () => {
+    expect(ADVISE_ACTIONS).toBe(STORE_ADVISE_ACTIONS);
+    expect(source("storage/sqlite/adjudicator.ts")).not.toMatch(/ADVISE_ACTIONS = new Set/);
   });
 
   it("names only real AdjudicationAction values", () => {
