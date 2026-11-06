@@ -935,7 +935,14 @@ function DecisionBody({
                 "—"
               ),
             ],
-            ["parent", row.parentId ? `#${row.parentId}` : "—"],
+            [
+              "parent",
+              row.parentId
+                ? row.source === "fallback"
+                  ? `#${row.parentId} · verdict from plan #${row.parentId}`
+                  : `#${row.parentId}`
+                : "—",
+            ],
             ["scorer", row.version ?? "—"],
           ]}
         />
@@ -1688,15 +1695,20 @@ export function Adjudicator({ params }: { params: Record<string, string> }): JSX
       ]
         .filter(Boolean)
         .join(" · "),
-      "followed ÷ (advised + followed + ignored), leaving out advised dispatches whose advice named no model (a kept pin, CLAUDE_CODE_SUBAGENT_MODEL_FORCE, a fork); apply = applied ÷ (applied + respected)",
+      "followed ÷ (advised + followed + ignored), leaving out advised dispatches whose advice named no model (a kept pin, CLAUDE_CODE_SUBAGENT_MODEL_FORCE, a fork) or named the baseline tier; apply = applied ÷ (applied + respected)",
     ],
     [
       "fallback rate",
       rate(o.fallbackRate),
-      statusCounts.length
-        ? statusCounts.map(([k, n]) => `${k} ${n}`).join(" · ")
-        : "no provider errors",
-      "decisions where the provider failed or was skipped and the heuristic answered",
+      [
+        statusCounts.length
+          ? statusCounts.map(([k, n]) => `${k} ${n}`).join(" · ")
+          : "no provider errors",
+        s.inherited ? `${s.inherited} agent rows carry their plan's Jev verdict` : "",
+      ]
+        .filter(Boolean)
+        .join(" · "),
+      "decisions where the provider failed or was skipped and the heuristic answered; agent rows that carry their plan's verdict are left out",
     ],
     [
       "provider latency",

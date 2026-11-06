@@ -808,6 +808,10 @@ describe("PreToolUse Agent, apply mode", () => {
     expect(r.action).toBe("respected");
     expect(r.baselineModel).toBe("opus");
     expect(r.modelFinal).toBe("opus");
+    expect(JSON.parse(r.scores!).applyBounds).toEqual({
+      floor: expect.any(String),
+      ceiling: expect.any(String),
+    });
     const pin = JSON.parse(r.scores!).pin;
     expect(pin).toMatchObject({
       status: "pinned",

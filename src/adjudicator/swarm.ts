@@ -424,7 +424,7 @@ export async function adjudicatePlan(
         }
       }
       if (allRolesPinned) advice.allRolesPinned = true;
-      markPlanRow(db, advice);
+      markPlanRow(db, advice, { floor: cfg.apply.floor, ceiling: cfg.apply.ceiling });
       return advice;
     });
   } catch (err) {
@@ -442,7 +442,11 @@ export async function adjudicatePlan(
  * pick, else the verdict clamped to the apply bounds) as savings.ts advisedPick, what follow
  * detection compares the call with.
  */
-function markPlanRow(db: StorageAdapter, a: PlanAdvice): void {
+function markPlanRow(
+  db: StorageAdapter,
+  a: PlanAdvice,
+  applyBounds: { floor: unknown; ceiling: unknown },
+): void {
   const kept = keptModelOf(dispatchRule(adviceFacts(a, false, false)));
   if ((!kept && !a.range && !a.model) || a.rowId === undefined) return;
   const pick = a.model ? { [ADVISED_PICK_FIELD]: a.model } : {};
@@ -450,6 +454,7 @@ function markPlanRow(db: StorageAdapter, a: PlanAdvice): void {
     const r = a.range;
     const extra: Record<string, unknown> = r
       ? {
+          applyBounds,
           // the AgentPin shape, so keptPin compares the run with the fallback
           pin: {
             status: "ranged",
@@ -461,7 +466,7 @@ function markPlanRow(db: StorageAdapter, a: PlanAdvice): void {
           [FALLBACK_PIN_FIELD]: r.fallback,
           ...pick,
         }
-      : { ...(a.pin ? { pin: a.pin } : {}), ...pick };
+      : { applyBounds, ...(a.pin ? { pin: a.pin } : {}), ...pick };
     const scores = withKeptModel(db.adjudicator.get(a.rowId)?.scores, kept, extra);
     if (scores === undefined) return;
     db.adjudicator.update(a.rowId, r ? { scores, baselineModel: r.fallback } : { scores });

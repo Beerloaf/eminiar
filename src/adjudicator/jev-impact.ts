@@ -37,7 +37,7 @@
  * config are taken structurally (StorageAdapter and AdjudicatorConfig satisfy them).
  */
 
-import { dispatchFilter, keptModel, tierOf } from "../storage/dispatch.js";
+import { dispatchFilter, followCount, keptModelOf, tierOf } from "../storage/dispatch.js";
 import { type ModelPrice, type PricingOverrides, resolvePrice } from "../usage/pricing.js";
 import {
   type AdjudicationRow,
@@ -118,12 +118,12 @@ const DEFAULT_LADDER: readonly Tier[] = ["haiku", "sonnet", "opus"];
 /** Scores-JSON keys written by the dispatch hook (savings.ts ADVISED_PICK_FIELD, RANGED_FLAG). */
 const ADVISED_PICK_FIELD = "advisedPick";
 const RANGED_FLAG = "ranged";
-/**
- * Actions that make a dispatch part of the follow rate: a copy of the store summary's
- * ADVISE_ACTIONS (src/storage/sqlite/adjudicator.ts, which the web bundle cannot import);
- * adjudicator-jev-parity.test.ts pins the two together.
- */
-export const ADVISE_ACTIONS: ReadonlySet<string> = new Set(["advised", "followed", "ignored"]);
+/** scores.applyBounds {floor, ceiling}: the apply bounds a dispatch ran under (hooks.ts, swarm.ts). */
+const APPLY_BOUNDS_FIELD = "applyBounds";
+
+/** Advise-mode actions (src/storage/dispatch.ts, shared with the store summary). */
+export { ADVISE_ACTIONS } from "../storage/dispatch.js";
+
 /** Prices count as proportional when every component is within 1% of the input ratio. */
 const PRICE_TOLERANCE = 0.01;
 
@@ -362,6 +362,8 @@ export interface JevImpactReport {
     /** Dispatches left out of attribution, by reason. */
     excluded: {
       kept: number;
+      /** Of `kept`: the pin's tier differs from the tier the advice named. */
+      keptDisagreed: number;
       deferred: number;
       notJev: number;
       unreconstructable: number;
@@ -867,10 +869,72 @@ export function rangedOf(row: Pick<AdjudicationRow, "scores">): boolean {
   return scoresOf(row)?.[RANGED_FLAG] === true;
 }
 
+const tierField = (v: unknown): Tier | undefined => (isTier(v) ? v : undefined);
+
+function boundsOf(v: unknown): ApplyBounds | undefined {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+  const o = v as Record<string, unknown>;
+  const floor = tierField(o.floor);
+  const ceiling = tierField(o.ceiling);
+  return floor || ceiling ? { floor, ceiling } : undefined;
+}
+
+/** The apply bounds the dispatch ran under (scores.applyBounds), if stored. */
+export function applyBoundsOf(row: Pick<AdjudicationRow, "scores">): ApplyBounds | undefined {
+  return boundsOf(scoresOf(row)?.[APPLY_BOUNDS_FIELD]);
+}
+
+/** The agent's model range (scores.pin.range), if stored. */
+export function pinRangeOf(row: Pick<AdjudicationRow, "scores">): ApplyBounds | undefined {
+  const pin = scoresOf(row)?.pin;
+  return pin && typeof pin === "object"
+    ? boundsOf((pin as Record<string, unknown>).range)
+    : undefined;
+}
+
+/** The tier of the agent's pinned model (scores.pin.model), if stored. */
+export function pinTierOf(row: Pick<AdjudicationRow, "scores">): Tier | undefined {
+  const pin = scoresOf(row)?.pin;
+  return pin && typeof pin === "object"
+    ? tierOf((pin as Record<string, unknown>).model as string)
+    : undefined;
+}
+
+/**
+ * A dispatch's ranged flag, role range and apply bounds as one unit (review-C C2): the agent
+ * row's when it stores any of them, else the decision row's. Taking each from whichever row has
+ * it would pair one row's range with the other's bounds.
+ */
+function rangeContextOf(
+  row: Pick<AdjudicationRow, "scores">,
+  decisionRow: Pick<AdjudicationRow, "scores"> | undefined,
+): Pick<EffectiveInput, "ranged" | "range" | "bounds"> {
+  const of = (x: Pick<AdjudicationRow, "scores">) => ({
+    ranged: rangedOf(x),
+    range: pinRangeOf(x),
+    bounds: applyBoundsOf(x),
+  });
+  const own = of(row);
+  return own.ranged || own.range || own.bounds || !decisionRow ? own : of(decisionRow);
+}
+
+function intersect(
+  a: ApplyBounds | undefined,
+  b: ApplyBounds | undefined,
+): ApplyBounds | undefined {
+  if (!a || !b) return a ?? b;
+  const hi = (x?: Tier, y?: Tier) => (x && y ? (tierRank(x) >= tierRank(y) ? x : y) : (x ?? y));
+  const lo = (x?: Tier, y?: Tier) => (x && y ? (tierRank(x) <= tierRank(y) ? x : y) : (x ?? y));
+  // An apply ceiling below its floor is lifted to the floor (swarm.ts rangedTier: the floor wins).
+  const bCeiling = b.floor && b.ceiling ? hi(b.floor, b.ceiling) : b.ceiling;
+  return { floor: hi(a.floor, b.floor), ceiling: lo(a.ceiling, bCeiling) };
+}
+
 function clampTier(t: Tier, floor?: Tier, ceiling?: Tier): Tier {
   let r = tierRank(t);
-  if (floor && r < tierRank(floor)) r = tierRank(floor);
+  // The ceiling first, then the floor: a floor above the ceiling wins (hooks.ts clampTier).
   if (ceiling && r > tierRank(ceiling)) r = tierRank(ceiling);
+  if (floor && r < tierRank(floor)) r = tierRank(floor);
   return TIERS[r] ?? t;
 }
 
@@ -886,6 +950,8 @@ export interface EffectiveInput {
   ranged: boolean;
   /** The apply bounds the dispatch ran under, when known (no row stores them today). */
   bounds?: ApplyBounds | undefined;
+  /** The ranged role's model range, when stored (scores.pin.range); intersected with `bounds`. */
+  range?: ApplyBounds | undefined;
   /**
    * Bounds that may have applied when `bounds` is not known (the report passes today's config
    * and DEFAULT_APPLY_BOUNDS): an answer any of them would move is "bounds", never guessed.
@@ -907,8 +973,9 @@ export function effectivePick(i: EffectiveInput): { final: Tier; cf: Tier } | "u
   if (!isTier(i.raw) || !isTier(i.cf)) return "unknown";
   const rawT = i.raw;
   const cfT = i.cf;
-  const floor = i.bounds?.floor;
-  const ceiling = i.bounds?.ceiling;
+  const known = intersect(i.ranged ? i.range : undefined, i.bounds);
+  const floor = known?.floor;
+  const ceiling = known?.ceiling;
   const unsure = (...ts: Tier[]): boolean =>
     !i.bounds && (i.possible ?? []).some((b) => ts.some((t) => clampedBy(t, b)));
   if (!i.pick) {
@@ -918,11 +985,19 @@ export function effectivePick(i: EffectiveInput): { final: Tier; cf: Tier } | "u
   const raw = tierRank(rawT);
   const pick = tierRank(i.pick);
   const cf = tierRank(cfT);
-  if (raw < pick) return cf <= pick ? { final: i.pick, cf: i.pick } : "unknown";
-  if (raw > pick) return cf >= pick ? { final: i.pick, cf: i.pick } : "unknown";
+  // With the bounds stored (or a ranged role's range) a heuristic tier on the far side of the
+  // pick is still determined: Jev's pick is the stored one, the heuristic's is clamped (review-A A4).
+  // A ranged role needs its range: the apply bounds alone do not say where it clamped (review-C C2).
+  const determined = (): { final: Tier; cf: Tier } | "unknown" | "bounds" => {
+    if (i.ranged ? !i.range : !i.bounds) return "unknown";
+    const cfC = clampTier(cfT, floor, ceiling);
+    return unsure(cfC) ? "bounds" : { final: i.pick as Tier, cf: cfC };
+  };
+  if (raw < pick) return cf <= pick ? { final: i.pick, cf: i.pick } : determined();
+  if (raw > pick) return cf >= pick ? { final: i.pick, cf: i.pick } : determined();
   if (cf === raw) return { final: i.pick, cf: i.pick };
-  if (i.ranged) return "unknown";
-  if (unsure(cfT)) return "bounds";
+  if (i.ranged && !i.range) return "unknown";
+  if (unsure(clampTier(cfT, floor, ceiling))) return "bounds";
   return { final: i.pick, cf: clampTier(cfT, floor, ceiling) };
 }
 
@@ -1345,6 +1420,7 @@ export function impactReport(
   const unchanged = zeroSplit();
   const excluded = {
     kept: 0,
+    keptDisagreed: 0,
     deferred: 0,
     notJev: 0,
     unreconstructable: 0,
@@ -1369,8 +1445,14 @@ export function impactReport(
   const units = new Set<string>();
   for (const r of scope) {
     if (!isDispatch(r)) continue;
-    if (keptModel(r) !== undefined) {
+    // A ranged stay (the pick is the fallback's tier) is a dispatch Jev decided, not a kept pin.
+    const kept = keptModelOf(scoresOf(r));
+    const rangedStay = kept === "pin" && rangedOf(r) && advisedPickOf(r) !== undefined;
+    if (kept !== undefined && !rangedStay) {
       excluded.kept++;
+      const adv = advisedPickOf(r);
+      const pinTier = pinTierOf(r);
+      if (kept === "pin" && adv && pinTier && adv !== pinTier) excluded.keptDisagreed++;
       continue;
     }
     const d = rowDecision.get(r.id);
@@ -1397,7 +1479,7 @@ export function impactReport(
       raw: d.tier.final,
       pick,
       cf: d.tier.cf,
-      ranged: rangedOf(r) || (decisionRow ? rangedOf(decisionRow) : false),
+      ...rangeContextOf(r, decisionRow),
       possible,
     });
     if (eff === "unknown" || eff === "bounds") {
@@ -1411,9 +1493,12 @@ export function impactReport(
     else effective.unchanged++;
     const split = isChanged ? changed : unchanged;
     split.dispatches++;
-    if (typeof r.action === "string" && ADVISE_ACTIONS.has(r.action)) {
+    // The store summary's rule (dispatch.ts followCount), on the scores parsed once: a ranged
+    // stay (kept pin) has nothing to pass, so it never enters the follow rate (review-A A3).
+    const fc = followCount(r, scoresOf(r));
+    if (fc) {
       split.followDenom++;
-      if (r.action === "followed") split.followed++;
+      if (fc === "followed") split.followed++;
     }
     // An outcome or a label speaks for Jev's tier only when that tier ran (J1), and a
     // reconcile outcome only once it is final (J2).

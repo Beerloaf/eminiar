@@ -440,6 +440,7 @@ class Reconciler {
     private readonly learning: LearningConfig,
     private readonly pricing: PricingOverrides | undefined,
     private readonly sessionsSince: Map<string, number>,
+    private readonly ladder: readonly string[] = TIERS,
   ) {
     this.latestCallTs = db.apiCallsLatestTs();
   }
@@ -656,6 +657,16 @@ class Reconciler {
         if (advice !== (tierOf(baseline) ?? baseline)) action = "followed";
       } else if (advice) action = "ignored";
       if (action !== row.action) patch.action = action;
+    } else if (action === "respected" && row.modelRequested && !deferred) {
+      // An explicit model on a free dispatch is labelled respected at dispatch time; passing the
+      // advised tier is still a follow. A mismatch stays respected (the coordinator's own call).
+      const parent = row.parentId ? this.db.adjudicator.get(row.parentId) : undefined;
+      const advice = advisedPick(row) ?? (parent ? advisedPick(parent) : undefined);
+      const requested = tierOf(row.modelRequested) ?? row.modelRequested;
+      if (advice && requested === advice && advice !== (tierOf(baseline) ?? baseline)) {
+        action = "followed";
+        patch.action = action;
+      }
     }
 
     if (!calls.length) return patch;
@@ -761,10 +772,13 @@ class Reconciler {
         ? this.calls(sessionId).filter((c) => c.agent_id === agentId && c.ts >= row.ts - 5_000)
         : [];
 
+    // Feedback given before reconcile finalised the row (applyFeedbackResult leaves a swarm row
+    // non-final) beats the guess: the label stays, and finalisation still waits on the task.
+    const fb = feedbackOf(row);
     const patch: AdjudicationPatch = {
       ...this.pricePatch(row, calls, sessionId, redone, outcome),
-      outcome,
-      outcomeSource: outcome === "pending" ? row.outcomeSource : source,
+      outcome: fb ? row.outcome : outcome,
+      outcomeSource: fb || outcome === "pending" ? row.outcomeSource : source,
     };
     if (agentId && !row.agentId) patch.agentId = agentId;
 
@@ -783,7 +797,24 @@ class Reconciler {
           role: task?.role ?? worker?.role ?? undefined,
         }
       : undefined;
-    this.commit(row, patch, teach);
+    if (!fb) {
+      this.commit(row, patch, teach);
+    } else {
+      // The row holds the feedback's lesson, not reconcile's: re-derive it from the linked row
+      // (the tier that actually ran is known now) and replace what the feedback taught.
+      const before = taughtLesson(this.db, row, this.ladder);
+      const linked: AdjudicationRow = {
+        ...row,
+        agentId: patch.agentId ?? row.agentId ?? null,
+        actualModel: patch.actualModel ?? row.actualModel ?? null,
+        actualCostUsd: patch.actualCostUsd ?? row.actualCostUsd ?? null,
+      };
+      const after = feedbackLesson(this.db, linked, fb, this.ladder);
+      const scores = withTaught(row.scores, this.learning.enabled ? after : before);
+      if (scores !== undefined) patch.scores = scores;
+      this.commit(row, patch);
+      this.result.learned += replaceLesson(this.db, before, after, this.learning, this.now);
+    }
     if (row.surface === "agent") this.penaliseEarlier(row, sibs);
   }
 
@@ -856,6 +887,13 @@ class Reconciler {
   }
 }
 
+/** A swarm dispatch row (agent or plan surface tied to a run task): reconciled by swarmRow. */
+function isSwarmRow(r: AdjudicationRow): boolean {
+  return (
+    (r.surface === "agent" || r.surface === "plan") && !!r.runId && typeof r.taskId === "number"
+  );
+}
+
 /**
  * Link outcomes, tokens and savings for up to `limit` non-final rows older than two minutes,
  * finalise what is settled (or 24 h old) and teach the bias buckets. Idempotent: final rows
@@ -870,9 +908,6 @@ export function reconcile(db: StorageAdapter, opts: ReconcileOptions = {}): Reco
   const rows = db.adjudicator.nonFinal(limit, now - SETTLE_MS);
   if (!rows.length) return { scanned: 0, updated: 0, finalized: 0, linked: 0, learned: 0 };
 
-  const isSwarm = (r: AdjudicationRow) =>
-    (r.surface === "agent" || r.surface === "plan") && !!r.runId && typeof r.taskId === "number";
-
   // Oldest pending row per session (swarm rows may borrow the run's session).
   const sessionsSince = new Map<string, number>();
   const note = (sid: string | null | undefined, ts: number) => {
@@ -882,22 +917,23 @@ export function reconcile(db: StorageAdapter, opts: ReconcileOptions = {}): Reco
   };
   for (const r of rows) {
     note(r.sessionId, r.ts);
-    if (isSwarm(r) && !r.sessionId) note(db.swarm.runGet(r.runId as string)?.session_id, r.ts);
+    if (isSwarmRow(r) && !r.sessionId) note(db.swarm.runGet(r.runId as string)?.session_id, r.ts);
   }
-  for (const w of rows.filter(isSwarm)) {
+  for (const w of rows.filter(isSwarmRow)) {
     // Worker rows may carry their own session id; include them so their calls load.
     for (const wk of db.swarm.workers(w.runId as string))
       if (wk.task_id === w.taskId) note(wk.session_id, w.ts);
   }
 
   const minTs = Math.min(...rows.map((r) => r.ts));
-  const rec = new Reconciler(db, now, learning, pricing, sessionsSince);
+  const ladder = opts.config?.adjudicator?.tiers ?? TIERS;
+  const rec = new Reconciler(db, now, learning, pricing, sessionsSince, ladder);
   rec.seedTaken(minTs);
   rec.result.scanned = rows.length;
 
   // Swarm rows first: they claim their agent ids before best-effort linking runs.
-  const swarm = rows.filter(isSwarm);
-  const rest = rows.filter((r) => !isSwarm(r));
+  const swarm = rows.filter(isSwarmRow);
+  const rest = rows.filter((r) => !isSwarmRow(r));
   for (const row of swarm) {
     try {
       rec.swarmRow(row);
@@ -1213,6 +1249,9 @@ export interface FeedbackResult {
  * final) and makes the row's lesson the feedback's (feedbackLesson), replacing what the row
  * taught before — an earlier feedback, or reconcile's lesson at finalisation — rather than
  * adding to it. Sending the same feedback again changes nothing. Undefined for an unknown id.
+ * A swarm row reconcile has not finalised yet (too young, ingestion behind, past the batch
+ * limit) stays non-final: reconcile only scans non-final rows, and its swarmRow still links
+ * the agent, baseline, cost and follow, keeps this label and re-derives its lesson.
  */
 export function applyFeedbackResult(
   db: StorageAdapter,
@@ -1237,7 +1276,7 @@ export function applyFeedbackResult(
     outcomeSource: feedbackSource(feedback),
     // Repeated identical feedback keeps the time it was first given.
     outcomeTs: same && row.outcomeTs != null ? row.outcomeTs : now,
-    final: true,
+    final: row.final || !isSwarmRow(row),
     ...(scores !== undefined ? { scores } : {}),
   });
   const learned = replaceLesson(db, before, after, learning, now);

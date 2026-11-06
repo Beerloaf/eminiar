@@ -254,6 +254,68 @@ export function excludedLine(x: JevImpactReport["outcomes"]["excluded"]): string
   ].join(" · ");
 }
 
+type Excluded = JevImpactReport["outcomes"]["excluded"];
+
+/** The kept-pin note: how many dispatches kept their pin and where Jev's pick differed. */
+export function keptLine(x: Pick<Excluded, "kept" | "keptDisagreed">): string | null {
+  if (!x.kept) return null;
+  const d = x.keptDisagreed ?? 0;
+  return d > 0
+    ? `${x.kept} kept their pin; Jev's pick differed on ${d}: give those roles a model_range`
+    : `${x.kept} kept their pin`;
+}
+
+/** The deferred-prompt note: promptMode "blocking" is the opt-in, at the measured p50. */
+export function deferredLine(r: Pick<JevImpactReport, "cost">, promptMode: unknown): string | null {
+  const n = r.cost.deferred;
+  if (!n || promptMode === "blocking") return null;
+  const p50 = r.cost.providerLatency.p50;
+  return `${n} prompts got the heuristic's advice while Jev answered in the background: set adjudicator.promptMode "blocking" to wait for Jev${p50 === null ? "" : ` (adds about ${ms(p50)} per prompt)`}`;
+}
+
+/** The decision features that are not enabled, from the overview's sanitized config. */
+export function featuresOff(config: unknown): string[] {
+  const f = (config as { features?: Record<string, { enabled?: boolean } | undefined> } | null)
+    ?.features;
+  if (!f || typeof f !== "object") return [];
+  return Object.keys(f).filter((k) => f[k] && f[k]?.enabled === false);
+}
+
+/** What would give the panel a verdict; empty once it has one. */
+export function verdictSteps(r: Pick<JevImpactReport, "verdict" | "outcomes">): string[] {
+  const v = r.verdict;
+  if (v.label !== "not enough data") return [];
+  const out: string[] = [];
+  if (!v.changed)
+    out.push("No dispatch ran a model Jev changed yet: ranged roles let Jev move the model");
+  const fb = (s: JevSplit) => s.feedback.good + s.feedback.too_small + s.feedback.too_big;
+  if (fb(r.outcomes.changed) + fb(r.outcomes.unchanged) === 0)
+    out.push(
+      "No feedback yet: label finished tasks with fit good, too_small or too_big (em_swarm update fit)",
+    );
+  // With no changed dispatch the first step already says why there are no outcomes (review-C C3).
+  if (v.changed && v.n < v.minEvidence)
+    out.push(`${v.n} labelled outcomes on decisions Jev changed; need ${v.minEvidence}`);
+  if (v.units < v.minUnits)
+    out.push(`Labelled outcomes come from ${v.units} runs or sessions; need ${v.minUnits}`);
+  if (v.compared < v.minCompared)
+    out.push(`${v.compared} compared plan or agent decisions; need ${v.minCompared}`);
+  // Every minimum met and still no verdict: the evidence is split (verdictOf).
+  if (!out.length && v.n >= v.minEvidence && v.units >= v.minUnits && v.compared >= v.minCompared)
+    out.push(
+      `Evidence is split (${v.help} help vs ${v.hurt} hurt): more labelled outcomes will settle it`,
+    );
+  return out;
+}
+
+/** An optional hint, not a verdict condition: decision features send text to the provider. */
+export function featuresHint(config: unknown): string | null {
+  const off = featuresOff(config);
+  return off.length
+    ? `Optional: decision features off (${off.join(", ")}); they send text to the provider, enable one with eminiar adjudicator features on <feature>`
+    : null;
+}
+
 /** The muted footer: latency, deferred, timeouts, models, eras. */
 export function footerFacts(r: JevImpactReport): string[] {
   const c = r.cost;

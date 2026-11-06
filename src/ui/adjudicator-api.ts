@@ -388,7 +388,10 @@ export function overviewPayload(
       effective: summary.applyChecked - summary.applyIneffective,
     },
     summary,
-    fallbackRate: summary.total ? fallback / summary.total : null,
+    fallbackRate:
+      summary.total - summary.inherited > 0
+        ? (fallback - summary.inherited) / (summary.total - summary.inherited)
+        : null,
     charts: chartsOf(rows),
     chartsCut: rows.length >= CHART_ROWS_MAX,
     filters: { surfaces: SURFACES, providers: PROVIDER_IDS, outcomes: OUTCOMES, sources: SOURCES },

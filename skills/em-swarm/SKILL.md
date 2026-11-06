@@ -88,6 +88,11 @@ every quiet worker is released); the task goes back to pending, so spawn a new w
   because it never reported: check that the work is really done.
 - Reopen unfinished work with `em_swarm {action:"update", task, status:"pending"}` or plan
   follow-up tasks; `blocked` tasks need an answer or a re-plan.
+- When a result shows the model was over- or under-powered, close the task with
+  `fit: "too_small"` or `"too_big"` (`"good"` when it fit): `em_swarm {action:"update", task,
+  status, result, fit}`. With the adjudicator on this labels that task's Jev decision. A
+  downgrade also counts through the task's outcome, but an upgrade counts as Jev evidence only
+  through this label. No free text is stored.
 - If the swarm has a reviewer role, run it **last**, on the full diff, as an adversarial
   review. Turn each confirmed finding into a task and repeat until none are left.
 - Run the tests yourself before you call the goal met.
