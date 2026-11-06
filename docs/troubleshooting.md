@@ -103,6 +103,23 @@ schema the code expects; opening it with a current version migrates it in place.
 persists, `eminiar purge usage --yes` followed by `eminiar usage ingest` rebuilds the usage tables
 from the transcripts.
 
+## "UserPromptSubmit hook timed out after 5s — output discarded"
+
+Claude Code stops a hook at its `timeout` and drops what it wrote. It shows up when many
+processes write to one project database at once, for example while an agent swarm runs: each
+SQLite statement used to wait up to 2 s for the write lock, and a handler runs several of them.
+Hooks now wait a limited time per statement (250 ms for the prompt hook and other read-only
+hooks, 1500 to 2000 ms for hooks whose job is a write; Cursor's hooks wait as the Claude Code
+event they map to) and answer within a time budget (see [Hooks](how-it-works.md#hooks)). A
+busy database costs the prompt, `SessionStart` and `PostToolUseFailure` hooks their
+bookkeeping, not their answer. A write-job hook such as `PostToolUse` or `SubagentStop` that
+cannot get the lock in time answers without its write, and `SubagentStart` gives the worker a
+short fallback brief. If the message still appears,
+`~/.eminiar/hook.log` has a line
+`<event>: hook budget of <n> ms exceeded; answered without it` for each run that gave up, and
+`database is locked` lines point at the processes holding the lock. A long `eminiar index` or
+`eminiar usage ingest` running at the same time is the usual one.
+
 ## Start over for one project
 
 ```sh

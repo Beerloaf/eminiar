@@ -52,6 +52,8 @@ export interface SqliteOptions {
   dims?: number;
   /** Skip loading sqlite-vec (hooks don't need it and it saves startup time). */
   vectors?: boolean;
+  /** How long one statement waits for a lock held by another process (default 2000). */
+  busyTimeoutMs?: number;
 }
 
 type Row = Record<string, unknown>;
@@ -146,7 +148,7 @@ export class SqliteAdapter implements StorageAdapter {
     readonly path: string,
     opts: SqliteOptions = {},
   ) {
-    this.db = new Database(path, { timeout: 2000 });
+    this.db = new Database(path, { timeout: opts.busyTimeoutMs ?? 2000 });
     // Statements are prepared lazily, so the tables only need to exist by the first call.
     this.swarm = new SqliteSwarmStore(this.db);
     this.adjudicator = new SqliteAdjudicatorStore(this.db);

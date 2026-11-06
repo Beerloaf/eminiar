@@ -95,6 +95,28 @@ function toolResponseOf(v: unknown): unknown {
   }
 }
 
+/**
+ * The event and tool name the handlers will see for a parsed payload, without translating the
+ * rest of it: `--event` forced as `dispatch` does, then a Cursor event or tool name mapped to
+ * Claude Code's. src/hook.ts picks the lock wait from this before `dispatch` opens the database.
+ */
+export function handlerEvent(
+  parsed: Record<string, unknown>,
+  argv: string[],
+): { event: string | undefined; tool: string | undefined } {
+  const forced = argv.indexOf("--event");
+  const p =
+    forced !== -1 && argv[forced + 1] ? { ...parsed, hook_event_name: argv[forced + 1] } : parsed;
+  const event = str(p.hook_event_name);
+  const tool = str(p.tool_name);
+  if (detectClient(p, argv) !== "cursor") return { event, tool };
+  if (event === "afterFileEdit") return { event: CURSOR_EVENTS[event], tool: "Edit" };
+  return {
+    event: event === undefined ? undefined : (CURSOR_EVENTS[event] ?? event),
+    tool: tool === undefined ? undefined : mapToolName(tool),
+  };
+}
+
 /** Translate a Cursor hook payload into the Claude Code shape the handlers read. */
 export function fromCursor(raw: Record<string, unknown>): HookInput {
   const event = str(raw.hook_event_name) ?? "";

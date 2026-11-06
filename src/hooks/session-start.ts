@@ -49,18 +49,24 @@ export const sessionStart: HookHandler = async (input) => {
   const sessionId = input.session_id || "unknown";
   setCurrentSession(ctx, sessionId);
   const db = getStorage(ctx, { vectors: false });
-  db.sessionUpsert({
-    id: sessionId,
-    project_root: ctx.root,
-    source: input.source,
-    transcript_path: input.transcript_path,
-  });
-  db.eventInsert({
-    sessionId,
-    category: "session_start",
-    priority: 4,
-    payload: { source: input.source },
-  });
+  // Bookkeeping: a database another process holds locked must not cost the session its
+  // guidance. The first locked write ends the block; the reads below still run.
+  try {
+    db.sessionUpsert({
+      id: sessionId,
+      project_root: ctx.root,
+      source: input.source,
+      transcript_path: input.transcript_path,
+    });
+    db.eventInsert({
+      sessionId,
+      category: "session_start",
+      priority: 4,
+      payload: { source: input.source },
+    });
+  } catch (err) {
+    hookLog("info", `SessionStart: session not recorded: ${(err as Error).message}`);
+  }
 
   if (process.env.CLAUDE_ENV_FILE) {
     try {
@@ -81,7 +87,11 @@ export const sessionStart: HookHandler = async (input) => {
     const snap = db.snapshotLatestUnconsumed(sessionId);
     if (snap) {
       parts.push(`## Session Guide (eminiar)\n${snap.body}`);
-      db.snapshotMarkConsumed(snap.id);
+      try {
+        db.snapshotMarkConsumed(snap.id);
+      } catch (err) {
+        hookLog("info", `SessionStart: snapshot not marked consumed: ${(err as Error).message}`);
+      }
     } else {
       // No PreCompact snapshot (e.g. resume after a crash): build one from recent events.
       const prev = input.source === "resume" ? db.sessionLatest() : undefined;

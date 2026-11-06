@@ -21,8 +21,15 @@ import {
 } from "../swarm/hooks.js";
 import { budgetWarnings } from "../usage/brief.js";
 import { ingestSession, ingestTranscript, usageEnabled } from "../usage/ingest.js";
+import { HOOK_BUSY_TIMEOUT_MS, hasBudget } from "./budget.js";
 import { hookLog } from "./log.js";
 import type { HookHandler, HookInput } from "./types.js";
+
+/** What a stage of the prompt hook needs left of the run's budget to be worth starting. */
+const RECALL_NEEDS_MS = 600;
+const ADJUDICATOR_NEEDS_MS = 1500;
+/** What one best-effort write of PostToolUseFailure needs left: its short wait and a margin. */
+const BEST_EFFORT_NEEDS_MS = 1000;
 
 /** Categories worth finding again with em_recall / em_search (source "session"). */
 const INDEXED = new Set([
@@ -106,15 +113,29 @@ export function ingestUsage(db: StorageAdapter, input: HookInput, sessionId: str
 
 export const userPromptSubmit: HookHandler = async (input) => {
   if (!input.prompt?.trim()) return undefined;
-  const { db, sessionId } = open(input);
-  db.sessionUpsert({ id: sessionId, last_prompt: clip(input.prompt, 600) });
-  persist(db, sessionId, withPriority(sessionId, classifyPrompt(input.prompt)));
+  const ctx = getContext(input.cwd);
+  const db = getStorage(ctx, { vectors: false });
+  const sessionId = input.session_id || "unknown";
+  // The session row and the prompt's events are bookkeeping: a database another process holds
+  // locked must not cost the prompt its recall. A reader is not blocked by a writer, so the
+  // reads below still run; the first locked write ends this block, since the next would only
+  // wait for the same lock again (src/hooks/budget.ts).
+  try {
+    db.sessionUpsert({
+      id: sessionId,
+      project_root: ctx.root,
+      transcript_path: input.transcript_path,
+      last_prompt: clip(input.prompt, 600),
+    });
+    persist(db, sessionId, withPriority(sessionId, classifyPrompt(input.prompt)));
+  } catch (err) {
+    hookLog("info", `UserPromptSubmit: prompt not recorded: ${(err as Error).message}`);
+  }
   // Hand Claude the memories and doc pages this prompt touches, so it does not have
   // to remember to ask em_recall / em_docs first.
-  const ctx = getContext(input.cwd);
   const { recall } = ctx.config;
   const parts: string[] = [];
-  if (recall.onPrompt) {
+  if (recall.onPrompt && hasBudget(RECALL_NEEDS_MS)) {
     try {
       const r = await recallForText(db, input.prompt, {
         maxMemories: recall.maxMemories,
@@ -124,17 +145,27 @@ export const userPromptSubmit: HookHandler = async (input) => {
         trace: true,
         path: "prompt",
       });
-      // Quiet decisions are recorded too: the hit rate is only measurable with both sides.
-      recordShown(db, sessionId, r.keys, { path: "prompt", trace: r.trace });
       if (r.text) parts.push(r.text);
+      // Quiet decisions are recorded too: the hit rate is only measurable with both sides.
+      // A statistic, written after the recall is in hand: a locked database loses the count,
+      // not the answer.
+      try {
+        recordShown(db, sessionId, r.keys, { path: "prompt", trace: r.trace });
+      } catch {
+        // statistics only
+      }
     } catch {
       // recall is best effort; never block a prompt on it
     }
   }
   // The adjudicator (off by default; loaded only when enabled): one advice line for Claude
-  // and, now and then, a main-session note for the user.
+  // and, now and then, a main-session note for the user. Skipped when the run is already late.
   let systemMessage: string | undefined;
-  if (ctx.config.adjudicator.enabled && input.client !== "cursor") {
+  if (
+    ctx.config.adjudicator.enabled &&
+    input.client !== "cursor" &&
+    hasBudget(ADJUDICATOR_NEEDS_MS)
+  ) {
     try {
       const { onPrompt } = await import("../adjudicator/hooks.js");
       const a = await onPrompt(ctx, db, input, sessionId);
@@ -222,15 +253,54 @@ export const postToolUse: HookHandler = async (input) => {
   return undefined;
 };
 
+/**
+ * The best-effort writes of PostToolUseFailure, once the spawn release has had its long wait:
+ * each waits at most HOOK_BUSY_TIMEOUT_MS for the lock, needs BEST_EFFORT_NEEDS_MS of the run's
+ * budget, and the first one that fails ends the rest (the database is busy; the answer is not).
+ * An Agent call's hook opens with a 1500 ms wait for the release, and three more writes at that
+ * wait would take it past its 5 s timeout under a sustained lock.
+ */
+function bestEffortWrites(db: StorageAdapter): (what: string, fn: () => void) => void {
+  let done = false;
+  return (what, fn) => {
+    if (done) return;
+    if (!hasBudget(BEST_EFFORT_NEEDS_MS)) {
+      done = true;
+      hookLog("info", `PostToolUseFailure: ${what} skipped: out of time`);
+      return;
+    }
+    try {
+      const short = db.adjudicator.withLockWait?.bind(db.adjudicator);
+      if (short) short(HOOK_BUSY_TIMEOUT_MS, fn);
+      else fn();
+    } catch (err) {
+      done = true;
+      hookLog("info", `PostToolUseFailure: ${what} not recorded: ${(err as Error).message}`);
+    }
+  };
+}
+
 export const postToolUseFailure: HookHandler = async (input) => {
   if (!input.tool_name) return undefined;
-  if (input.agent_id) swarmActivity(getContext(input.cwd), input, true);
-  if (input.tool_name === "Agent" || input.tool_name === "Task")
-    swarmAgentReturned(getContext(input.cwd), input);
-  const { db, root, sessionId } = open(input);
-  // Look the error up before it is persisted, so it does not find itself.
+  const ctx = getContext(input.cwd);
+  // The one write this hook must not lose, first and with the event's full lock wait: a lost
+  // release keeps the worker's slot until the reservation expires, so the retry is denied.
+  if (input.tool_name === "Agent" || input.tool_name === "Task") swarmAgentReturned(ctx, input);
+  const db = getStorage(ctx, { vectors: false });
+  const sessionId = input.session_id || "unknown";
+  const write = bestEffortWrites(db);
+  if (input.agent_id) write("swarm activity", () => swarmActivity(ctx, input, true));
+  write("session", () =>
+    db.sessionUpsert({
+      id: sessionId,
+      project_root: ctx.root,
+      transcript_path: input.transcript_path,
+    }),
+  );
+  // Look the error up before it is persisted, so it does not find itself. Reads are not
+  // blocked by another process's write lock (WAL), so the recall runs whatever the writes did.
   let recalled: string | undefined;
-  const { recall } = getContext(input.cwd).config;
+  const { recall } = ctx.config;
   if (recall.onError && input.error) {
     try {
       const r = await recallForError(db, input.error, {
@@ -240,7 +310,7 @@ export const postToolUseFailure: HookHandler = async (input) => {
       });
       if (r.text) {
         recalled = r.text;
-        recordShown(db, sessionId, r.keys, { path: "error" });
+        write("recall", () => recordShown(db, sessionId, r.keys, { path: "error" }));
       }
     } catch {
       // recall is best effort
@@ -250,9 +320,9 @@ export const postToolUseFailure: HookHandler = async (input) => {
     toolName: input.tool_name,
     toolInput: input.tool_input ?? {},
     error: input.error ?? "tool failed",
-    root,
+    root: ctx.root,
   }).filter((d) => d.category !== "tool_call");
-  persist(db, sessionId, withPriority(sessionId, drafts));
+  write("failure", () => persist(db, sessionId, withPriority(sessionId, drafts)));
   return recalled
     ? { hookSpecificOutput: { hookEventName: "PostToolUseFailure", additionalContext: recalled } }
     : undefined;
