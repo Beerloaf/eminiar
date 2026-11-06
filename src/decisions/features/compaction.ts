@@ -104,7 +104,10 @@ function taskOf(sections: GuideSection[]): string {
 }
 
 /** A token with a slash, delimited the way guide sections join items. */
-const PATH_TOKEN = /[^\s|,;()"'`]*[\\/][^\s|,;()"'`]*/g;
+const PATH_TOKEN = /[^\s|,;()"'`]+/g;
+/** Looks like a path rather than a key: an anchor (`/`, `~/`, `./`, `../`, `X:\`) or a dot-extension. */
+const PATH_ANCHOR = /^(?:[A-Za-z]:[\\/]|~[\\/]|\.{1,2}[\\/]|[\\/])/;
+const PATH_EXT = /[\\/][^\\/]*\.[A-Za-z0-9_]+(?::\d+){0,2}$/;
 /**
  * A filesystem path and nothing else: word characters, `.`, `~`, `+`, `-` and slashes, an
  * optional drive letter and an optional `:line[:col]`. A token with `://`, `//`, `@`, `=`, `?`,
@@ -117,6 +120,8 @@ const PH_CHARS = /[]/;
 
 /** The readable form of a path token, or the token itself when it is not one to shorten. */
 function shortPath(tok: string, root: string): string {
+  if (!/[\\/]/.test(tok)) return tok;
+  if (!PATH_ANCHOR.test(tok) && !PATH_EXT.test(tok)) return tok;
   if (!FS_PATH.test(tok) || tok.includes("//")) return tok;
   let rest: string;
   if (root && (tok.startsWith(`${root}/`) || tok.startsWith(`${root}\\`)))

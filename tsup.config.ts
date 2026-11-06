@@ -42,7 +42,7 @@ const HOOK_STATIC = ["src/hooks/dispatch.ts", "src/hooks/log.ts"].map((p) => res
  * What an adjudicator-on hook process loads on top of that: the adjudicator's hook handlers and
  * everything they reach statically (engine, config, redaction, providers, breaker). Importing them
  * from every lazy entry puts them in one more shared chunk instead of five, so an adjudicator-on
- * prompt or Bash hook loads hook.js + the static chunk + that chunk (3 files, not 7).
+ * prompt or Bash hook loads hook.js + the shared hook chunks + that chunk (4 files, not 7).
  */
 const HOOK_ADJUDICATOR = ["src/adjudicator/hooks.ts", "src/adjudicator/async.ts"].map((p) =>
   resolve(p),

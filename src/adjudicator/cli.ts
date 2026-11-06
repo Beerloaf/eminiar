@@ -791,6 +791,8 @@ export interface StatusReport {
   consentVia: string | null;
   /** The origins ~/.eminiar/config.json records consent for. */
   consentedOrigins: string[];
+  /** EMINIAR_ADJUDICATOR_PROVIDER names a remote provider the personal file does not itself use. */
+  envProviderPinned?: string | null;
   /** projectAdjudicatorWarning(): adjudicator keys the project file sets that are ignored. */
   projectIgnored: string | null;
   key: {
@@ -927,6 +929,13 @@ export async function statusReport(
     consent: r0.configuredRemote && r0.consent,
     consentVia: r0.consentVia ?? null,
     consentedOrigins: consentedOrigins(a),
+    envProviderPinned:
+      io.env.EMINIAR_ADJUDICATOR_PROVIDER &&
+      r0.configuredRemote &&
+      !r0.consent &&
+      consentedOrigins(a).length > 0
+        ? io.env.EMINIAR_ADJUDICATOR_PROVIDER
+        : null,
     projectIgnored: safe(() => projectAdjudicatorWarning(ctx.root)) ?? null,
     key: {
       id: need?.id ?? null,
@@ -1060,6 +1069,10 @@ export function formatStatus(s: StatusReport): string {
       }`,
     );
   else lines.push("remote: no, nothing leaves this machine");
+  if (s.envProviderPinned)
+    lines.push(
+      `note: EMINIAR_ADJUDICATOR_PROVIDER=${s.envProviderPinned} selects a provider other than the one in your personal config, and an environment choice only runs when it is that provider (or heuristic/embedding). \`enable --accept-remote\` does not change that: set it in the personal config with \`eminiar adjudicator provider <name>\` instead (consent already given for ${s.consentedOrigins.join(", ")}).`,
+    );
   if (s.projectIgnored) lines.push(`warning: ${s.projectIgnored}`);
   if (s.key.id)
     lines.push(

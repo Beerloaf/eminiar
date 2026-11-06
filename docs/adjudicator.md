@@ -204,9 +204,11 @@ cannot set `remoteConsentOrigins`.
 No environment variable can grant consent: a project's `.claude/settings.json` can set
 environment variables for your session and its hooks, so a cloned repo must not be able to start
 sending your prompts anywhere. `EMINIAR_ADJUDICATOR=1` may turn the adjudicator on (never over a personal `enabled: false`, and with no provider and no decision features unless your personal file itself says `enabled: true`), and
-`EMINIAR_ADJUDICATOR_PROVIDER` may pick a remote provider, but that provider runs only when
-`remoteConsentOrigins` in `~/.eminiar/config.json` already lists its origin; otherwise the
-heuristic runs with `no_consent`. `EMINIAR_ADJUDICATOR_REMOTE=1` does nothing.
+`EMINIAR_ADJUDICATOR_PROVIDER` (or a project file) may pick a provider, but a remote one runs only
+when it is the very provider your personal `~/.eminiar/config.json` itself configures (with its origin
+in `remoteConsentOrigins`); heuristic and embedding always work. Any other choice, even one whose
+origin you consented to, degrades to the heuristic with `no_consent`: set it in the personal config
+with `eminiar adjudicator provider <name>`. `EMINIAR_ADJUDICATOR_REMOTE=1` does nothing.
 `EMINIAR_ADJUDICATOR_REMOTE=0` withdraws every consent, and `EMINIAR_ADJUDICATOR=0` turns the
 adjudicator off.
 
