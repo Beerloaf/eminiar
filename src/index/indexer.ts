@@ -41,6 +41,9 @@ export interface IndexResult {
  */
 const CAPTURED = new Set<Source>(["exec", "batch", "url"]);
 
+/** Bump when the masking rules change enough that stored output should be masked again. */
+const CAPTURED_MASK_VERSION = "1";
+
 /** A captured document as stored: title, content, pre-cut chunks and string meta masked. */
 function maskCaptured(input: IndexInput): IndexInput {
   const meta = input.meta
@@ -62,6 +65,35 @@ function maskCaptured(input: IndexInput): IndexInput {
       body: redactSecrets(c.body),
     })),
   };
+}
+
+/** How long one slice of the re-mask may hold the server before it yields to tool calls. */
+const REMASK_SLICE_MS = 20;
+
+/**
+ * Mask captured output stored before it was masked (or under older rules) in place, once per
+ * database. The server runs it in its warm-up; it yields every REMASK_SLICE_MS so a tool call is
+ * never queued behind it, and records where it got to, so a server stopped halfway resumes there.
+ * Hooks never run it. Returns the number of chunks that changed.
+ */
+export async function remaskCapturedOutput(db: StorageAdapter): Promise<number> {
+  if (db.metaGet("captured_mask_version") === CAPTURED_MASK_VERSION) return 0;
+  const [version, id] = (db.metaGet("captured_mask_resume") ?? "").split(":");
+  let afterId = version === CAPTURED_MASK_VERSION ? Number(id) || 0 : 0;
+  let changed = 0;
+  for (;;) {
+    const slice = db.remaskDocuments([...CAPTURED], redactSecrets, afterId, REMASK_SLICE_MS);
+    changed += slice.changed;
+    if (slice.done) break;
+    afterId = slice.lastId;
+    // Written after the slice, not inside its transactions: a stop between the two only redoes
+    // documents that are already masked, which changes nothing.
+    db.metaSet("captured_mask_resume", `${CAPTURED_MASK_VERSION}:${afterId}`);
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  db.metaSet("captured_mask_version", CAPTURED_MASK_VERSION);
+  db.metaDelete("captured_mask_resume");
+  return changed;
 }
 
 /** Chunk + store one piece of content. Unchanged uri+content is a no-op (created=false). */

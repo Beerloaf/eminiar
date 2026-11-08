@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ConfigSchema } from "../../src/config.js";
 import type { ProjectContext } from "../../src/context.js";
-import { indexContent } from "../../src/index/indexer.js";
+import { indexContent, remaskCapturedOutput } from "../../src/index/indexer.js";
 import { processOutput } from "../../src/sandbox/output.js";
 import { search } from "../../src/search/pipeline.js";
 import { closeAllStorage } from "../../src/storage/index.js";
@@ -127,5 +127,61 @@ describe("captured output in the index", () => {
     expect(db.getDocument(documentId)?.meta).toBe('{"intent":"why does DB_PASSWORD=*** fail"}');
     const [c] = db.chunksOfDocument(documentId);
     expect([c?.title, c?.body]).toEqual(["API_TOKEN=***", "export API_TOKEN=***"]);
+  });
+
+  const secret = "ghp_Z9y8X7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i2";
+  /** A document as an older version stored it: raw, with its chunk already embedded. */
+  const legacy = (source: string, tag: string) => {
+    const { id } = db.upsertDocument(
+      {
+        source,
+        title: `echo ${secret}`,
+        contentType: "prose",
+        contentHash: `old-${source}-${tag}`,
+        meta: { intent: `why is GH_TOKEN=${secret} rejected` },
+      },
+      [{ ord: 0, title: "", body: `GH_TOKEN=${secret}`, contentType: "prose", hash: "h" }],
+    );
+    db.markEmbedded(db.chunksOfDocument(id).map((c) => c.id));
+    return id;
+  };
+
+  it("masks output stored before masking once, in place, and leaves other sources", async () => {
+    const exec = legacy("exec", "a");
+    const file = legacy("file", "a");
+    db.metaDelete("captured_mask_version");
+    expect(await remaskCapturedOutput(db)).toBeGreaterThan(0);
+    expect(db.getDocument(exec)?.title).toBe("echo ghp_***");
+    expect(db.getDocument(exec)?.meta).toBe('{"intent":"why is GH_TOKEN=*** rejected"}');
+    const [chunk] = db.chunksOfDocument(exec);
+    expect(chunk?.body).toBe("GH_TOKEN=***");
+    // the old vector was embedded from the raw text: the chunk is queued to be embedded again
+    expect(db.unembeddedChunkIds(1000)).toContain(chunk?.id);
+    expect(db.chunksOfDocument(file)[0]?.body).toBe(`GH_TOKEN=${secret}`);
+    const hits = await search(db, "Z9y8X7w6V5u4T3s2", { mode: "lexical" });
+    expect(hits.hits.map((h) => h.chunk.document.id)).toEqual([file]);
+    // once per database: a later warm-up does nothing
+    legacy("exec", "later");
+    expect(await remaskCapturedOutput(db)).toBe(0);
+  });
+
+  it("works in slices that yield to the event loop, and resumes where it stopped", async () => {
+    db.metaDelete("captured_mask_version");
+    const docs = [legacy("exec", "s1"), legacy("batch", "s2"), legacy("url", "s3")];
+    // a run stopped after the first document resumes after it
+    db.metaSet("captured_mask_resume", `1:${docs[0]}`);
+    // one document per slice, as if each took the whole 20 ms
+    const sliced = Object.create(db) as SqliteAdapter;
+    const order: string[] = [];
+    sliced.remaskDocuments = (sources, mask, afterId) => {
+      order.push("slice");
+      return db.remaskDocuments(sources, mask, afterId, 0);
+    };
+    setImmediate(() => order.push("tick"));
+    await remaskCapturedOutput(sliced);
+    expect(order).toEqual(["slice", "tick", "slice", "slice"]);
+    expect(db.chunksOfDocument(docs[0] as number)[0]?.body).toBe(`GH_TOKEN=${secret}`);
+    for (const id of docs.slice(1)) expect(db.chunksOfDocument(id)[0]?.body).toBe("GH_TOKEN=***");
+    expect(db.metaGet("captured_mask_resume")).toBeUndefined();
   });
 });

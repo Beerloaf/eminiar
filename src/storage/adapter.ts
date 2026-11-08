@@ -63,6 +63,17 @@ export interface StorageAdapter {
   findDocumentByUri(uri: string): DocumentRow | undefined;
   deleteDocument(id: number): void;
   deleteDocumentsBySource(source: string): number;
+  /**
+   * Rewrite the title, string meta and chunk text of these sources' documents through `mask`, in
+   * place (FTS follows; changed chunks are re-embedded), in id order from after `afterId` until
+   * `budgetMs` has passed. `lastId` is the last document done; `done` when none are left.
+   */
+  remaskDocuments(
+    sources: string[],
+    mask: (text: string) => string,
+    afterId: number,
+    budgetMs: number,
+  ): { changed: number; lastId: number; done: boolean };
   countDocuments(source?: string): number;
   /** Documents of one source, newest first, with chunk counts. */
   documentsBySource(source: string, limit?: number): DocumentSummaryRow[];

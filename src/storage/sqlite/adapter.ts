@@ -122,6 +122,21 @@ function usageWhere(
   return { where: clauses.join(" AND "), params };
 }
 
+/** A meta JSON string with its string values (one level) passed through `mask`. */
+function maskJsonStrings(json: string, mask: (text: string) => string): string {
+  try {
+    const o = JSON.parse(json) as unknown;
+    if (!o || typeof o !== "object" || Array.isArray(o)) return json;
+    const out = Object.fromEntries(
+      Object.entries(o).map(([k, v]) => [k, typeof v === "string" ? mask(v) : v]),
+    );
+    const masked = JSON.stringify(out);
+    return masked === JSON.stringify(o) ? json : masked;
+  } catch {
+    return json;
+  }
+}
+
 export class SqliteAdapter implements StorageAdapter {
   readonly db: Database.Database;
   readonly vectors: boolean;
@@ -281,6 +296,50 @@ export class SqliteAdapter implements StorageAdapter {
       for (const { id } of ids) this.deleteDocument(id);
     });
     return ids.length;
+  }
+
+  remaskDocuments(
+    sources: string[],
+    mask: (text: string) => string,
+    afterId: number,
+    budgetMs: number,
+  ): { changed: number; lastId: number; done: boolean } {
+    const next = this.prep(
+      `SELECT id, title, meta FROM documents WHERE id > ? AND source IN (${sources.map(() => "?").join(", ")}) ORDER BY id LIMIT 1`,
+    );
+    const until = performance.now() + budgetMs;
+    let changed = 0;
+    let lastId = afterId;
+    // One short transaction per document, so a hook waiting on the lock is never held for long.
+    for (;;) {
+      const d = next.get(lastId, ...sources) as
+        | { id: number; title: string; meta: string | null }
+        | undefined;
+      if (!d) return { changed, lastId, done: true };
+      this.transaction(() => {
+        const title = mask(d.title);
+        const meta = d.meta === null ? null : maskJsonStrings(d.meta, mask);
+        if (title !== d.title || meta !== d.meta)
+          this.prep("UPDATE documents SET title = ?, meta = ? WHERE id = ?").run(title, meta, d.id);
+        const rows = this.prep("SELECT id, title, body FROM chunks WHERE document_id = ?").all(
+          d.id,
+        ) as Array<{ id: number; title: string; body: string }>;
+        for (const c of rows) {
+          const t = mask(c.title);
+          const b = mask(c.body);
+          if (t === c.title && b === c.body) continue;
+          // chunks_au keeps both FTS tables in step; embedded = 0 replaces the vector.
+          this.prep("UPDATE chunks SET title = ?, body = ?, embedded = 0 WHERE id = ?").run(
+            t,
+            b,
+            c.id,
+          );
+          changed++;
+        }
+      });
+      lastId = d.id;
+      if (performance.now() >= until) return { changed, lastId, done: false };
+    }
   }
 
   countDocuments(source?: string): number {
