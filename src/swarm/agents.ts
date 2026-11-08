@@ -220,6 +220,8 @@ export interface SyncAction {
   path: string;
   action: SyncActionKind;
   reason?: string | undefined;
+  /** A write held back because the swarm file has keys this version does not know. */
+  held?: true | undefined;
 }
 
 export interface SyncResult {
@@ -374,6 +376,21 @@ export function planAgentSync(
               reason: config?.enabled ? "no longer in the swarm file" : "swarms are disabled",
             },
       );
+  // A swarm file with keys this version does not know may come from a newer eminiar, whose
+  // agent files carry those settings (a permission mode, a hook): rewriting or deleting them here
+  // would drop them. A create has nothing to drop. Report the rest as conflicts; --force writes.
+  if (config?.ignoredKeys.length && !opts.force)
+    return actions.map((a) =>
+      a.action === "update" || a.action === "delete"
+        ? {
+            agentType: a.agentType,
+            path: a.path,
+            action: "conflict" as const,
+            held: true as const,
+            reason: `kept: ${config.rel} has keys this eminiar version does not know, and a newer one may have generated this file with them; update eminiar, or sync with --force`,
+          }
+        : a,
+    );
   return actions;
 }
 

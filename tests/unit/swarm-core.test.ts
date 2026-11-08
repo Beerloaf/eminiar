@@ -6,7 +6,13 @@ import { parse as parseYaml } from "yaml";
 import { getContext, resetContextCache } from "../../src/context.js";
 import type { StorageAdapter } from "../../src/storage/adapter.js";
 import { closeAllStorage, getStorage } from "../../src/storage/index.js";
-import { planAgentSync, renderAgentFile, syncAgents, workerTools } from "../../src/swarm/agents.js";
+import {
+  generatedState,
+  planAgentSync,
+  renderAgentFile,
+  syncAgents,
+  workerTools,
+} from "../../src/swarm/agents.js";
 import { coordinatorBrief, taskBrief, workerBrief } from "../../src/swarm/brief.js";
 import {
   activeSwarmConfig,
@@ -178,7 +184,7 @@ swarms:
     agents:
       a:
         description: x
-        hooks: { SessionStart: [] }
+        hooks: { PostToolUse: [{ hooks: [] }] }
 `).state,
     ).toBe("invalid");
     expect(
@@ -194,6 +200,182 @@ swarms:
     if (syn.state === "invalid") expect(syn.issues[0]!.line).toBe(1);
     expect(parse("").state).toBe("invalid");
     expect(parse("swarms: {}").state).toBe("invalid");
+  });
+});
+
+describe("swarm config written for a newer eminiar", () => {
+  const FUTURE = `version: 1
+background_default: true
+defaults:
+  model: sonnet
+  later_default: 1
+swarms:
+  s:
+    description: d
+    retries: 2
+    agents:
+      a:
+        description: x
+        count: 2
+        permission_mode: plan
+        context: { docs: 1, rerank: true }
+        hooks:
+          SubagentStop: [{ hooks: [{ type: command, command: "echo" }] }]
+          PostToolUse: [{ hooks: [{ type: command, command: "echo", async: true }] }]
+`;
+
+  const KNOWN = `version: 1
+defaults:
+  model: sonnet
+swarms:
+  s:
+    description: d
+    agents:
+      a:
+        description: x
+        count: 2
+        context: { docs: 1 }
+        hooks:
+          PostToolUse: [{ hooks: [{ type: command, command: "echo" }] }]
+`;
+
+  it("ignores unknown keys, one note per key in file order, and keeps every known setting", () => {
+    const c = ok(FUTURE);
+    expect(c.ignoredKeys.map((w) => [w.path, w.message.match(/"(.+?)"/)?.[1], w.line])).toEqual([
+      ["", "background_default", 2],
+      ["defaults", "later_default", 5],
+      ["swarms.s", "retries", 9],
+      ["swarms.s.agents.a", "permission_mode", 14],
+      ["swarms.s.agents.a.context", "rerank", 15],
+      ["swarms.s.agents.a.hooks", "SubagentStop", 17],
+      ["swarms.s.agents.a.hooks.PostToolUse.0.hooks.0", "async", 18],
+    ]);
+    expect(c.ignoredKeys[1]!.message).toBe(
+      'unknown key "later_default" ignored: not a setting in this eminiar version',
+    );
+    const role = c.swarms[0]!.roles[0]!;
+    expect(role).toMatchObject({ model: "sonnet", count: 2 });
+    expect(role.context).toMatchObject({ docs: 1 });
+    expect(role.hooks).toEqual({
+      PostToolUse: [{ hooks: [{ type: "command", command: "echo" }] }],
+    });
+    // the agent file is the one the same file without those keys gives
+    const k = ok(KNOWN);
+    expect(renderAgentFile(c, c.swarms[0]!, role)).toBe(
+      renderAgentFile(k, k.swarms[0]!, k.swarms[0]!.roles[0]!),
+    );
+    expect(k.ignoredKeys).toEqual([]);
+  });
+
+  it("keeps a typo of a known key an error, with the key it is close to", () => {
+    for (const [line, near] of [
+      ["        disallowedTools: [Bash]", "disallowed_tools"],
+      ["        Tools: [Read]", "tools"],
+      ["        MAX_TURNS: 5", "max_turns"],
+      ["        max_turn: 5", "max_turns"],
+      ["        isolaton: worktree", "isolation"],
+      // two edits, allowed for a key of 7+ characters
+      ["        disalowed_tool: [Bash]", "disallowed_tools"],
+      // the known limit: a new key this close to an existing one reads as a typo too
+      ["        min_turns: 5", "max_turns"],
+    ] as const) {
+      const r = parse(
+        `swarms:\n  s:\n    description: d\n    agents:\n      a:\n        description: x\n${line}\n`,
+      );
+      expect(r.state, line).toBe("invalid");
+      if (r.state !== "invalid") continue;
+      expect(r.issues).toEqual([
+        {
+          path: "swarms.s.agents.a",
+          message: expect.stringContaining(`did you mean "${near}"?`),
+          line: 7,
+        },
+      ]);
+    }
+    const top = parse(
+      `enforced: true\nswarms:\n  s: { description: d, agents: { a: { description: x } } }\n`,
+    );
+    expect(top.state === "invalid" && top.issues[0]!.message).toBe(
+      'unknown key "enforced" (did you mean "enforce"?)',
+    );
+  });
+
+  it("still runs the refinements of an object that has an unknown key", () => {
+    const r = parse(`swarms:
+  s:
+    description: d
+    agents:
+      a: { description: x, model: sonnet, model_range: { floor: opus, ceiling: haiku, step: 1 } }
+`);
+    expect(r.state).toBe("invalid");
+    if (r.state === "invalid")
+      expect(r.issues.map((i) => i.message)).toEqual([
+        expect.stringMatching(/floor must not be above ceiling/),
+      ]);
+  });
+
+  it("reads an object a YAML alias shares between a known and an unknown place", () => {
+    // `model` is a real key of defaults and an unknown one in a context: the same object
+    const c = ok(`defaults: &d { model: opus }
+swarms:
+  s:
+    description: d
+    agents:
+      a: { description: x, context: *d }
+`);
+    expect(c.ignoredKeys.map((w) => w.path)).toEqual(["swarms.s.agents.a.context"]);
+    expect(c.swarms[0]!.roles[0]!.model).toBe("opus");
+  });
+
+  it("reports a typo and a bad value together, and no ignored key while the file is invalid", () => {
+    const r = parse(
+      "swarms:\n  s:\n    description: d\n    retries: 2\n    max_agent: 3\n    agents:\n      a: { description: x, count: 0 }\n",
+    );
+    expect(r.state).toBe("invalid");
+    if (r.state === "invalid")
+      expect(r.issues.map((i) => i.path)).toEqual(["swarms.s", "swarms.s.agents.a.count"]);
+  });
+});
+
+describe("agent files under a swarm file with ignored keys", () => {
+  it("keeps the files a newer eminiar generated unless forced, and still creates missing ones", () => {
+    const root = mkdtempSync(join(tmpdir(), "em-held-"));
+    // what the newer eminiar wrote: a generated file this version would render differently
+    const newer = ok(
+      "swarms:\n  s:\n    description: d\n    agents:\n      a: { description: newer }\n",
+    );
+    syncAgents(root, newer);
+    const file = join(root, ".claude", "agents", "swarm-s-a.md");
+    const before = readFileSync(file, "utf8");
+    const c = ok(
+      "swarms:\n  s:\n    description: d\n    agents:\n      a: { description: x, permission_mode: plan }\n      b: { description: y }\n",
+    );
+    const r = syncAgents(root, c);
+    // a create has no newer file to lose; an update would rewrite one
+    expect(r.changed).toBe(1);
+    expect(r.actions.map((a) => [a.agentType, a.action, a.held])).toEqual([
+      ["swarm-s-a", "conflict", true],
+      ["swarm-s-b", "create", undefined],
+    ]);
+    expect(r.actions[0]!.reason).toMatch(
+      /^kept: .*keys this eminiar version does not know.*--force/,
+    );
+    expect(readFileSync(file, "utf8")).toBe(before);
+    // created in full: a valid generated file
+    expect(
+      generatedState(readFileSync(join(root, ".claude", "agents", "swarm-s-b.md"), "utf8")),
+    ).toBe("generated");
+    // a delete is held too: the newer version may still define that role
+    const fewer = ok(
+      "swarms:\n  s:\n    description: d\n    agents:\n      a: { description: newer, permission_mode: plan }\n",
+    );
+    expect(syncAgents(root, fewer).actions.find((a) => a.agentType === "swarm-s-b")).toMatchObject({
+      action: "conflict",
+      held: true,
+    });
+    // --force writes anyway
+    expect(syncAgents(root, c, { force: true }).changed).toBe(1);
+    expect(readFileSync(file, "utf8")).not.toBe(before);
   });
 });
 

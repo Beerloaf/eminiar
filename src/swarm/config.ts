@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import { join } from "node:path";
 import { z } from "zod";
 import { TIERS, type Tier } from "../adjudicator/types.js";
+import { editDistance } from "../search/typo.js";
 import { tierOf } from "../storage/dispatch.js";
 import { checkGlob, GlobError } from "./glob.js";
 
@@ -47,15 +48,6 @@ const FENCE_MSG = 'must not contain "---" (Claude Code would end the agent front
 /** Model aliases Claude Code accepts, or a Claude model id (incl. Bedrock/Vertex forms). */
 const MODEL_RE =
   /^(?:inherit|opusplan|(?:sonnet|opus|haiku|fable)(?:\[1m\])?|(?:[a-z0-9-]+\.)*claude-[a-z0-9.:@-]+(?:\[1m\])?)$/;
-const TOP_KEYS = new Set([
-  "version",
-  "enabled",
-  "sync",
-  "enforce",
-  "allowed_agents",
-  "defaults",
-  "swarms",
-]);
 
 export const DEFAULT_CONTEXT: ContextSpec = {
   memories: 4,
@@ -77,7 +69,9 @@ export const AGENT_COLORS = [
   "cyan",
 ] as const;
 
-// --- raw YAML schema (snake_case, strict so typos are reported, not ignored) ------------
+// --- raw YAML schema (snake_case) --------------------------------------------------------
+// zod strips keys it does not know; parseSwarmYaml lists them first (unknownKeys) and keeps a
+// typo of a known key an error.
 
 const ToolName = z
   .string()
@@ -105,7 +99,7 @@ const rank = (t: Tier) => TIERS.indexOf(t);
  * `model` values; an unset bound is the fallback model's tier (see roleRange).
  */
 const RawModelRange = z
-  .strictObject({ floor: z.enum(TIERS).optional(), ceiling: z.enum(TIERS).optional() })
+  .object({ floor: z.enum(TIERS).optional(), ceiling: z.enum(TIERS).optional() })
   .refine(
     (r) => !r.floor || !r.ceiling || rank(r.floor) <= rank(r.ceiling),
     `floor must not be above ceiling (${TIERS.join(" < ")})`,
@@ -141,7 +135,7 @@ const AgentName = z
     "swarm workers need no entry: they are allowed during a run of their swarm",
   );
 
-const RawContext = z.strictObject({
+const RawContext = z.object({
   memories: z.number().int().min(0).max(10).optional(),
   docs: z.number().int().min(0).max(10).optional(),
   history: z.boolean().optional(),
@@ -152,12 +146,12 @@ const RawContext = z.strictObject({
 });
 type RawContext = z.infer<typeof RawContext>;
 
-const RawHookCommand = z.strictObject({
+const RawHookCommand = z.object({
   type: z.literal("command"),
   command: z.string().trim().min(1).max(2000).refine(noFence, FENCE_MSG),
   timeout: z.number().int().positive().max(600).optional(),
 });
-const RawHookMatcher = z.strictObject({
+const RawHookMatcher = z.object({
   matcher: z
     .string()
     .max(200)
@@ -173,13 +167,13 @@ const RawHookMatcher = z.strictObject({
     .optional(),
   hooks: z.array(RawHookCommand).min(1).max(10),
 });
-const RawHooks = z.strictObject({
+const RawHooks = z.object({
   PreToolUse: z.array(RawHookMatcher).max(10).optional(),
   PostToolUse: z.array(RawHookMatcher).max(10).optional(),
   Stop: z.array(RawHookMatcher).max(10).optional(),
 });
 
-const RawAgent = z.strictObject({
+const RawAgent = z.object({
   description: z.string().trim().min(1).max(500).refine(noFence, FENCE_MSG),
   prompt: z.string().max(20_000).optional(),
   model: Model.optional(),
@@ -199,7 +193,7 @@ const RawAgent = z.strictObject({
 });
 type RawAgent = z.infer<typeof RawAgent>;
 
-const RawSwarm = z.strictObject({
+const RawSwarm = z.object({
   description: z.string().trim().min(1).max(500),
   topology: z.enum(TOPOLOGIES).optional(),
   max_agents: z.number().int().min(1).max(16).optional(),
@@ -210,8 +204,7 @@ const RawSwarm = z.strictObject({
   agents: z.record(z.string(), RawAgent),
 });
 
-// Loose at the top so `x-*` keys can hold YAML anchors; other unknown keys are reported in
-// parseSwarmYaml.
+// Loose at the top so `x-*` keys can hold YAML anchors.
 const RawFile = z.looseObject({
   version: z.literal(1).optional(),
   enabled: z.boolean().optional(),
@@ -219,7 +212,7 @@ const RawFile = z.looseObject({
   enforce: z.boolean().optional(),
   allowed_agents: z.array(AgentName).max(50).optional(),
   defaults: z
-    .strictObject({
+    .object({
       model: Model.optional(),
       model_range: RawModelRange.optional(),
       skills: z.array(SkillName).max(20).optional(),
@@ -253,6 +246,53 @@ function mergeContext(...layers: Array<RawContext | undefined>): ContextSpec {
 }
 
 const uniq = <T>(xs: T[]): T[] => [...new Set(xs)];
+
+/** A key the schema does not know: the path of its object, the key, and that object's keys. */
+interface UnknownKey {
+  at: string[];
+  key: string;
+  known: string[];
+}
+
+/**
+ * Walk the parsed YAML along the file schema and list the keys it does not know. Top-level
+ * `x-*` keys (YAML anchor holders) and merge keys are part of the format.
+ */
+function unknownKeys(v: unknown, s: unknown = RawFile, at: string[] = []): UnknownKey[] {
+  if (s instanceof z.ZodOptional) s = s.unwrap();
+  if (Array.isArray(v))
+    return s instanceof z.ZodArray
+      ? v.flatMap((x, i) => unknownKeys(x, s.element, [...at, String(i)]))
+      : [];
+  if (!v || typeof v !== "object") return [];
+  const entries = Object.entries(v);
+  if (s instanceof z.ZodRecord)
+    return entries.flatMap(([k, x]) => unknownKeys(x, s.valueType, [...at, k]));
+  if (!(s instanceof z.ZodObject)) return [];
+  const known = Object.keys(s.shape);
+  return entries.flatMap(([k, x]) =>
+    Object.hasOwn(s.shape, k)
+      ? unknownKeys(x, s.shape[k], [...at, k])
+      : at.length === 0 && (k.startsWith("x-") || k === "<<")
+        ? []
+        : [{ at, key: k, known }],
+  );
+}
+
+/**
+ * The known key an unknown one is a typo of: equal but for case, or one edit away (two for
+ * keys of 7+ characters, as search's typo correction counts them). `disallowedTools`,
+ * `max_agent` and `enforced` are typos; `permission_mode` is not.
+ */
+function typoOf(key: string, known: readonly string[]): string | undefined {
+  const max = key.length >= 7 ? 2 : 1;
+  let best: { k: string; d: number } | undefined;
+  for (const k of known) {
+    const d = editDistance(key.toLowerCase(), k.toLowerCase(), max);
+    if (d <= max && (!best || d < best.d)) best = { k, d };
+  }
+  return best?.k;
+}
 
 /**
  * A role's model range: its own `model_range`, else `defaults.model_range` (taken whole, never
@@ -441,6 +481,22 @@ export function parseSwarmYaml(text: string, file: string, rel: string): LoadRes
           checkName(["swarms", name, "agents", role], role, "agent");
     }
 
+  // A key this version does not know is ignored with a note, so a file written for a newer
+  // eminiar still loads (and still enforces) here. A typo of a known key stays an error:
+  // ignoring it would silently drop the setting the author meant.
+  const ignoredKeys: ConfigIssue[] = [];
+  for (const u of unknownKeys(js)) {
+    const near = typoOf(u.key, u.known);
+    const found = { path: u.at.join("."), line: lineOf([...u.at, u.key]) };
+    if (near)
+      issues.push({ ...found, message: `unknown key "${u.key}" (did you mean "${near}"?)` });
+    else
+      ignoredKeys.push({
+        ...found,
+        message: `unknown key "${u.key}" ignored: not a setting in this eminiar version`,
+      });
+  }
+
   const parsed = RawFile.safeParse(js);
   if (!parsed.success) {
     return {
@@ -459,15 +515,9 @@ export function parseSwarmYaml(text: string, file: string, rel: string): LoadRes
     };
   }
 
-  for (const k of Object.keys(js as Record<string, unknown>))
-    if (!TOP_KEYS.has(k) && !k.startsWith("x-") && k !== "<<")
-      issue(
-        [k],
-        `unknown key "${k}" (top-level keys: ${[...TOP_KEYS].join(", ")}; x-* keys may hold YAML anchors)`,
-      );
   const config = resolve(parsed.data, file, rel, issue);
   if (issues.length) return { state: "invalid", file, rel, enforce, issues };
-  return { state: "ok", config };
+  return { state: "ok", config: { ...config, ignoredKeys } };
 }
 
 function resolve(
@@ -475,7 +525,7 @@ function resolve(
   file: string,
   rel: string,
   issue: (path: string[], message: string) => void,
-): SwarmConfig {
+): Omit<SwarmConfig, "ignoredKeys"> {
   const swarms: SwarmSpec[] = [];
   const seenAgent = new Map<string, string>();
   const reported = new Set<string>();

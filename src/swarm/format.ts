@@ -173,6 +173,7 @@ export function formatSwarmList(
   const lines = [
     `eminiar swarms · ${config.rel} · sync ${config.sync}${enforceNote(config)} · agent files: ${fileSummary || "none"}`,
   ];
+  if (config.ignoredKeys.length) lines.push(formatIssues(config.rel, config.ignoredKeys));
   if (opts.swarm && !swarms.length)
     lines.push(
       `No swarm "${opts.swarm}"; ${config.rel} defines: ${config.swarms.map((s) => s.name).join(", ")}`,

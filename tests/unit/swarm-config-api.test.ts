@@ -101,6 +101,25 @@ describe("swarm config API", () => {
     expect(b.issues[0].path).toContain("count");
   });
 
+  it("lists ignored keys as warnings that do not block a save", async () => {
+    const text = A.replace("prompt: P", "prompt: P\n        permission_mode: plan");
+    put(text);
+    const cfg = (await get("/api/swarm/config")).body as J;
+    expect(cfg.state).toBe("ok");
+    expect(cfg.issues).toEqual([]);
+    const ignored = {
+      path: "swarms.one.agents.a",
+      kind: "ignored-key",
+      message: 'unknown key "permission_mode" ignored: not a setting in this eminiar version',
+    };
+    expect(cfg.warnings).toEqual([ignored]);
+    const edited = text.replace("description: One", "description: Two");
+    const saved = await post("/api/swarm/config/save", { text: edited, baseHash: hashText(text) });
+    expect(saved.status).toBe(200);
+    expect((saved.body as J).warnings).toEqual([ignored]);
+    expect(readFileSync(file(), "utf8")).toBe(edited);
+  });
+
   it("save writes the project's swarm file and returns the new hash", async () => {
     put();
     const cfg = (await get("/api/swarm/config")).body as J;
