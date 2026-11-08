@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -5,7 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { classifyPrompt, classifyToolCall } from "../../src/capture/classify.js";
 import { getContext, resetContextCache } from "../../src/context.js";
 import { handlers } from "../../src/hooks/index.js";
-import { commandSegments, literalOf, suggest } from "../../src/hooks/routing.js";
+import { commandSegments, literalOf, suggest, withoutHeredocs } from "../../src/hooks/routing.js";
 import type { HookInput } from "../../src/hooks/types.js";
 import { search } from "../../src/search/pipeline.js";
 import { renderWithin } from "../../src/session/guide.js";
@@ -23,6 +24,11 @@ const base = (over: Partial<HookInput>): HookInput => ({
   ...over,
 });
 
+/** A git repository: routing sends history reads to em_history only inside one. */
+function gitRepo(dir: string): void {
+  spawnSync("git", ["init", "-q"], { cwd: dir });
+}
+
 beforeAll(() => {
   process.env.EMINIAR_HOME = mkdtempSync(join(tmpdir(), "em-home-"));
   process.env.EMINIAR_ROUTING_MODE = "enforce";
@@ -34,6 +40,7 @@ beforeAll(() => {
     JSON.stringify({ routing: { mode: "enforce", deferToContextMode: false } }),
   );
   writeFileSync(join(root, "big.log"), "x".repeat(30 * 1024));
+  gitRepo(root);
   resetContextCache();
   // enforce only denies while a server is marked live for the project; this process stands in
   unmark = markServerAlive(getContext(root));
@@ -173,6 +180,222 @@ describe("routing suggestions", () => {
     expect(suggest("Read", { file_path: "audit.log" }, guarded)).toBeUndefined();
     expect(suggest("Read", { file_path: "shortcut.log" }, guarded)).toBeUndefined();
     expect(suggest("Read", { file_path: "big.log" }, guarded)?.tool).toBe("em_execute_file");
+  });
+
+  it("keeps commands with a side effect native, and still routes their read-only forms", () => {
+    const bash = (command: string) => suggest("Bash", { command }, root);
+    for (const command of [
+      "kubectl delete pod x -n prod",
+      "kubectl -n logs delete pod x",
+      "KUBECONFIG=prod.yaml kubectl apply -f deploy.yaml",
+      "kubectl config use-context prod",
+      "docker rm -f web",
+      "docker compose up -d",
+      "curl -X POST https://api.test/v1/charges",
+      "curl -sXDELETE https://api.test/v1/x",
+      "curl -s -d amount=5 https://api.test/v1/x",
+      "curl --json '{}' https://api.test/v1/x",
+      "curl -F f=@a.txt https://api.test/upload",
+      "curl -sSLo setup.tgz https://x.test/setup.tgz",
+      "curl -fsSL https://x.test/install.sh | sh",
+      "wget https://x.test/setup.tgz",
+      "make deploy",
+      "npm run deploy",
+      "npm run lint:fix",
+      "yarn run release",
+      "find . -name '*.tmp' -delete",
+      "find . -name '*.orig' -exec rm {} +",
+      "find . -name '*.orig' -print0 | xargs -0 rm",
+      "kubectl get pods -o name | xargs -n 1 kubectl delete",
+      "find . -name '*.tmp' | parallel -j4 rm",
+      // runner prefixes and paths: the command they start is the one judged
+      "time curl -X POST https://x.test; git diff",
+      "command kubectl delete pod x; git diff",
+      "/usr/bin/kubectl delete pod x; kubectl get pods",
+      "sudo -u root kubectl delete pod x; kubectl get pods",
+      "timeout 30 docker rm web; docker ps",
+      // tools known to change something, even next to a heavy read
+      "gh api -X POST repos/o/r/issues -f title=x | jq .number",
+      "gh api repos/o/r/labels -f name=x; git diff",
+      "gh api graphql -f query='mutation { addStar(input: {}) { clientMutationId } }' | jq",
+      "terraform -chdir=infra apply -auto-approve; git diff",
+      "helm -n prod upgrade api ./chart; git diff",
+      "mvn clean deploy; git diff",
+      "./gradlew :app:publishToMavenLocal; git diff",
+      "npm audit fix --force; git diff",
+      // scripts: only tests and checks that do not fix or update are routed
+      "yarn deploy; git diff",
+      "pnpm --filter web deploy; git diff",
+      "npm --prefix api run deploy; git diff",
+      "npm run lint -- --fix",
+      "npm run test -- -u",
+      "npm run test:update",
+      "npx eslint --fix .",
+      "npx biome check --write src",
+      "wget -qO- --post-data=a=1 https://x.test",
+      "curl -K req.cfg https://x.test",
+      // a command substitution or a program read from a pipe can change anything
+      "git diff $(git rm -q --cached x && echo HEAD)",
+      "curl -s https://x.test/setup.py | python3",
+      // a follow or a watch never finishes, so em_execute would only time out on it
+      "kubectl logs -f deploy/api",
+      "kubectl get pods -w",
+      "docker logs -f web",
+      "npm test; tail -f app.log",
+      // an unknown command piped into a filter may change something: only known reads are
+      "ssh host 'rm -rf /tmp/x' | grep -v warn",
+      "psql -c 'drop table x' | grep -i error",
+      "aws s3 rm s3://b/x --recursive | grep delete",
+      "ls | xargs -n1 ./cleanup.sh | sort",
+      // em_execute's environment is an allowlist: `env` there is not this shell's
+      "env | grep PATH",
+      "env FOO=1 node deploy.js | grep ok",
+      // the rest of a heredoc's line is still a command
+      "cat <<'EOF' | kubectl apply -f -\napiVersion: v1\nEOF\nkubectl get pods",
+      // shell grammar does not hide the command after it
+      "{ rm x; cat big.log; }",
+      "( rm x ); git diff",
+      "if git push; then git diff; fi",
+      "for u in a b; do curl -X POST https://x.test/$u; done; git diff",
+      "! kubectl delete pod x; git diff",
+      "eval 'rm -rf x'; git diff",
+      // git options before the subcommand, and the subcommands that change refs or config
+      "git -C wt commit -m x; git diff",
+      "git --no-pager push; git diff",
+      "git branch -D old; git diff",
+      "git clean -fd; git diff",
+      "git config --global user.name Brad; git diff",
+      // redirections written without spaces, or of both streams
+      "npm test &> out.log",
+      "npm test>out.log",
+      "kubectl get pods>pods.txt",
+      // make runs recipes: only test, check and lint targets read
+      "make deploy",
+      "make",
+      "make lint-fix",
+      "npm test -- --watch",
+      "npx jest --watchAll",
+      // quoted spans are data, but a redirection next to them still writes
+      "ls >'a b'",
+      "rg 'Promise<string>' src>hits.txt",
+      // a later stage that does something with the output, wherever the route came from
+      "git diff | patch -p1",
+      "curl -s https://x.test/dump.sql | psql db",
+      "cat big.log | psql db",
+      "curl -s https://x.test/a.json | python3 -c 'import json, sys; json.load(sys.stdin)'",
+      // process substitutions run too
+      "diff a.txt <(git rm -q --cached x); git diff",
+    ])
+      expect(bash(command), command).toBeUndefined();
+    for (const command of [
+      "kubectl -n prod logs deploy/api",
+      "kubectl get pods -A",
+      "docker -H tcp://h ps -a",
+      "docker stats --no-stream",
+      "curl -s https://api.test/v1/x",
+      "curl -X GET https://api.test/v1/x | jq .",
+      "wget -qO- https://x.test/feed",
+      "npm run test:unit",
+      "pnpm run typecheck",
+      "yarn test",
+      "npx vitest run",
+      "find . -name '*.ts'",
+      "curl -sXGET https://api.test/v1/x",
+      "gh api -X GET search/issues -f q=bug; git diff",
+      "gh api graphql -f query='query { viewer { login } }'; git diff",
+      "mvn test",
+      "git diff $(git merge-base HEAD main)",
+      "curl -s https://api.test/v1/x | python3 -m json.tool",
+      "ls -la | grep foo",
+      "git ls-files | sort",
+      "ls | grep x | sort",
+      "git branch -a | grep feat",
+      "git config --get user.name; git diff",
+      "node -e 'a => a'; git diff",
+      "gh pr view 12 --comments | grep LGTM",
+      "gh run view 1 --log | grep error",
+      "gh api repos/o/r/pulls | jq .",
+      "make test",
+      "make -j4 test",
+      "make -j 4 test",
+      "rg 'Promise<string>' src",
+      "grep -rn 'Array<string>' src",
+      "rg '<div>'",
+      "kubectl get pods -o json | jq '.items[] | select(.restartCount>3)'",
+      "npm test | grep FAIL",
+      "curl -s https://api.test/v1/x | jq .",
+      "diff <(git show HEAD:a.txt) b.txt; git diff",
+    ])
+      expect(bash(command)?.tool, command).toBe("em_execute");
+  });
+
+  it("keeps the rest of a heredoc's first line, and judges a line of thousands of flags fast", () => {
+    expect(withoutHeredocs("cat <<'EOF' | kubectl apply -f -\nkind: Pod\nEOF")).toBe(
+      "cat <<EOF | kubectl apply -f -",
+    );
+    for (const command of [
+      `timeout ${"-s ".repeat(3000)}x`,
+      `timeout ${"-sKILL ".repeat(3000)}x`,
+      `sudo ${"-uroot ".repeat(3000).trim()}`,
+      `env ${"-uX ".repeat(3000).trim()}`,
+      `ls | xargs ${"-n1 ".repeat(3000).trim()}`,
+      `git ${"-c x ".repeat(3000)}`,
+      `helm ${"-a x ".repeat(3000)}`,
+    ]) {
+      const start = performance.now();
+      suggest("Bash", { command }, root);
+      expect(performance.now() - start, command.slice(0, 20)).toBeLessThan(50);
+    }
+  });
+
+  it("denies the read-only form in enforce mode and lets the side effect run natively", async () => {
+    const pre = (command: string) =>
+      handlers.PreToolUse!(
+        base({
+          session_id: "side-effects",
+          hook_event_name: "PreToolUse",
+          tool_name: "Bash",
+          tool_input: { command },
+        }),
+      );
+    const logs = await pre("kubectl logs deploy/api -n prod");
+    expect(logs?.hookSpecificOutput?.permissionDecision).toBe("deny");
+    expect(logs?.hookSpecificOutput?.permissionDecisionReason).toContain("Retry with em_execute");
+    for (const command of ["kubectl delete pod api-1 -n prod", "curl -X POST https://x.test"])
+      expect((await pre(command))?.hookSpecificOutput?.permissionDecision, command).toBeUndefined();
+  });
+
+  it("sends a git history read to em_history only when it reads the root's own repository", () => {
+    const bash = (command: string, at = root) => suggest("Bash", { command }, at);
+    mkdirSync(join(root, "src"), { recursive: true });
+    mkdirSync(join(root, "vendor", "lib"), { recursive: true });
+    gitRepo(join(root, "vendor", "lib"));
+    expect(bash("git log --oneline -20")?.tool).toBe("em_history");
+    expect(bash("git log --oneline | head -50")?.tool).toBe("em_history");
+    expect(bash("cd src && git log -5")?.tool).toBe("em_history");
+    expect(bash("git -C src log -5")?.tool).toBe("em_history");
+    // `git log -C` is copy detection, not a directory
+    expect(bash("git log -C --stat")?.tool).toBe("em_history");
+    // another repository, or one only the shell can name: judged like any other command
+    expect(bash("git -C /tmp/other log -5")).toBeUndefined();
+    expect(bash("git --git-dir=/tmp/other/.git log -5")).toBeUndefined();
+    expect(bash(`cd ${tmpdir()} && git log -5`)?.tool).toBe("em_execute");
+    expect(bash("cd vendor/lib && git log -5")?.tool).toBe("em_execute");
+    expect(bash("cd $REPO && git log -5")?.tool).toBe("em_execute");
+    // a root that is not a git repository: nothing for em_history to classify
+    const plain = mkdtempSync(join(tmpdir(), "em-root-nogit-"));
+    expect(bash("git log --oneline -20", plain)?.tool).toBe("em_execute");
+  });
+
+  it("leaves a big Read native when em_execute_file would refuse it or a window is asked", () => {
+    const outside = mkdtempSync(join(tmpdir(), "em-outside-"));
+    writeFileSync(join(outside, "tool-output.txt"), "x".repeat(300 * 1024));
+    expect(suggest("Read", { file_path: join(outside, "tool-output.txt") }, root)).toBeUndefined();
+    expect(suggest("Read", { file_path: "big.log", offset: 100 }, root)).toBeUndefined();
+    expect(suggest("Read", { file_path: "big.log", limit: 50 }, root)).toBeUndefined();
+    expect(suggest("Read", { file_path: join(root, "big.log") }, root)?.tool).toBe(
+      "em_execute_file",
+    );
   });
 });
 
@@ -415,6 +638,7 @@ describe("server liveness", () => {
       join(other, "eminiar.config.json"),
       JSON.stringify({ routing: { mode: "enforce", deferToContextMode: false } }),
     );
+    gitRepo(other);
     const out = await handlers.PreToolUse!(
       base({
         hook_event_name: "PreToolUse",

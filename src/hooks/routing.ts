@@ -1,11 +1,12 @@
-import { realpathSync, statSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { extname, join, relative, resolve } from "node:path";
+import { dirname, extname, join, relative, resolve } from "node:path";
 import type { ProjectContext } from "../context.js";
 import { getContext } from "../context.js";
 import { type DocSource, readManifestAt } from "../docs/manifest.js";
 import { git } from "../history/log.js";
-import { checkReadPath, loadPermissionRules } from "../permissions/settings.js";
+import { loadPermissionRules } from "../permissions/settings.js";
+import { confinePath } from "../sandbox/file.js";
 import { renderProjectBrief } from "../session/brief.js";
 import {
   commitContext,
@@ -64,8 +65,9 @@ export function coverageHint(db: StorageAdapter, rel: string): string | undefine
   return `eminiar graph: ${rel} is ${row.status}${row.reason ? ` (${row.reason})` : ""}; graph answers about it may be incomplete.`;
 }
 
+/** A history read: [1] the options before the subcommand (`-C dir`), [2] it, [3] its arguments. */
 const GIT_HISTORY =
-  /(?:^|[;&|]\s*)git\s+(?:(?:-C|--git-dir|--work-tree)[= ]\S+\s+|--no-pager\s+)*(log|blame|shortlog|show|whatchanged|reflog)\b([^;&|]*)/;
+  /(?:^|[;&|]\s*)git\s+((?:(?:-C|--git-dir|--work-tree)[= ]\S+\s+|--no-pager\s+)*)(log|blame|shortlog|show|whatchanged|reflog)\b([^;&|]*)/;
 /** One commit, printed short: `git log -1 --format=%H` is a lookup, not a history read. */
 const ONE_COMMIT = /(^|\s)(-1|-n\s*1|-n1|--max-count[= ]1)(?=\s|$)/;
 
@@ -77,8 +79,8 @@ const ONE_COMMIT = /(^|\s)(-1|-n\s*1|-n1|--max-count[= ]1)(?=\s|$)/;
 export function historyCall(cmd: string): string | undefined {
   const m = GIT_HISTORY.exec(cmd);
   if (!m) return undefined;
-  const sub = m[1]!;
-  const rest = (m[2] ?? "").trim();
+  const sub = m[2]!;
+  const rest = (m[3] ?? "").trim();
   const args = rest.split(/\s+/).filter(Boolean);
   const q = (s: string) => JSON.stringify(s.replace(/^['"]|['"]$/g, ""));
   const positional = (a: string) => !a.startsWith("-");
@@ -117,6 +119,52 @@ export function historyCall(cmd: string): string | undefined {
   if (author) return `{action:"timeline", author:${q(author[1]!)}}`;
   if (sub === "shortlog") return `{action:"timeline"}`;
   return `{action:"overview"}`;
+}
+
+/**
+ * The directory the first history read in these segments runs in: the shell's, moved by each
+ * `cd` before it and by `git -C`. Undefined when the shell decides (`cd $X`, `cd -`) or git is
+ * pointed at a repository directly (`--git-dir`, `--work-tree`).
+ */
+function historyDir(segments: string[], cwd: string): string | undefined {
+  let dir: string | undefined = cwd;
+  for (const segment of segments) {
+    const m = GIT_HISTORY.exec(segment);
+    if (m) {
+      const opts = m[1] ?? "";
+      if (/--(git-dir|work-tree)\b/.test(opts)) return undefined;
+      for (const c of opts.matchAll(/-C[= ](\S+)/g)) dir = dir && changeDir(dir, c[1]!);
+      return dir;
+    }
+    const cd = /^\(?\s*(?:cd|pushd)\b(.*)$/.exec(segment);
+    if (cd) dir = dir && changeDir(dir, cd[1]!);
+  }
+  return dir;
+}
+
+/** Where `cd <arg>` from `dir` lands, or undefined when only the shell knows. */
+function changeDir(dir: string, arg: string): string | undefined {
+  const a = arg.trim().replace(/^(['"])(.*)\1$/, "$2") || "~";
+  if (/^-|^~[^/]|[\s$`*?[\]{}()\\]/.test(a)) return undefined;
+  return a === "~" || a.startsWith("~/") ? join(homedir(), a.slice(1)) : resolve(dir, a);
+}
+
+/**
+ * Is `dir` in the root's own repository: under the root, with the nearest `.git` (a folder, or
+ * a worktree's file) at or above the root rather than in a nested repository on the way?
+ */
+function inRootRepo(root: string, dir: string): boolean {
+  try {
+    const top = realpathSync(root);
+    let inside = false;
+    for (let d = realpathSync(dir); ; d = dirname(d)) {
+      if (d === top) inside = true;
+      if (existsSync(join(d, ".git"))) return inside;
+      if (dirname(d) === d) return false; // no repository at all
+    }
+  } catch {
+    return false; // a directory that does not exist: git fails there too
+  }
 }
 
 export interface Suggestion {
@@ -170,6 +218,10 @@ export function docsSourceFor(url: string, root: string): string | undefined {
   return undefined;
 }
 
+/**
+ * Commands that usually print a lot. kubectl, docker, curl, wget, make and `npm run` reach this only
+ * in their read-only forms: `staysNative` keeps the others native first.
+ */
 const HEAVY_BASH =
   /^\s*(git\s+(log|diff|show|blame)|npm\s+(test|run|ls|list|outdated|audit|why)|pnpm\s+(test|run|ls|list|outdated|why)|yarn\s+(test|run|list|why)|npx\s+(vitest|jest|tsc|eslint|biome)|cat\s|head\s|tail\s|find\s|grep\s|rg\s|ls\s+-[a-zA-Z]*R|tree\b|curl\s|wget\s|docker\s|kubectl\s|du\s|df\s|ps\s|lsof\s|brew\s+(list|outdated)|pip\s+(list|freeze)|cargo\s+(test|build)|go\s+(test|build)|make\b|pytest\b|mvn\b|gradle\b)/;
 const TINY_BASH =
@@ -193,9 +245,12 @@ const BIG_TEXT_EXT = new Set([
  */
 const VISUAL_EXT = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".pdf"]);
 
-/** A command with its heredoc bodies cut out: they are data, not commands to classify. */
+/**
+ * A command with its heredoc bodies cut out: they are data, not commands to classify. The rest of
+ * the `<<EOF` line stays (`cat <<EOF | kubectl apply -f -`).
+ */
 export function withoutHeredocs(cmd: string): string {
-  return cmd.replace(/<<-?\s*(['"]?)(\w+)\1[^\n]*\n[\s\S]*?\n\s*\2\s*(?=\n|$)/g, "<<$2");
+  return cmd.replace(/<<-?\s*(['"]?)(\w+)\1([^\n]*)\n[\s\S]*?\n\s*\2\s*(?=\n|$)/g, "<<$2$3");
 }
 
 /** Split `s` at every unquoted position where `sep` returns the separator's length. */
@@ -260,17 +315,190 @@ function bounds(stage: string): boolean {
 }
 
 /**
- * Commands whose point is a side effect: commits, installs, file writes. Their output is
- * secondary and the native Bash tool is where Claude Code's permission prompts live, so a
+ * Commands whose point is a side effect: commits, installs, file writes, deploys, running a
+ * project's own scripts or recipes (`make`, `npm run <x>`: judged in CHANGES below). Their output
+ * is secondary and the native Bash tool is where Claude Code's permission prompts live, so a
  * command containing one is never redirected to the sandbox.
  */
 const MUTATING =
-  /^\s*(?:(?:sudo|env|[A-Z_][A-Z0-9_]*=\S*)\s+)*(git\s+(add|commit|checkout|switch|push|pull|fetch|merge|rebase|stash|reset|restore|cherry-pick|revert|tag|init|clone|worktree|mv|rm|am|apply|submodule)|npm\s+(install|i|ci|uninstall|un|link|publish|version|update|up|dedupe)|pnpm\s+(install|i|add|remove|rm|update|up|link)|yarn\s+(add|remove|install|upgrade)|pip3?\s+(install|uninstall)|cargo\s+(add|install)|brew\s+(install|uninstall|upgrade)|gh\s+(pr|issue|release|repo)\s+(create|edit|merge|close|comment|delete|ready)|rm|mv|cp|mkdir|rmdir|touch|chmod|chown|ln|sed\s+(?:-\S+\s+)*-i|tee)\b/;
-/** A redirection into a file (not /dev/null, not a file descriptor) writes something. */
-const WRITES_FILE = /(?:^|\s|\d)>{1,2}\s*(?!&)(?!\/dev\/null)\S/;
+  /^(git\s+(?:(?:-[Cc]\s*[^-\s]\S*|--(?:git-dir|work-tree)[= ]\S+|--no-pager)\s+)*(add|commit|checkout|switch|push|pull|fetch|merge|rebase|stash|reset|restore|cherry-pick|revert|tag|init|clone|worktree|mv|rm|am|apply|submodule|clean|branch\s(?:.*\s)?(-[dDmM]|--delete|--move)|config(?:\s+--(?:global|local|system|worktree))*\s+(?:set|unset|--(?:unset|unset-all|add|replace-all|rename-section|remove-section|edit)|-e|\w[\w.-]*\s+\S+))|npm\s+(install|i|ci|uninstall|un|link|publish|version|update|up|dedupe|audit\s+fix)|pnpm\s+(install|i|add|remove|rm|update|up|link|audit\s.*--fix)|yarn\s+(add|remove|install|upgrade)|pip3?\s+(install|uninstall)|cargo\s+(add|install)|brew\s+(install|uninstall|upgrade)|gh\s+(pr|issue|release|repo)\s+(create|edit|merge|close|comment|delete|ready)|terraform\s+(?:-\S+\s+)*(apply|destroy|import|taint|untaint|state\s+(rm|mv|push))|helm\s+(?:-\S+\s+(?:[^-\s]\S*\s+)?)*(install|upgrade|uninstall|rollback|delete)|mvnw?\s.*\s(deploy|install|release:\S*)|gradlew?\s.*[\s:](publish|upload)\w*|rm|mv|cp|mkdir|rmdir|touch|chmod|chown|ln|sed\s+(?:-\S+\s+)*-i|tee|eval|sh|bash|zsh|find\s.*\s-(delete|exec|execdir|ok|okdir))(?![\w-])/;
+/**
+ * Commands that run the one after them, with the options they take (`sudo -u root`, `timeout 30`).
+ * Each option is either one that takes a value or one that does not, never both: an ambiguous
+ * split backtracks exponentially on a line of many flags.
+ */
+const RUNNERS = [
+  String.raw`sudo(?:\s+(?:-[ugCDhpRrtTU]\s*[^-\s]\S*|-(?![ugCDhpRrtTU])\S+))*`,
+  String.raw`env(?:\s+(?:-[uC]\s*[^-\s]\S*|-(?![uC])\S+))*`,
+  String.raw`(?:xargs|parallel)(?:\s+(?:-[nILPsdEaj]\s*[^-\s]\S*|-(?![nILPsdEaj])\S+))*`,
+  String.raw`timeout(?:\s+(?:-[sk]\s*[^-\s]\S*|-(?![sk])\S+))*\s+\d\S*`,
+  String.raw`nice(?:\s+-n\s*\S+|\s+-\d+)?`,
+  String.raw`stdbuf(?:\s+-[ioe]\s*\S+)*`,
+  String.raw`(?:time|command)(?:\s+-p)?`,
+  "nohup",
+  String.raw`[A-Z_][A-Z0-9_]*=\S*`,
+];
+/** Shell grammar before a command: `{ rm x; }`, `( … )`, `! cmd`, `then cmd`, `do cmd` …. */
+const SHELL_WORDS = /^(?:\s*(?:[({!]|(?:then|do|else|exec|if|elif|while|until)\s))*\s*/;
+/** What runs the command after it, which is the one to judge: `sudo`, `FOO=1`, `xargs -0` …. */
+const RUNNER = new RegExp(String.raw`^\s*(?:(?:${RUNNERS.join("|")})\s+)*`);
+/**
+ * A redirection into a file (`> f`, `>> f`, `&> f`, `cmd>f`; not /dev/null, not `2>&1`) writes
+ * something. `=>` and `->` are not redirections.
+ */
+const WRITES_FILE = /(?<![-=>])>{1,2}\s*(?!&)(?!\/dev\/null)\S/;
+/** A program read from a pipe (`curl … | python3`): whatever it does, it does like `| sh`. */
+const RUNS_STDIN = /^(python3?|node|perl|ruby|deno|bun)(\s+-\S*)*$/;
+/** Commands that never finish (follow, `--watch`): em_execute would only time out on them. */
+const FOLLOWS =
+  /^((kubectl|docker)(\s.*)?\s(-f|-w|--follow)(?=[\s=]|$)|tail(\s.*)?\s(-[a-zA-Z]*[fF]|--follow)|.*\s--watch(All)?(?=[\s=]|$))/;
 
-function mutates(segment: string): boolean {
-  return MUTATING.test(segment) || WRITES_FILE.test(segment);
+/**
+ * curl sending or saving something: a method other than GET / HEAD, a body, an upload, an output
+ * file, a config file. In a flag cluster, everything after `X` is its value (`-sXGET`).
+ */
+const CURL_SENDS =
+  /\s(?:-(?:(?!X)[a-zA-Z])*[dFTOoK]|(?:-[a-zA-Z]*X|--request)(?![\s=]*['"]?(?:GET|HEAD)\b)|--(?:data|json|form|upload-file|output|remote-name|config))/;
+/** wget printing instead of saving: `-O -`, `-qO-`, `--output-document=-`, or `--spider`. */
+const WGET_PRINTS = /\s(?:-[a-zA-Z]*O\s*-|--output-document[= ]-|--spider)(?=\s|$)/;
+const WGET_SENDS = /\s--(post-data|post-file|body-data|body-file|method)\b/;
+const KUBECTL_READS =
+  /^(get|describe|logs|top|explain|api-resources|api-versions|events|version|cluster-info|config\s+(view|get-contexts|current-context)|rollout\s+(status|history)|auth\s+can-i)\b/;
+const DOCKER_READS =
+  /^(ps|logs|images|inspect|history|version|info|stats\s.*--no-stream|(container|image|network|volume)\s+(ls|inspect)|compose\s+(ps|logs|config|images|ls)|system\s+df)\b/;
+/** Scripts that only test or check (`test:unit`, `lint`, `typecheck`), not ones that fix or write. */
+const CHECK_SCRIPT = /^(t|test|lint|type-?check|check)(?=$|[:.-])(?![\w:.-]*(fix|write|update))/;
+/** Arguments that turn a check into a write: `-- --fix`, `--write`, `-u` (update snapshots). */
+const FIX_ARGS =
+  /(?:^|\s)(--fix|--write|--apply(-unsafe)?|-u|--update(-?[sS]napshots?)?)(?=[\s=]|$)/;
+/** npx tools that only check or test, unless told to fix or write. */
+const NPX_CHECKS = /^(vitest|jest|tsc|eslint|biome|prettier)\b/;
+/** pnpm / yarn words that are their own read-only commands, not scripts (`pnpm ls`, `yarn why`). */
+const PM_READS = /^(ls|list|outdated|why|info|view|audit|licenses|bin|root|help)$/;
+/**
+ * Options that take the next word, before a subcommand: one set for kubectl and docker globals
+ * (`-n prod`, `--context x`, `-H host`) and package-manager ones (`--prefix a`, `--filter web`).
+ */
+const VALUE_OPTS = new Set([
+  "-n",
+  "--namespace",
+  "--context",
+  "--cluster",
+  "--kubeconfig",
+  "--user",
+  "-s",
+  "--server",
+  "--token",
+  "--as",
+  "-H",
+  "--host",
+  "-c",
+  "--config",
+  "-l",
+  "--log-level",
+  "-j",
+  "--prefix",
+  "-C",
+  "--dir",
+  "--cwd",
+  "-w",
+  "--workspace",
+  "-F",
+  "--filter",
+]);
+
+/** The words after the options before them: ` -n prod get pods` → [get, pods]. */
+function afterOptions(args: string): string[] {
+  const words = args.trim().split(/\s+/);
+  let i = 0;
+  while (words[i]?.startsWith("-")) i += VALUE_OPTS.has(words[i]!) ? 2 : 1;
+  return words.slice(i);
+}
+
+const subcommand = (args: string) => afterOptions(args).join(" ");
+
+/**
+ * `npm run <script>`, `yarn <script>`, `pnpm --filter x <script>`: anything but a test or check
+ * script run as a check. npm's own commands (`npm ls`) are not scripts; MUTATING names those that
+ * change something.
+ */
+function runsScript(tool: string, args: string): boolean {
+  const words = afterOptions(args);
+  let script = words.shift();
+  if (script === "run" || script === "run-script") script = words.shift();
+  else if (script === undefined || PM_READS.test(script) || (tool === "npm" && script !== "test"))
+    return false;
+  if (script === undefined) return false; // `npm run` lists the scripts
+  return !CHECK_SCRIPT.test(script) || FIX_ARGS.test(words.join(" "));
+}
+
+/** `make`: recipes run anything; only test / check / lint targets, not told to fix, read. */
+function makeChanges(args: string): boolean {
+  const targets = afterOptions(args).filter((w) => w && !w.includes("="));
+  return !targets.length || !targets.every((t) => CHECK_SCRIPT.test(t)) || FIX_ARGS.test(args);
+}
+
+/** `gh api`: a method other than GET, fields (which make it a POST), or a GraphQL mutation. */
+function ghApiSends(args: string): boolean {
+  if (!/^\s+api\s/.test(args)) return false;
+  const method = /\s(?:-X|--method)[\s=]*['"]?(\w+)/.exec(args)?.[1];
+  if (method) return method.toUpperCase() !== "GET";
+  if (/\sgraphql\b/.test(args)) return /\bmutation\b/.test(args);
+  return /\s(-[fF]|--field|--raw-field|--input)\b/.test(args);
+}
+
+/**
+ * Tools with read-only forms worth routing (`kubectl logs`, `curl -s url`, `npm test`): does
+ * this call (the arguments after the tool's name) change something instead?
+ */
+const CHANGES = new Map<string, (args: string) => boolean>([
+  ["curl", (a) => CURL_SENDS.test(a)],
+  ["wget", (a) => !WGET_PRINTS.test(a) || WGET_SENDS.test(a)],
+  ["kubectl", (a) => !KUBECTL_READS.test(subcommand(a))],
+  ["docker", (a) => !DOCKER_READS.test(subcommand(a))],
+  ["gh", ghApiSends],
+  ["make", makeChanges],
+  ["npx", (a) => !NPX_CHECKS.test(subcommand(a)) || FIX_ARGS.test(a)],
+  ["npm", (a) => runsScript("npm", a)],
+  ["pnpm", (a) => runsScript("pnpm", a)],
+  ["yarn", (a) => runsScript("yarn", a)],
+]);
+
+/** The commands inside `$(…)`, backticks and process substitutions `<(…)` / `>(…)`, innermost first. */
+function substitutions(segment: string): string[] {
+  const found: string[] = [];
+  const inner = /[$<>]\(([^()]*)\)|`([^`]*)`/g;
+  for (let s = segment, prev = ""; s !== prev; ) {
+    prev = s;
+    s = s.replace(inner, (_, a: string | undefined, b: string | undefined) => {
+      found.push(a ?? b ?? "");
+      return "_";
+    });
+  }
+  return found;
+}
+
+/**
+ * Must this segment run natively? It changes something (in any pipe stage), or it never
+ * finishes. Each stage is judged by the command a runner prefix
+ * starts, by its name without a path (`sudo /usr/bin/kubectl delete …` is `kubectl delete …`).
+ */
+function staysNative(segment: string): boolean {
+  // Quoted text is data (`rg 'Promise<string>'`, `jq 'select(.n>3)'`), not a redirection.
+  if (WRITES_FILE.test(segment.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, "''"))) return true;
+  return pipeStages(segment).some((stage, i) => {
+    const cmd = stage
+      .replace(SHELL_WORDS, "")
+      .replace(RUNNER, "")
+      .replace(/^\S*\//, "");
+    const [, tool = "", args = ""] = /^(\S+)([\s\S]*)$/.exec(cmd) ?? [];
+    return (
+      MUTATING.test(cmd) ||
+      FOLLOWS.test(cmd) ||
+      (i > 0 && RUNS_STDIN.test(cmd)) ||
+      CHANGES.get(tool)?.(args) === true
+    );
+  });
 }
 
 /** Output size Read tolerates natively; a `cat` of that much is the same read through Bash. */
@@ -399,6 +627,17 @@ function firstStageBound(first: string, cwd: string): true | Heavy | undefined {
   return undefined;
 }
 
+/**
+ * Read-only commands whose output can be long: a filter after them still reads all of it. Not
+ * `env`: em_execute runs with an allowlisted environment, so it would answer about a different one.
+ */
+const READ_SOURCE =
+  /^\s*(ls|cat|sed|awk|cut|sort|uniq|tr|nl|echo|printf|ps|lsof|jq|yq|diff|strings|xxd|od|git\s+(diff|ls-files|ls-tree|grep|status|show|log|blame|branch|rev-list|for-each-ref|cat-file)|gh\s+(api|pr\s+(list|view|diff|checks)|issue\s+(list|view)|run\s+(list|view)|search))\b/;
+/** Stages that only filter what they are given; the pipe rule needs one that does not bound it. */
+const FILTERS =
+  /^\s*(grep|egrep|fgrep|rg|sort|uniq|jq|head|tail|wc|cut|tr|column|less|awk|sed|python3?\s+-m\s+json\.tool)\b/;
+const UNBOUNDED_FILTERS = /^\s*(grep|rg|sort|uniq|jq|less)\b/;
+
 /** Why one simple command would print a lot, or undefined when its output is bounded. */
 function heavySegment(segment: string, cwd: string): Heavy | undefined {
   if (TINY_BASH.test(segment)) return undefined;
@@ -407,11 +646,16 @@ function heavySegment(segment: string, cwd: string): Heavy | undefined {
   if (!first) return undefined;
   // `… | head -40` caps whatever came before it.
   if (stages.length > 1 && bounds(stages[stages.length - 1]!)) return undefined;
+  // A later stage that does something with the output (`| patch -p1`, `| psql db`) may change
+  // something: only a pipe through known filters is routed.
+  const rest = stages.slice(1);
+  if (!rest.every((s) => FILTERS.test(s))) return undefined;
   const bound = firstStageBound(first, cwd);
   if (bound === true) return undefined;
   if (bound) return bound;
   if (HEAVY_BASH.test(first)) return { rule: "heavy", text: "usually prints a lot" };
-  if (stages.slice(1).some((s) => /^\s*(grep|rg|sort|uniq|jq|less)\b/.test(s)))
+  // Only a source known to just read: an unknown one (`ssh`, `psql`, `aws`) may change something.
+  if (READ_SOURCE.test(first) && rest.some((s) => UNBOUNDED_FILTERS.test(s)))
     return { rule: "pipe", text: "streams an unbounded output through a filter" };
   return undefined;
 }
@@ -428,15 +672,19 @@ function headOf(segment: string, n = 60): string {
  * (and is not capped by `| head`, and is not a cat of what Read would show anyway) goes to
  * em_execute.
  */
-function bashSuggestion(raw: string, cwd: string): Suggestion | undefined {
+function bashSuggestion(raw: string, root: string, cwd: string): Suggestion | undefined {
   const cmd = withoutHeredocs(raw);
   if (!cmd.trim()) return undefined;
   const segments = commandSegments(cmd);
-  if (segments.some(mutates)) return undefined;
+  // `$(…)` and backticks run too: their commands are judged like the line's own.
+  if ([...segments, ...substitutions(cmd).flatMap(commandSegments)].some(staysNative))
+    return undefined;
   // git history reads have a classified answer: fixes traced to their origin, risk per
-  // file, branches vs base — em_history, not a raw log through em_execute.
+  // file, branches vs base — em_history, not a raw log through em_execute. em_history reads
+  // the root's repository only, so a read of another one (or of none) is judged like any command.
   const history = historyCall(cmd);
-  if (history) {
+  const dir = history && historyDir(segments, cwd);
+  if (history && dir && inRootRepo(root, dir)) {
     return {
       tool: "em_history",
       rule: "history",
@@ -455,6 +703,17 @@ function bashSuggestion(raw: string, cwd: string): Suggestion | undefined {
   return undefined;
 }
 
+/** Would em_execute_file accept this path? It is given the root as a real path, like the server. */
+function executeFileTakes(root: string, fp: string): boolean {
+  try {
+    const real = realpathSync(root);
+    confinePath(real, resolve(root, fp), loadPermissionRules(real));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Decide whether a native tool call is better served by an em_* tool. */
 export function suggest(
   toolName: string,
@@ -464,19 +723,21 @@ export function suggest(
 ): Suggestion | undefined {
   switch (toolName) {
     case "Bash":
-      return bashSuggestion(String(input.command ?? ""), extra.cwd ?? root);
+      return bashSuggestion(String(input.command ?? ""), root, extra.cwd ?? root);
     case "Read": {
       const fp = String(input.file_path ?? "");
       if (!fp) return undefined;
+      // An offset or limit is a window the model already chose: bounded, like `sed -n 'A,Bp'`.
+      if (input.offset != null || input.limit != null) return undefined;
       const ext = extname(fp).toLowerCase();
       if (VISUAL_EXT.has(ext)) return undefined;
       try {
-        const abs = resolve(root, fp);
-        const st = statSync(abs);
+        const st = statSync(resolve(root, fp));
         if (st.size > 200 * 1024 || (BIG_TEXT_EXT.has(ext) && st.size > 20 * 1024)) {
-          // em_execute_file refuses what a Read deny or ask rule matches; leave the native Read
+          // em_execute_file refuses a file outside the root (Claude Code's own saved tool
+          // outputs among them) and what a Read deny or ask rule matches; leave the native Read
           // to Claude Code's own permission check instead of redirecting to a dead end.
-          if (!checkReadPath(loadPermissionRules(root), abs).allowed) return undefined;
+          if (!executeFileTakes(root, fp)) return undefined;
           return {
             tool: "em_execute_file",
             rule: "big-read",
