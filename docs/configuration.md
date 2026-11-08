@@ -22,13 +22,31 @@ eminiar merges four layers. A later layer overrides an earlier one.
 
 ## Example
 
+A project `eminiar.config.json` (`~/.eminiar/config.json` takes the same keys):
+
 ```json
 {
   "routing": { "mode": "enforce" },
-  "sandbox": { "timeoutMs": 120000, "envAllow": ["MY_API_TOKEN"] },
-  "graph": { "exclude": ["**/generated/**"] },
+  "sandbox": { "timeoutMs": 120000 },
   "recall": { "maxMemories": 5 },
   "docs": { "crawl": { "maxPages": 20 } }
+}
+```
+
+Objects merge key by key. Any other value replaces the one from the earlier layer, lists
+included: a list you set replaces the built-in list, and one in the project file also replaces
+your personal one. Lists cannot add to each other yet, so to skip one more folder, repeat the
+default excludes:
+
+```json
+{
+  "graph": {
+    "exclude": [
+      "**/node_modules/**", "**/dist/**", "**/build/**", "**/.git/**", "**/coverage/**",
+      "**/*.d.ts", "**/.venv/**", "**/venv/**", "**/__pycache__/**", "**/site-packages/**",
+      "**/vendor/**", "**/*.min.js", "**/*.blade.php", "**/generated/**"
+    ]
+  }
 }
 ```
 
@@ -71,7 +89,7 @@ eminiar merges four layers. A later layer overrides an earlier one.
 | Key | Default | Description |
 |---|---|---|
 | `include` | `**/*.{ts,tsx,js,jsx,mjs,cjs,py,go,php}` | Files to parse |
-| `exclude` | `node_modules`, `dist`, `build`, `.git`, `coverage`, `*.d.ts`, virtualenvs, `__pycache__`, `site-packages`, `vendor`, `*.min.js`, `*.blade.php` | Files to skip |
+| `exclude` | `node_modules`, `dist`, `build`, `.git`, `coverage`, `*.d.ts`, virtualenvs, `__pycache__`, `site-packages`, `vendor`, `*.min.js`, `*.blade.php` | Files to skip. Setting it replaces this whole list |
 
 ### `git`
 
