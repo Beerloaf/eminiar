@@ -14,19 +14,6 @@ import {
 } from "./claude-config.js";
 import { claudeCli, log, run } from "./shell.js";
 
-const HOOK_EVENTS = [
-  "SessionStart",
-  "UserPromptSubmit",
-  "PreToolUse",
-  "PostToolUse",
-  "PostToolUseFailure",
-  "SubagentStart",
-  "SubagentStop",
-  "PreCompact",
-  "Stop",
-  "SessionEnd",
-];
-
 /** Files whose content must match between the stable copy and Claude Code's cached copy. */
 const CACHE_FINGERPRINT = [
   "dist/server.js",
@@ -137,32 +124,75 @@ export function unregisterPlugin(): void {
 }
 
 /** Does a hook/server command string point at an eminiar binary (stable copy or `stable`)? */
-export function isOurs(cmd: unknown, stable: string): boolean {
+export function isOurs(cmd: unknown, stable: string): cmd is string {
   return typeof cmd === "string" && (cmd.includes("/.eminiar/plugin/") || cmd.includes(stable));
+}
+
+/** Is this hook command eminiar's own hook binary? Other eminiar commands a user hooks up stay. */
+function isOurHook(cmd: unknown, stable: string): boolean {
+  return isOurs(cmd, stable) && cmd.includes("/bin/em-hook");
+}
+
+/**
+ * Take eminiar's hooks out of every event, one hook at a time as `eminiar replace` does: a user's
+ * hook that shares an entry with ours stays, and only an entry left with no hooks goes. Every
+ * event, not only the ones hooks.json lists now, so an event it drops later is cleaned up too.
+ */
+function removeOurHooks(hooks: Record<string, unknown>, stable: string): void {
+  for (const [ev, list] of Object.entries(hooks)) {
+    if (!Array.isArray(list)) continue;
+    const kept = (list as Json[]).flatMap((entry) => {
+      const all = (entry.hooks as Json[] | undefined) ?? [];
+      const rest = all.filter((h) => !isOurHook(h.command, stable));
+      if (rest.length === all.length) return [entry];
+      return rest.length ? [{ ...entry, hooks: rest }] : [];
+    });
+    if (kept.length) hooks[ev] = kept;
+    else if (list.length) delete hooks[ev];
+  }
+}
+
+const PLUGIN_ROOT = `\${CLAUDE_PLUGIN_ROOT}`;
+
+/**
+ * The plugin's own hook table, hooks/hooks.json in the stable copy, with the plugin root filled
+ * in. The settings method writes exactly this, so the two registrations cannot drift apart: a
+ * hand-kept copy once lacked Edit, MultiEdit, Write and WebSearch, and settings installs never
+ * got the before-edit recall.
+ */
+function settingsHooks(stable: string): Record<string, Json[]> {
+  const file = join(stable, "hooks", "hooks.json");
+  if (!existsSync(file)) throw new Error(`${file} is missing`);
+  const table = readJson(file).hooks as Record<string, Json[]> | undefined;
+  if (!table) throw new Error(`${file} has no hooks`);
+  const fill = (h: Json): Json => {
+    if (typeof h.command !== "string") return h;
+    // Settings hooks get no plugin variables, so one left unfilled would run a broken path.
+    if (h.command.replaceAll(PLUGIN_ROOT, "").includes(`\${CLAUDE_PLUGIN_`))
+      throw new Error(`${file}: the settings method cannot fill the variable in ${h.command}`);
+    // A function, so a `$&` or `$$` in the path is not read as a replacement pattern.
+    return { ...h, command: h.command.replaceAll(PLUGIN_ROOT, () => stable) };
+  };
+  const out: Record<string, Json[]> = {};
+  for (const [ev, entries] of Object.entries(table)) {
+    out[ev] = entries.map((entry) => ({
+      ...entry,
+      hooks: ((entry.hooks as Json[] | undefined) ?? []).map(fill),
+    }));
+  }
+  return out;
 }
 
 /** Fallback: write hooks + MCP server directly, context-mode style. */
 export function registerSettings(stable: string): InstallRecord["wrote"] {
   const settings = readJson(settingsPath());
-  const hooks = (settings.hooks as Record<string, unknown[]> | undefined) ?? {};
-  const hookCmd = `"${join(stable, "bin", "em-hook")}"`;
-  for (const ev of HOOK_EVENTS) {
-    const list = (hooks[ev] as Json[] | undefined) ?? [];
-    const filtered = list.filter(
-      (entry) =>
-        !((entry.hooks as Json[] | undefined) ?? []).some((h) => isOurs(h.command, stable)),
-    );
-    const entry: Json = {
-      hooks: [{ type: "command", command: hookCmd, timeout: ev === "PreCompact" ? 15 : 10 }],
-    };
-    if (ev === "PreToolUse")
-      entry.matcher = "^(Bash|Read|Grep|Glob|WebFetch|Agent|Task|mcp__.*__em_swarm)$";
-    // Only generated swarm workers need SubagentStart; other subagents skip the hook process.
-    if (ev === "SubagentStart") entry.matcher = "^swarm-";
-    if (ev === "PostToolUse" || ev === "PostToolUseFailure")
-      (entry.hooks as Json[])[0]!.async = true;
-    filtered.push(entry);
-    hooks[ev] = filtered;
+  const hooks = (settings.hooks as Record<string, unknown> | undefined) ?? {};
+  const ours = settingsHooks(stable);
+  // A re-install or upgrade replaces the previous registration whole.
+  removeOurHooks(hooks, stable);
+  for (const [ev, entries] of Object.entries(ours)) {
+    const list = hooks[ev];
+    hooks[ev] = [...(Array.isArray(list) ? list : []), ...entries];
   }
   settings.hooks = hooks;
   writeJsonWithBackup(settingsPath(), settings);
@@ -185,23 +215,14 @@ export function registerSettings(stable: string): InstallRecord["wrote"] {
     cpSync(join(stable, "skills", name), join(skillsDir, name), { recursive: true });
     skills.push(name);
   }
-  return { hookEvents: HOOK_EVENTS, mcpServer: true, skills };
+  return { hookEvents: Object.keys(ours), mcpServer: true, skills };
 }
 
 export function unregisterSettings(stable: string, wrote: InstallRecord["wrote"]): void {
   if (wrote.hookEvents?.length) {
     const settings = readJson(settingsPath());
-    const hooks = (settings.hooks as Record<string, Json[]> | undefined) ?? {};
-    for (const ev of wrote.hookEvents) {
-      const list = hooks[ev];
-      if (!list) continue;
-      const kept = list.filter(
-        (entry) =>
-          !((entry.hooks as Json[] | undefined) ?? []).some((h) => isOurs(h.command, stable)),
-      );
-      if (kept.length) hooks[ev] = kept;
-      else delete hooks[ev];
-    }
+    const hooks = (settings.hooks as Record<string, unknown> | undefined) ?? {};
+    removeOurHooks(hooks, stable);
     if (Object.keys(hooks).length) settings.hooks = hooks;
     else delete settings.hooks;
     writeJsonWithBackup(settingsPath(), settings);
