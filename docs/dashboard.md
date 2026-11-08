@@ -456,6 +456,11 @@ http://127.0.0.1:7331/#/explore?file=src/server.ts
 ## Security
 
 - The server answers loopback hosts only (`127.0.0.1`, `localhost`, `[::1]`).
+- The API answers the dashboard itself only: a request another site or another local port
+  makes (a link, an `<img>`, a form or a fetch, which the browser marks `Sec-Fetch-Site:
+  cross-site` or `same-site`) gets a 403, GETs included. Browsers too old to send
+  `Sec-Fetch-Site` (Safari before 16.4) are covered for writes only.
+- `doctor --fix` from the System tab is a POST.
 - Every request that writes needs a JSON content type and a loopback `Origin`.
 - File reads are checked to stay inside the project root.
 

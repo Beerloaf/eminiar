@@ -118,14 +118,21 @@ const FALLBACK_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8
 <body><h1>eminiar dashboard</h1><p>The frontend bundle is missing. Run <code>npm run build</code> in the eminiar checkout (or reinstall the package) and reload.</p>
 <p>The JSON API is available under <code>/api/*</code>.</p></body></html>`;
 
-/** Only the loopback origins may call the API: blocks DNS-rebinding and cross-site POSTs. */
-function originAllowed(req: IncomingMessage, port: number): boolean {
+/**
+ * Only the loopback origins may call the API: blocks DNS rebinding (Host) and cross-site
+ * requests. Pages can be opened from anywhere, but every /api/ call, GET included, must come
+ * from the dashboard itself: some GETs do work (`?root=` opens a project database,
+ * `/api/changes` runs git), and any web page can send a GET with an <img> or a no-cors fetch.
+ * Browsers mark those `Sec-Fetch-Site: cross-site`; curl and tests send none.
+ */
+function originAllowed(req: IncomingMessage, port: number, api: boolean): boolean {
   const host = req.headers.host ?? "";
   const ok = (h: string) =>
     h === `127.0.0.1:${port}` || h === `localhost:${port}` || h === `[::1]:${port}`;
   if (!ok(host)) return false;
   const method = req.method ?? "GET";
-  if (method === "GET" || method === "HEAD") return true;
+  const read = method === "GET" || method === "HEAD";
+  if (read && !api) return true;
   const origin = req.headers.origin;
   if (origin) {
     try {
@@ -136,6 +143,7 @@ function originAllowed(req: IncomingMessage, port: number): boolean {
   }
   const site = req.headers["sec-fetch-site"];
   if (site && site !== "same-origin" && site !== "none") return false;
+  if (read) return true;
   const type = String(req.headers["content-type"] ?? "");
   return type.startsWith("application/json");
 }
@@ -170,16 +178,18 @@ function serveStatic(res: ServerResponse, p: string): boolean {
 
 /**
  * Local dashboard: binds 127.0.0.1 only. Reads are GET; memory writes and system
- * actions use other methods with a JSON content type and a loopback Origin, so
- * neither a stray link nor a cross-site form can trigger them.
+ * actions use other methods with a JSON content type and a loopback Origin, and no API
+ * call is served to another site, so neither a stray link, an <img> nor a cross-site form
+ * can trigger them.
  */
 export async function serve(opts: { port: number; open: boolean; root?: string }): Promise<void> {
   const defaultRoot = opts.root;
   const server = createServer(async (req, res) => {
     try {
-      if (!originAllowed(req, opts.port)) return json(res, 403, { error: "forbidden origin" });
       const url = new URL(req.url ?? "/", "http://127.0.0.1");
       const p = url.pathname;
+      if (!originAllowed(req, opts.port, p.startsWith("/api/")))
+        return json(res, 403, { error: "forbidden origin" });
       const q = url.searchParams;
       const root = q.get("root") ?? defaultRoot ?? undefined;
       const ctx = () => ctxFor(root);
@@ -589,7 +599,11 @@ export async function serve(opts: { port: number; open: boolean; root?: string }
             categories: strList(q.get("category")),
           }),
         );
-      if (p === "/api/doctor") return json(res, 200, await doctorPayload(q.get("fix") === "1"));
+      if (p === "/api/doctor") {
+        // --fix rewrites the install, so it is a write: POST with a JSON body, never a GET.
+        const fix = method === "POST" && (await readJson<{ fix?: unknown }>(req)).fix === true;
+        return json(res, 200, await doctorPayload(fix));
+      }
       if (p === "/api/actions") {
         if (method !== "POST") return json(res, 405, { error: "POST only" });
         const body = await readJson<ActionInput & { glob?: unknown; paths?: unknown }>(req);
