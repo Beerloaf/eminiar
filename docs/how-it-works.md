@@ -59,6 +59,19 @@ equivalents are [below](#cursor)):
 Hooks are fast by design. They never run `git log` and never load the embedding model. Recall
 is a few FTS queries against the project database.
 
+Every hook uses the project the session started in: `CLAUDE_PROJECT_DIR`, walked up to the
+nearest project marker. Claude Code sets it for every hook and for the MCP server, and keeps it
+when Claude runs `cd`; Cursor sets it to the workspace root. So after `cd backend && npm test` in
+a multi-repo folder, events, decisions, snapshots and usage still go to the database that
+`em_search` and `em_recall` read, and a repository's own memories and config apply only to a
+session started in it. The payload's `cwd` still resolves relative paths in a Bash command and
+decides where a commit hint runs `git`, and swarm tracking tries the `cwd`'s repository after the
+session's ([Agent swarms](#agent-swarms)). An edit inside a git worktree of the project
+(`.claude/worktrees/…`) is recorded too, but only files a full scan with `graph.include` and
+`graph.exclude` would list are re-parsed, so the graph never holds the worktree's copy.
+`EMINIAR_PROJECT_ROOT` binds the MCP server and the CLI, not these hooks (see
+[Configuration](configuration.md#environment-variables)).
+
 Claude Code discards the output of a hook that outlasts its `timeout` in `hooks/hooks.json`, so
 every run also has a time budget below that timeout (3.5 s for the 5 s hooks, 8 s for
 `SessionStart`, `PostToolUse` and `SubagentStart`, 12 s for `PreCompact`). Three rules keep a
