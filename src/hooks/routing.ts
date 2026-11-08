@@ -19,7 +19,14 @@ import { type RoutingEvent, recordRouting } from "../session/routing-stats.js";
 import { serverAlive } from "../session/server-alive.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import { getStorage } from "../storage/index.js";
-import { isSwarmTool, swarmPreAgent, swarmStampCaller, swarmTouch } from "../swarm/hooks.js";
+import {
+  isSwarmTool,
+  spawnType,
+  swarmPreAgent,
+  swarmStampCaller,
+  swarmTouch,
+  workerLacksTool,
+} from "../swarm/hooks.js";
 import { contextModeInstalled, effectiveRoutingMode } from "./coexist.js";
 import { hookLog } from "./log.js";
 import type { HookHandler, HookInput, HookOutput } from "./types.js";
@@ -535,12 +542,17 @@ export function suggest(
         tool: "em_*",
         reason:
           "subagents should prefer em_execute / em_batch_execute / em_search over Bash, Read and Grep",
-        prefixPrompt:
-          'Use the eminiar tools (em_execute, em_batch_execute, em_execute_file, em_fetch_and_index, em_search, em_symbols, em_history) instead of Bash/Read/Grep/WebFetch whenever output may be large; return only derived answers. Check em_recall {query} for project decisions and constraints before proposing changes, em_history {action:"file", path} before editing a file, em_symbols / em_search {source:"code"} before grepping for an identifier, and em_docs {action:"lookup", query} before WebFetch/WebSearch for anything the project depends on.\n\n',
+        prefixPrompt: subagentPrefix(true),
       };
     default:
       return undefined;
   }
+}
+
+/** The prompt prefix for a subagent; without `shell` it leaves out the command runners. */
+function subagentPrefix(shell: boolean): string {
+  const runners = shell ? "em_execute, em_batch_execute, em_execute_file, " : "";
+  return `Use the eminiar tools (${runners}em_fetch_and_index, em_search, em_symbols, em_history) instead of ${shell ? "Bash/" : ""}Read/Grep/WebFetch whenever output may be large; return only derived answers. Check em_recall {query} for project decisions and constraints before proposing changes, em_history {action:"file", path} before editing a file, em_symbols / em_search {source:"code"} before grepping for an identifier, and em_docs {action:"lookup", query} before WebFetch/WebSearch for anything the project depends on.\n\n`;
 }
 
 /** Project-relative path of a tool's file_path, or undefined when it is outside the project. */
@@ -766,15 +778,20 @@ async function route(
 
   if (mode === "enforce") {
     if (s.prefixPrompt) {
+      // A swarm worker without Bash has no em_execute*: do not point it at them.
+      const prefix =
+        swarmWorker && workerLacksTool(input, spawnType(input), "em_execute")
+          ? subagentPrefix(false)
+          : s.prefixPrompt;
       const prompt = String(input.tool_input.prompt ?? "");
-      if (prompt.startsWith(s.prefixPrompt)) return undefined;
+      if (prompt.startsWith(prefix)) return undefined;
       return {
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
           permissionDecision: "allow",
           updatedInput: {
             ...input.tool_input,
-            prompt: s.prefixPrompt + (swarmWorker ? "" : await briefFor(ctx, prompt)) + prompt,
+            prompt: prefix + (swarmWorker ? "" : await briefFor(ctx, prompt)) + prompt,
           },
         },
       };
@@ -795,6 +812,12 @@ async function route(
         ),
         hint,
       );
+    }
+    // Nor if the caller cannot call it: a swarm worker without Bash has no em_execute*, so
+    // the native call is its only way and the suggestion would be noise.
+    if (input.agent_id && workerLacksTool(input, input.agent_type, s.tool)) {
+      record("allow", "no-shell");
+      return withContext(undefined, hint);
     }
     record("deny");
     hookLog("info", `deny ${input.tool_name} → ${s.tool} [${s.rule ?? "?"}]: ${callHead(input)}`);
