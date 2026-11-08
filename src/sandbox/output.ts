@@ -10,6 +10,11 @@ import type { Source } from "../storage/types.js";
 
 export interface ProcessInput {
   stdout: string;
+  /**
+   * As `cleanStderr` leaves it (the caller cleans once and reuses it). Returned after stdout under
+   * STDERR_MARK, and indexed as a document of its own.
+   */
+  stderr?: string | undefined;
   title: string;
   source: Source;
   intent?: string | undefined;
@@ -21,13 +26,37 @@ export interface ProcessInput {
 
 export interface Processed {
   text: string;
+  /** The stdout document, or the stderr one when only stderr had text. */
   documentId?: number;
+  /** Every document indexed: stdout's, then stderr's. */
+  documentIds?: number[];
   chunks?: number;
   returnedChars: number;
 }
 
 const HEAD = 3 * 1024;
 const TAIL = 1 * 1024;
+const STDERR_MARK = "--- stderr ---";
+
+/**
+ * stderr as it is returned and indexed. A `\r` that is not part of a CRLF starts a frame over
+ * the previous one (curl's meter, npm's spinner), so only the last frame of each line is kept.
+ * Anchored at line starts (`^` with `m` also matches after a `\r`): unanchored, `[^\n]*` rescans
+ * the rest of the line from every position, quadratic on a long line with no `\r`.
+ */
+export function cleanStderr(stderr: string): string {
+  return stderr.replace(/^[^\n]*\r(?=[^\n])/gm, "").trimEnd();
+}
+
+/**
+ * One run's output as the model sees it: stdout, then the cleaned stderr after STDERR_MARK.
+ * Jest, compilers and git report on stderr, so an `intent` has to find it too.
+ */
+export function joinOutput(stdout: string, stderr = ""): string {
+  if (!stderr.trim()) return stdout;
+  const gap = stdout === "" || stdout.endsWith("\n") ? "" : "\n";
+  return `${stdout}${gap}${STDERR_MARK}\n${stderr}\n`;
+}
 
 /**
  * Decide what the model gets to see. Small outputs are returned verbatim. Large
@@ -41,26 +70,35 @@ export async function processOutput(
   input: ProcessInput,
 ): Promise<Processed> {
   const threshold = ctx.config.sandbox.indexThreshold;
-  const out = input.stdout;
+  const out = joinOutput(input.stdout, input.stderr);
   if (!input.forceIndex && out.length <= threshold) {
     return { text: out, returnedChars: out.length };
   }
   if (!out.trim()) return { text: "", returnedChars: 0 };
 
-  const r = indexContent(db, {
-    source: input.source,
-    title: input.title,
-    content: out,
-    sessionId: getCurrentSession(ctx),
-    meta: input.intent ? { intent: input.intent } : undefined,
-  });
+  // One document per stream, so each is chunked as what it is: JSON on stdout stays json.
+  const streams = [
+    { title: input.title, content: input.stdout },
+    { title: `${input.title} (stderr)`, content: input.stderr ?? "" },
+  ].filter((s) => s.content.trim());
+  const docs = streams.map((s) =>
+    indexContent(db, {
+      source: input.source,
+      title: s.title,
+      content: s.content,
+      sessionId: getCurrentSession(ctx),
+      meta: input.intent ? { intent: input.intent } : undefined,
+    }),
+  );
+  const ids = docs.map((d) => d.documentId);
+  const chunks = docs.reduce((n, d) => n + d.chunks, 0);
+  // processOutput returned above when neither stream had text, so ids is never empty.
+  const indexed = { documentId: ids[0]!, documentIds: ids, chunks };
   kickEmbedding(ctx, db);
   const queries = [...(input.queries ?? [])];
   if (input.intent && !queries.includes(input.intent)) queries.unshift(input.intent);
 
-  if (out.length <= threshold) {
-    return { text: out, documentId: r.documentId, chunks: r.chunks, returnedChars: out.length };
-  }
+  if (out.length <= threshold) return { text: out, ...indexed, returnedChars: out.length };
 
   const lines: string[] = [];
   if (queries.length) {
@@ -70,13 +108,13 @@ export async function processOutput(
         await search(db, q, {
           limit: 5,
           mode: "lexical",
-          filters: { documentIds: [r.documentId] },
+          filters: { documentIds: ids },
         }),
       );
     }
     lines.push(formatResults(responses, input.maxTokens ?? 1500));
-    // Vocabulary from this document's chunks only; see topTermsOf for why not fts5vocab.
-    const bodies = db.chunksOfDocument(r.documentId).map((c) => c.body);
+    // Vocabulary from these documents' chunks only; see topTermsOf for why not fts5vocab.
+    const bodies = ids.flatMap((id) => db.chunksOfDocument(id).map((c) => c.body));
     const terms = topTermsOf(bodies, 40).map((t) => t.term);
     if (terms.length) lines.push(`\nsearchable terms: ${terms.join(", ")}`);
   } else {
@@ -84,9 +122,10 @@ export async function processOutput(
     if (out.length > HEAD + TAIL) lines.push(`\n… ${out.length - HEAD - TAIL} chars omitted …\n`);
     lines.push(out.slice(-TAIL));
   }
+  const docList = ids.join(", ");
   lines.push(
-    `\n[indexed as doc ${r.documentId} (${r.chunks} chunks, ${out.length} chars); em_search with document_ids: [${r.documentId}] for more]`,
+    `\n[indexed as doc${ids.length > 1 ? "s" : ""} ${docList} (${chunks} chunks, ${out.length} chars); em_search with document_ids: [${docList}] for more]`,
   );
   const text = lines.join("\n");
-  return { text, documentId: r.documentId, chunks: r.chunks, returnedChars: text.length };
+  return { text, ...indexed, returnedChars: text.length };
 }

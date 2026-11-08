@@ -66,6 +66,21 @@ describe("runProcess", () => {
     expect(big.truncated).toBe(true);
     expect(big.stdout.length).toBeLessThanOrEqual(2048);
   });
+  it("keeps the end of stderr up to the output cap, whole characters only", async () => {
+    const run = (js: string, maxOutputBytes: number) =>
+      runProcess([process.execPath, "-e", js], {
+        cwd: ctx.root,
+        env: { PATH: process.env.PATH ?? "" },
+        timeoutMs: 10_000,
+        maxOutputBytes,
+      });
+    // 400 KB of a two-byte character after one odd byte: past the old 8 KB tail, and the pipe's
+    // even-sized chunks then end mid-character.
+    const wide = await run("process.stderr.write('a' + 'é'.repeat(200000))", 1024 * 1024);
+    expect(wide.stderr).toBe(`a${"é".repeat(200000)}`);
+    const capped = await run("process.stderr.write('a'.repeat(5000) + 'END')", 1024);
+    expect(capped.stderr).toBe(`${"a".repeat(1021)}END`);
+  });
 });
 
 describe("execute", () => {

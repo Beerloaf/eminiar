@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { describeRun, execute } from "../sandbox/execute.js";
-import { processOutput } from "../sandbox/output.js";
+import { cleanStderr, joinOutput, processOutput } from "../sandbox/output.js";
 import { formatResults } from "../search/format.js";
 import { type SearchResponse, search } from "../search/pipeline.js";
 import { recordStat } from "../stats/record.js";
@@ -61,7 +61,7 @@ export const emBatchExecute = defineTool({
       label: string;
       header: string;
       stdout?: string | undefined;
-      docId?: number | undefined;
+      docIds?: number[] | undefined;
       stderr?: string | undefined;
     }> = [];
     let rawChars = 0;
@@ -81,18 +81,21 @@ export const emBatchExecute = defineTool({
             timeoutMs: args.timeout_ms,
           });
           rawChars += r.stdout.length + r.stderr.length;
+          // Cleaned once: the output, the stderr document, the header and the tail all use it.
+          const stderr = cleanStderr(r.stderr);
           const p = await processOutput(db, ctx, {
             stdout: r.stdout,
+            stderr,
             title: cmd.label,
             source: "batch",
             forceIndex: true,
           });
           results.push({
             label: cmd.label,
-            header: describeRun(r),
-            stdout: r.stdout,
-            docId: p.documentId,
-            stderr: r.exitCode !== 0 ? r.stderr.trim().slice(-800) : undefined,
+            header: describeRun({ ...r, stderr }),
+            stdout: joinOutput(r.stdout, stderr),
+            docIds: p.documentIds,
+            stderr: r.exitCode !== 0 ? stderr.slice(-800) : undefined,
           });
         } catch (err) {
           results.push({ label: cmd.label, header: `failed: ${(err as Error).message}` });
@@ -118,15 +121,16 @@ export const emBatchExecute = defineTool({
     const lines: string[] = [];
     results.forEach((r, i) => {
       const shown = inline.has(i) && r.stdout !== undefined;
-      const hint =
-        r.docId && !shown ? ` · em_search {document_ids: [${r.docId}]} for the output` : "";
-      lines.push(`## ${r.label} — ${r.header}${r.docId ? ` · doc ${r.docId}` : ""}${hint}`);
+      const ids = r.docIds?.join(", ");
+      const docs = ids ? ` · doc${r.docIds!.length > 1 ? "s" : ""} ${ids}` : "";
+      const hint = ids && !shown ? ` · em_search {document_ids: [${ids}]} for the output` : "";
+      lines.push(`## ${r.label} — ${r.header}${docs}${hint}`);
       if (shown) lines.push(r.stdout!.trimEnd());
-      if (r.stderr) lines.push(`stderr: ${r.stderr}`);
+      if (r.stderr && !shown) lines.push(`stderr: ${r.stderr}`);
       lines.push("");
     });
 
-    const docIds = results.map((r) => r.docId).filter((d): d is number => d !== undefined);
+    const docIds = results.flatMap((r) => r.docIds ?? []);
     if (queries.length && docIds.length) {
       const responses: SearchResponse[] = [];
       for (const q of queries) {
