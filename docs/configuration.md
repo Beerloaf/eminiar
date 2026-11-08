@@ -172,12 +172,13 @@ only:
 - It must not hold a key. A field named like `apiKey`, `token`, `secret` or `password` makes the
   config invalid. Keys go in `~/.eminiar/adjudicator.key` (`eminiar adjudicator key set`) or an
   environment variable named by `keyEnv`.
-- Only `enabled`, `mode`, `surfaces`, `promptMode`, `minPromptChars`, `tiers`, `weights`,
-  `apply`, `advice`, `embedding`, `learning` and `cache` may be set in the committed
-  `eminiar.config.json`. Everything that decides where text and keys go or how much is spent
-  (`provider`, `typesafe`, `openai`, `keyEnv`, `remoteConsent`, `remoteConsentOrigins`,
-  `privacy`, `budget`, `timeouts`, `breaker`) comes from `~/.eminiar/config.json` only, and from
-  there only while that file is outside the project (see `EMINIAR_HOME` below).
+- Only `enabled`, `surfaces`, `promptMode`, `minPromptChars`, `weights`, `advice`, `embedding`,
+  `learning` and `cache` may be set in the committed `eminiar.config.json`, plus `mode: "advise"`
+  (a project can keep the adjudicator advise-only). Everything that decides where text and keys
+  go or how much is spent, plus apply mode, its settings and the tier ladder (`provider`,
+  `typesafe`, `openai`, `keyEnv`, `remoteConsent`, `remoteConsentOrigins`, `privacy`, `budget`,
+  `timeouts`, `breaker`, `mode: "apply"`, `apply`, `tiers`) comes from `~/.eminiar/config.json`
+  only, and from there only while that file is outside the project (see `EMINIAR_HOME` below).
 
 | Key | Default | Description |
 |---|---|---|
@@ -242,7 +243,7 @@ only:
 |---|---|
 | `EMINIAR_ROUTING_MODE` | Overrides `routing.mode` |
 | `EMINIAR_EMBEDDINGS=0` | Turns off embeddings |
-| `EMINIAR_HOME` | Moves the data directory (default `~/.eminiar`). A `config.json` there that lies inside or above the project (or any git work tree around it, a submodule's superproject included), or a relative `EMINIAR_HOME`, cannot set the adjudicator's provider, consent, endpoints, `keyEnv`, privacy, budget or timeouts, since a repo's `.claude/settings.json` could set this variable. The same applies when `HOME` is moved into the project |
+| `EMINIAR_HOME` | Moves the data directory (default `~/.eminiar`). A `config.json` there that lies inside or above the project (or any git work tree around it, a submodule's superproject included), or a relative `EMINIAR_HOME`, cannot set the adjudicator's provider, consent, endpoints, `keyEnv`, privacy, budget, timeouts, apply mode, `apply` or `tiers`, since a repo's `.claude/settings.json` could set this variable. The same applies when `HOME` is moved into the project |
 | `CURSOR_CONFIG_DIR` | Where `install --cursor` writes Cursor's `hooks.json`, `mcp.json` and `skills/` (default `~/.cursor`) |
 | `EMINIAR_PROJECT_ROOT` | Sets the project root. Otherwise `CLAUDE_PROJECT_DIR`, then the current directory |
 | `EMINIAR_DEBUG` | Prints stack traces from the CLI |
