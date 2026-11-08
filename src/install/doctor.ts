@@ -15,6 +15,7 @@ import {
   pluginInstalled,
   pluginInstallPath,
   readInstallRecord,
+  settingsPath,
 } from "./claude-config.js";
 import { cursorPresent, cursorStatus } from "./cursor.js";
 import { stableRoot, stableVersion } from "./materialize.js";
@@ -218,9 +219,7 @@ export async function fullDoctor(opts: { fix?: boolean } = {}): Promise<Check[]>
       });
     }
   } else if (rec.method === "settings") {
-    const s = existsSync(join(process.env.HOME ?? "", ".claude", "settings.json"))
-      ? readFileSync(join(process.env.HOME ?? "", ".claude", "settings.json"), "utf8")
-      : "";
+    const s = existsSync(settingsPath()) ? readFileSync(settingsPath(), "utf8") : "";
     checks.push({
       name: "hooks in settings.json",
       ok: s.includes("em-hook"),

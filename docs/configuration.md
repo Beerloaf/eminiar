@@ -246,7 +246,9 @@ only:
 | `CURSOR_CONFIG_DIR` | Where `install --cursor` writes Cursor's `hooks.json`, `mcp.json` and `skills/` (default `~/.cursor`) |
 | `EMINIAR_PROJECT_ROOT` | Sets the project root. Otherwise `CLAUDE_PROJECT_DIR`, then the current directory |
 | `EMINIAR_DEBUG` | Prints stack traces from the CLI |
-| `EMINIAR_CLAUDE_DIR` | Where Claude Code keeps its transcripts (default `~/.claude`) |
+| `CLAUDE_CONFIG_DIR` | Claude Code's own variable for its config directory (default `~/.claude`). eminiar follows it for settings, permission rules, agents, plugins, transcripts and `.claude.json`, which then lives inside that directory instead of at `~/.claude.json` |
+| `CLAUDE_CODE_PLUGIN_CACHE_DIR` | Claude Code's own variable for its plugins root (default `plugins/` in the config directory). eminiar follows it for `installed_plugins.json`, the plugin cache and plugin agents |
+| `EMINIAR_CLAUDE_DIR` | Where Claude Code keeps its transcripts (default: `CLAUDE_CONFIG_DIR`, else `~/.claude`) |
 | `EMINIAR_ADJUDICATOR=0` / `=1` | Turns the adjudicator off (the kill switch) or on, over every config file |
 | `EMINIAR_ADJUDICATOR_PROVIDER` | Overrides `adjudicator.provider`. A remote provider runs only when `remoteConsentOrigins` in `~/.eminiar/config.json` lists its origin |
 | `EMINIAR_ADJUDICATOR_MODE` | Overrides `adjudicator.mode` (`advise` or `apply`) |
