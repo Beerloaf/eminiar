@@ -1,5 +1,6 @@
 import Database from "better-sqlite3";
 import * as sqliteVec from "sqlite-vec";
+import { restrictDbFiles } from "../../paths.js";
 import type { SessionPatch, StorageAdapter } from "../adapter.js";
 import { topTermsOf } from "../terms.js";
 import type {
@@ -149,6 +150,7 @@ export class SqliteAdapter implements StorageAdapter {
     opts: SqliteOptions = {},
   ) {
     this.db = new Database(path, { timeout: opts.busyTimeoutMs ?? 2000 });
+    restrictDbFiles(path);
     // Statements are prepared lazily, so the tables only need to exist by the first call.
     this.swarm = new SqliteSwarmStore(this.db);
     this.adjudicator = new SqliteAdjudicatorStore(this.db);
@@ -1645,6 +1647,9 @@ export class SqliteAdapter implements StorageAdapter {
         );
         // Swarm runs are session activity; deleting runs cascades to the rest of the ledger.
         this.db.exec("DELETE FROM swarm_runs;");
+        // The memorable events were also indexed (source "session"), and that copy is what
+        // em_recall and the prompt hook recall. The index scope clears it with everything else.
+        if (scope === "sessions") this.deleteDocumentsBySource("session");
       }
       if (scope === "graph" || scope === "all") {
         this.db.exec(

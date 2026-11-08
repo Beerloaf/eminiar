@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { forRemote, head, isSecretName, redact } from "../../src/adjudicator/redact.js";
+import {
+  forRemote,
+  head,
+  isSecretName,
+  redact,
+  redactSecrets,
+} from "../../src/adjudicator/redact.js";
 
 /** [label, input, sentinel that must not survive] */
 const LEAKS: Array<[string, string, string]> = [
@@ -382,6 +388,149 @@ describe("redact: ordinary text survives", () => {
     });
 });
 
+describe("redactSecrets: stored command output", () => {
+  // Only redact() cleans the text first, so a name hidden by an invisible or fullwidth character
+  // is a remote-only case, like the generic hex run.
+  const plain = (s: string) =>
+    s.replace(/\p{Default_Ignorable_Code_Point}/gu, "").normalize("NFKC") === s;
+  for (const [label, input, sentinel] of LEAKS)
+    if (plain(input) && label !== "hex 24+")
+      it(`masks ${label}`, () => {
+        const out = redactSecrets(input);
+        expect(out).not.toContain(sentinel);
+        expect(redactSecrets(out)).toBe(out);
+      });
+
+  it("leaves ordinary text alone", () => {
+    for (const text of KEEP) expect(redactSecrets(text)).toBe(text);
+  });
+
+  it("masks what `env` prints and keeps the rest", () => {
+    const env = [
+      "PATH=/usr/bin:/bin",
+      "GH_TOKEN=ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8",
+      "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+      "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+      "DATABASE_URL=postgres://app:Sup3rS3cret@db.internal:5432/app",
+      "KUBECONFIG=/Users/me/.kube/config",
+    ].join("\n");
+    expect(redactSecrets(env)).toBe(
+      [
+        "PATH=/usr/bin:/bin",
+        "GH_TOKEN=***",
+        "AWS_ACCESS_KEY_ID=AKIA***",
+        "AWS_SECRET_ACCESS_KEY=***",
+        "DATABASE_URL=postgres://***@db.internal:5432/app",
+        "KUBECONFIG=/Users/me/.kube/config",
+      ].join("\n"),
+    );
+  });
+
+  it("keeps what a search of the output looks for: SHAs, checksums, emails, base64, lone keys", () => {
+    for (const text of [
+      "commit 826dd7c8a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  empty.txt",
+      "Author: Jane Doe <jane@example.com>",
+      '"integrity": "sha512-v2kDEe57lecTulaDIuNTPy3Ry4gLGJ6Z1O3vE1krgXZNrsQ+LFTGHVxVjcXPs17LhbZVGedAJv8XZ1tvj5FvSg=="',
+      'const fixture = "dGhpcyBpcyBhIGxvbmcgYmFzZTY0IHN0cmluZyB1c2VkIGluIHRlc3Rz"',
+      '{ "Key": "photos/2024/beach.jpg", "Size": 120934 }',
+      "+function pref(key: string, fallback: boolean): boolean {",
+    ]) {
+      expect(redactSecrets(text)).toBe(text);
+    }
+    // redact() is unchanged: for remote text those runs and a lone key still go.
+    expect(redact('{ "Key": "photos/2024/beach.jpg" }')).toBe('{ "Key": "***" }');
+    expect(redact("Author: Jane Doe <jane@example.com>")).toBe("Author: Jane Doe <[email]>");
+    // Compound names are still secret, and a real key under a lone `key` keeps its shape rule.
+    expect(redactSecrets("tls.key: LS0tLS1CRUdJTiBQUklW")).toBe("tls.key: ***");
+    expect(redactSecrets('{"key": "sk-ant-api03-abcdefghijklmnop"}')).toBe('{"key": "sk-***"}');
+  });
+
+  it("keeps a lone key's name or path, and masks an opaque value under it", () => {
+    for (const text of [
+      'i18n: { key: "greeting.hello" }',
+      "key = env/prod/terraform.tfstate",
+      '{"Key": "logs/2024/11/08/app-server-1"}',
+      "key: ab12",
+      "KEY=ENABLE_FEATURE_FLAG_FOR_BETA",
+      // object, cache and store keys: UUIDs, words between _ - : /, ISO dates, digests
+      '{"Key": "550e8400-e29b-41d4-a716-446655440000"}',
+      "key: 550E8400-E29B-41D4-A716-446655440000",
+      '"Key": "user_123456_avatar_original_png"',
+      '"Key": "2024-11-08T12:00:00Z_backup_v2_tar"',
+      `key=sha256:${"0a1b2c3d".repeat(8)}`,
+      `key: session:${"9f3a7c1e".repeat(4)}`,
+    ]) {
+      expect(redactSecrets(text)).toBe(text);
+    }
+    for (const [text, masked] of [
+      ["KEY=Zx9Qw7Er5Ty3Ui1Op8As6Df4Gh2Jk", "KEY=***"],
+      ["key=Zx9Qw7Er5Ty3Ui1Op8As6Df4Gh2Jk&x=1", "key=***&x=1"],
+      ["datadog:\n  key: tsk9Qw7Er5Ty3Ui1Op8As6Df4Gh2Jk0Lz", "datadog:\n  key: ***"],
+      // an env-prefixed token: a plain word beside a long opaque part
+      ["key: live_Zx9Qw7Er5Ty3Ui1Op8As6Df4Gh2Jk", "key: ***"],
+      ["key: test_Zx9Qw7Er5Ty3Ui1Op8As6Df4Gh2Jk", "key: ***"],
+      ['KEY="prod-Zx9Qw7Er5Ty3Ui1Op8As6Df4Gh2Jk"', 'KEY="***"'],
+      ['{"key": "key_live_Zx9Qw7Er5Ty3Ui1Op8As6Df4Gh2Jk"}', '{"key": "***"}'],
+      ['"Key": "AB12CD34EF56GH78IJ90KL12/report-final"', '"Key": "***"'],
+      // short parts, but no plain word among them: a base64url token with a dash
+      ["key: Zx9Qw7Er5Ty3Ui1-Op8As6Df4Gh2Jk", "key: ***"],
+      ['{"Key": "Zx9Qw7Er5Ty3Ui1Op8As6Df4Gh2Jk"}', '{"Key": "***"}'],
+      [
+        "data:\n  password: c3VwZXJzZWNyZXQ=\n  key: c2stbGl2ZS1zZWNyZXQ=",
+        "data:\n  password: ***\n  key: ***",
+      ],
+    ] as const) {
+      expect(redactSecrets(text)).toBe(masked);
+    }
+  });
+
+  it("masks the bare tokens a CLI prints on their own", () => {
+    for (const [text, masked] of [
+      ["ya29.a0AfB_byC1x2y3z4ABCDEFGHIJKLMNOPQRSTUV", "ya29.***"],
+      ["hvs.CAESIJ1x2y3z4ABCDEFGHIJKLMNOPQRSTUVwxyz", "hvs.***"],
+      ["token               hvb.AAAAAQJ1x2y3z4ABCDEFGHIJKLMNOP", "token               hvb.***"],
+      [`dop_v1_${"0a1b2c3d".repeat(8)}`, "dop_v1_***"],
+      [`shpat_${"0123456789abcdef".repeat(2)}`, "shpat_***"],
+      [`pypi-AgEIcHlwaS5vcmc${"A1b2C3".repeat(10)}`, "pypi-***"],
+      [`eyJwYXlsb2FkIjoi${"QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo".repeat(3)}`, "[ecr password]"],
+    ] as const) {
+      const out = redactSecrets(text);
+      expect(out).toBe(masked);
+      expect(redactSecrets(out)).toBe(out);
+    }
+  });
+
+  it("masks a private key block without eating the output after a cut-off one", () => {
+    const block =
+      "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAsentinelLine\n-----END RSA PRIVATE KEY-----";
+    expect(redactSecrets(`a\n${block}\nb`)).toBe("a\n[private key]\nb");
+    const cut =
+      "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcw\nMIIEvQIBADANBgkq";
+    const log = `${cut}\n\ncommit 826dd7c\n    Fix the parser\n${block}\ntail`;
+    expect(redactSecrets(log)).toBe(
+      "[private key]\n\ncommit 826dd7c\n    Fix the parser\n[private key]\ntail",
+    );
+    // a key quoted on one line (JSON) and a cut-off one in a string
+    expect(
+      redactSecrets('"pem": "-----BEGIN PRIVATE KEY-----\\nMIIE\\n-----END PRIVATE KEY-----\\n",'),
+    ).toBe('"pem": "[private key]\\n",');
+    expect(redactSecrets('["unterminated", "-----BEGIN PRIVATE KEY-----\\nMIIEvQ"],\nnext')).toBe(
+      '["unterminated", "[private key]\nnext',
+    );
+    // indented (YAML, Helm values) or behind a diff marker, the cut-off body goes too
+    const b64 = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcw";
+    expect(
+      redactSecrets(`tls: |\n    -----BEGIN PRIVATE KEY-----\n    ${b64}\n    ${b64}\nrest`),
+    ).toBe("tls: |\n    [private key]\nrest");
+    expect(redactSecrets(`  -----BEGIN PRIVATE KEY-----\n  ${b64}\n- ${b64}\n> ${b64}\nrest`)).toBe(
+      "  [private key]\nrest",
+    );
+    // redact() still masks a cut-off key to the end of the (short, remote) text
+    expect(redact(`${cut}\n\ncommit 826dd7c`)).toBe("[private key]");
+  });
+});
+
 describe("isSecretName", () => {
   it("matches secret suffixes in any case and style", () => {
     for (const n of [
@@ -418,23 +567,25 @@ describe("isSecretName", () => {
 });
 
 describe("redact: performance", () => {
-  const time = (s: string): number => {
+  const time = (s: string, f = redact): number => {
     const t0 = performance.now();
-    redact(s);
+    f(s);
     return performance.now() - t0;
   };
   // warm the regex JIT so the first measured run is not a compile
   redact("warm up DB_PASS=x curl -u a:b Authorization: Basic x".repeat(10));
 
-  it("redacts 100 KB of realistic text in under 20 ms", () => {
+  it("redacts 100 KB of realistic text in under 20 ms, either pass", () => {
     const chunk =
       "Please fix the race in src/session/store.ts where keyEnv is read twice; export DB_PASS=Tr0ub4dor&3x and " +
       'run `curl -u admin:pw https://x` then {"password": "a b c"} and ghp_AbCdEfGhIjKlMnOpQrStUvWxYz0123 ok.\n' +
       "docker login -u me -p pw1x x.io; sshpass -p pw ssh -p 22 h; machine x.io login me password pw\n" +
       "curl -H 'Cookie: sid=abc; t=1' -b 'a=b' https://x and mkdir -p out\n";
     const text = chunk.repeat(Math.ceil(100_000 / chunk.length)).slice(0, 100_000);
-    const best = Math.min(time(text), time(text), time(text));
-    expect(best).toBeLessThan(20);
+    for (const f of [redact, redactSecrets]) {
+      const best = Math.min(time(text, f), time(text, f), time(text, f));
+      expect(best, f.name).toBeLessThan(20);
+    }
   });
 
   it("has no catastrophic backtracking on pathological input", () => {
@@ -498,6 +649,19 @@ describe("redact: performance", () => {
       "a͏_".repeat(n / 3),
       "pass​word： |\n".concat(" x\n".repeat(n / 3)),
       "a： |\n".repeat(n / 5),
+      // redactSecrets' private key rule: a window to END that stops at the next BEGIN
+      "-----BEGIN PRIVATE KEY-----\n".repeat(n / 28),
+      "-----BEGIN PRIVATE KEY-----".concat(" x".repeat(n / 2)),
+      "-----BEGIN PRIVATE KEY-----".concat("\nAAAAAAAAAAAAAAAAAAAA".repeat(n / 21)),
+      "-----BEGIN PRIVATE KEY-----".concat("-----END ".repeat(n / 9)),
+      "-----BEGIN PRIVATE KEY-----\n".concat(" ".repeat(n)),
+      "-----BEGIN PRIVATE KEY-----".concat(`\n${" ".repeat(98)}x`.repeat(n / 100)),
+      "-----BEGIN PRIVATE KEY-----".concat("\n + > - AAAAAAAAAAAAAAAA".repeat(n / 26)),
+      // redactSecrets' lone-key value test and token shapes
+      "key=".concat("a1/".repeat(n / 3)),
+      "key: a1\n".repeat(n / 8),
+      "ya29.".repeat(n / 5),
+      "eyJwYXlsb2FkIjoi".repeat(n / 16),
     ];
     // A quadratic rule on 100 KB is ~5e9 steps (seconds); a linear pass is a few ms. Under
     // parallel load (vitest workers, CI neighbours) an absolute 100 ms flakes, so the bound scales
@@ -505,14 +669,17 @@ describe("redact: performance", () => {
     // input is re-timed before it fails. The bound stays an order of magnitude below a real
     // blow-up, so only a real blow-up fails.
     const plain = "the quick brown fox jumps over the lazy dog 0123456789\n".repeat(n / 55);
-    const baseline = Math.min(time(plain), time(plain), time(plain));
-    const bound = Math.max(100, 25 * baseline);
-    for (const s of inputs) {
-      let t = time(s);
-      for (let retry = 0; retry < 2 && t >= bound; retry++) t = Math.min(t, time(s));
-      expect(t, `${JSON.stringify(s.slice(0, 20))} (bound ${bound.toFixed(0)} ms)`).toBeLessThan(
-        bound,
-      );
+    for (const f of [redact, redactSecrets]) {
+      const baseline = Math.min(time(plain, f), time(plain, f), time(plain, f));
+      const bound = Math.max(100, 25 * baseline);
+      for (const s of inputs) {
+        let t = time(s, f);
+        for (let retry = 0; retry < 2 && t >= bound; retry++) t = Math.min(t, time(s, f));
+        expect(
+          t,
+          `${f.name} ${JSON.stringify(s.slice(0, 20))} (bound ${bound.toFixed(0)} ms)`,
+        ).toBeLessThan(bound);
+      }
     }
   });
 });

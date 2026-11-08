@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { isAbsolute, relative } from "node:path";
+import { redactSecrets } from "../adjudicator/redact.js";
 
 /** Project-relative path; tolerates symlinked roots (macOS /var → /private/var). */
 export function relPath(root: string, fp: string): string {
@@ -114,10 +115,19 @@ function responseText(r: unknown): string {
 function responseFailed(r: unknown): string | undefined {
   if (!r || typeof r !== "object") return undefined;
   const o = r as Record<string, unknown>;
-  if (o.is_error === true || o.isError === true) return clip(responseText(r), 400);
-  if (typeof o.exit_code === "number" && o.exit_code !== 0) return clip(responseText(r), 400);
+  if (o.is_error === true || o.isError === true) return responseText(r);
+  if (typeof o.exit_code === "number" && o.exit_code !== 0) return responseText(r);
   if (typeof o.interrupted === "boolean" && o.interrupted) return "interrupted";
   return undefined;
+}
+
+/**
+ * A failed call's output as the error event keeps it, which persist() also indexes for em_recall:
+ * its secrets masked before the cut (a cut token can be too short for its shape rule), and on the
+ * first 4 KB only, so a failing 2 MB output costs the hook nothing.
+ */
+function errorText(text: string): string {
+  return clip(redactSecrets(text.slice(0, 4096)), 400);
 }
 
 /** Events for one completed (or failed) tool call. */
@@ -188,7 +198,11 @@ export function classifyToolCall(info: ToolCallInfo): Draft[] {
     out.push(
       ev(
         "error",
-        { tool: toolName, summary: summarizeInput(toolName, toolInput), error: clip(failure, 400) },
+        {
+          tool: toolName,
+          summary: redactSecrets(summarizeInput(toolName, toolInput)),
+          error: errorText(failure),
+        },
         toolName,
       ),
     );

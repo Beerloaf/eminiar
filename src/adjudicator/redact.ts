@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 /**
  * Text hygiene for the adjudicator (docs/design/adjudicator.md §6, §12): the cache key, the
  * 80-char head kept in the DB, and the text sent to a remote provider all pass through here.
+ * The index uses redactSecrets() to mask captured command and page output before storing it
+ * (src/index/indexer.ts), which is why this module stays pure (adjudicator-hooks-off.test.ts).
  */
 
 /** Unicode NFKC, CRLF → LF, trailing spaces and runs of blank lines collapsed, trimmed. */
@@ -109,7 +111,10 @@ const ASSIGN_VALUE = new RegExp(
   "y",
 );
 
-function maskAssignments(text: string): string {
+/** A secret name's value that a caller wants left as it is (see keepInOutput). */
+type KeepValue = (name: string, value: string) => boolean;
+
+function maskAssignments(text: string, keep?: KeepValue): string {
   ASSIGN_NAME.lastIndex = 0;
   let out = "";
   let last = 0;
@@ -121,7 +126,7 @@ function maskAssignments(text: string): string {
     if (!v) continue;
     const [value, q, quoted, bare] = v;
     const raw = q ? (quoted ?? "") : (bare ?? "");
-    if (!raw || NOT_A_SECRET_VALUE.test(raw)) continue;
+    if (!raw || NOT_A_SECRET_VALUE.test(raw) || keep?.(m[1] as string, raw)) continue;
     out += text.slice(last, start) + (q ? `${q}***${q}` : "***");
     last = start + value.length;
     ASSIGN_NAME.lastIndex = last;
@@ -206,13 +211,18 @@ type Rule =
   | [RegExp, string | ((...m: string[]) => string)]
   | ["assignments", typeof maskAssignments];
 
+// One BEGIN and END for both private-key rules (redact()'s below, redactSecrets' bounded one).
+const PRIVATE_KEY_BEGIN = "-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----";
+const PRIVATE_KEY_END = "-----END [A-Z0-9 ]{0,60}-----";
+const PRIVATE_KEY_TO_END = new RegExp(
+  `${PRIVATE_KEY_BEGIN}[\\s\\S]*?(?:${PRIVATE_KEY_END}|$)`,
+  "g",
+);
+
 /** Ordered: the specific shapes first, the generic runs last. */
 const RULES: Rule[] = [
   // PEM / OpenSSH / PGP private key blocks, whole (to the END line, or the end of the text).
-  [
-    /-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END [A-Z0-9 ]{0,60}-----|$)/g,
-    "[private key]",
-  ],
+  [PRIVATE_KEY_TO_END, "[private key]"],
   // Credentials inside URLs: scheme://user:pass@host, scheme://:pass@host
   [/\b([a-z][a-z0-9+.-]{0,30}:\/\/)[^\s/:@]*:[^\s/@]+@/gi, "$1***@"],
   // Authorization / Proxy-Authorization headers: the scheme stays, the credentials go.
@@ -318,19 +328,97 @@ const RULES: Rule[] = [
   ],
 ];
 
+// Private key blocks in stored output, where "to the end of the text" would wipe the rest of a
+// 9 MB `git log -p` after one cut-off key in a test fixture. The END line must come within 64 KB
+// and before the next BEGIN (which also keeps the scan linear). A BEGIN without one masks the rest
+// of its line and the base64 lines under it, indented or behind a diff or quote marker.
+const PRIVATE_KEY_BLOCK: Rule = [
+  new RegExp(
+    `${PRIVATE_KEY_BEGIN}(?:(?:(?!-----BEGIN )[\\s\\S]){0,65536}?${PRIVATE_KEY_END}|[^\\n]*(?:\\n[ \\t]*(?:[+>-][ \\t]*)?[A-Za-z0-9+/=]{16,}[ \\t\\r]*)*)`,
+    "g",
+  ),
+  "[private key]",
+];
+
+// Tokens a CLI prints on a line of their own (`gcloud auth print-access-token`, `vault print
+// token`, `aws ecr get-login-password`), which redact() catches only as a base64 run.
+const TOKEN_SHAPES: Rule[] = [
+  [/\bya29\.[A-Za-z0-9_-]{20,}/g, "ya29.***"],
+  [/\b(hv[sbr])\.[A-Za-z0-9_-]{20,}/g, "$1.***"],
+  [/\b(do[por])_v1_[a-f0-9]{64}\b/g, "$1_v1_***"],
+  [/\b(shp(?:at|ca|pa|ss))_[a-fA-F0-9]{32}\b/g, "$1_***"],
+  [/\bpypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{50,}/g, "pypi-***"],
+  // base64 of `{"payload":"`, the ECR login password
+  [/\beyJwYXlsb2FkIjoi[A-Za-z0-9+/=]{64,}/g, "[ecr password]"],
+];
+
+/**
+ * redactSecrets' rules: RULES up to the assignments (the generic runs after them are for remote
+ * text only), with the bounded private-key rule in place of redact()'s and the token shapes added.
+ */
+const ASSIGNMENTS_AT = RULES.findIndex((r) => r[0] === "assignments");
+if (ASSIGNMENTS_AT < 0) throw new Error("redact: RULES has no assignments entry to cut at");
+const STORED_RULES: Rule[] = [
+  ...RULES.slice(0, ASSIGNMENTS_AT).map(
+    (r): Rule => (r[0] === PRIVATE_KEY_TO_END ? PRIVATE_KEY_BLOCK : r),
+  ),
+  ...TOKEN_SHAPES,
+  ["assignments", maskAssignments],
+];
+
+/**
+ * In command output a lone `key` usually names an identifier, not a secret: S3 and DynamoDB
+ * `"Key": "photos/2024/beach.jpg"`, `key: string` in a diff, i18n `key: "greeting.hello"`.
+ * Masking those would hide the very text a search of the output looks for. So its value is kept
+ * when it reads as a name, a path or an id: under 20 characters, no digit or no letter, a dot or
+ * a space, a UUID, an `algo:hex` digest, or short parts between `/ _ - :` with a plain word among
+ * them (`user_123456_avatar`, `logs/2024/11/08/app-1`; a long hex part may follow a `:`, as in
+ * `session:9f3a…`). A long opaque part (`live_<token>`, `prod-<token>`) is masked as under any
+ * secret name.
+ */
+function keepInOutput(name: string, value: string): boolean {
+  if (name.toLowerCase() !== "key") return false;
+  if (value.length < 20 || !/\d/.test(value) || !/[A-Za-z]/.test(value) || /[.\s]/.test(value))
+    return true;
+  if (/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value)) return true;
+  if (/^(?:sha(?:1|224|256|384|512)|md5):[0-9a-f]+$/i.test(value)) return true;
+  const parts = value
+    .split(/[/_-]/)
+    .flatMap((part) => part.split(":").map((text, i) => ({ text, afterColon: i > 0 })));
+  return (
+    parts.length > 1 &&
+    parts.some((p) => /^[a-z]{3,}$/.test(p.text)) &&
+    parts.every((p) => p.text.length < 20 || (p.afterColon && /^[0-9a-f]+$/i.test(p.text)))
+  );
+}
+
+function applyRules(text: string, rules: Rule[], keep?: KeepValue): string {
+  let out = text;
+  for (const rule of rules) {
+    if (rule[0] === "assignments") out = rule[1](out, keep);
+    else if (typeof rule[1] === "string") out = out.replace(rule[0], rule[1]);
+    else out = out.replace(rule[0], rule[1]);
+  }
+  return out;
+}
+
 /**
  * Mask secrets, emails and long hex/base64 runs. Idempotent; linear in the input. The text is
  * cleaned first (default-ignorable characters stripped, NFKC applied), so neither an invisible
  * character nor a fullwidth form can hide a secret's name from the rules.
  */
 export function redact(text: string): string {
-  let out = maskYamlBlocks(clean(text));
-  for (const rule of RULES) {
-    if (rule[0] === "assignments") out = rule[1](out);
-    else if (typeof rule[1] === "string") out = out.replace(rule[0], rule[1]);
-    else out = out.replace(rule[0], rule[1]);
-  }
-  return out;
+  return applyRules(maskYamlBlocks(clean(text)), RULES);
+}
+
+/**
+ * Mask the secrets in command and page output before it is stored: the same shapes and secret
+ * names as redact(), plus a few bare token shapes. Idempotent; linear in the input. Emails, git
+ * SHAs, checksums and base64 stay, and the text is not cleaned, so the stored copy keeps every
+ * other character as printed (nobody hides a name with invisible characters in their own output).
+ */
+export function redactSecrets(text: string): string {
+  return applyRules(maskYamlBlocks(text), STORED_RULES, keepInOutput);
 }
 
 /** The redacted head kept in the DB: at most n chars (code points), with "…" when cut. */

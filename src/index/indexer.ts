@@ -1,6 +1,7 @@
 import { readFileSync, statSync } from "node:fs";
 import { relative, resolve } from "node:path";
 import fg from "fast-glob";
+import { redactSecrets } from "../adjudicator/redact.js";
 import { chunk, hashText, type Kind, kindToContentType } from "../chunker/index.js";
 import { finalize, type RawChunk } from "../chunker/types.js";
 import type { StorageAdapter } from "../storage/adapter.js";
@@ -31,8 +32,41 @@ export interface IndexResult {
   fallback: boolean;
 }
 
+/**
+ * Captured output: what em_execute, em_execute_file, em_batch_execute and em_fetch_and_index
+ * store. Unlike a project file or a memory, the index holds the only copy, it outlives the session
+ * and any later em_search reads it, so secrets are masked before it is chunked. What the tools
+ * show inline (small outputs, the head/tail preview) is as printed; sections they return for an
+ * intent or queries come from this masked copy.
+ */
+const CAPTURED = new Set<Source>(["exec", "batch", "url"]);
+
+/** A captured document as stored: title, content, pre-cut chunks and string meta masked. */
+function maskCaptured(input: IndexInput): IndexInput {
+  const meta = input.meta
+    ? Object.fromEntries(
+        Object.entries(input.meta).map(([k, v]) => [
+          k,
+          typeof v === "string" ? redactSecrets(v) : v,
+        ]),
+      )
+    : undefined;
+  return {
+    ...input,
+    title: redactSecrets(input.title),
+    content: redactSecrets(input.content),
+    meta,
+    chunks: input.chunks?.map((c) => ({
+      ...c,
+      title: redactSecrets(c.title),
+      body: redactSecrets(c.body),
+    })),
+  };
+}
+
 /** Chunk + store one piece of content. Unchanged uri+content is a no-op (created=false). */
-export function indexContent(db: StorageAdapter, input: IndexInput): IndexResult {
+export function indexContent(db: StorageAdapter, raw: IndexInput): IndexResult {
+  const input = CAPTURED.has(raw.source) ? maskCaptured(raw) : raw;
   const kind =
     input.kind ??
     (input.contentType === "code" ? "code" : input.contentType === "json" ? "json" : undefined);

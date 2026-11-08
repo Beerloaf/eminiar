@@ -291,7 +291,9 @@ Your code, tool output and memories stay on your machine. eminiar uses the netwo
 - only if you turn on the adjudicator with a remote provider and agree to it: send redacted
   prompt and task text to that provider ([what is sent](docs/adjudicator.md#providers-and-privacy)).
 
-The dashboard listens on `127.0.0.1` only.
+The dashboard listens on `127.0.0.1` only. On disk, `~/.eminiar` is readable by your user alone
+(macOS and Linux), and secrets with a known shape or name are masked in stored command and page
+output ([what is kept as written](docs/how-it-works.md#privacy-and-data)).
 
 ## About
 

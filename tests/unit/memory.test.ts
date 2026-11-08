@@ -11,6 +11,8 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getContext, type ProjectContext, resetContextCache } from "../../src/context.js";
 import { impact } from "../../src/graph/query.js";
+import { persist } from "../../src/hooks/capture.js";
+import { handlers } from "../../src/hooks/index.js";
 import { parseMemoryFile, serializeMemoryFile } from "../../src/memory/frontmatter.js";
 import {
   autoName,
@@ -28,6 +30,7 @@ import {
 import { search } from "../../src/search/pipeline.js";
 import type { StorageAdapter } from "../../src/storage/adapter.js";
 import { closeAllStorage, getStorage } from "../../src/storage/index.js";
+import { emExecute } from "../../src/tools/em_execute.js";
 import { emMemory } from "../../src/tools/em_memory.js";
 import { emPurge } from "../../src/tools/em_purge.js";
 import { emRecall } from "../../src/tools/em_recall.js";
@@ -318,6 +321,63 @@ describe("memory tools", () => {
     reconcile(ctx, db);
     expect(db.memoryCount()).toBe(before);
     expect(db.graphGetNode("memory:auth/session-tokens")).toBeDefined();
+  });
+
+  it("keeps a failed command's error text in session history with its secrets masked", async () => {
+    const token = "ghp_Q1w2E3r4T5y6U7i8O9p0A1s2D3f4G5h6J7k8";
+    const input = { language: "shell", code: `echo "fatal: auth GH_TOKEN=${token}" >&2; exit 2` };
+    const reply = await emExecute.handler(input, ctx);
+    expect(reply.isError).toBe(true);
+    await handlers.PostToolUse?.({
+      session_id: "s-err",
+      cwd: root,
+      hook_event_name: "PostToolUse",
+      tool_name: "mcp__plugin_eminiar_eminiar__em_execute",
+      tool_input: input,
+      tool_response: reply,
+    });
+    const recalled = textOf(await emRecall.handler({ query: "fatal auth" }, ctx));
+    expect(recalled).toContain("[session error]");
+    expect(recalled).toContain("GH_TOKEN=***");
+    expect(
+      (await search(db, "Q1w2E3r4T5y6U7i8", { mode: "lexical", filters: { source: "session" } }))
+        .hits,
+    ).toHaveLength(0);
+
+    // a failed native Bash call: its command line is stored with the error, masked too
+    await handlers.PostToolUse?.({
+      session_id: "s-err",
+      cwd: root,
+      hook_event_name: "PostToolUse",
+      tool_name: "Bash",
+      tool_input: { command: `curl -fsS -H "Authorization: Bearer ${token}" https://x.invalid` },
+      tool_response: { exit_code: 6, stdout: "", stderr: "curl: (6) Could not resolve host" },
+    });
+    const bash = textOf(await emRecall.handler({ query: "resolve host" }, ctx));
+    expect(bash).toContain("Authorization: Bearer ***");
+    expect(
+      (await search(db, "Q1w2E3r4T5y6U7i8", { mode: "lexical", filters: { source: "session" } }))
+        .hits,
+    ).toHaveLength(0);
+  }, 30_000);
+
+  it("em_purge sessions also drops the session history em_recall returns", async () => {
+    persist(db, "s-purge", [
+      {
+        sessionId: "s-purge",
+        category: "constraint",
+        priority: 2,
+        payload: { text: "never deploy the zebrafish service on a Friday" },
+      },
+    ]);
+    const recall = async () => textOf(await emRecall.handler({ query: "zebrafish deploy" }, ctx));
+    expect(await recall()).toContain("[session constraint]");
+    const memories = db.countDocuments("memory");
+    await emPurge.handler({ scope: "sessions", confirm: true }, ctx);
+    expect(await recall()).not.toContain("[session");
+    expect(db.countDocuments("session")).toBe(0);
+    // memories are not session data
+    expect(db.countDocuments("memory")).toBe(memories);
   });
 });
 
