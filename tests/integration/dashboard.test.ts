@@ -1,4 +1,12 @@
-import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { request } from "node:http";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -313,6 +321,52 @@ describe("dashboard", () => {
       (await post("/api/actions", { action: "reindex", scope: "code", paths: ["src/a.ts"] })).body,
     ) as { output: string };
     expect(one.output).toContain("1 scanned");
+  });
+
+  it("refuses files a Read deny or ask rule matches in the file viewer", async () => {
+    // Rules also come from ~/.claude/settings.json; keep the developer's own rules out of it.
+    const home = process.env.HOME;
+    const userHome = mkdtempSync(join(tmpdir(), "em-userhome-"));
+    process.env.HOME = userHome;
+    mkdirSync(join(root, ".claude"), { recursive: true });
+    mkdirSync(join(root, "vault"), { recursive: true });
+    writeFileSync(
+      join(root, ".claude", "settings.json"),
+      JSON.stringify({ permissions: { deny: ["Read(**/creds.txt)"], ask: ["Read(**/vault/**)"] } }),
+    );
+    writeFileSync(join(root, "creds.txt"), "SECRET=1\n");
+    writeFileSync(join(root, "vault", "key.txt"), "k\n");
+    symlinkSync(join(root, "creds.txt"), join(root, "link.txt"));
+    try {
+      for (const path of ["creds.txt", "link.txt", "vault/key.txt", "missing/creds.txt"]) {
+        const r = await get(`/api/file?path=${encodeURIComponent(path)}`);
+        expect([r.status, r.body], path).toEqual([403, expect.stringContaining("refused")]);
+        expect(r.body).not.toContain("SECRET");
+      }
+      expect((await get("/api/file?path=src/a.ts")).status).toBe(200);
+    } finally {
+      for (const p of [".claude", "vault", "creds.txt", "link.txt"])
+        rmSync(join(root, p), { recursive: true, force: true });
+      rmSync(userHome, { recursive: true, force: true });
+      if (home === undefined) delete process.env.HOME;
+      else process.env.HOME = home;
+    }
+  });
+
+  it("answers 400, not 500, for an invalid memory name", async () => {
+    writeFileSync(join(root, "victim.md"), "keep me\n");
+    try {
+      const name = encodeURIComponent("../../victim");
+      expect((await get(`/api/memories?name=${name}`)).status).toBe(400);
+      const del = await get(`/api/memories?name=${name}`, {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+      });
+      expect([del.status, del.body]).toEqual([400, expect.stringContaining("invalid memory name")]);
+      expect(readFileSync(join(root, "victim.md"), "utf8")).toBe("keep me\n");
+    } finally {
+      rmSync(join(root, "victim.md"), { force: true });
+    }
   });
 
   it("answers the usage endpoints", async () => {

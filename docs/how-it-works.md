@@ -213,7 +213,9 @@ root.
   with a `Read(<path>)` allow rule. A matching `Read` deny or `ask` rule refuses the path, inside
   the root or out, even when an allow rule matches. The path as written, its symlink target and
   (on macOS) its on-disk letter case are all checked. This guards the `path` only: the code you
-  pass is checked against Bash rules like any snippet, and can still open other files.
+  pass is checked against Bash rules like any snippet, and can still open other files. `em_index`
+  applies the same check to its `path`, and skips (and lists) the files under a directory that
+  a rule matches.
 - **Read rule forms:** a `Read` pattern is matched as a `*` / `**` glob against the absolute
   path, after a leading `~` becomes your home folder, so `Read(**/.env)` and `Read(~/.ssh/**)`
   match. These do not match yet: Claude Code's relative forms (`./.env`, `.env`, `/path` from the

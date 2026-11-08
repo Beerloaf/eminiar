@@ -3,6 +3,7 @@ import {
   mkdirSync,
   mkdtempSync,
   realpathSync,
+  rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -18,9 +19,10 @@ import { confinePath } from "../../src/sandbox/file.js";
 import { prepareCode, resolveLanguage } from "../../src/sandbox/languages.js";
 import { processOutput } from "../../src/sandbox/output.js";
 import { runProcess } from "../../src/sandbox/run.js";
-import { closeAllStorage } from "../../src/storage/index.js";
+import { closeAllStorage, getStorage } from "../../src/storage/index.js";
 import { SqliteAdapter } from "../../src/storage/sqlite/adapter.js";
 import { chooseInline, emBatchExecute } from "../../src/tools/em_batch_execute.js";
+import { emIndex } from "../../src/tools/em_index.js";
 
 let ctx: ProjectContext;
 let db: SqliteAdapter;
@@ -304,4 +306,63 @@ describe("confinePath", () => {
       );
     },
   );
+});
+
+describe("em_index Read rules", () => {
+  // Rules also come from ~/.claude/settings.json; keep the developer's own rules out of it.
+  const home = process.env.HOME;
+  const made: string[] = [];
+  let ictx: ProjectContext;
+  const textOf = (r: { content: Array<{ text: string }> }) =>
+    r.content.map((c) => c.text).join("\n");
+  beforeAll(() => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "em-index-read-")));
+    const userHome = mkdtempSync(join(tmpdir(), "em-userhome-"));
+    made.push(root, userHome);
+    process.env.HOME = userHome;
+    mkdirSync(join(root, ".claude"));
+    writeFileSync(
+      join(root, ".claude", "settings.json"),
+      JSON.stringify({ permissions: { deny: ["Read(**/creds.md)"], ask: ["Read(**/vault/**)"] } }),
+    );
+    mkdirSync(join(root, "notes", "vault"), { recursive: true });
+    writeFileSync(join(root, "notes", "guide.md"), "# Guide\n\nOrdinary notes.\n");
+    writeFileSync(join(root, "notes", "vault", "keys.md"), "# Keys\n\nhunter2\n");
+    writeFileSync(join(root, "notes", "creds.md"), "# Creds\n\nSECRET=1\n");
+    // A symlink with an innocent name: its target is what the rule matches.
+    symlinkSync(join(root, "notes", "creds.md"), join(root, "notes", "link.md"));
+    ictx = {
+      root,
+      id: "em-index-read",
+      dbPath: join(process.env.EMINIAR_HOME!, "index-read.db"),
+      config: ConfigSchema.parse({ embeddings: { enabled: false } }),
+    };
+  });
+  afterAll(() => {
+    if (home === undefined) delete process.env.HOME;
+    else process.env.HOME = home;
+    for (const d of made) rmSync(d, { recursive: true, force: true });
+  });
+
+  it("refuses a file a Read deny or ask rule matches, like em_execute_file", async () => {
+    const denied = await emIndex.handler({ path: "notes/creds.md" }, ictx);
+    expect(denied.isError).toBe(true);
+    expect(textOf(denied)).toMatch(/refused by permission rule Read\(\*\*\/creds\.md\) \(deny\)/);
+    const viaLink = await emIndex.handler({ path: "notes/link.md" }, ictx);
+    expect(viaLink.isError).toBe(true);
+    const asked = await emIndex.handler({ path: "notes/vault/keys.md" }, ictx);
+    expect(textOf(asked)).toMatch(/\(ask\)/);
+  });
+
+  it("indexes the rest of a directory and reports the files it skipped", async () => {
+    const out = textOf(await emIndex.handler({ path: "notes", glob: ["**/*.md"] }, ictx));
+    expect(out).toContain("1 indexed");
+    expect(out).toMatch(/skipped notes\/creds\.md: refused by permission rule .* \(deny\)/);
+    expect(out).toMatch(/skipped notes\/link\.md: refused by permission rule .* \(deny\)/);
+    expect(out).toMatch(/skipped notes\/vault\/keys\.md: refused by permission rule .* \(ask\)/);
+    const docs = getStorage(ictx)
+      .documentsBySource("file")
+      .map((d) => d.title);
+    expect(docs).toEqual(["notes/guide.md"]);
+  });
 });

@@ -272,13 +272,22 @@ export async function serve(opts: { port: number; open: boolean; root?: string }
             return json(res, 400, { error: (err as Error).message });
           }
         }
+        // An invalid name is the caller's error (400), like PUT and PATCH, not a server one.
         if (method === "DELETE") {
-          const removed = deleteMemory(ctx(), name || num("id", 0));
-          return json(res, 200, { ok: removed });
+          try {
+            const removed = deleteMemory(ctx(), name || num("id", 0));
+            return json(res, 200, { ok: removed });
+          } catch (err) {
+            return json(res, 400, { error: (err as Error).message });
+          }
         }
         if (name) {
-          const m = memoryBody(ctx(), name);
-          return m ? json(res, 200, m) : json(res, 404, { error: "not found" });
+          try {
+            const m = memoryBody(ctx(), name);
+            return m ? json(res, 200, m) : json(res, 404, { error: "not found" });
+          } catch (err) {
+            return json(res, 400, { error: (err as Error).message });
+          }
         }
         return json(
           res,

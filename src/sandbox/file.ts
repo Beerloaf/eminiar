@@ -1,4 +1,4 @@
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import type { PermissionRules } from "../permissions/rules.js";
 import { matchRead } from "../permissions/rules.js";
@@ -34,7 +34,29 @@ export function confinePath(root: string, target: string, rules: PermissionRules
   );
 }
 
+/**
+ * Why `abs` must not be read, or undefined: the Read deny and ask rules checked as confinePath
+ * checks them (the path as written, then, when it exists, its resolved forms) and worded as its
+ * refusal. For readers that keep their own root rules: em_index and the dashboard file viewer.
+ */
+export function readRefusal(
+  rules: PermissionRules,
+  abs: string,
+  target: string,
+): string | undefined {
+  let check = checkRead(rules, [abs]);
+  try {
+    if (check.allowed && existsSync(abs)) check = checkReadPath(rules, abs);
+  } catch {
+    // removed after the existence check: the reader reports it as missing
+  }
+  return check.allowed ? undefined : refusal(check, target);
+}
+
+function refusal(check: ReadCheck, target: string): string {
+  return `refused by permission rule ${check.rule} (${check.kind}) on path: ${target}`;
+}
+
 function refuse(check: ReadCheck, target: string): void {
-  if (!check.allowed)
-    throw new Error(`refused by permission rule ${check.rule} (${check.kind}) on path: ${target}`);
+  if (!check.allowed) throw new Error(refusal(check, target));
 }

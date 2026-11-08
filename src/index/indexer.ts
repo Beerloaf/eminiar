@@ -1,8 +1,9 @@
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { relative, resolve } from "node:path";
 import fg from "fast-glob";
 import { chunk, hashText, type Kind, kindToContentType } from "../chunker/index.js";
 import { finalize, type RawChunk } from "../chunker/types.js";
+import { within } from "../docs/manifest.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import type { ContentType, Source } from "../storage/types.js";
 
@@ -117,6 +118,30 @@ export interface IndexPathOptions {
         rel: string,
       ) => { content: string; title?: string | undefined; kind?: Kind | undefined } | undefined)
     | undefined;
+  /**
+   * Why a file found under the target must not be read (a Read deny rule, a symlink out of the
+   * project), or undefined. Refused files are reported in `skipped` and never opened; the
+   * target itself is the caller's to check.
+   */
+  refuse?: ((file: string) => string | undefined) | undefined;
+}
+
+/**
+ * An IndexPathOptions.refuse for paths that must stay inside `root` once symlinks are resolved
+ * (fast-glob follows them), so a committed `docs/link -> ~` cannot index the home folder. A path
+ * that cannot be resolved is left to the reader, which reports it.
+ */
+export function refuseOutside(root: string): (file: string) => string | undefined {
+  const realRoot = realpathSync.native(root);
+  return (file) => {
+    let real: string;
+    try {
+      real = realpathSync.native(file);
+    } catch {
+      return undefined;
+    }
+    return within(real, realRoot) ? undefined : "refused, it resolves outside the project";
+  };
 }
 
 export function indexPath(
@@ -149,6 +174,11 @@ export function indexPath(
     summary.files++;
     const rel = relative(root, file) || file;
     try {
+      const refused = opts.refuse?.(file);
+      if (refused) {
+        summary.skipped.push({ path: rel, reason: refused });
+        continue;
+      }
       const size = statSync(file).size;
       if (size > MAX_FILE_BYTES) {
         summary.skipped.push({ path: rel, reason: `too large (${size} bytes)` });

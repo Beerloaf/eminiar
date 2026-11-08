@@ -1,10 +1,18 @@
+import { resolve } from "node:path";
 import type { ProjectContext } from "../context.js";
 import { kickEmbedding } from "../embeddings/queue.js";
 import { type Fetched, fetchMarkdown } from "../fetch/fetcher.js";
-import { indexContent, indexPath } from "../index/indexer.js";
+import { indexContent, indexPath, refuseOutside } from "../index/indexer.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import { syncDocsGraphQuietly } from "./graph.js";
-import { type DocSource, docsTag, readManifest, setSyncState } from "./manifest.js";
+import {
+  clearSyncState,
+  type DocSource,
+  docsTag,
+  manifestPath,
+  probeManifestAt,
+  setSyncState,
+} from "./manifest.js";
 import { looksLikeSpec, specToMarkdown } from "./specs.js";
 
 export interface SyncResult {
@@ -195,11 +203,24 @@ function syncPathSource(
   opts: SyncOptions,
 ): void {
   const tag = docsTag(src.name);
+  // The manifest is committed: its path, and every file a directory walk finds, must stay
+  // inside the project once symlinks are resolved.
+  const refuse = refuseOutside(ctx.root);
+  const target = src.path as string;
+  const refused = refuse(resolve(ctx.root, target));
+  if (refused) {
+    // What this source indexed before (e.g. by a version without this check) goes too.
+    db.deleteDocumentsBySource(tag);
+    r.skipped = 1;
+    r.errors.push(`${target}: ${refused}`);
+    return;
+  }
   if (opts.force) db.deleteDocumentsBySource(tag);
-  const s = indexPath(db, ctx.root, src.path as string, {
+  const s = indexPath(db, ctx.root, target, {
     source: tag,
     globs: src.glob ?? ctx.config.index.docs,
     recursive: true,
+    refuse,
     transform: (content, rel) => {
       const max = ctx.config.docs.crawl.maxPageBytes;
       if (!looksLikeSpec(rel, content))
@@ -268,25 +289,37 @@ export async function syncSources(
   names?: string[] | undefined,
   opts: SyncOptions = {},
 ): Promise<SyncResult[]> {
-  const m = readManifest(ctx);
+  // readManifest, plus the entries it dropped for a path outside the project.
+  const p = probeManifestAt(manifestPath(ctx), { root: ctx.root });
+  const m = p.state === "ok" ? p.manifest : { version: 1 as const, sources: [] };
+  const outside = new Set(p.state === "ok" ? (p.outside ?? []) : []);
+  const registered = (name: string) => m.sources.some((s) => s.name === name);
   const wanted = names?.length ? m.sources.filter((s) => names.includes(s.name)) : m.sources;
   const out: SyncResult[] = [];
-  for (const name of names ?? []) {
-    if (!m.sources.some((s) => s.name === name))
-      out.push({
-        name,
-        kind: "url",
-        pages: 0,
-        indexed: 0,
-        unchanged: 0,
-        cached: 0,
-        chunks: 0,
-        skipped: 0,
-        specs: 0,
-        truncated: 0,
-        errors: ["not registered"],
-        ms: 0,
-      });
+  const failed = (name: string, kind: DocSource["kind"], error: string): SyncResult => ({
+    name,
+    kind,
+    pages: 0,
+    indexed: 0,
+    unchanged: 0,
+    cached: 0,
+    chunks: 0,
+    skipped: 0,
+    specs: 0,
+    truncated: 0,
+    errors: [error],
+    ms: 0,
+  });
+  for (const name of names ?? [])
+    if (!registered(name) && !outside.has(name)) out.push(failed(name, "url", "not registered"));
+  // Such an entry indexes nothing, and what an earlier version indexed for it goes too, so a
+  // hand-edited `../docs` is reported on every sync rather than served from old pages.
+  for (const name of outside) {
+    if (registered(name) || (names?.length && !names.includes(name))) continue;
+    const removed = db.deleteDocumentsBySource(docsTag(name));
+    if (removed) clearSyncState(db, name);
+    const note = removed ? `; ${removed} earlier page(s) removed` : "";
+    out.push(failed(name, "path", `ignored: its path is outside the project${note}`));
   }
   for (const src of wanted) out.push(await syncSource(ctx, db, src, opts));
   // Pages just (re)indexed may name different code files: refresh the doc nodes' edges.

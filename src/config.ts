@@ -11,9 +11,11 @@ export type RoutingMode = z.infer<typeof RoutingMode>;
 /**
  * A relative path that stays inside the folder it is joined to: not empty, no leading `/` or
  * `\`, no drive letter, no `..` segment (either separator), no control character (`\p{Cc}`: NUL, newline,
- * ...). Lexical only: symlinks are checked where the path is used (src/docs/manifest.ts). The
- * `..` lookahead reads `[\s\S]` so a line break could never hide a segment from it, and it also
- * refuses `.. ` / `...` segments, which Windows trims to `..` (trailing dots and spaces).
+ * ...). Lexical only: symlinks are checked where the path is used (the docs manifest in
+ * src/docs/manifest.ts, docs path sources by refuseOutside in src/index/indexer.ts, memory files
+ * in reconcile in src/memory/store.ts). The `..` lookahead reads `[\s\S]` so a line break could
+ * never hide a segment from it, and it also refuses `.. ` / `...` segments, which Windows trims
+ * to `..` (trailing dots and spaces).
  */
 export const PROJECT_RELATIVE_PATH_RE =
   /^(?![/\\])(?![A-Za-z]:)(?!(?:[\s\S]*[/\\])?\.\.[. ]*(?:[/\\]|$))[^\p{Cc}]+$/u;
@@ -368,8 +370,14 @@ const BaseConfigSchema = z.object({
     .prefault({}),
   memories: z
     .object({
-      /** Project-relative directory of markdown memory files (`<topic>/<name>.md`); commit it. */
-      dir: z.string().default(".eminiar/memories"),
+      /**
+       * Project-relative directory of markdown memory files (`<topic>/<name>.md`); commit it.
+       * Absolute paths and `..` segments are refused: reconcile repairs the headers of files there.
+       */
+      dir: z
+        .string()
+        .regex(PROJECT_RELATIVE_PATH_RE, "must be a path inside the project (no leading / or ..)")
+        .default(".eminiar/memories"),
     })
     .prefault({}),
   recall: z
@@ -869,26 +877,34 @@ function projectLayer(raw: Record<string, unknown>): Record<string, unknown> {
   return { ...(ownJson(raw) as Record<string, unknown>), adjudicator: kept };
 }
 
+/** Paths joined to the project root and written through, as [section, key]. */
+const PROJECT_PATH_KEYS = [
+  ["docs", "manifest"],
+  ["memories", "dir"],
+] as const;
+
 /**
- * A config layer without a docs.manifest that could leave the project (absolute, `..`, not a
- * string): em_docs rewrites that file, so a cloned repo must not aim it at ../settings.json, and a
- * bad personal value must not cost the rest of the personal config. Only that key is dropped, so
- * the next layer's or the default value applies and everything else stays. `source` names the
- * file in the stderr note. The real guard stays at write time (src/docs/manifest.ts).
+ * A config layer without a PROJECT_PATH_KEYS value that could leave the project (absolute, `..`,
+ * not a string): em_docs rewrites the docs manifest and reconcile repairs memory file headers,
+ * so a cloned repo must not aim them at ../settings.json or ~, and a bad personal value must not
+ * cost the rest of the personal config. Only that key is dropped, so the next layer's or the
+ * default value applies and everything else stays. `source` names the file in the stderr note.
+ * The real guard for the manifest stays at write time (src/docs/manifest.ts).
  */
-function withoutUnsafeDocsManifest(
-  raw: Record<string, unknown>,
-  source: string,
-): Record<string, unknown> {
-  const docs = raw.docs;
-  if (!isPlainObject(docs) || !Object.hasOwn(docs, "manifest")) return raw;
-  const m = docs.manifest;
-  if (typeof m === "string" && PROJECT_RELATIVE_PATH_RE.test(m)) return raw;
-  process.stderr.write(
-    `eminiar: ignoring docs.manifest ${JSON.stringify(m)} in ${source}: it must be a path inside the project\n`,
-  );
-  const { manifest: _dropped, ...rest } = ownJson(docs) as Record<string, unknown>;
-  return { ...(ownJson(raw) as Record<string, unknown>), docs: rest };
+function withoutUnsafePaths(raw: Record<string, unknown>, source: string): Record<string, unknown> {
+  let out = raw;
+  for (const [section, key] of PROJECT_PATH_KEYS) {
+    const sec = out[section];
+    if (!isPlainObject(sec) || !Object.hasOwn(sec, key)) continue;
+    const v = sec[key];
+    if (typeof v === "string" && PROJECT_RELATIVE_PATH_RE.test(v)) continue;
+    process.stderr.write(
+      `eminiar: ignoring ${section}.${key} ${JSON.stringify(v)} in ${source}: it must be a path inside the project\n`,
+    );
+    const { [key]: _dropped, ...rest } = ownJson(sec) as Record<string, unknown>;
+    out = { ...(ownJson(out) as Record<string, unknown>), [section]: rest };
+  }
+  return out;
 }
 
 /**
@@ -903,7 +919,7 @@ function personalLayer(projectRoot: string): Record<string, unknown> {
     !droppedProjectAdjudicatorKeys(raw).length || personalConfigTrusted(projectRoot, file)
       ? raw
       : projectLayer(raw);
-  return withoutUnsafeDocsManifest(layer, file);
+  return withoutUnsafePaths(layer, file);
 }
 
 /**
@@ -914,7 +930,7 @@ export function loadConfig(projectRoot: string): Config {
   const merged = deepMerge(
     deepMerge(
       personalLayer(projectRoot),
-      withoutUnsafeDocsManifest(
+      withoutUnsafePaths(
         projectLayer(readJson(join(projectRoot, "eminiar.config.json"))),
         "eminiar.config.json",
       ),

@@ -17,6 +17,8 @@ import {
   routes,
 } from "../graph/query.js";
 import { indexFreshness, MAX_CODE_BYTES } from "../graph/reindex.js";
+import { loadPermissionRules } from "../permissions/settings.js";
+import { readRefusal } from "../sandbox/file.js";
 import { getStorage } from "../storage/index.js";
 import type { GraphEdgeRow, GraphNodeRow } from "../storage/types.js";
 import { indexStatus } from "../tools/em_index_status.js";
@@ -114,11 +116,16 @@ export function treePayload(ctx: ProjectContext) {
   return { root: ctx.root, files };
 }
 
-/** Project file for the source viewer; refuses paths outside the root (including via symlinks). */
+/**
+ * Project file for the source viewer; refuses paths outside the root (including via symlinks)
+ * and paths a Claude Code Read deny or ask rule matches, checked as em_execute_file does.
+ */
 export function filePayload(ctx: ProjectContext, rel: string) {
   const clean = rel.replace(/^\.\//, "");
   const abs = resolve(ctx.root, clean);
   if (relative(ctx.root, abs).startsWith("..")) throw new Error("path outside the project");
+  const refused = readRefusal(loadPermissionRules(ctx.root), abs, clean);
+  if (refused) throw new Error(refused);
   let real = abs;
   try {
     real = realpathSync(abs);
