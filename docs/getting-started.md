@@ -147,7 +147,8 @@ The installer reads the committed `eminiar.config.json`.
 
 ## Status line
 
-Add this to `~/.claude/settings.json`, or pass `--statusline` to `install`:
+Add this to `~/.claude/settings.json` (`$CLAUDE_CONFIG_DIR/settings.json` when you set
+`CLAUDE_CONFIG_DIR`), or pass `--statusline` to `install`:
 
 ```json
 { "statusLine": { "type": "command", "command": "eminiar statusline" } }

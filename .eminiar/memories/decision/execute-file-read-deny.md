@@ -4,7 +4,7 @@ kind: decision
 tags: [security, permissions, sandbox, routing]
 related: [file:src/permissions/settings.ts, file:src/permissions/rules.ts, file:src/sandbox/file.ts, file:src/hooks/routing.ts, file:src/tools/em_execute_file.ts, file:tests/unit/sandbox.test.ts, file:tests/unit/permissions.test.ts, file:tests/unit/hooks.test.ts]
 created: 2026-10-24T19:40:00.000Z
-updated: 2026-10-24T20:40:00.000Z
+updated: 2026-11-08T13:30:00.000Z
 ---
 
 em_execute_file honours Claude Code's `Read` deny and ask rules for its `path`, not only the project-root boundary (2026-10-24, branch fix/execute-file-read-deny).
@@ -20,4 +20,4 @@ em_execute_file honours Claude Code's `Read` deny and ask rules for its `path`, 
   - `matchRead` does not yet understand Claude Code's relative forms (`./.env`, `.env`, `/x` from the settings file, `//abs`), `?`, `[...]`, or a `/**/` that matches no folder;
   - em_index takes any path with no root or Read check;
   - routing still redirects big Reads outside the root, which em_execute_file refuses;
-  - only user, project and local settings are read (no managed settings or `CLAUDE_CONFIG_DIR`).
+  - only user, project and local settings are read (no managed settings). `CLAUDE_CONFIG_DIR` is honoured since 2026-11-08 (branch fix/claude-config-dir): the user file is `$CLAUDE_CONFIG_DIR/settings.json` when set, through `claudeConfigDir` in src/paths.ts, and the rules cache key includes it.

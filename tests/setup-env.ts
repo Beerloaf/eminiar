@@ -3,3 +3,8 @@
 delete process.env.EMINIAR_PROJECT_ROOT;
 delete process.env.CLAUDE_PROJECT_DIR;
 delete process.env.EMINIAR_SESSION_ID;
+// It may also run under another Claude Code account (CLAUDE_CONFIG_DIR) or plugins root; tests
+// that point HOME at a temp dir must not read that account's settings, agents or plugins.
+delete process.env.CLAUDE_CONFIG_DIR;
+delete process.env.CLAUDE_CODE_PLUGIN_CACHE_DIR;
+delete process.env.EMINIAR_CLAUDE_DIR;

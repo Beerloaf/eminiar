@@ -7,7 +7,7 @@ import type { HookHandler, HookInput, HookOutput } from "../hooks/types.js";
 import { resolveProjectRoot, sessionRoot } from "../project.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import { getStorage } from "../storage/index.js";
-import { syncAgents } from "./agents.js";
+import { EXEC_TOOLS, roleHasShell, syncAgents } from "./agents.js";
 import { workerBrief } from "./brief.js";
 import {
   activeSwarmConfig,
@@ -62,7 +62,7 @@ const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v 
  * undefined when absent. Reservation (PreToolUse) and release (PostToolUse / failure) both
  * read it, so they always agree on the type a spawn was recorded under.
  */
-function spawnType(input: Pick<HookInput, "tool_input">): string | undefined {
+export function spawnType(input: Pick<HookInput, "tool_input">): string | undefined {
   return str(input.tool_input?.subagent_type)?.trim() || undefined;
 }
 
@@ -594,6 +594,31 @@ export function swarmTouch(ctx: ProjectContext, input: HookInput): void {
   } catch (err) {
     fail("touch", err);
   }
+}
+
+/**
+ * Does the swarm worker type `agentType` lack the em_* tool `tool`? Only the command runners
+ * are ever left out, for a role without Bash (roleHasShell), so routing neither denies toward
+ * them nor tells the worker to use them. A role that lists an em_execute name in its own
+ * `tools` without Bash still counts as lacking it: at worst a routing hint is not given.
+ * Swarm files only (swarmRoots), no context or database. Never throws.
+ */
+export function workerLacksTool(
+  input: Pick<HookInput, "cwd">,
+  agentType: string | undefined,
+  tool: string,
+): boolean {
+  if (!EXEC_TOOLS.has(tool) || !isSwarmAgentType(agentType)) return false;
+  try {
+    for (const dir of swarmRoots(input)) {
+      const config = activeSwarmConfig(dir);
+      const found = config && findRole(config, agentType);
+      if (found) return !roleHasShell(found.role);
+    }
+  } catch (err) {
+    fail("shell", err);
+  }
+  return false;
 }
 
 function allowWith(updatedInput: Record<string, unknown>): HookOutput {

@@ -22,13 +22,31 @@ eminiar merges four layers. A later layer overrides an earlier one.
 
 ## Example
 
+A project `eminiar.config.json` (`~/.eminiar/config.json` takes the same keys):
+
 ```json
 {
   "routing": { "mode": "enforce" },
-  "sandbox": { "timeoutMs": 120000, "envAllow": ["MY_API_TOKEN"] },
-  "graph": { "exclude": ["**/generated/**"] },
+  "sandbox": { "timeoutMs": 120000 },
   "recall": { "maxMemories": 5 },
   "docs": { "crawl": { "maxPages": 20 } }
+}
+```
+
+Objects merge key by key. Any other value replaces the one from the earlier layer, lists
+included: a list you set replaces the built-in list, and one in the project file also replaces
+your personal one. Lists cannot add to each other yet, so to skip one more folder, repeat the
+default excludes:
+
+```json
+{
+  "graph": {
+    "exclude": [
+      "**/node_modules/**", "**/dist/**", "**/build/**", "**/.git/**", "**/coverage/**",
+      "**/*.d.ts", "**/.venv/**", "**/venv/**", "**/__pycache__/**", "**/site-packages/**",
+      "**/vendor/**", "**/*.min.js", "**/*.blade.php", "**/generated/**"
+    ]
+  }
 }
 ```
 
@@ -71,7 +89,7 @@ eminiar merges four layers. A later layer overrides an earlier one.
 | Key | Default | Description |
 |---|---|---|
 | `include` | `**/*.{ts,tsx,js,jsx,mjs,cjs,py,go,php}` | Files to parse |
-| `exclude` | `node_modules`, `dist`, `build`, `.git`, `coverage`, `*.d.ts`, virtualenvs, `__pycache__`, `site-packages`, `vendor`, `*.min.js`, `*.blade.php` | Files to skip |
+| `exclude` | `node_modules`, `dist`, `build`, `.git`, `coverage`, `*.d.ts`, virtualenvs, `__pycache__`, `site-packages`, `vendor`, `*.min.js`, `*.blade.php` | Files to skip. Setting it replaces this whole list |
 
 ### `git`
 
@@ -172,12 +190,13 @@ only:
 - It must not hold a key. A field named like `apiKey`, `token`, `secret` or `password` makes the
   config invalid. Keys go in `~/.eminiar/adjudicator.key` (`eminiar adjudicator key set`) or an
   environment variable named by `keyEnv`.
-- Only `enabled`, `mode`, `surfaces`, `promptMode`, `minPromptChars`, `tiers`, `weights`,
-  `apply`, `advice`, `embedding`, `learning` and `cache` may be set in the committed
-  `eminiar.config.json`. Everything that decides where text and keys go or how much is spent
-  (`provider`, `typesafe`, `openai`, `keyEnv`, `remoteConsent`, `remoteConsentOrigins`,
-  `privacy`, `budget`, `timeouts`, `breaker`) comes from `~/.eminiar/config.json` only, and from
-  there only while that file is outside the project (see `EMINIAR_HOME` below).
+- Only `enabled`, `surfaces`, `promptMode`, `minPromptChars`, `weights`, `advice`, `embedding`,
+  `learning` and `cache` may be set in the committed `eminiar.config.json`, plus `mode: "advise"`
+  (a project can keep the adjudicator advise-only). Everything that decides where text and keys
+  go or how much is spent, plus apply mode, its settings and the tier ladder (`provider`,
+  `typesafe`, `openai`, `keyEnv`, `remoteConsent`, `remoteConsentOrigins`, `privacy`, `budget`,
+  `timeouts`, `breaker`, `mode: "apply"`, `apply`, `tiers`) comes from `~/.eminiar/config.json`
+  only, and from there only while that file is outside the project (see `EMINIAR_HOME` below).
 
 | Key | Default | Description |
 |---|---|---|
@@ -242,11 +261,13 @@ only:
 |---|---|
 | `EMINIAR_ROUTING_MODE` | Overrides `routing.mode` |
 | `EMINIAR_EMBEDDINGS=0` | Turns off embeddings |
-| `EMINIAR_HOME` | Moves the data directory (default `~/.eminiar`). A `config.json` there that lies inside or above the project (or any git work tree around it, a submodule's superproject included), or a relative `EMINIAR_HOME`, cannot set the adjudicator's provider, consent, endpoints, `keyEnv`, privacy, budget or timeouts, since a repo's `.claude/settings.json` could set this variable. The same applies when `HOME` is moved into the project |
+| `EMINIAR_HOME` | Moves the data directory (default `~/.eminiar`). A `config.json` there that lies inside or above the project (or any git work tree around it, a submodule's superproject included), or a relative `EMINIAR_HOME`, cannot set the adjudicator's provider, consent, endpoints, `keyEnv`, privacy, budget, timeouts, apply mode, `apply` or `tiers`, since a repo's `.claude/settings.json` could set this variable. The same applies when `HOME` is moved into the project |
 | `CURSOR_CONFIG_DIR` | Where `install --cursor` writes Cursor's `hooks.json`, `mcp.json` and `skills/` (default `~/.cursor`) |
 | `EMINIAR_PROJECT_ROOT` | Sets the project root of the MCP server and the CLI. Otherwise `CLAUDE_PROJECT_DIR`, then the current directory. Under Claude Code and Cursor the hooks always use `CLAUDE_PROJECT_DIR`, so setting this for a session puts the hooks and the server in different projects. `SessionStart` exports it to Bash commands through `CLAUDE_ENV_FILE`, so `eminiar` run from Bash uses the session's project; a `claude` started from Bash inherits it too, and its server then uses the outer session's project |
 | `EMINIAR_DEBUG` | Prints stack traces from the CLI |
-| `EMINIAR_CLAUDE_DIR` | Where Claude Code keeps its transcripts (default `~/.claude`) |
+| `CLAUDE_CONFIG_DIR` | Claude Code's own variable for its config directory (default `~/.claude`). eminiar follows it for settings, permission rules, agents, plugins, transcripts and `.claude.json`, which then lives inside that directory instead of at `~/.claude.json` |
+| `CLAUDE_CODE_PLUGIN_CACHE_DIR` | Claude Code's own variable for its plugins root (default `plugins/` in the config directory). eminiar follows it for `installed_plugins.json`, the plugin cache and plugin agents |
+| `EMINIAR_CLAUDE_DIR` | Where Claude Code keeps its transcripts (default: `CLAUDE_CONFIG_DIR`, else `~/.claude`) |
 | `EMINIAR_ADJUDICATOR=0` / `=1` | Turns the adjudicator off (the kill switch) or on, over every config file |
 | `EMINIAR_ADJUDICATOR_PROVIDER` | Overrides `adjudicator.provider`. A remote provider runs only when `remoteConsentOrigins` in `~/.eminiar/config.json` lists its origin |
 | `EMINIAR_ADJUDICATOR_MODE` | Overrides `adjudicator.mode` (`advise` or `apply`) |
