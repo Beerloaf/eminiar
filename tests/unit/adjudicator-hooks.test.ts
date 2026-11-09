@@ -64,6 +64,7 @@ const ENV_KEYS = [
   "CLAUDE_CODE_SUBAGENT_MODEL_FORCE",
   "CLAUDE_CODE_EFFORT_LEVEL",
   "HOME",
+  "CLAUDE_CONFIG_DIR",
   "CLAUDE_CODE_PLUGIN_CACHE_DIR",
   "CLAUDE_CODE_PLUGIN_DIRS",
 ];
@@ -1827,6 +1828,24 @@ describe("resolveAgentPin: Claude Code's agent lookup order", () => {
         env: { HOME: "/nonexistent", CLAUDE_CODE_PLUGIN_DIRS: `/rel:${dev}` },
       }),
     ).toMatchObject({ status: "unpinned", source: "plugin" });
+  });
+
+  it("user agents and the plugins root follow CLAUDE_CONFIG_DIR", () => {
+    const { home, put, look } = world();
+    const config = mkdtempSync(join(tmpdir(), "em-pin-config-"));
+    const inst = mkdtempSync(join(tmpdir(), "em-pin-inst-"));
+    scratch.push(config, inst);
+    const env = { HOME: home, CLAUDE_CONFIG_DIR: config };
+    put(join(home, ".claude", "agents"), "u.md", md("u", "opus"));
+    put(join(config, "agents"), "u.md", md("u", "haiku"));
+    expect(look("u", { env })).toMatchObject({ status: "pinned", source: "user", model: "haiku" });
+    put(join(inst, "agents"), "a.md", md("a", "sonnet"));
+    put(
+      join(config, "plugins"),
+      "installed_plugins.json",
+      JSON.stringify({ plugins: { "pc@m": [{ installPath: inst }] } }),
+    );
+    expect(look("pc:a", { env })).toMatchObject({ status: "pinned", model: "sonnet" });
   });
 });
 
