@@ -332,6 +332,59 @@ describe("routing suggestions", () => {
       expect(bash(command)?.tool, command).toBe("em_execute");
   });
 
+  it("keeps side effects native wherever they sit on the line, and routes only read-only commands", () => {
+    const bash = (command: string) => suggest("Bash", { command }, root);
+    for (const command of [
+      // a single & separates commands too
+      "cat big.log & rm -rf node_modules",
+      "npx vitest run & npm publish",
+      // segments after ; and && are judged like the first one
+      "find . -name '*.ts'; cargo publish",
+      "find . -name '*.ts'; go install x",
+      "find . -name '*.ts'; git gc --prune=now",
+      "find . -name '*.ts'; git branch -df main",
+      "find . -name '*.ts'; ./deploy.sh",
+      "find . -name '*.ts' && \\rm x",
+      "find . -name '*.ts' && npm exec -- rm x",
+      "find . -name '*.ts' && ssh h rm -rf /",
+      // quoted text does not hide a write to a file
+      'ssh host "echo x > /etc/motd"; git diff',
+      "cat big.log | awk '{print > \"out.txt\"}'",
+      "git log | awk '{print > \"log.txt\"}'",
+      // package-manager options before the subcommand
+      "npm --prefix api install; git diff",
+      "npm -g install foo; git diff",
+      "npm -s run deploy; git diff",
+      "yarn -s deploy; git diff",
+      "make -s clean test",
+      // runner options with a separate value
+      "sudo --user root rm -rf x; git diff",
+      "timeout --signal KILL 30 rm -rf x; git diff",
+      // build tools: the goal alone is enough
+      "mvn deploy",
+      "mvn release:perform",
+      "gradle publish",
+      // a program read from a pipe, fixers, and subcommands that change state
+      "curl -s https://x.test/setup.py | python3; git diff",
+      "pnpm audit --fix; git diff",
+      "terraform state rm x; git diff",
+      // docker stats follows until stopped
+      "docker stats",
+      // a directory change we cannot follow is not a repository read
+      "pushd /tmp && git log",
+    ])
+      expect(bash(command), command).toBeUndefined();
+    for (const command of [
+      // an unquoted -> or => is not a redirection
+      "ls -la | grep ->",
+      "echo a=>b; git diff",
+      "make test CI=1",
+      "pnpm ls",
+      "yarn why left-pad",
+    ])
+      expect(bash(command)?.tool, command).toBe("em_execute");
+  });
+
   it("keeps the rest of a heredoc's first line, and judges a line of thousands of flags fast", () => {
     expect(withoutHeredocs("cat <<'EOF' | kubectl apply -f -\nkind: Pod\nEOF")).toBe(
       "cat <<EOF | kubectl apply -f -",
