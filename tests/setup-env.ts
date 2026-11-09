@@ -2,3 +2,4 @@
 // variables must not leak into hooks and recall, which resolve the project root from them.
 delete process.env.EMINIAR_PROJECT_ROOT;
 delete process.env.CLAUDE_PROJECT_DIR;
+delete process.env.EMINIAR_SESSION_ID;

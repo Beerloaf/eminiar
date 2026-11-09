@@ -140,6 +140,11 @@ describe("hooks after a cd into a nested repository", () => {
   });
 
   it("PreCompact's snapshot is replayed by SessionStart(compact) from the session root", async () => {
+    // The snapshot is built from the session's events; seed one so the test never depends on
+    // what the tests before it recorded.
+    await handlers.UserPromptSubmit!(
+      afterCd({ hook_event_name: "UserPromptSubmit", prompt: "Let's go with better-sqlite3." }),
+    );
     await handlers.PreCompact!(afterCd({ hook_event_name: "PreCompact", trigger: "auto" }));
     expect(wsDb().snapshotLatestUnconsumed(SESSION)).toBeDefined();
     const out = await handlers.SessionStart!(
