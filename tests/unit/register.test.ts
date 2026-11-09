@@ -129,6 +129,101 @@ describe("registerSettings", () => {
     expect(left.Stop).toEqual([null, { matcher: "x", hooks: "nope" }, { hooks: [null] }]);
   });
 
+  it("keeps a user's `--gate` entry through an upgrade, quoted or not, without duplicating it", () => {
+    const stable = stableCopy();
+    const bin = join(stable, "bin", "em-hook");
+    const gateQuoted = hook(`"${bin}" --gate`);
+    const gatePlain = hook(`${bin} --gate`);
+    const gateLegacy = hook(`"${join("/home/u", ".eminiar", "plugin", "bin", "em-hook")}" --gate`);
+    writeSettings({
+      PreToolUse: [{ matcher: "Bash", hooks: [gateQuoted, gatePlain, gateLegacy] }],
+    });
+
+    const wrote = registerSettings(stable);
+    registerSettings(stable); // upgrade over an install
+    registerSettings(stable);
+
+    const gates = (readHooks().PreToolUse ?? [])
+      .flatMap((e) => e.hooks)
+      .filter((h) => h.command.endsWith("--gate"));
+    expect(gates).toEqual([gateQuoted, gatePlain, gateLegacy]);
+    unregisterSettings(stable, wrote);
+    expect(readHooks()).toEqual({
+      PreToolUse: [{ matcher: "Bash", hooks: [gateQuoted, gatePlain, gateLegacy] }],
+    });
+  });
+
+  it("tolerates malformed entries in every event on install, upgrade and uninstall", () => {
+    const stable = stableCopy();
+    const ours = hook(`"${join(stable, "bin", "em-hook")}"`);
+    const junk = [null, 7, "x", { matcher: "m" }, { hooks: null }, { hooks: { a: 1 } }];
+    const events = Object.keys(pluginTable(stable));
+    const seeded = Object.fromEntries(
+      events.map((ev) => [ev, [...junk, { hooks: [null, 3, ours] }]]),
+    );
+    writeFileSync(settingsFile(), JSON.stringify({ hooks: { ...seeded, Custom: "not-a-list" } }));
+
+    let wrote!: ReturnType<typeof registerSettings>;
+    expect(() => {
+      wrote = registerSettings(stable);
+      registerSettings(stable);
+    }).not.toThrow();
+    const hooks = readHooks() as Record<string, unknown>;
+    expect(hooks.Custom).toBe("not-a-list");
+    for (const ev of events) expect((hooks[ev] as unknown[]).slice(0, junk.length)).toEqual(junk);
+
+    expect(() => unregisterSettings(stable, wrote)).not.toThrow();
+    const left = readHooks() as Record<string, unknown>;
+    expect(left.Custom).toBe("not-a-list");
+    for (const ev of events) expect(left[ev]).toEqual([...junk, { hooks: [null, 3] }]);
+  });
+
+  it("copes with settings whose `hooks` is not an object holding lists", () => {
+    const stable = stableCopy();
+    writeFileSync(settingsFile(), JSON.stringify({ hooks: { Stop: null, Notification: {} } }));
+    const wrote = registerSettings(stable);
+    expect(readHooks().Stop).toEqual(pluginTable(stable).Stop);
+    expect(() => unregisterSettings(stable, wrote)).not.toThrow();
+  });
+
+  it("raises `has no hooks` and leaves settings.json byte-identical on a refused install", () => {
+    const stable = stableCopy("em-stable-", JSON.stringify({ name: "no table here" }));
+    const original = `{\n  "theme": "dark",\n  "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "./mine.sh"}]}]}\n}\n`;
+    writeFileSync(settingsFile(), original);
+    const cjBefore = (() => {
+      try {
+        return readFileSync(claudeJsonPath(), "utf8");
+      } catch {
+        return undefined;
+      }
+    })();
+
+    expect(() => registerSettings(stable)).toThrow(/hooks\.json has no hooks/);
+    expect(readFileSync(settingsFile(), "utf8")).toBe(original);
+    const cjAfter = (() => {
+      try {
+        return readFileSync(claudeJsonPath(), "utf8");
+      } catch {
+        return undefined;
+      }
+    })();
+    expect(cjAfter).toBe(cjBefore);
+  });
+
+  it("leaves settings.json byte-identical when hooks.json is unusable or missing", () => {
+    const original = `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"./mine.sh"}]}]}}`;
+    const bad = {
+      hooks: { Stop: [{ hooks: [hook(`"\${CLAUDE_PLUGIN_DATA}/bin/em-hook"`)] }] },
+    };
+    const stable = stableCopy("em-stable-", JSON.stringify(bad));
+    writeFileSync(settingsFile(), original);
+    expect(() => registerSettings(stable)).toThrow(/cannot fill the variable/);
+    expect(readFileSync(settingsFile(), "utf8")).toBe(original);
+    rmSync(join(stable, "hooks", "hooks.json"));
+    expect(() => registerSettings(stable)).toThrow(/is missing/);
+    expect(readFileSync(settingsFile(), "utf8")).toBe(original);
+  });
+
   it("fills a stable root holding `$&` or `$$` literally", () => {
     const stable = stableCopy("em-st$&$$-");
     registerSettings(stable);
