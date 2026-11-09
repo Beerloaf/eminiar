@@ -205,7 +205,13 @@ function cursorDirHint(): string {
   return process.env.CURSOR_CONFIG_DIR || "~/.cursor";
 }
 
-/** Commit-able defaults so teammates get the same behaviour from `npx eminiar install`. */
+/**
+ * Commit-able defaults so teammates get the same behaviour from `npx eminiar install`. No list
+ * keys: an array in the project file replaces the teammate's own and the built-in one, so
+ * `extraDeny: []` would wipe personal deny rules, and a `graph.exclude` written for every team
+ * would keep later default excludes out of its repo. A team that needs one sets the full list
+ * by hand (docs/configuration.md).
+ */
 export function writeTeamFiles(
   root: string,
   marketplace?: string,
@@ -219,18 +225,6 @@ export function writeTeamFiles(
         {
           $schema: "https://raw.githubusercontent.com/rydn/eminiar/main/eminiar.config.schema.json",
           routing: { mode: "auto", deferToContextMode: true },
-          graph: {
-            exclude: [
-              "**/node_modules/**",
-              "**/dist/**",
-              "**/build/**",
-              "**/.git/**",
-              "**/coverage/**",
-              "**/*.d.ts",
-            ],
-          },
-          index: { docs: ["**/*.md", "docs/**"] },
-          permissions: { extraDeny: [] },
         },
         null,
         2,
