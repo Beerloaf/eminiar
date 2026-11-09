@@ -456,8 +456,49 @@ function bounds(stage: string): boolean {
  * is secondary and the native Bash tool is where Claude Code's permission prompts live, so a
  * command containing one is never redirected to the sandbox.
  */
-const MUTATING =
-  /^(git\s+(?:(?:-[Cc]\s*[^-\s]\S*|--(?:git-dir|work-tree)[= ]\S+|--no-pager)\s+)*(add|commit|checkout|switch|push|pull|fetch|merge|rebase|stash|reset|restore|cherry-pick|revert|tag|init|clone|worktree|mv|rm|am|apply|submodule|clean|branch\s(?:.*\s)?(-[a-zA-Z]*[dDmM][a-zA-Z]*|--delete|--move)|config(?:\s+--(?:global|local|system|worktree))*\s+(?:set|unset|--(?:unset|unset-all|add|replace-all|rename-section|remove-section|edit)|-e|\w[\w.-]*\s+\S+))|npm\s+(install|i|ci|uninstall|un|link|publish|version|update|up|dedupe|audit\s+fix)|pnpm\s+(install|i|add|remove|rm|update|up|link|audit\s.*--fix)|yarn\s+(add|remove|install|upgrade)|pip3?\s+(install|uninstall)|cargo\s+(add|install)|brew\s+(install|uninstall|upgrade)|gh\s+(pr|issue|release|repo)\s+(create|edit|merge|close|comment|delete|ready)|terraform\s+(?:-\S+\s+)*(apply|destroy|import|taint|untaint|state\s+(rm|mv|push))|helm\s+(?:-\S+\s+(?:[^-\s]\S*\s+)?)*(install|upgrade|uninstall|rollback|delete)|mvnw?(?:\s.*)?\s(deploy|install|release:\S*)|gradlew?(?:\s.*)?[\s:](publish|upload)\w*|rm|mv|cp|mkdir|rmdir|touch|chmod|chown|ln|sed\s+(?:-\S+\s+)*-i|tee|eval|sh|bash|zsh|find\s.*\s-(delete|exec|execdir|ok|okdir))(?![\w-])/;
+const GIT_MUTATING =
+  /^(git\s+(?:(?:-[Cc]\s*[^-\s]\S*|--(?:git-dir|work-tree)[= ]\S+|--no-pager)\s+)*(add|commit|checkout|switch|push|pull|fetch|merge|rebase|stash|reset|restore|cherry-pick|revert|tag|init|clone|worktree|mv|rm|am|apply|submodule|clean|branch\s(?:.*\s)?(-[a-zA-Z]*[dDmM][a-zA-Z]*|--delete|--move)|config(?:\s+--(?:global|local|system|worktree))*\s+(?:set|unset|--(?:unset|unset-all|add|replace-all|rename-section|remove-section|edit)|-e|\w[\w.-]*\s+\S+)))(?![\w-])/;
+const OTHER_MUTATING =
+  /^(npm\s+(install|i|ci|uninstall|un|link|publish|version|update|up|dedupe|audit\s+fix)|pnpm\s+(install|i|add|remove|rm|update|up|link|audit\s.*--fix)|yarn\s+(add|remove|install|upgrade)|pip3?\s+(install|uninstall)|cargo\s+(add|install)|brew\s+(install|uninstall|upgrade)|gh\s+(pr|issue|release|repo)\s+(create|edit|merge|close|comment|delete|ready)|terraform\s+(?:-\S+\s+)*(apply|destroy|import|taint|untaint|state\s+(rm|mv|push))|helm\s+(?:-\S+\s+(?:[^-\s]\S*\s+)?)*(install|upgrade|uninstall|rollback|delete)|mvnw?(?:\s.*)?\s(deploy|install|release:\S*)|gradlew?(?:\s.*)?[\s:](publish|upload)\w*|rm|mv|cp|mkdir|rmdir|touch|chmod|chown|ln|sed\s+(?:-\S+\s+)*-i|tee|eval|sh|bash|zsh|find\s.*\s-(delete|exec|execdir|ok|okdir))(?![\w-])/;
+const MUTATING_WORDS = new Set([
+  "npm",
+  "pnpm",
+  "yarn",
+  "pip",
+  "pip3",
+  "cargo",
+  "brew",
+  "gh",
+  "terraform",
+  "helm",
+  "mvn",
+  "mvnw",
+  "gradle",
+  "gradlew",
+  "rm",
+  "mv",
+  "cp",
+  "mkdir",
+  "rmdir",
+  "touch",
+  "chmod",
+  "chown",
+  "ln",
+  "sed",
+  "tee",
+  "eval",
+  "sh",
+  "bash",
+  "zsh",
+  "find",
+]);
+const MUTATING = {
+  test(cmd: string): boolean {
+    const word = /^[A-Za-z0-9]*/.exec(cmd)![0];
+    if (word === "git") return GIT_MUTATING.test(cmd);
+    return MUTATING_WORDS.has(word) && OTHER_MUTATING.test(cmd);
+  },
+};
 /**
  * Commands that run the one after them, with the options they take (`sudo -u root`, `timeout 30`).
  * Each option is either one that takes a value or one that does not, never both: an ambiguous
@@ -480,6 +521,9 @@ const RUNNERS = [
 const SHELL_WORDS = /^(?:\s*(?:[({!]|(?:then|do|else|exec|if|elif|while|until)\s))*\s*/;
 /** What runs the command after it, which is the one to judge: `sudo`, `FOO=1`, `xargs -0` …. */
 const RUNNER = new RegExp(String.raw`^\s*(?:(?:${RUNNERS.join("|")})\s+)*`);
+const RUNNER_HEAD = /^\s*(?:sudo|env|xargs|parallel|timeout|nice|stdbuf|time|command|nohup|[A-Z_])/;
+const stripRunners = (s: string) =>
+  RUNNER_HEAD.test(s) ? s.replace(RUNNER, "") : s.replace(/^\s+/, "");
 /**
  * A redirection into a file (`> f`, `>> f`, `&> f`, `cmd>f`; not /dev/null, not `2>&1`) writes
  * something. `=>` and `->` are not redirections.
@@ -937,8 +981,8 @@ function staysNative(segment: string, cwd: string): boolean {
   if (GLUED_WRITE.test(segment.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, "''"))) return true;
   return pipeStages(segment).some((stage, i) => {
     const plain = stage.replace(SHELL_WORDS, "");
-    if (GIT_ENV.test(plain)) return true;
-    const cmd = plain.replace(RUNNER, "").replace(/^\S*\//, "");
+    if (plain.includes("GIT_") && GIT_ENV.test(plain)) return true;
+    const cmd = stripRunners(plain).replace(/^\S*\//, "");
     const [, quoted = "", args = ""] = /^(\S+)([\s\S]*)$/.exec(cmd) ?? [];
     const tool = quoted.replace(/['"\\]/g, "");
     const named = tool + args;
@@ -949,7 +993,8 @@ function staysNative(segment: string, cwd: string): boolean {
     return (
       MUTATING.test(named) ||
       MUTATING.test(bare) ||
-      FOLLOWS.test(named) ||
+      ((/^(?:kubectl|docker|tail)(?![^\s])/.test(named) || named.includes("--watch")) &&
+        FOLLOWS.test(named)) ||
       (i > 0 && RUNS_STDIN.test(named)) ||
       CHANGES.get(tool)?.(args, cwd) === true ||
       FLAG_WRITES.get(tool)?.(shellWords(args)) === true
@@ -975,10 +1020,7 @@ const TOOL_READS: Record<string, (args: string) => boolean> = {
 /** Is this simple command (every pipe stage of it) known to only read? Unknown means no. */
 function readsOnly(segment: string, cwd: string): boolean {
   return pipeStages(segment).every((stage) => {
-    const cmd = stage
-      .replace(SHELL_WORDS, "")
-      .replace(RUNNER, "")
-      .replace(/^\S*\//, "");
+    const cmd = stripRunners(stage.replace(SHELL_WORDS, "")).replace(/^\S*\//, "");
     const [, tool = "", args = ""] = /^(\S+)([\s\S]*)$/.exec(cmd) ?? [];
     // Flags that make a reader write: `git diff --output=f`, `sort -o f`.
     if (/(?:^|\s)--output(?=[\s=]|$)/.test(args) || (tool === "sort" && /\s-\w*o\b/.test(args)))

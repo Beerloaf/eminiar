@@ -389,6 +389,40 @@ describe("routing regression table", () => {
     expect(routed).toEqual([]);
   });
 
+  it("judges runner, GIT_ env, follow and mutating-word forms as before the cold-regex guards", () => {
+    // Decisions captured from the unguarded implementation (one MUTATING alternation, RUNNER and
+    // FOLLOWS tried on every stage); the guards only skip regexes that cannot match.
+    const expected: [string, string][] = [
+      ["cargo build", "em_execute[heavy]"],
+      ["find . -name x", "em_execute[heavy]"],
+      ["mvn test", "em_execute[heavy]"],
+      ["npm test", "em_execute[heavy]"],
+      ["gh pr view 1", "native"],
+      ["sed s/a/b/ f", "native"],
+      ["tail -n 5 big.log", "native"],
+      ["terraform plan", "native"],
+      ["time git log", "native"],
+      ["timeout 30 git diff", "native"],
+      ["sudo -u root git log", "native"],
+      ["FOO=1 BAR=2 git diff", "native"],
+      ["GIT_DIR=x git log", "native"],
+      ["git -C a push", "native"],
+      ["  git   push", "native"],
+      ["/usr/bin/git push", "native"],
+      ["env FOO=1 git push", "native"],
+      ["timeout 30 npm install", "native"],
+      ["xargs -0 rm", "native"],
+      ["nice -n 5 cp a b", "native"],
+      ["kubectl logs -f pod", "native"],
+      ["kubectl logs pod --watch", "native"],
+      ["docker logs -f c", "native"],
+      ["tail -f big.log", "native"],
+      ["rmx y", "native"],
+      ["git-lfs push", "native"],
+    ];
+    expect(expected.filter(([c, r]) => route(c) !== r).map(([c]) => c)).toEqual([]);
+  });
+
   it("moves only these routes, on purpose", () => {
     // `tsc` emits unless told not to: routed when --noEmit or the tsconfig says so, else native
     expect(route("npx tsc")).toBe("native");
