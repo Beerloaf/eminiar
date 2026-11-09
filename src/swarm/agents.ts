@@ -30,7 +30,10 @@ export function modelRangeText(r: ModelRange): string {
   return `${r.floor}..${r.ceiling}`;
 }
 
-/** eminiar tools a worker always keeps, whatever its `tools` allowlist says. */
+/**
+ * eminiar tools a worker keeps whatever its `tools` allowlist says, except the command runners
+ * (EXEC_TOOLS): those only when the role keeps Bash.
+ */
 export const WORKER_EM_TOOLS = [
   "em_swarm",
   "em_recall",
@@ -59,6 +62,21 @@ function yaml(): typeof import("yaml") {
   return yamlLib;
 }
 
+/**
+ * eminiar's command runners. Each runs arbitrary code, so a role without Bash (a `tools` list
+ * that leaves it out, or Bash in `disallowed_tools`) must not get them back this way.
+ */
+export const EXEC_TOOLS: ReadonlySet<string> = new Set([
+  "em_execute",
+  "em_execute_file",
+  "em_batch_execute",
+]);
+
+/** Does the role keep Bash? An unset `tools` means every tool; `disallowed_tools` wins. */
+export function roleHasShell(role: Pick<RoleSpec, "tools" | "disallowedTools">): boolean {
+  return (role.tools?.includes("Bash") ?? true) && !role.disallowedTools?.includes("Bash");
+}
+
 /** MCP tool name prefixes: plugin install and `install --method settings`. */
 export const EM_MCP_PREFIXES = ["mcp__plugin_eminiar_eminiar__", "mcp__eminiar__"] as const;
 
@@ -80,14 +98,22 @@ const TOPOLOGY_RULE: Record<Topology, string> = {
     "work moves in stages. You can claim a task only once every task of the earlier stages is done.",
 };
 
-/** The role's tool allowlist with the eminiar tools added under both MCP name forms. */
-export function workerTools(tools: string[]): string[] {
+/**
+ * The role's tool allowlist with the eminiar tools added under both MCP name forms; the
+ * command runners only when `shell` (the role keeps Bash).
+ */
+export function workerTools(tools: string[], shell = tools.includes("Bash")): string[] {
   // ToolSearch loads deferred MCP tools; without it an allowlisted worker may not reach em_*.
   const out = tools.includes("ToolSearch") ? [...tools] : [...tools, "ToolSearch"];
   for (const prefix of EM_MCP_PREFIXES)
-    for (const t of WORKER_EM_TOOLS) if (!out.includes(prefix + t)) out.push(prefix + t);
+    for (const t of WORKER_EM_TOOLS)
+      if ((shell || !EXEC_TOOLS.has(t)) && !out.includes(prefix + t)) out.push(prefix + t);
   return out;
 }
+
+/** The command runners under both MCP name forms, for a role that disallows Bash. */
+const execToolNames = (): string[] =>
+  EM_MCP_PREFIXES.flatMap((prefix) => [...EXEC_TOOLS].map((t) => prefix + t));
 
 function frontmatter(swarm: SwarmSpec, role: RoleSpec): Record<string, unknown> {
   const fm: Record<string, unknown> = {
@@ -95,11 +121,16 @@ function frontmatter(swarm: SwarmSpec, role: RoleSpec): Record<string, unknown> 
     description: `Worker "${role.role}" of the eminiar swarm "${swarm.name}": ${role.description} Spawn it for a task of this swarm and name the task as "task #N" in the prompt; the em-swarm skill coordinates runs.`,
   };
   if (role.model) fm.model = role.model;
-  if (role.tools) fm.tools = workerTools(role.tools).join(", ");
+  if (role.tools) fm.tools = workerTools(role.tools, roleHasShell(role)).join(", ");
   // Workers are leaves: Claude Code lets subagents spawn subagents unless Agent is disallowed.
   // A role that lists Agent or Task in its own `tools` opted out of that.
   const spawns = role.tools?.some((t) => t === "Agent" || t === "Task");
-  const disallowed = [...new Set([...(role.disallowedTools ?? []), ...(spawns ? [] : ["Agent"])])];
+  // Without a `tools` list the worker inherits every MCP tool, so disallowing Bash has to
+  // disallow the command runners too.
+  const noShell = role.disallowedTools?.includes("Bash") ? execToolNames() : [];
+  const disallowed = [
+    ...new Set([...(role.disallowedTools ?? []), ...(spawns ? [] : ["Agent"]), ...noShell]),
+  ];
   if (disallowed.length) fm.disallowedTools = disallowed.join(", ");
   if (role.skills.length) fm.skills = role.skills;
   if (role.hooks) {
@@ -126,6 +157,15 @@ const hashOf = (fm: string, rest: string, range?: string) =>
     .digest("hex")
     .slice(0, 12);
 
+/**
+ * A worker without `isolation: worktree` shares the session's working tree with the other
+ * workers' uncommitted edits. Workers have stashed and popped files there while coders were
+ * active, and nothing was lost only by luck of timing, so the protocol says it once for every
+ * worker that has a shell, rather than each spawn prompt.
+ */
+const SHARED_TREE_RULE =
+  "Other workers may be editing this working tree at the same time, and their changes are not committed. Never run `git stash`, `git checkout`, `git switch`, `git reset`, `git restore` or `git clean`, not even on one path: they hide or wipe another worker's work. If you commit, add only the files you changed: `git add -A` or `git commit -a` takes their unfinished work with yours. To test without your change (a mutation check), copy the files into a scratch directory outside the tree and run the tests there.";
+
 /** The full agent file for one role. Deterministic, so sync can compare by content. */
 export function renderAgentFile(config: SwarmConfig, swarm: SwarmSpec, role: RoleSpec): string {
   const fm = yaml().stringify(frontmatter(swarm, role), { lineWidth: 0 }).trimEnd();
@@ -145,12 +185,15 @@ export function renderAgentFile(config: SwarmConfig, swarm: SwarmSpec, role: Rol
     ...(role.prompt ? [role.prompt, ""] : []),
     "## Swarm protocol",
     "",
-    '1. eminiar starts you with a swarm brief: the run goal, the open tasks, the shared notes and what the project knows (memories, history, structure). First claim the task your prompt names with `em_swarm {action:"claim", task:N}` (or the next open one with `em_swarm {action:"claim"}`); if the brief says you already hold a task, continue it.',
-    '2. Ask eminiar before acting: `em_recall {query}` for decisions and constraints, `em_history {action:"file", path}` before editing a file, `em_graph_impact {node}` before changing a symbol, `em_symbols` / `em_search` instead of grepping.',
-    '3. Share what other workers need with `em_swarm {action:"post", key, value}` and read theirs with `em_swarm {action:"read"}`.',
-    '4. Close every task with `em_swarm {action:"update", task, status, result}`: status `done`, `failed` or `blocked`; the result says what changed and how you verified it.',
-    "5. Record durable decisions with `em_remember` so later sessions know them.",
-    "6. Your final message goes back to the coordinator: lead with the outcome, then the files you changed and anything left open.",
+    ...[
+      'eminiar starts you with a swarm brief: the run goal, the open tasks, the shared notes and what the project knows (memories, history, structure). First claim the task your prompt names with `em_swarm {action:"claim", task:N}` (or the next open one with `em_swarm {action:"claim"}`); if the brief says you already hold a task, continue it.',
+      'Ask eminiar before acting: `em_recall {query}` for decisions and constraints, `em_history {action:"file", path}` before editing a file, `em_graph_impact {node}` before changing a symbol, `em_symbols` / `em_search` instead of grepping.',
+      ...(!role.isolation && roleHasShell(role) ? [SHARED_TREE_RULE] : []),
+      'Share what other workers need with `em_swarm {action:"post", key, value}` and read theirs with `em_swarm {action:"read"}`.',
+      'Close every task with `em_swarm {action:"update", task, status, result}`: status `done`, `failed` or `blocked`; the result says what changed and how you verified it.',
+      "Record durable decisions with `em_remember` so later sessions know them.",
+      "Your final message goes back to the coordinator: lead with the outcome, then the files you changed and anything left open.",
+    ].map((step, i) => `${i + 1}. ${step}`),
     "",
   ].join("\n");
   const range = role.range ? modelRangeText(role.range) : undefined;

@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { claudeConfigDir } from "../paths.js";
 import { matchBash, matchRead, type PermissionRules, parseRule, type Rule } from "./rules.js";
 import { splitCommand } from "./split.js";
 
@@ -39,11 +39,12 @@ const cache = new Map<string, { stamps: number[]; rules: PermissionRules }>();
  */
 export function loadPermissionRules(root: string, extraDeny: string[] = []): PermissionRules {
   const files = [
-    join(homedir(), ".claude", "settings.json"),
+    join(claudeConfigDir(), "settings.json"),
     join(root, ".claude", "settings.json"),
     join(root, ".claude", "settings.local.json"),
   ];
-  const key = `${root}\0${extraDeny.join("\0")}`;
+  // The user file moves with CLAUDE_CONFIG_DIR, so it is part of the key.
+  const key = [...files, ...extraDeny].join("\0");
   const stamps = files.map(stamp);
   const hit = cache.get(key);
   if (hit?.stamps.every((s, i) => s === stamps[i])) return hit.rules;
