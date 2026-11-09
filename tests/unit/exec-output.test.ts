@@ -98,6 +98,16 @@ describe("processOutput threshold", () => {
     expect(r.text.length).toBeLessThan(stdout.length + 2600);
   });
 
+  it("keeps a summary on the last stdout line when stdout is long and stderr is noisy", async () => {
+    const stdout = `${"case ok\n".repeat(1500)}Tests: 5 passed, 0 failed`;
+    const stderr = `${"warn: deprecated call\n".repeat(400)}stderr end`;
+    const r = await processOutput(db, ctx, { stdout, stderr, title: "t", source: "exec" });
+    const [shownStdout, shownStderr] = r.text.split("--- stderr ---");
+    expect(shownStdout).toContain("Tests: 5 passed, 0 failed");
+    expect(shownStderr).toContain("stderr end");
+    expect(shownStderr).not.toContain("Tests: 5 passed");
+  });
+
   it("previews a long stdout by its own head and tail, then stderr", async () => {
     const stdout = `HEAD${"y".repeat(9000)}TAIL`;
     const r = await processOutput(db, ctx, {
@@ -188,6 +198,36 @@ describe("exec tools and stderr", () => {
     const out = textOf(r);
     expect(out).toContain("out\n--- stderr ---\nwarned");
     expect(count(out, "warned")).toBe(1);
+  }, 30_000);
+
+  it("em_execute: a failure that printed some stdout is not flagged isError", async () => {
+    const r = await emExecute.handler({ language: "shell", code: "echo partial; exit 1" }, ctx);
+    expect(textOf(r)).toContain("partial");
+    expect(textOf(r)).toMatch(/^exit 1/);
+    expect(r.isError).toBeFalsy();
+  }, 30_000);
+
+  it("em_batch_execute shows the stderr tail of a failing command over 1 KB when queries are given", async () => {
+    const command =
+      'head -c 3000 /dev/zero | tr "\\0" "o"; echo; echo "ENDS WITH tailmarker-77" >&2; exit 3';
+    const r = await emBatchExecute.handler(
+      { commands: [{ label: "bad", command }], queries: ["tailmarker"] },
+      ctx,
+    );
+    const out = textOf(r);
+    expect(out).not.toContain("o".repeat(1500));
+    expect(out).toMatch(/\nstderr: ENDS WITH tailmarker-77\n/);
+  }, 30_000);
+
+  it("em_execute_file shows 'stderr (tail):' for an intent run on a failing script", async () => {
+    const r = await emExecuteFile.handler(
+      { path: "package.json", code: jestLike, intent: "quokka" },
+      ctx,
+    );
+    const out = textOf(r);
+    expect(out).toContain("FAIL case 50: quokka expected 1, received 2");
+    expect(out).toContain("stderr (tail):");
+    expect(count(out, "LAST LINE UNIQUE")).toBe(1);
   }, 30_000);
 
   it("em_batch_execute answers queries from what a command wrote to stderr", async () => {
