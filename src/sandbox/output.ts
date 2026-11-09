@@ -42,11 +42,11 @@ const STDERR_MARK = "--- stderr ---";
 /**
  * stderr as it is returned and indexed. A `\r` that is not part of a CRLF starts a frame over
  * the previous one (curl's meter, npm's spinner), so only the last frame of each line is kept.
- * Anchored at line starts (`^` with `m` also matches after a `\r`): unanchored, `[^\n]*` rescans
- * the rest of the line from every position, quadratic on a long line with no `\r`.
+ * Anchored at line starts with a lookbehind, not `^` with `m`: `m` also matches after U+2028 and
+ * U+2029, and unanchored, `[^\n]*` rescans the rest of the line from every position, quadratic.
  */
 export function cleanStderr(stderr: string): string {
-  return stderr.replace(/^[^\n]*\r(?=[^\n])/gm, "").trimEnd();
+  return stderr.replace(/(?<![^\n])[^\n]*\r(?=[^\n])/g, "").trimEnd();
 }
 
 /**
@@ -61,9 +61,14 @@ export function joinOutput(stdout: string, stderr = ""): string {
 
 /** stdout whole, then at most the last STDERR_BUDGET chars of stderr under the mark. */
 function stderrTail(stdout: string, stderr: string): string {
-  if (stderr.length <= STDERR_BUDGET) return joinOutput(stdout, stderr);
+  return joinOutput(stdout, boundStderr(stderr));
+}
+
+/** stderr as is when within STDERR_BUDGET, else its last STDERR_BUDGET chars after an omitted count. */
+export function boundStderr(stderr: string): string {
+  if (stderr.length <= STDERR_BUDGET) return stderr;
   const cut = stderr.length - STDERR_BUDGET;
-  return joinOutput(stdout, `… ${cut} chars omitted …\n${stderr.slice(-STDERR_BUDGET)}`);
+  return `… ${cut} chars omitted …\n${stderr.slice(-STDERR_BUDGET)}`;
 }
 
 /**

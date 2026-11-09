@@ -231,7 +231,7 @@ describe("exec tools and stderr", () => {
   }, 30_000);
 
   it("em_batch_execute answers queries from what a command wrote to stderr", async () => {
-    // Over the 1 KB inline cap with queries, and exit 0: only the index can return the line.
+    // stderr over its 2 KB tail budget, exit 0: only the index can return the line from its head.
     const command =
       'echo "spec run"; echo "FAIL quokka spec" >&2; head -c 3000 /dev/zero | tr "\\0" "y" >&2';
     const r = await emBatchExecute.handler(
@@ -240,7 +240,8 @@ describe("exec tools and stderr", () => {
     );
     const out = textOf(r);
     expect(out).not.toContain("y".repeat(3000));
-    expect(out).toMatch(/^## spec — .* · docs \d+, \d+ · em_search \{document_ids: \[\d+, \d+\]\}/);
+    expect(out).toMatch(/^## spec — .* · docs \d+, \d+/);
+    expect(out).toContain("chars omitted");
     expect(out.split("# query hits")[1]).toContain("FAIL quokka spec");
   }, 30_000);
 });

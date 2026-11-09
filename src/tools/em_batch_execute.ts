@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { describeRun, execute } from "../sandbox/execute.js";
-import { cleanStderr, joinOutput, processOutput } from "../sandbox/output.js";
+import { boundStderr, cleanStderr, joinOutput, processOutput } from "../sandbox/output.js";
 import { formatResults } from "../search/format.js";
 import { type SearchResponse, search } from "../search/pipeline.js";
 import { recordStat } from "../stats/record.js";
@@ -63,6 +63,7 @@ export const emBatchExecute = defineTool({
       stdout?: string | undefined;
       docIds?: number[] | undefined;
       stderr?: string | undefined;
+      stdoutLen?: number | undefined;
     }> = [];
     let rawChars = 0;
     const queries = [...(args.queries ?? [])];
@@ -93,7 +94,8 @@ export const emBatchExecute = defineTool({
           results.push({
             label: cmd.label,
             header: describeRun({ ...r, stderr }),
-            stdout: joinOutput(r.stdout, stderr),
+            stdout: joinOutput(r.stdout, boundStderr(stderr)),
+            stdoutLen: r.stdout.length,
             docIds: p.documentIds,
             stderr: r.exitCode !== 0 ? stderr.slice(-800) : undefined,
           });
@@ -112,9 +114,15 @@ export const emBatchExecute = defineTool({
     const perOutputCap = queries.length
       ? INLINE_LIMIT_WITH_QUERIES
       : ctx.config.sandbox.indexThreshold;
+    // The cap is about stdout alone: a noisy stderr must not hide a short stdout ("added 812
+    // packages"). The budget counts what is shown, which holds at most a bounded stderr tail.
     const inline = chooseInline(
-      results.map((r) => r.stdout?.length ?? Number.POSITIVE_INFINITY),
-      perOutputCap,
+      results.map((r) =>
+        r.stdoutLen !== undefined && r.stdoutLen <= perOutputCap
+          ? (r.stdout?.length ?? 0)
+          : Number.POSITIVE_INFINITY,
+      ),
+      Number.MAX_SAFE_INTEGER, // already filtered on stdout above
       maxTokens * 4,
     );
 

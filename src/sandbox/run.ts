@@ -15,6 +15,8 @@ export interface RunResult {
   signal: NodeJS.Signals | null;
   timedOut: boolean;
   truncated: boolean;
+  /** Characters of stderr dropped from the front to stay within the cap (0 when none). */
+  stderrDropped?: number;
   durationMs: number;
 }
 
@@ -36,6 +38,7 @@ export function runProcess(argv: string[], opts: RunOptions): Promise<RunResult>
     const out: Buffer[] = [];
     let outBytes = 0;
     let errTail = "";
+    let errDropped = 0;
     let truncated = false;
     let timedOut = false;
     let done = false;
@@ -69,15 +72,20 @@ export function runProcess(argv: string[], opts: RunOptions): Promise<RunResult>
     child.stderr?.on("data", (d: string) => {
       errTail += d;
       // Trim only past twice the cap, so a chatty stderr costs linear time, not a copy per chunk.
-      if (errTail.length > 2 * opts.maxOutputBytes) errTail = errTail.slice(-opts.maxOutputBytes);
+      if (errTail.length > 2 * opts.maxOutputBytes) {
+        errDropped += errTail.length - opts.maxOutputBytes;
+        errTail = errTail.slice(-opts.maxOutputBytes);
+      }
     });
     const finish = (exitCode: number | null, signal: NodeJS.Signals | null) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
+      const stderr = errTail.slice(-opts.maxOutputBytes);
       resolve({
         stdout: Buffer.concat(out).toString("utf8"),
-        stderr: errTail.slice(-opts.maxOutputBytes),
+        stderr,
+        stderrDropped: errDropped + (errTail.length - stderr.length),
         exitCode,
         signal,
         timedOut,

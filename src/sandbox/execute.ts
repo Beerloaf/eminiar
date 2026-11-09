@@ -75,5 +75,6 @@ export function describeRun(r: RunResult): string {
   parts.push(`${(r.durationMs / 1000).toFixed(1)}s`);
   if (r.timedOut) parts.push("TIMED OUT");
   if (r.truncated) parts.push("TRUNCATED at output cap");
+  if (r.stderrDropped) parts.push(`stderr TRUNCATED (${r.stderrDropped} earlier chars dropped)`);
   return parts.join(" · ");
 }
