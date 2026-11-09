@@ -22,6 +22,7 @@ import { catalogForProvider, catalogLookup } from "../../src/docs/catalog.js";
 import { categoryInfo, docCategory } from "../../src/docs/category.js";
 import { discoverDocs, rootDomain } from "../../src/docs/discover.js";
 import {
+  clearSyncState,
   type DocSource,
   docsTag,
   MANIFEST_MAX_BYTES,
@@ -32,6 +33,7 @@ import {
   readManifest,
   readManifestAt,
   removeSource,
+  setSyncState,
   syncState,
   upsertSources,
 } from "../../src/docs/manifest.js";
@@ -1273,6 +1275,84 @@ describe("path sources stay inside the project", () => {
       rmSync(manifestPath(pctx), { force: true });
       pdb.deleteDocumentsBySource(docsTag("keep"));
     }
+  });
+
+  describe("entries dropped for a path outside the project", () => {
+    const state = { hash: "h", syncedAt: "2026-01-01T00:00:00.000Z" } as unknown as Parameters<
+      typeof setSyncState
+    >[2];
+    const seed = () => {
+      writeFileSync(
+        manifestPath(pctx),
+        JSON.stringify({
+          version: 1,
+          sources: [src("up", "docs/../.."), src("down", "/abs"), src("keep", "docs")],
+        }),
+      );
+      for (const name of ["up", "down"]) {
+        indexContent(pdb, {
+          source: docsTag(name),
+          title: `${name}/old.md`,
+          uri: `file:///gone/${name}.md`,
+          content: `# Old ${name}\n\nEarlier page.\n`,
+          kind: "markdown",
+        });
+        setSyncState(pdb, name, state);
+      }
+    };
+    const cleanup = () => {
+      rmSync(manifestPath(pctx), { force: true });
+      for (const n of ["up", "down", "keep"]) {
+        pdb.deleteDocumentsBySource(docsTag(n));
+        clearSyncState(pdb, n);
+      }
+    };
+
+    it("clears the stale sync state along with the pages", async () => {
+      const err = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      try {
+        seed();
+        expect(syncState(pdb, "up")).toBeDefined();
+        await syncSources(pctx, pdb);
+        expect(pdb.countDocuments(docsTag("up"))).toBe(0);
+        expect(syncState(pdb, "up")).toBeUndefined();
+        expect(syncState(pdb, "down")).toBeUndefined();
+      } finally {
+        err.mockRestore();
+        cleanup();
+      }
+    });
+
+    it("syncing one source leaves an unrequested dropped entry untouched", async () => {
+      const err = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      try {
+        seed();
+        const results = await syncSources(pctx, pdb, ["keep"]);
+        expect(results.map((r) => r.name)).toEqual(["keep"]);
+        expect(pdb.countDocuments(docsTag("up"))).toBe(1);
+        expect(pdb.countDocuments(docsTag("down"))).toBe(1);
+        expect(syncState(pdb, "up")).toBeDefined();
+      } finally {
+        err.mockRestore();
+        cleanup();
+      }
+    });
+
+    it("syncing a dropped entry by name gives one result, not also 'not registered'", async () => {
+      const err = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      try {
+        seed();
+        const results = await syncSources(pctx, pdb, ["up"]);
+        expect(results.map((r) => r.name)).toEqual(["up"]);
+        expect(results[0]?.errors).toEqual([
+          "ignored: its path is outside the project; 1 earlier page(s) removed",
+        ]);
+        expect(pdb.countDocuments(docsTag("down"))).toBe(1);
+      } finally {
+        err.mockRestore();
+        cleanup();
+      }
+    });
   });
 
   it("sync refuses a source that resolves outside the project through a symlink", async () => {

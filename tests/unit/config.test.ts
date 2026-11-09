@@ -2,7 +2,13 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { loadConfig, ownJson, PROJECT_RELATIVE_PATH_RE, parseJsonSafe } from "../../src/config.js";
+import {
+  ConfigSchema,
+  loadConfig,
+  ownJson,
+  PROJECT_RELATIVE_PATH_RE,
+  parseJsonSafe,
+} from "../../src/config.js";
 import { findProjectRoot, projectId } from "../../src/project.js";
 
 describe("config", () => {
@@ -99,6 +105,15 @@ describe("unsafe docs.manifest in a config layer (#152, #153)", () => {
       expect(PROJECT_RELATIVE_PATH_RE.test(m), JSON.stringify(m)).toBe(false);
     for (const m of [".eminiar/docs.json", "docs/..hidden/x.json", "a..b", "dir with space/m.json"])
       expect(PROJECT_RELATIVE_PATH_RE.test(m), m).toBe(true);
+  });
+});
+
+describe("memories.dir schema rule", () => {
+  it("accepts a project-relative directory and refuses one that leaves the project", () => {
+    const ok = (dir: string) => ConfigSchema.safeParse({ memories: { dir } }).success;
+    for (const dir of [".eminiar/memories", "notes/mem", "a..b"]) expect(ok(dir), dir).toBe(true);
+    for (const dir of ["/abs/mem", "../mem", "a/../../mem", "C:\\m", ""])
+      expect(ok(dir), dir).toBe(false);
   });
 });
 

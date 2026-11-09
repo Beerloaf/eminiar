@@ -622,6 +622,26 @@ describe("memory files outside the project", () => {
     expect(readFileSync(join(notes, "topic", "page.md"), "utf8")).toBe("personal notes\n");
   });
 
+  it("rename into a topic folder that is a symlink out of the project is refused by the folder check", () => {
+    const notes = outsideNotes();
+    const project = projectAt();
+    mkdirSync(join(project, ".eminiar", "memories"), { recursive: true });
+    symlinkSync(join(notes, "topic"), join(project, ".eminiar", "memories", "linked"));
+    resetContextCache();
+    const c = getContext(project);
+    const cdb = getStorage(c);
+    write(c, cdb, { name: "plain/page", kind: "note", content: "Stays in the project." });
+    // "linked/moved" is a valid name; only the on-disk folder is wrong.
+    expect(isValidName("linked/moved")).toBe(true);
+    expect(() => rename(c, cdb, "plain/page", "linked/moved")).toThrow(
+      /is dangling or outside the memories folder/,
+    );
+    expect(existsSync(join(notes, "topic", "moved.md"))).toBe(false);
+    expect(existsSync(join(project, ".eminiar", "memories", "plain", "page.md"))).toBe(true);
+    expect(cdb.memoryGetByName("plain/page")).toBeDefined();
+    expect(readFileSync(join(notes, "topic", "page.md"), "utf8")).toBe("personal notes\n");
+  });
+
   it("legacy rows are not migrated through a link out of the memories folder", () => {
     const notes = outsideNotes();
     const project = projectAt();
