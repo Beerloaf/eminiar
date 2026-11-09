@@ -252,6 +252,11 @@ export function formatSync(
       `  ${SYNC_VERB[a.action].mark} ${word(a.action)} ${a.path}${a.reason ? `: ${a.reason}` : ""}`,
     );
   }
+  const held = result.actions.filter((a) => a.held).length;
+  if (held)
+    lines.push(
+      `${held} update(s) held: the swarm file has keys this eminiar version does not know, so those agent files were not rewritten (an update that only tightens a file still applies). Update eminiar, or run \`eminiar swarm sync --force\`.`,
+    );
   if (!opts.dryRun && result.actions.some((a) => a.action === "create"))
     lines.push(
       "Claude Code reads agent files when a session starts: if a new worker type is not available yet, open /agents or restart the session.",

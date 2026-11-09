@@ -739,17 +739,17 @@ describe("eminiar swarm CLI", () => {
     const js = await run("validate", "--json");
     expect(JSON.parse(js.out).state).toBe("invalid");
     // a key from a newer eminiar is a warning: validation passes and names it
-    writeSwarm(root, YAML.replace("count: 2", "count: 2\n        permission_mode: plan"));
+    writeSwarm(root, YAML.replace("count: 2", "count: 2\n        retry_policy: plan"));
     const newer = await run("validate");
     expect(newer.code).toBe(0);
     expect(newer.out).toMatch(/^ok: /);
     expect(newer.err).toMatch(
-      /^\.eminiar\/swarm\.yaml:\d+ swarms\.feat\.agents\.coder: unknown key "permission_mode" ignored: not a setting/,
+      /^\.eminiar\/swarm\.yaml:\d+ swarms\.feat\.agents\.coder: unknown key "retry_policy" ignored: not a setting/,
     );
     expect(JSON.parse((await run("validate", "--json")).out).ignored_keys).toEqual([
       expect.objectContaining({ path: "swarms.feat.agents.coder" }),
     ]);
-    expect((await run("list")).out).toContain('unknown key "permission_mode" ignored');
+    expect((await run("list")).out).toContain('unknown key "retry_policy" ignored');
     writeSwarm(root, YAML);
   });
 

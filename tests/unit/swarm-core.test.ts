@@ -217,7 +217,7 @@ swarms:
       a:
         description: x
         count: 2
-        permission_mode: plan
+        retry_policy: plan
         context: { docs: 1, rerank: true }
         hooks:
           SubagentStop: [{ hooks: [{ type: command, command: "echo" }] }]
@@ -245,7 +245,7 @@ swarms:
       ["", "background_default", 2],
       ["defaults", "later_default", 5],
       ["swarms.s", "retries", 9],
-      ["swarms.s.agents.a", "permission_mode", 14],
+      ["swarms.s.agents.a", "retry_policy", 14],
       ["swarms.s.agents.a.context", "rerank", 15],
       ["swarms.s.agents.a.hooks", "SubagentStop", 17],
       ["swarms.s.agents.a.hooks.PostToolUse.0.hooks.0", "async", 18],
@@ -368,7 +368,7 @@ describe("agent files under a swarm file with ignored keys", () => {
     const file = join(root, ".claude", "agents", "swarm-s-a.md");
     const before = readFileSync(file, "utf8");
     const c = ok(
-      "swarms:\n  s:\n    description: d\n    agents:\n      a: { description: x, permission_mode: plan }\n      b: { description: y }\n",
+      "swarms:\n  s:\n    description: d\n    agents:\n      a: { description: x, retry_policy: plan }\n      b: { description: y }\n",
     );
     const r = syncAgents(root, c);
     // a create has no newer file to lose; an update would rewrite one
@@ -385,16 +385,15 @@ describe("agent files under a swarm file with ignored keys", () => {
     expect(
       generatedState(readFileSync(join(root, ".claude", "agents", "swarm-s-b.md"), "utf8")),
     ).toBe("generated");
-    // a delete is held too: the newer version may still define that role
+    // a delete is never held: removing an agent only restricts
     const fewer = ok(
-      "swarms:\n  s:\n    description: d\n    agents:\n      a: { description: newer, permission_mode: plan }\n",
+      "swarms:\n  s:\n    description: d\n    agents:\n      a: { description: newer, retry_policy: plan }\n",
     );
     expect(syncAgents(root, fewer).actions.find((a) => a.agentType === "swarm-s-b")).toMatchObject({
-      action: "conflict",
-      held: true,
+      action: "delete",
     });
     // --force writes anyway
-    expect(syncAgents(root, c, { force: true }).changed).toBe(1);
+    expect(syncAgents(root, c, { force: true }).changed).toBe(2);
     expect(readFileSync(file, "utf8")).not.toBe(before);
   });
 });
@@ -1108,5 +1107,110 @@ swarms:
     } finally {
       closeAllStorage();
     }
+  });
+});
+
+describe("hold scope and tightening (task #66)", () => {
+  const setup = (older: string) => {
+    const root = mkdtempSync(join(tmpdir(), "em-hold-"));
+    syncAgents(root, ok(older));
+    return root;
+  };
+  const AGENTS = (a: string, b: string) =>
+    `swarms:\n  s:\n    description: d\n    agents:\n      a: { description: x${a} }\n      b: { description: y${b} }\n`;
+
+  it("holds only the role whose own settings carry an ignored key", () => {
+    const root = setup(AGENTS("", ""));
+    const c = ok(AGENTS(", retries: 3, tools: [Read]", ", tools: [Read]"));
+    const r = syncAgents(root, c, { dryRun: true });
+    const a = r.actions.find((x) => x.agentType === "swarm-s-a")!;
+    const b = r.actions.find((x) => x.agentType === "swarm-s-b")!;
+    // a's update tightens (a first allowlist), so it applies even with the key
+    expect(a.action).toBe("update");
+    expect(b.action).toBe("update");
+    // a widening update is held for a, not for b
+    const root2 = setup(AGENTS(", tools: [Read]", ", tools: [Read]"));
+    const c2 = ok(AGENTS(", retries: 3, tools: [Read, Bash]", ", tools: [Read, Bash]"));
+    const r2 = syncAgents(root2, c2, { dryRun: true });
+    expect(r2.actions.find((x) => x.agentType === "swarm-s-a")).toMatchObject({
+      action: "conflict",
+      held: true,
+    });
+    expect(r2.actions.find((x) => x.agentType === "swarm-s-b")!.action).toBe("update");
+    expect(r2.actions.find((x) => x.agentType === "swarm-s-a")!.reason).toContain("retries");
+  });
+
+  it("never holds an update that only tightens: fewer tools, more disallowed tools, more hooks", () => {
+    const root = setup(AGENTS(", tools: [Read, Bash], disallowed_tools: [Edit]", ""));
+    const c = ok(AGENTS(", retries: 3, tools: [Read], disallowed_tools: [Edit, Write]", ""));
+    expect(
+      syncAgents(root, c, { dryRun: true }).actions.find((x) => x.agentType === "swarm-s-a")!
+        .action,
+    ).toBe("update");
+    // dropping a restriction (disallowed_tools) is a widening: held
+    const wide = ok(AGENTS(", retries: 3, tools: [Read]", ""));
+    expect(
+      syncAgents(root, wide, { dryRun: true }).actions.find((x) => x.agentType === "swarm-s-a"),
+    ).toMatchObject({ action: "conflict", held: true });
+  });
+
+  it("deletes a removed role and cleans up under enabled: false despite ignored keys", () => {
+    const root = setup(AGENTS("", ""));
+    const off = ok(`${AGENTS("", ", retries: 3")}enabled: false\n`);
+    const r = syncAgents(root, off, { dryRun: true });
+    expect(r.actions.map((x) => x.action)).toEqual(["delete", "delete"]);
+  });
+});
+
+describe("restriction-like unknown keys in a role are errors", () => {
+  const role = (line: string) =>
+    parseSwarmYaml(
+      `swarms:\n  s:\n    description: d\n    agents:\n      a:\n        description: x\n        ${line}\n`,
+      "/x/swarm.yaml",
+      "swarm.yaml",
+    );
+  it("rejects scp and other short typos, and any key naming a restriction", () => {
+    for (const k of [
+      "scp: [src]",
+      "scpe: [src]",
+      "toolz: [Read]",
+      "allowed_tools: [Read]",
+      "deny_paths: [a]",
+      "toolzz: 1",
+      "permission_mode: plan",
+      "hook: 1",
+      "models: 1",
+      "max_count: 1",
+    ])
+      expect(role(k).state, k).toBe("invalid");
+  });
+  it("still ignores a genuinely new unrelated key, with a note", () => {
+    const r = role("retries: 3");
+    expect(r.state).toBe("ok");
+    if (r.state === "ok") expect(r.config.ignoredKeys).toHaveLength(1);
+  });
+  it("outside agents a new key is still ignored", () => {
+    const r = parseSwarmYaml(
+      "swarms:\n  s:\n    description: d\n    permission_mode: plan\n    agents:\n      a: { description: x }\n",
+      "/x/swarm.yaml",
+      "swarm.yaml",
+    );
+    expect(r.state).toBe("ok");
+  });
+});
+
+describe("typo length boundary for a non-restriction key (task #66)", () => {
+  const agent = (line: string) =>
+    parseSwarmYaml(
+      `swarms:\n  s:\n    description: d\n    agents:\n      a:\n        description: x\n        ${line}\n`,
+      "/x/swarm.yaml",
+      "swarm.yaml",
+    );
+  it("6 characters, two edits from color is a new key; 7 is a typo", () => {
+    expect(agent("zolorz: 1").state).toBe("ok");
+    expect(agent("colorzz: 1").state).toBe("invalid");
+  });
+  it("a key the schema knows at another level is misplaced, not new", () => {
+    expect(agent("defaults: 1").state).toBe("invalid");
   });
 });

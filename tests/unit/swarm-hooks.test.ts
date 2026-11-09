@@ -1248,7 +1248,7 @@ describe("swarm enforcement matrix", () => {
   });
 
   it("enforces a file from a newer eminiar as written: its unknown keys are ignored, not a lockout", async () => {
-    const future = ENF.replace("count: 2", "count: 2\n        permission_mode: plan");
+    const future = ENF.replace("count: 2", "count: 2\n        retry_policy: plan");
     const ws = project("mx11", `${future}worker_ttl: 3h\n`);
     enter(ws);
     const r = await agent(ws, "Explore");
@@ -1346,27 +1346,27 @@ describe("swarm enforcement matrix", () => {
     const coder = join(ws, ".claude", "agents", "swarm-feat-coder.md");
     writeFileSync(
       join(ws, ".eminiar", "swarm.yaml"),
-      `${ENF.replace("description: writes code", "description: writes code, newer\n        permission_mode: plan")}worker_ttl: 3h\n`,
+      `${ENF.replace("description: writes code", "description: writes code, newer\n        retry_policy: plan")}worker_ttl: 3h\n`,
     );
     const before = readFileSync(coder, "utf8");
     const future = await start(ws);
     expect(future).toContain("Swarm enforcement is on:");
     expect(future).toMatch(
-      /\.eminiar\/swarm\.yaml: 2 unknown key\(s\) ignored \(first: swarms\.feat\.agents\.coder \(line \d+\): unknown key "permission_mode" ignored: not a setting in this eminiar version\); existing generated agent files are not rewritten while they remain .*`eminiar swarm validate` lists the keys\./,
+      /\.eminiar\/swarm\.yaml: 2 unknown key\(s\) ignored \(first: swarms\.feat\.agents\.coder \(line \d+\): unknown key "retry_policy" ignored: not a setting in this eminiar version\); generated agent files of the roles those keys belong to are not rewritten unless .*`eminiar swarm validate` lists the keys\./,
     );
     expect(future).not.toContain("were left alone (hand-written");
     expect(future).not.toContain("regenerated");
     expect(readFileSync(coder, "utf8")).toBe(before);
 
-    // disabled: the generated files are kept too, and the line says why
+    // disabled: cleanup is a delete, which only restricts, so it is never held
     writeFileSync(
       join(ws, ".eminiar", "swarm.yaml"),
-      `${BASIC.replace("count: 2", "count: 2\n        permission_mode: plan")}enabled: false\n`,
+      `${BASIC.replace("count: 2", "count: 2\n        retry_policy: plan")}enabled: false\n`,
     );
     expect(await start(ws)).toContain(
-      "swarms are disabled in .eminiar/swarm.yaml, but it has unknown keys, so 2 generated agent file(s) were kept",
+      "swarms are disabled in .eminiar/swarm.yaml; removed 2 generated agent file(s)",
     );
-    expect(readFileSync(coder, "utf8")).toBe(before);
+    expect(existsSync(coder)).toBe(false);
   });
 });
 

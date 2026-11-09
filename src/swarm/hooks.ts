@@ -852,9 +852,6 @@ function sessionStartAt(ctx: ProjectContext, sessionId?: string): string | undef
     if (!config.enabled) {
       if (config.sync !== "auto") return undefined;
       const pruned = syncAgents(local, config);
-      const kept = pruned.actions.filter((a) => a.held).length;
-      if (kept)
-        return `eminiar swarm: swarms are disabled in ${config.rel}, but it has unknown keys, so ${kept} generated agent file(s) were kept (\`eminiar swarm sync --force\` removes them).`;
       return pruned.changed
         ? `eminiar swarm: swarms are disabled in ${config.rel}; removed ${pruned.changed} generated agent file(s) from .claude/agents.`
         : undefined;
@@ -877,7 +874,7 @@ function sessionStartAt(ctx: ProjectContext, sessionId?: string): string | undef
     if (config.ignoredKeys.length)
       out.push(
         clip(
-          `${config.rel}: ${config.ignoredKeys.length} unknown key(s) ignored (first: ${issueWhere(config.ignoredKeys)}); existing generated agent files are not rewritten while they remain (\`eminiar swarm sync --force\` does). \`eminiar swarm validate\` lists the keys.`,
+          `${config.rel}: ${config.ignoredKeys.length} unknown key(s) ignored (first: ${issueWhere(config.ignoredKeys)}); generated agent files of the roles those keys belong to are not rewritten unless an update only tightens them (\`eminiar swarm sync --force\` does). \`eminiar swarm validate\` lists the keys.`,
           400,
         ),
       );

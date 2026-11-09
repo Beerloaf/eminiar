@@ -293,6 +293,26 @@ function schemaKeys(s: unknown = RawFile, out = new Set<string>()): Set<string> 
   return out;
 }
 
+/** An agent-level key that reads as a restriction: ignoring it would silently lift a limit. */
+const RESTRICTION_KEY = /tool|scope|hook|allow|deny|permission|model|effort|count/i;
+
+/**
+ * Whether an unknown key inside a role could be meant as one of its restrictions: it names one
+ * (`tool`, `scope`, `hook`, `allow`, `deny`, `permission`, `model`, `effort`, `count`) or is
+ * within two edits of such a known key (`scp` for `scope`), whatever its length. Returns the
+ * closest such known key, or "" when the key only looks like a restriction.
+ */
+function restrictionLike(key: string, known: readonly string[]): string | undefined {
+  let best: { k: string; d: number } | undefined;
+  for (const k of known) {
+    if (!RESTRICTION_KEY.test(k)) continue;
+    const d = editDistance(key.toLowerCase(), k.toLowerCase(), 2);
+    if (d <= 2 && key.length >= 3 && (!best || d < best.d)) best = { k, d };
+  }
+  if (best) return best.k;
+  return RESTRICTION_KEY.test(key) ? "" : undefined;
+}
+
 /**
  * The known key an unknown one is a typo of: equal but for case, or one edit away (two for
  * keys of 7+ characters, as search's typo correction counts them). `disallowedTools`,
@@ -509,7 +529,18 @@ export function parseSwarmYaml(text: string, file: string, rel: string): LoadRes
       issues.push({ ...found, message: `unknown key "${u.key}": not allowed here` });
     else if (near)
       issues.push({ ...found, message: `unknown key "${u.key}" (did you mean "${near}"?)` });
-    else
+    else if (
+      u.at.length === 4 &&
+      u.at[0] === "swarms" &&
+      u.at[2] === "agents" &&
+      restrictionLike(u.key, u.known) !== undefined
+    ) {
+      const like = restrictionLike(u.key, u.known);
+      issues.push({
+        ...found,
+        message: `unknown key "${u.key}" looks like a restriction${like ? ` (did you mean "${like}"?)` : ""}: ignoring it would silently drop a limit`,
+      });
+    } else
       ignoredKeys.push({
         ...found,
         message: `unknown key "${u.key}" ignored: not a setting in this eminiar version`,
