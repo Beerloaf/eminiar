@@ -87,7 +87,8 @@ swarms:
             - matcher: "Edit|Write"
               hooks:
                 - type: command
-                  command: "npx biome check --write --no-errors-on-unmatched ."
+                  # formats only the edited file: the other coder shares the tree
+                  command: "node \"$CLAUDE_PROJECT_DIR/.eminiar/hooks/format-edited.mjs\""
         prompt: Implement the claimed task. Keep the diff minimal.
       reviewer:
         description: Adversarial reviewer that tries to break the change.
@@ -124,7 +125,10 @@ You are the **coder** worker in the eminiar swarm "feature" …role prompt…
 - When the YAML gives a `tools` allowlist, the eminiar tools (`em_swarm`, `em_recall`,
   `em_search`, `em_symbols`, `em_history`, `em_execute`, …) are appended under both MCP name
   forms (`mcp__plugin_eminiar_eminiar__*` for plugin installs, `mcp__eminiar__*` for settings
-  installs). Without em_* tools a worker would be stranded by enforce-mode routing.
+  installs). Without em_* tools a worker would be stranded by enforce-mode routing. The
+  command runners (`em_execute`, `em_execute_file`, `em_batch_execute`) are the exception: a
+  role without `Bash` does not get them, and routing lets that worker's native call through
+  instead of denying it toward a tool it lacks, and leaves them out of its spawn prefix.
 - Sync only rewrites or deletes files carrying the `eminiar:swarm` marker. A hand-written file
   with the same name is reported as a conflict and left alone.
 
