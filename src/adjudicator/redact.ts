@@ -100,7 +100,7 @@ const NOT_A_SECRET_VALUE =
 // The separator may follow an escaped quote: JSON inside a JSON string (`{\"password\":\"x\"}`,
 // kubectl's last-applied-configuration) escapes its quotes once or more.
 const ASSIGN_NAME =
-  /(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+)(\\{0,8}["'`]?[ \t]*(?::=|=>|[:=])[ \t]*)/g;
+  /(?<![A-Za-z0-9_.-])(?=([A-Za-z0-9_.-]+))\1(\\{0,8}["'`]?[ \t]*(?::=|=>|[:=])[ \t]*)/g;
 // The value is read by the first of these sticky patterns that matches at its start; each one
 // stops at a quote or whitespace it cannot cross, so a failed attempt stays cheap. (Each names
 // the opening quote, with any backslashes before it, `open`, and the value `value`.)
@@ -161,12 +161,14 @@ function readValue(
 /** A secret name's value that a caller wants left as it is (see keepInOutput). */
 type KeepValue = (name: string, value: string) => boolean;
 
+const SECRET_HINT = /key|token|secret|pass|pw|cred|auth|pat/i;
+
 function maskAssignments(text: string, keep?: KeepValue): string {
   ASSIGN_NAME.lastIndex = 0;
   let out = "";
   let last = 0;
   for (let m = ASSIGN_NAME.exec(text); m; m = ASSIGN_NAME.exec(text)) {
-    if (!isSecretName(m[1] as string)) continue;
+    if (!SECRET_HINT.test(m[1] as string) || !isSecretName(m[1] as string)) continue;
     const start = m.index + m[0].length;
     const v = readValue(text, start);
     if (!v) continue;
@@ -245,7 +247,8 @@ function maskCookiePairs(pairs: string): string {
  * Hangul fillers, tag characters and the BOM. They render as nothing, so `PASS\u200BWORD=` or
  * `DB_PASS\u{E0041}WORD=` would otherwise split the name and the rules would miss it.
  */
-const IGNORABLE = /\p{Default_Ignorable_Code_Point}/gu;
+let IGNORABLE_RE: RegExp | undefined;
+const ignorable = (): RegExp => (IGNORABLE_RE ??= /\p{Default_Ignorable_Code_Point}/gu);
 
 /**
  * Strip the default-ignorable characters and apply NFKC (fullwidth `＝` / `：` become `=` / `:`,
@@ -253,7 +256,7 @@ const IGNORABLE = /\p{Default_Ignorable_Code_Point}/gu;
  * U+1160. Leaves spaces, tabs and newlines alone, so YAML indentation survives. Idempotent.
  */
 function clean(text: string): string {
-  return text.replace(IGNORABLE, "").normalize("NFKC").replace(IGNORABLE, "");
+  return text.replace(ignorable(), "").normalize("NFKC").replace(ignorable(), "");
 }
 
 type Rule =
@@ -391,6 +394,22 @@ const RULES: Rule[] = [
   ],
 ];
 
+/** Literals one of which every match of the rule contains (lower case, tested on the lower-cased text, for an i rule). */
+const NEEDLES = new Map<RegExp, string[] | RegExp>();
+function needles(rule: Rule, ...words: string[]): void {
+  if (rule[0] !== "assignments")
+    NEEDLES.set(
+      rule[0],
+      rule[0].flags.includes("i")
+        ? new RegExp(words.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "i")
+        : words,
+    );
+}
+needles(RULES[1] as Rule, "://");
+needles(RULES[7] as Rule, "login", "mongo", "redis-cli", "ldap", "zip", "mosquitto_");
+needles(RULES[16] as Rule, "password");
+needles(RULES[18] as Rule, "pass", "secret", "token", "api", "access");
+
 // Private key blocks in stored output, where "to the end of the text" would wipe the rest of a
 // 9 MB `git log -p` after one cut-off key in a test fixture. The END line must come within 64 KB
 // and before the next BEGIN (which also keeps the scan linear). A BEGIN without one masks the rest
@@ -478,6 +497,9 @@ function keepInOutput(name: string, value: string): boolean {
 function applyRules(text: string, rules: Rule[], keep?: KeepValue): string {
   let out = text;
   for (const rule of rules) {
+    const need = rule[0] === "assignments" ? undefined : NEEDLES.get(rule[0]);
+    if (need && !(need instanceof RegExp ? need.test(out) : need.some((w) => out.includes(w))))
+      continue;
     if (rule[0] === "assignments") out = rule[1](out, keep);
     else if (typeof rule[1] === "string") out = out.replace(rule[0], rule[1]);
     else out = out.replace(rule[0], rule[1]);

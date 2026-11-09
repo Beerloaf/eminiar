@@ -95,6 +95,14 @@ export function ensureDirs(): EminiarPaths {
  */
 export function restrictDbFiles(dbPath: string): void {
   if (dbPath === "" || dbPath === ":memory:") return;
+  // SQLite gives -wal / -shm the main file's mode: a main file that is already owner-only needs
+  // nothing, so a hook pays one stat per database instead of three chmods (two of them throwing).
+  try {
+    const st = statSync(dbPath, { throwIfNoEntry: false });
+    if (st && (st.mode & 0o077) === 0) return;
+  } catch {
+    // fall through to the chmods
+  }
   for (const file of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
     try {
       chmodSync(file, 0o600);
