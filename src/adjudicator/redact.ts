@@ -334,7 +334,7 @@ const RULES: Rule[] = [
 // of its line and the base64 lines under it, indented or behind a diff or quote marker.
 const PRIVATE_KEY_BLOCK: Rule = [
   new RegExp(
-    `${PRIVATE_KEY_BEGIN}(?:(?:(?!-----BEGIN )[\\s\\S]){0,65536}?${PRIVATE_KEY_END}|[^\\n]*(?:\\n[ \\t]*(?:[+>-][ \\t]*)?[A-Za-z0-9+/=]{16,}[ \\t\\r]*)*)`,
+    `${PRIVATE_KEY_BEGIN}(?:(?:(?!-----BEGIN )[\\s\\S]){0,65536}?${PRIVATE_KEY_END}|[^\\n]*(?:\\n[ \\t]*(?:[+>-][ \\t]*)?[A-Za-z0-9+/=]{16,}[ \\t\\r]*(?=\\n|$))*)`,
     "g",
   ),
   "[private key]",
@@ -343,6 +343,8 @@ const PRIVATE_KEY_BLOCK: Rule = [
 // Tokens a CLI prints on a line of their own (`gcloud auth print-access-token`, `vault print
 // token`, `aws ecr get-login-password`), which redact() catches only as a base64 run.
 const TOKEN_SHAPES: Rule[] = [
+  // age secret keys (bech32, always upper case)
+  [/\bAGE-SECRET-KEY-1[A-Z0-9]{20,}/g, "AGE-SECRET-KEY-***"],
   [/\bya29\.[A-Za-z0-9_-]{20,}/g, "ya29.***"],
   [/\b(hv[sbr])\.[A-Za-z0-9_-]{20,}/g, "$1.***"],
   [/\b(do[por])_v1_[a-f0-9]{64}\b/g, "$1_v1_***"],

@@ -1709,6 +1709,9 @@ export class SqliteAdapter implements StorageAdapter {
         // The memorable events were also indexed (source "session"), and that copy is what
         // em_recall and the prompt hook recall. The index scope clears it with everything else.
         if (scope === "sessions") this.deleteDocumentsBySource("session");
+        // Drop the deleted rows' tokens from the FTS segments too, before the VACUUM.
+        this.db.exec("INSERT INTO chunks_fts_porter(chunks_fts_porter) VALUES ('optimize')");
+        this.db.exec("INSERT INTO chunks_fts_trigram(chunks_fts_trigram) VALUES ('optimize')");
       }
       if (scope === "graph" || scope === "all") {
         this.db.exec(

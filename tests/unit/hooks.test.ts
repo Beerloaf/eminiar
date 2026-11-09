@@ -77,6 +77,58 @@ describe("classify", () => {
     });
     expect(slowFail.map((d) => d.category)).toEqual(expect.arrayContaining(["latency", "error"]));
   });
+
+  describe("secrets in what is stored", () => {
+    const token = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+    const payloads = (drafts: ReturnType<typeof classifyToolCall>, category: string) =>
+      drafts.filter((d) => d.category === category).map((d) => JSON.stringify(d.payload));
+
+    it("masks a token in the tool_call and latency summaries", () => {
+      const drafts = classifyToolCall({
+        toolName: "Bash",
+        toolInput: { command: `curl -H "Authorization: Bearer ${token}" https://api.example.com` },
+        durationMs: 9000,
+        root,
+      });
+      for (const category of ["tool_call", "latency"]) {
+        const [p] = payloads(drafts, category);
+        expect(p, category).toBeDefined();
+        expect(p).toContain("Bearer ***");
+        expect(p).not.toContain("ghp_");
+        expect(p).not.toContain(token.slice(4));
+      }
+    });
+
+    it("masks a token in the error summary and text", () => {
+      const drafts = classifyToolCall({
+        toolName: "Bash",
+        toolInput: { command: `GH_TOKEN=${token} gh api /user` },
+        toolResponse: { stdout: "", stderr: `fatal: bad credentials ${token}`, exit_code: 1 },
+        root,
+      });
+      const [p] = payloads(drafts, "error");
+      expect(p).toContain("GH_TOKEN=***");
+      expect(p).toContain("bad credentials ghp_***");
+      expect(p).not.toContain(token.slice(4));
+    });
+
+    it("masks before it cuts an error to 400 characters", () => {
+      // 385 characters, then a whole token: the cut falls inside it, and a cut token is too short
+      // for its shape rule, so its prefix would be stored as typed
+      const stderr = `${"x".repeat(384)} ${token}`;
+      const drafts = classifyToolCall({
+        toolName: "Bash",
+        toolInput: { command: "make" },
+        toolResponse: { stdout: "", stderr: `${stderr}\n`, exit_code: 2 },
+        root,
+      });
+      const error = drafts.find((d) => d.category === "error")?.payload.error as string;
+      expect(error).toContain("x".repeat(384));
+      expect(error).toContain("ghp_***");
+      expect(error).not.toContain("A1b2C3");
+      expect(error.length).toBeLessThanOrEqual(400);
+    });
+  });
 });
 
 describe("routing suggestions", () => {
