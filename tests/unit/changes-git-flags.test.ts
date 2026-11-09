@@ -37,7 +37,7 @@ describe("detectChanges git flags", () => {
     writeFileSync(driver, `#!/bin/sh\ntouch '${marker}'\ncat "$1"\n`, { mode: 0o755 });
     sh(`git config diff.marker.textconv '${driver}'`);
     writeFileSync(join(root, "a.dat"), "one\n");
-    sh("git add . && git commit -qm one");
+    sh("git add . && git -c commit.gpgsign=false commit -qm one");
     writeFileSync(join(root, "a.dat"), "two\n");
     // sanity: plain git does run the driver, so the marker below proves the flag
     sh("git diff >/dev/null");

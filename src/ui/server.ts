@@ -3,6 +3,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { extname, join, normalize, resolve } from "node:path";
 import { URL } from "node:url";
+import { paths } from "../paths.js";
 import { pluginRoot } from "../version.js";
 import { adjudicatorRoute } from "./adjudicator-api.js";
 import {
@@ -185,11 +186,37 @@ export function requestRoot(asked: string | null, defaultRoot?: string): string 
   if (!asked || (defaultRoot && resolve(asked) === resolve(defaultRoot))) return defaultRoot;
   const want = resolve(asked);
   try {
-    for (const p of listProjects()) if (p.root && resolve(p.root) === want) return p.root;
+    for (const p of listedProjects()) if (p.root && resolve(p.root) === want) return p.root;
   } catch {
     // unreadable project list: fall through to the default
   }
   return defaultRoot;
+}
+
+// listProjects() opens and migrates every project database, far too slow to run on each API
+// request. The list only changes when a project folder appears or a project's latest root
+// changes, so keep it for a few seconds, keyed on the projects folder's mtime.
+const PROJECT_LIST_TTL_MS = 5000;
+let projectList: { at: number; mtime: number; list: ReturnType<typeof listProjects> } | undefined;
+
+function listedProjects(): ReturnType<typeof listProjects> {
+  let mtime = -1;
+  try {
+    mtime = statSync(paths().projects).mtimeMs;
+  } catch {
+    // no projects folder yet: listProjects decides
+  }
+  const now = Date.now();
+  if (projectList && projectList.mtime === mtime && now - projectList.at < PROJECT_LIST_TTL_MS)
+    return projectList.list;
+  const list = listProjects(); // a throw is not cached
+  projectList = { at: now, mtime, list };
+  return list;
+}
+
+/** Test hook: forget the cached project list. */
+export function resetProjectListCache(): void {
+  projectList = undefined;
 }
 
 /**
