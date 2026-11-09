@@ -314,17 +314,37 @@ swarms:
       ]);
   });
 
-  it("reads an object a YAML alias shares between a known and an unknown place", () => {
-    // `model` is a real key of defaults and an unknown one in a context: the same object
-    const c = ok(`defaults: &d { model: opus }
+  it("reads an object a YAML alias shares between two places", () => {
+    const c = ok(`defaults: &d { future_knob: 1 }
 swarms:
   s:
     description: d
     agents:
       a: { description: x, context: *d }
 `);
-    expect(c.ignoredKeys.map((w) => w.path)).toEqual(["swarms.s.agents.a.context"]);
-    expect(c.swarms[0]!.roles[0]!.model).toBe("opus");
+    expect(c.ignoredKeys.map((w) => w.path).sort()).toEqual([
+      "defaults",
+      "swarms.s.agents.a.context",
+    ]);
+  });
+
+  it("keeps a known key at the wrong level an error, not an ignored key", () => {
+    const agent = "agents:\n      a: { description: x }\n";
+    for (const [yaml, path] of [
+      [
+        `swarms:\n  s:\n    description: d\n    ${agent}defaults: { disallowed_tools: [Bash] }\n`,
+        "defaults",
+      ],
+      [`swarms:\n  s:\n    description: d\n    tools: [Read]\n    ${agent}`, "swarms.s"],
+      [`defaults: { enforce: true }\nswarms:\n  s:\n    description: d\n    ${agent}`, "defaults"],
+    ] as const) {
+      const r = parse(yaml);
+      expect(r.state, yaml).toBe("invalid");
+      if (r.state === "invalid")
+        expect(r.issues).toEqual([
+          { path, message: expect.stringContaining("not allowed here"), line: expect.any(Number) },
+        ]);
+    }
   });
 
   it("reports a typo and a bad value together, and no ignored key while the file is invalid", () => {

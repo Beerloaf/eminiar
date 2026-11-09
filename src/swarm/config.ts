@@ -279,6 +279,20 @@ function unknownKeys(v: unknown, s: unknown = RawFile, at: string[] = []): Unkno
   );
 }
 
+/** Every key the file schema names at any level: one of them at the wrong level is misplaced. */
+function schemaKeys(s: unknown = RawFile, out = new Set<string>()): Set<string> {
+  if (s instanceof z.ZodOptional) s = s.unwrap();
+  if (s instanceof z.ZodArray) schemaKeys(s.element, out);
+  else if (s instanceof z.ZodRecord) schemaKeys(s.valueType, out);
+  else if (s instanceof z.ZodObject)
+    for (const [k, v] of Object.entries(s.shape))
+      if (!out.has(k)) {
+        out.add(k);
+        schemaKeys(v, out);
+      }
+  return out;
+}
+
 /**
  * The known key an unknown one is a typo of: equal but for case, or one edit away (two for
  * keys of 7+ characters, as search's typo correction counts them). `disallowedTools`,
@@ -484,11 +498,16 @@ export function parseSwarmYaml(text: string, file: string, rel: string): LoadRes
   // A key this version does not know is ignored with a note, so a file written for a newer
   // eminiar still loads (and still enforces) here. A typo of a known key stays an error:
   // ignoring it would silently drop the setting the author meant.
+  // A key the schema knows at another level (`disallowed_tools` under defaults) is misplaced,
+  // not new: ignoring it would drop the setting, so it stays an error.
   const ignoredKeys: ConfigIssue[] = [];
+  const allKeys = schemaKeys();
   for (const u of unknownKeys(js)) {
     const near = typoOf(u.key, u.known);
     const found = { path: u.at.join("."), line: lineOf([...u.at, u.key]) };
-    if (near)
+    if (allKeys.has(u.key))
+      issues.push({ ...found, message: `unknown key "${u.key}": not allowed here` });
+    else if (near)
       issues.push({ ...found, message: `unknown key "${u.key}" (did you mean "${near}"?)` });
     else
       ignoredKeys.push({
