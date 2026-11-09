@@ -1,7 +1,14 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { classifyPrompt, classifyToolCall } from "../../src/capture/classify.js";
 import { getContext, resetContextCache } from "../../src/context.js";
@@ -27,6 +34,21 @@ const base = (over: Partial<HookInput>): HookInput => ({
 /** A git repository: routing sends history reads to em_history only inside one. */
 function gitRepo(dir: string): void {
   spawnSync("git", ["init", "-q"], { cwd: dir });
+}
+
+/** A new folder with no git repository at or above it, or undefined when no temp base has none. */
+function outsideAnyRepo(prefix: string): string | undefined {
+  const inRepo = (d: string): boolean =>
+    existsSync(join(d, ".git")) || (dirname(d) !== d && inRepo(dirname(d)));
+  for (const base of [tmpdir(), "/tmp", "/var/tmp"]) {
+    try {
+      const real = realpathSync(base);
+      if (!inRepo(real)) return mkdtempSync(join(real, prefix));
+    } catch {
+      // that base does not exist here
+    }
+  }
+  return undefined;
 }
 
 beforeAll(() => {
@@ -482,9 +504,11 @@ describe("routing suggestions", () => {
     expect(bash(`cd ${tmpdir()} && git log -5`)).toBeUndefined();
     expect(bash("cd vendor/lib && git log -5")).toBeUndefined();
     expect(bash("cd $REPO && git log -5")?.tool).toBe("em_execute");
-    // a root that is not a git repository: nothing for em_history to classify
-    const plain = mkdtempSync(join(tmpdir(), "em-root-nogit-"));
-    expect(bash("git log --oneline -20", plain)?.tool).toBe("em_execute");
+    // a root that is not a git repository: nothing for em_history to classify. The temp folder
+    // can itself sit in a checkout (TMPDIR inside a repository or worktree): then any folder
+    // made there is in that repository, so this is checked only where no repository is above.
+    const plain = outsideAnyRepo("em-root-nogit-");
+    if (plain) expect(bash("git log --oneline -20", plain)?.tool).toBe("em_execute");
   });
 
   it("leaves a big Read native when em_execute_file would refuse it or a window is asked", () => {
