@@ -122,7 +122,12 @@ function realLocation(abs: string, real: RealPath): string {
 
 /** The memories folder once symlinks are resolved, or undefined when that leaves the project. */
 function memoriesBound(ctx: ProjectContext, real: RealPath): string | undefined {
-  const dir = realLocation(memoriesDir(ctx), real);
+  const configured = memoriesDir(ctx);
+  // An existing folder by its on-disk name: on a case-insensitive filesystem `.eminiar/Memories`
+  // is the folder `memories`, and the files below it resolve to that spelling.
+  const dir = lstatSync(configured, { throwIfNoEntry: false })
+    ? real(configured)
+    : realLocation(configured, real);
   return within(dir, real(ctx.root)) ? dir : undefined;
 }
 
@@ -140,7 +145,9 @@ function insideMemories(
   const real = realPaths(memo);
   try {
     const bound = memoriesBound(ctx, real);
-    return bound !== undefined && within(realLocation(abs, real), bound);
+    if (bound === undefined) return false;
+    // The folder itself is `bound` (by its on-disk name), however its configured spelling reads.
+    return abs === memoriesDir(ctx) || within(realLocation(abs, real), bound);
   } catch {
     return false; // dangling, a loop, or gone since it was listed
   }

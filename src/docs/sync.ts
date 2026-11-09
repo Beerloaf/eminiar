@@ -3,6 +3,8 @@ import type { ProjectContext } from "../context.js";
 import { kickEmbedding } from "../embeddings/queue.js";
 import { type Fetched, fetchMarkdown } from "../fetch/fetcher.js";
 import { indexContent, indexPath, refuseOutside } from "../index/indexer.js";
+import { checkReadPath, loadPermissionRules } from "../permissions/settings.js";
+import { readRefusal } from "../sandbox/file.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import { syncDocsGraphQuietly } from "./graph.js";
 import {
@@ -195,25 +197,45 @@ async function syncUrlSource(
   }
 }
 
+/**
+ * An IndexPathOptions.refuse for committed or configured doc globs: files must stay inside the
+ * project once symlinks are resolved, and Claude Code's Read deny/ask rules apply per file as
+ * they do for em_index, so a denied `.env` is never indexed.
+ */
+export function refuseUnreadable(ctx: ProjectContext): (file: string) => string | undefined {
+  const outside = refuseOutside(ctx.root);
+  const rules = loadPermissionRules(ctx.root);
+  return (file) => {
+    const refused = outside(file);
+    if (refused) return refused;
+    const c = checkReadPath(rules, file);
+    return c.allowed ? undefined : `refused by permission rule ${c.rule} (${c.kind})`;
+  };
+}
+
+/** Returns false when the source was refused (its sync state is cleared, not recorded). */
 function syncPathSource(
   ctx: ProjectContext,
   db: StorageAdapter,
   src: DocSource,
   r: SyncResult,
   opts: SyncOptions,
-): void {
+): boolean {
   const tag = docsTag(src.name);
   // The manifest is committed: its path, and every file a directory walk finds, must stay
-  // inside the project once symlinks are resolved.
-  const refuse = refuseOutside(ctx.root);
+  // inside the project once symlinks are resolved and pass the Read rules.
+  const refuse = refuseUnreadable(ctx);
   const target = src.path as string;
-  const refused = refuse(resolve(ctx.root, target));
+  const abs = resolve(ctx.root, target);
+  const refused =
+    refuseOutside(ctx.root)(abs) ?? readRefusal(loadPermissionRules(ctx.root), abs, target);
   if (refused) {
     // What this source indexed before (e.g. by a version without this check) goes too.
     db.deleteDocumentsBySource(tag);
+    clearSyncState(db, src.name);
     r.skipped = 1;
     r.errors.push(`${target}: ${refused}`);
-    return;
+    return false;
   }
   if (opts.force) db.deleteDocumentsBySource(tag);
   const s = indexPath(db, ctx.root, target, {
@@ -237,6 +259,7 @@ function syncPathSource(
   r.chunks = s.chunks;
   r.skipped = s.skipped.length;
   r.errors.push(...s.skipped.slice(0, 5).map((k) => `${k.path}: ${k.reason}`));
+  return true;
 }
 
 /** Fetch/scan one source and (re)index it under `docs:<name>`; records the outcome in the DB. */
@@ -261,14 +284,16 @@ export async function syncSource(
     errors: [],
     ms: 0,
   };
+  let recorded = true;
   try {
     if (src.kind === "url") await syncUrlSource(ctx, db, src, r, opts);
-    else syncPathSource(ctx, db, src, r, opts);
+    else recorded = syncPathSource(ctx, db, src, r, opts);
   } catch (err) {
     r.errors.push((err as Error).message);
   }
   if (!ctx.config.docs.embed) skipEmbedding(db, docsTag(src.name));
   r.ms = Date.now() - started;
+  if (!recorded) return r;
   setSyncState(db, src.name, {
     at: Date.now(),
     pages: r.pages,

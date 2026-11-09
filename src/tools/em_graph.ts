@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { refuseUnreadable } from "../docs/sync.js";
 import { getProvider } from "../embeddings/provider.js";
 import { embedPending } from "../embeddings/queue.js";
 import { formatEdges, formatHits, nodeLabel } from "../graph/format.js";
@@ -23,7 +24,7 @@ import {
   reindexCode,
   reindexGitSignals,
 } from "../graph/reindex.js";
-import { indexPath, refuseOutside } from "../index/indexer.js";
+import { indexPath } from "../index/indexer.js";
 import { reconcile } from "../memory/store.js";
 import { fileBytes, recordStat } from "../stats/record.js";
 import { getStorage } from "../storage/index.js";
@@ -433,7 +434,7 @@ export const emReindex = defineTool({
       const s = indexPath(db, ctx.root, ".", {
         source: "file",
         globs: ctx.config.index.docs,
-        refuse: refuseOutside(ctx.root),
+        refuse: refuseUnreadable(ctx),
       });
       lines.push(
         `docs: ${s.files} files, ${s.indexed} indexed, ${s.unchanged} unchanged${s.skipped.length ? `, ${s.skipped.length} skipped` : ""}`,

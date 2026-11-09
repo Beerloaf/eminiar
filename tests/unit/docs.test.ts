@@ -32,6 +32,7 @@ import {
   readManifest,
   readManifestAt,
   removeSource,
+  syncState,
   upsertSources,
 } from "../../src/docs/manifest.js";
 import { docGuesses, githubRepo, resolveProvider } from "../../src/docs/resolve.js";
@@ -1288,6 +1289,51 @@ describe("path sources stay inside the project", () => {
     expect([r.pages, r.indexed, r.skipped]).toEqual([0, 0, 1]);
     expect(r.errors).toEqual(["elsewhere: refused, it resolves outside the project"]);
     expect(pdb.countDocuments(docsTag("elsewhere"))).toBe(0);
+    // Refused, not synced: no state is recorded for it, and an earlier one is cleared.
+    expect(syncState(pdb, "elsewhere")).toBeUndefined();
+  });
+
+  it("a Read-denied file is never indexed by a path source sync or em_reindex docs", async () => {
+    const settings = join(pctx.root, ".claude", "settings.json");
+    mkdirSync(join(pctx.root, ".claude"), { recursive: true });
+    mkdirSync(join(pctx.root, "guides"), { recursive: true });
+    writeFileSync(join(pctx.root, "guides", "open.md"), "# Open\n\nPublic guide.\n");
+    writeFileSync(join(pctx.root, "guides", "secret.md"), "# Secret\n\nhunter2 token.\n");
+    writeFileSync(
+      settings,
+      JSON.stringify({ permissions: { deny: ["Read(**/guides/secret.md)"] } }),
+    );
+    const secret = `file://${join(pctx.root, "guides", "secret.md")}`;
+    try {
+      const r = await syncSource(pctx, pdb, src("guides", "guides"));
+      expect([r.pages, r.indexed, r.skipped]).toEqual([2, 1, 1]);
+      expect(r.errors[0]).toContain("guides/secret.md: refused by permission rule");
+      expect(pdb.documentsBySource(docsTag("guides")).map((d) => d.title)).toEqual([
+        "guides/open.md",
+      ]);
+      // A denied source folder is refused whole.
+      writeFileSync(
+        settings,
+        JSON.stringify({ permissions: { deny: ["Read(**/guides)", "Read(**/guides/**)"] } }),
+      );
+      const whole = await syncSource(pctx, pdb, src("guides", "guides"));
+      expect(whole.errors[0]).toContain("guides: refused by permission rule");
+      expect(pdb.countDocuments(docsTag("guides"))).toBe(0);
+      expect(syncState(pdb, "guides")).toBeUndefined();
+      // em_reindex docs applies the same rules to the default globs.
+      writeFileSync(
+        settings,
+        JSON.stringify({ permissions: { deny: ["Read(**/guides/secret.md)"] } }),
+      );
+      await emReindex.handler({ scope: "docs" }, pctx);
+      expect(pdb.findDocumentByUri(secret)).toBeUndefined();
+      expect(pdb.findDocumentByUri(`file://${join(pctx.root, "guides", "open.md")}`)).toBeDefined();
+    } finally {
+      rmSync(settings, { force: true });
+      rmSync(join(pctx.root, "guides"), { recursive: true, force: true });
+      pdb.deleteDocumentsBySource(docsTag("guides"));
+      pdb.deleteDocumentsBySource("file");
+    }
   });
 
   it("sync skips files a folder source reaches through a symlink out of the project", async () => {

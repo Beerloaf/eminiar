@@ -501,6 +501,20 @@ describe("memory files outside the project", () => {
     expect(readFileSync(join(notes, "topic", "page.md"), "utf8")).toBe("personal notes\n");
   });
 
+  it("a memories.dir spelled in another case than the folder on disk keeps working", () => {
+    // On a case-insensitive filesystem (macOS, Windows) `Memories` is the folder `memories`;
+    // elsewhere it is simply a new folder. Either way writes and reads must succeed.
+    const project = projectAt({ memories: { dir: ".eminiar/Memories" } });
+    mkdirSync(join(project, ".eminiar", "memories"), { recursive: true });
+    resetContextCache();
+    const c = getContext(project);
+    const cdb = getStorage(c);
+    write(c, cdb, { name: "topic/page", kind: "fact", content: "Cased folder note." });
+    expect(read(c, cdb, "topic/page")?.body).toContain("Cased folder note.");
+    expect(reconcile(c, cdb).skipped).toEqual([]);
+    expect(cdb.memoryGetByName("topic/page")).toBeDefined();
+  });
+
   it("reconcile lists a linked memories folder or topic that leads out once, untouched", () => {
     for (const link of [".eminiar/memories", ".eminiar/memories/topic"]) {
       const notes = outsideNotes();
