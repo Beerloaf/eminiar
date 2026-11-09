@@ -268,6 +268,35 @@ export function adjudicatorDefaults(): AdjudicatorConfig {
 }
 
 /** Everything but the adjudicator section; loadConfig parses this alone while it is untouched. */
+/**
+ * Why a graph include/exclude glob is refused, or undefined when it is fine. The patterns reach
+ * micromatch, whose regexes backtrack exponentially in the number of `*` groups inside one path
+ * segment (`**\/*a*a*a*a*a*a*a*a*b.ts` froze a server for a minute on a 40 character file name),
+ * and a committed eminiar.config.json is untrusted. Bounds: 200 characters, 4 braces, 2 extglob
+ * groups, 3 wildcard groups per segment and 8 per pattern; the defaults use at most 2.
+ */
+export function graphGlobProblem(g: string): string | undefined {
+  if (g.length > 200) return "longer than 200 characters";
+  if ((g.match(/\{/g)?.length ?? 0) > 4) return "more than 4 braces";
+  if ((g.match(/\(/g)?.length ?? 0) > 2) return "more than 2 extglob groups";
+  let total = 0;
+  for (const seg of g.split(/[\\/]/)) {
+    const groups = seg.match(/\*+|\?/g)?.length ?? 0;
+    if (groups > 3) return "more than 3 wildcards in one path segment";
+    total += groups;
+  }
+  return total > 8 ? "more than 8 wildcards" : undefined;
+}
+
+const GraphGlob = z.string().superRefine((g, ctx) => {
+  const why = graphGlobProblem(g);
+  if (why)
+    ctx.addIssue({
+      code: "custom",
+      message: `graph glob ${JSON.stringify(g.slice(0, 40))} is ${why}`,
+    });
+});
+
 const BaseConfigSchema = z.object({
   routing: z
     .object({
@@ -312,7 +341,7 @@ const BaseConfigSchema = z.object({
   graph: z
     .object({
       include: z
-        .array(z.string())
+        .array(GraphGlob)
         .default([
           "**/*.ts",
           "**/*.tsx",
@@ -320,12 +349,15 @@ const BaseConfigSchema = z.object({
           "**/*.jsx",
           "**/*.mjs",
           "**/*.cjs",
+          "**/*.mts",
+          "**/*.cts",
           "**/*.py",
+          "**/*.pyi",
           "**/*.go",
           "**/*.php",
         ]),
       exclude: z
-        .array(z.string())
+        .array(GraphGlob)
         .default([
           "**/node_modules/**",
           "**/dist/**",

@@ -20,6 +20,9 @@ import { getCurrentSession } from "../../src/session/current.js";
 import { markServerAlive } from "../../src/session/server-alive.js";
 import type { StorageAdapter } from "../../src/storage/adapter.js";
 import { closeAllStorage, getStorage } from "../../src/storage/index.js";
+import { activeSwarmConfig, resetSwarmConfigCache } from "../../src/swarm/config.js";
+import { swarmRoots } from "../../src/swarm/hooks.js";
+import { startRun } from "../../src/swarm/runtime.js";
 
 // The session starts in `ws`, a folder with no project marker (a multi-repo workspace), and
 // Claude then cd's into `app`, a git repository inside it. Claude Code keeps CLAUDE_PROJECT_DIR
@@ -313,5 +316,119 @@ describe("Cursor", () => {
       ),
     );
     expect(out.env.EMINIAR_PROJECT_ROOT).toBe(ws);
+  });
+});
+
+describe("git commit -a from a nested repository", () => {
+  it("names a tracked file with unstaged changes only when -a is given", async () => {
+    const svc = join(ws, "svc-all");
+    mkdirSync(join(svc, "src"), { recursive: true });
+    writeFileSync(join(svc, "src", "a.ts"), "export const a = 1;\n");
+    const git = (...args: string[]) =>
+      spawnSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: svc });
+    git("init", "-q");
+    git("add", ".");
+    git("commit", "-q", "-m", "init");
+    writeFileSync(join(svc, "src", "a.ts"), "export const a = 2;\n");
+    const risk = { commits: 9, fixes: 5, bugOrigins: 2, risk: 0.62, reasons: ["fix density"] };
+    wsDb().metaSet(
+      "history_files",
+      JSON.stringify({ head: "abc", files: { "svc-all/src/a.ts": risk } }),
+    );
+    const ask = async (command: string) =>
+      String(
+        (
+          await handlers.PreToolUse!(
+            afterCd({
+              hook_event_name: "PreToolUse",
+              cwd: svc,
+              tool_name: "Bash",
+              tool_input: { command },
+            }),
+          )
+        )?.hookSpecificOutput?.additionalContext ?? "",
+      );
+    expect(await ask('git commit -m "x"')).not.toContain("a.ts is bug-prone");
+    expect(await ask('git commit -am "x"')).toContain("svc-all/src/a.ts is bug-prone");
+    expect(await ask('git commit --all -m "x"')).toContain("svc-all/src/a.ts is bug-prone");
+  });
+});
+
+describe("swarm hooks after a cd", () => {
+  const SWARM = `version: 1
+swarms:
+  feat:
+    description: test swarm
+    max_agents: 3
+    agents:
+      coder:
+        description: writes code
+        count: 2
+        tools: [Read, Edit]
+`;
+  // A workspace of its own: a swarm file in the session root, or only in the nested repository.
+  const workspace = (name: string, swarmIn: "root" | "nested", enforce: boolean) => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), `em-sw-${name}-`)));
+    const nested = join(root, "sub");
+    mkdirSync(join(nested, ".git"), { recursive: true });
+    writeFileSync(join(nested, "package.json"), "{}");
+    const dir = join(swarmIn === "root" ? root : nested, ".eminiar");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "swarm.yaml"), `${SWARM}${enforce ? "enforce: true\n" : ""}`);
+    process.env.CLAUDE_PROJECT_DIR = root;
+    resetContextCache();
+    resetSwarmConfigCache();
+    return { root, nested };
+  };
+  const spawn = (cwd: string, id: string): HookInput => ({
+    session_id: "s-sw",
+    cwd,
+    hook_event_name: "PreToolUse",
+    tool_name: "Agent",
+    tool_input: { subagent_type: "swarm-feat-coder", prompt: "go" },
+    tool_use_id: id,
+  });
+
+  it("swarmRoots tries the session root, then the root of the directory Claude cd'd into", () => {
+    const { root, nested } = workspace("roots", "nested", false);
+    expect(swarmRoots({ cwd: nested })).toEqual([root, nested]);
+    expect(swarmRoots({ cwd: root })).toEqual([root]);
+  });
+
+  it("tracks a spawn through a swarm file that exists only in the nested repository", async () => {
+    const { nested } = workspace("track", "nested", false);
+    const db = getStorage(getContext(nested), { vectors: false });
+    const run = startRun(db, activeSwarmConfig(nested)!, {
+      swarm: "feat",
+      goal: "g",
+      sessionId: "s-sw",
+    });
+    const out = await handlers.PreToolUse!(spawn(nested, "toolu_nested"));
+    expect(out?.hookSpecificOutput?.permissionDecision).toBe("allow");
+    expect(db.swarm.spawnsPending(run.id, 0)).toBe(1);
+  });
+
+  it("releases the reservation of a denied spawn in the session root's ledger after a cd", async () => {
+    const { root, nested } = workspace("fail", "root", true);
+    const db = getStorage(getContext(root), { vectors: false });
+    const run = startRun(db, activeSwarmConfig(root)!, {
+      swarm: "feat",
+      goal: "g",
+      sessionId: "s-sw",
+    });
+    const original = handlers.PreToolUse;
+    try {
+      // the handler reserves the slot, then dies late
+      handlers.PreToolUse = async (i) => {
+        await original!(i);
+        throw new Error("handler exploded");
+      };
+      const out = JSON.parse(await dispatch(JSON.stringify(spawn(nested, "toolu_fc_cd")), []));
+      expect(out.hookSpecificOutput.permissionDecision).toBe("deny");
+      expect(db.swarm.spawnsPending(run.id, 0)).toBe(0);
+    } finally {
+      handlers.PreToolUse = original!;
+    }
+    expect(existsSync(getContext(nested).dbPath)).toBe(false);
   });
 });

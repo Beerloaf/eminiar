@@ -63,6 +63,17 @@ export function listCodeFiles(ctx: ProjectContext): string[] {
  * under `.claude/worktrees/` must not put a second copy of the code into the graph.
  */
 export function codeFileFilter(graph: Config["graph"]): (rel: string) => boolean {
+  // Compiled once per config object: the server drains the queue on every request.
+  const cached = FILTERS.get(graph);
+  if (cached) return cached;
+  const f = compileCodeFilter(graph);
+  FILTERS.set(graph, f);
+  return f;
+}
+
+const FILTERS = new WeakMap<Config["graph"], (rel: string) => boolean>();
+
+function compileCodeFilter(graph: Config["graph"]): (rel: string) => boolean {
   const tasks = fg.generateTasks(graph.include, { ignore: graph.exclude });
   const re = (patterns: string[], opts: micromatch.Options) =>
     patterns.map((p) => micromatch.makeRe(p, opts));
