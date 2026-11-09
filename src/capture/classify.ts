@@ -135,7 +135,9 @@ export function classifyToolCall(info: ToolCallInfo): Draft[] {
   const { toolName, toolInput, root } = info;
   const out: Draft[] = [];
   const key = callKey(toolName, toolInput);
-  out.push(ev("tool_call", { key, summary: summarizeInput(toolName, toolInput) }, toolName));
+  out.push(
+    ev("tool_call", { key, summary: redactSecrets(summarizeInput(toolName, toolInput)) }, toolName),
+  );
 
   if (EDIT_TOOLS.has(toolName)) {
     const fp = String(toolInput.file_path ?? toolInput.notebook_path ?? "");
@@ -188,7 +190,7 @@ export function classifyToolCall(info: ToolCallInfo): Draft[] {
     out.push(
       ev(
         "latency",
-        { ms: info.durationMs, summary: summarizeInput(toolName, toolInput) },
+        { ms: info.durationMs, summary: redactSecrets(summarizeInput(toolName, toolInput)) },
         toolName,
       ),
     );
