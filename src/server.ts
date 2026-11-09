@@ -125,7 +125,8 @@ const warm = setTimeout(async () => {
       // not a git repo
     }
     try {
-      // once per database, in slices: output indexed before secrets were masked
+      // in slices: output indexed before secrets were masked, then on later starts what was
+      // stored since (by an older eminiar still running on this database)
       await remaskCapturedOutput(db);
     } catch (err) {
       process.stderr.write(`eminiar: masking stored output skipped: ${(err as Error).message}\n`);

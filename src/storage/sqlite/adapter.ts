@@ -137,6 +137,88 @@ function maskJsonStrings(json: string, mask: (text: string) => string): string {
   }
 }
 
+/** Set while a remask has changed chunks whose old tokens the FTS segments still hold. */
+const REMASK_FTS_PENDING = "remask_fts_optimize";
+
+/** How far past a masked line the remask looks for the next unchanged line. */
+const RESYNC_LINES = 4096;
+
+interface StoredChunk {
+  id: number;
+  title: string;
+  body: string;
+  start_line: number | null;
+  end_line: number | null;
+}
+
+/**
+ * Each chunk's body (in `chunks` order) cut from the document they make up, masked as one text.
+ * The document is rebuilt from the chunks in order, a code chunk's lines repeated from the chunk
+ * before (the overlap) taken once. The masked text is laid back over the chunks by line: an
+ * unchanged line stays on its line, and a line that a mask rewrote (and the lines it swallowed,
+ * up to the next unchanged line) goes to the chunk its first line was in. A chunk whose lines
+ * were all swallowed gets "". Every returned body is cut from the masked text, so a mismatch in
+ * the line matching can only move masked text to a neighbouring chunk.
+ */
+function maskAcrossChunks(chunks: StoredChunk[], mask: (text: string) => string): string[] {
+  const lines: string[] = [];
+  const ranges: Array<[number, number]> = []; // each chunk's first and last line in `lines`
+  let prev: StoredChunk | undefined;
+  for (const c of chunks) {
+    const body = c.body.split("\n");
+    const [prevLo, prevHi] = ranges[ranges.length - 1] ?? [0, -1];
+    let shared = 0;
+    if (prev?.end_line && c.start_line && c.start_line <= prev.end_line) {
+      const k = Math.min(prev.end_line - c.start_line + 1, body.length, prevHi - prevLo + 1);
+      if (body.slice(0, k).every((l, i) => l === lines[prevHi - k + 1 + i])) shared = k;
+    }
+    const lo = lines.length - shared;
+    for (let i = shared; i < body.length; i++) lines.push(body[i] as string);
+    ranges.push([lo, lines.length - 1]);
+    prev = c;
+  }
+  const text = lines.join("\n");
+  const masked = mask(text);
+  if (masked === text) return chunks.map((c) => c.body);
+  // owner[j]: the line of `lines` that masked line j starts on (non-decreasing in j)
+  const out = masked.split("\n");
+  const owner = new Int32Array(out.length);
+  let i = 0;
+  for (let j = 0; j < out.length; j++) {
+    if (i >= lines.length) {
+      owner[j] = lines.length - 1;
+      continue;
+    }
+    owner[j] = i;
+    if (out[j] === lines[i]) {
+      i++;
+      continue;
+    }
+    // A rewritten line ends on the line before the one the next masked line matches; the lines
+    // left must still cover the masked lines left.
+    let end = j + 1 < out.length ? i : lines.length - 1;
+    const limit = Math.min(lines.length - 1 - (out.length - j - 1), i + RESYNC_LINES);
+    for (let b = i; b <= limit && j + 1 < out.length; b++) {
+      if (lines[b + 1] === out[j + 1]) {
+        end = b;
+        break;
+      }
+    }
+    i = end + 1;
+  }
+  const bodies: string[] = [];
+  let j = 0;
+  for (const [lo, hi] of ranges) {
+    // ranges only overlap by the shared lines, so step back to the first masked line in this one
+    while (j > 0 && (owner[j - 1] as number) >= lo) j--;
+    while (j < out.length && (owner[j] as number) < lo) j++;
+    const start = j;
+    while (j < out.length && (owner[j] as number) <= hi) j++;
+    bodies.push(out.slice(start, j).join("\n"));
+  }
+  return bodies;
+}
+
 export class SqliteAdapter implements StorageAdapter {
   readonly db: Database.Database;
   readonly vectors: boolean;
@@ -310,32 +392,57 @@ export class SqliteAdapter implements StorageAdapter {
     const until = performance.now() + budgetMs;
     let changed = 0;
     let lastId = afterId;
+    let flagged = false;
     // One short transaction per document, so a hook waiting on the lock is never held for long.
     for (;;) {
       const d = next.get(lastId, ...sources) as
         | { id: number; title: string; meta: string | null }
         | undefined;
-      if (!d) return { changed, lastId, done: true };
+      if (!d) {
+        // An UPDATE leaves the old text's tokens in the FTS segments until they are merged, so a
+        // run that changed anything (in this process or one stopped part-way) ends with a merge.
+        if (this.metaGet(REMASK_FTS_PENDING) !== undefined) {
+          this.db.exec("INSERT INTO chunks_fts_porter(chunks_fts_porter) VALUES ('optimize')");
+          this.db.exec("INSERT INTO chunks_fts_trigram(chunks_fts_trigram) VALUES ('optimize')");
+          this.metaDelete(REMASK_FTS_PENDING);
+        }
+        return { changed, lastId, done: true };
+      }
       this.transaction(() => {
         const title = mask(d.title);
         const meta = d.meta === null ? null : maskJsonStrings(d.meta, mask);
         if (title !== d.title || meta !== d.meta)
           this.prep("UPDATE documents SET title = ?, meta = ? WHERE id = ?").run(title, meta, d.id);
-        const rows = this.prep("SELECT id, title, body FROM chunks WHERE document_id = ?").all(
-          d.id,
-        ) as Array<{ id: number; title: string; body: string }>;
-        for (const c of rows) {
+        const rows = this.prep(
+          "SELECT id, title, body, start_line, end_line FROM chunks WHERE document_id = ? ORDER BY ord, id",
+        ).all(d.id) as StoredChunk[];
+        // The chunks were cut from unmasked text, so a secret can span two of them (a private key's
+        // base64 lines under a BEGIN line in the chunk before): mask the document as one text.
+        const bodies = maskAcrossChunks(rows, mask);
+        let touched = 0;
+        rows.forEach((c, k) => {
           const t = mask(c.title);
-          const b = mask(c.body);
-          if (t === c.title && b === c.body) continue;
+          const b = mask(bodies[k] as string);
+          if (t === c.title && b === c.body) return;
+          touched++;
+          if (b.trim() === "") {
+            // all of it was inside a secret masked in an earlier chunk
+            if (this.vectors) this.prep("DELETE FROM chunk_vec WHERE chunk_id = ?").run(c.id);
+            this.prep("DELETE FROM chunks WHERE id = ?").run(c.id);
+            return;
+          }
           // chunks_au keeps both FTS tables in step; embedded = 0 replaces the vector.
           this.prep("UPDATE chunks SET title = ?, body = ?, embedded = 0 WHERE id = ?").run(
             t,
             b,
             c.id,
           );
-          changed++;
+        });
+        if (touched && !flagged) {
+          this.metaSet(REMASK_FTS_PENDING, "1");
+          flagged = true;
         }
+        changed += touched;
       });
       lastId = d.id;
       if (performance.now() >= until) return { changed, lastId, done: false };

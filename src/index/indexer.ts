@@ -71,29 +71,35 @@ function maskCaptured(input: IndexInput): IndexInput {
 const REMASK_SLICE_MS = 20;
 
 /**
- * Mask captured output stored before it was masked (or under older rules) in place, once per
- * database. The server runs it in its warm-up; it yields every REMASK_SLICE_MS so a tool call is
- * never queued behind it, and records where it got to, so a server stopped halfway resumes there.
- * Hooks never run it. Returns the number of chunks that changed.
+ * `<CAPTURED_MASK_VERSION>:<id>`: every captured document up to that id is masked under these
+ * rules. Document ids are AUTOINCREMENT, so they are never handed out again below it.
+ */
+const CAPTURED_MASK_KEY = "captured_mask_upto";
+
+/**
+ * Mask captured output stored before it was masked (or under older rules) in place. The server
+ * runs it in its warm-up on every start: the first run goes over the whole database, and later
+ * ones only over the documents stored since, which catches output that an older eminiar still
+ * running on the same database stored unmasked meanwhile. It yields every REMASK_SLICE_MS so a
+ * tool call is never queued behind it, and records where it got to after each slice, so a server
+ * stopped halfway resumes there. Hooks never run it. Returns the number of chunks that changed.
  */
 export async function remaskCapturedOutput(db: StorageAdapter): Promise<number> {
-  if (db.metaGet("captured_mask_version") === CAPTURED_MASK_VERSION) return 0;
-  const [version, id] = (db.metaGet("captured_mask_resume") ?? "").split(":");
+  const [version, id] = (db.metaGet(CAPTURED_MASK_KEY) ?? "").split(":");
   let afterId = version === CAPTURED_MASK_VERSION ? Number(id) || 0 : 0;
   let changed = 0;
   for (;;) {
     const slice = db.remaskDocuments([...CAPTURED], redactSecrets, afterId, REMASK_SLICE_MS);
     changed += slice.changed;
-    if (slice.done) break;
-    afterId = slice.lastId;
     // Written after the slice, not inside its transactions: a stop between the two only redoes
     // documents that are already masked, which changes nothing.
-    db.metaSet("captured_mask_resume", `${CAPTURED_MASK_VERSION}:${afterId}`);
+    if (slice.lastId !== afterId || version !== CAPTURED_MASK_VERSION) {
+      afterId = slice.lastId;
+      db.metaSet(CAPTURED_MASK_KEY, `${CAPTURED_MASK_VERSION}:${afterId}`);
+    }
+    if (slice.done) return changed;
     await new Promise((resolve) => setImmediate(resolve));
   }
-  db.metaSet("captured_mask_version", CAPTURED_MASK_VERSION);
-  db.metaDelete("captured_mask_resume");
-  return changed;
 }
 
 /** Chunk + store one piece of content. Unchanged uri+content is a no-op (created=false). */

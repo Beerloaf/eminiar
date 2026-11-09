@@ -1,7 +1,10 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { generateKeyPairSync } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { redactSecrets } from "../../src/adjudicator/redact.js";
+import { chunk, hashText } from "../../src/chunker/index.js";
 import { ConfigSchema } from "../../src/config.js";
 import type { ProjectContext } from "../../src/context.js";
 import { indexContent, remaskCapturedOutput } from "../../src/index/indexer.js";
@@ -146,10 +149,10 @@ describe("captured output in the index", () => {
     return id;
   };
 
-  it("masks output stored before masking once, in place, and leaves other sources", async () => {
+  it("masks output stored before masking in place, and leaves other sources", async () => {
     const exec = legacy("exec", "a");
     const file = legacy("file", "a");
-    db.metaDelete("captured_mask_version");
+    db.metaDelete("captured_mask_upto");
     expect(await remaskCapturedOutput(db)).toBeGreaterThan(0);
     expect(db.getDocument(exec)?.title).toBe("echo ghp_***");
     expect(db.getDocument(exec)?.meta).toBe('{"intent":"why is GH_TOKEN=*** rejected"}');
@@ -160,16 +163,27 @@ describe("captured output in the index", () => {
     expect(db.chunksOfDocument(file)[0]?.body).toBe(`GH_TOKEN=${secret}`);
     const hits = await search(db, "Z9y8X7w6V5u4T3s2", { mode: "lexical" });
     expect(hits.hits.map((h) => h.chunk.document.id)).toEqual([file]);
-    // once per database: a later warm-up does nothing
-    legacy("exec", "later");
+    // a later start goes over only what was stored since: here an older server's raw output
+    const later = legacy("exec", "later");
+    const from: number[] = [];
+    const spy = Object.create(db) as SqliteAdapter;
+    spy.remaskDocuments = (sources, mask, afterId, budget) => {
+      from.push(afterId);
+      return db.remaskDocuments(sources, mask, afterId, budget);
+    };
+    expect(await remaskCapturedOutput(spy)).toBeGreaterThan(0);
+    // the first run ended on the last captured document, `exec` (`file` is not captured)
+    expect(from).toEqual([exec]);
+    expect(db.chunksOfDocument(later)[0]?.body).toBe("GH_TOKEN=***");
+    expect(db.metaGet("captured_mask_upto")).toBe(`1:${later}`);
     expect(await remaskCapturedOutput(db)).toBe(0);
   });
 
   it("works in slices that yield to the event loop, and resumes where it stopped", async () => {
-    db.metaDelete("captured_mask_version");
+    db.metaDelete("captured_mask_upto");
     const docs = [legacy("exec", "s1"), legacy("batch", "s2"), legacy("url", "s3")];
     // a run stopped after the first document resumes after it
-    db.metaSet("captured_mask_resume", `1:${docs[0]}`);
+    db.metaSet("captured_mask_upto", `1:${docs[0]}`);
     // one document per slice, as if each took the whole 20 ms
     const sliced = Object.create(db) as SqliteAdapter;
     const order: string[] = [];
@@ -182,6 +196,134 @@ describe("captured output in the index", () => {
     expect(order).toEqual(["slice", "tick", "slice", "slice"]);
     expect(db.chunksOfDocument(docs[0] as number)[0]?.body).toBe(`GH_TOKEN=${secret}`);
     for (const id of docs.slice(1)) expect(db.chunksOfDocument(id)[0]?.body).toBe("GH_TOKEN=***");
-    expect(db.metaGet("captured_mask_resume")).toBeUndefined();
+    expect(db.metaGet("captured_mask_upto")).toBe(`1:${docs[2]}`);
+  });
+
+  it("a server stopped part-way resumes after the last slice it finished", async () => {
+    const docs = [legacy("exec", "c1"), legacy("batch", "c2"), legacy("url", "c3")];
+    const before = (docs[0] as number) - 1;
+    db.metaSet("captured_mask_upto", `1:${before}`);
+    let slices = 0;
+    const dying = Object.create(db) as SqliteAdapter;
+    dying.remaskDocuments = (sources, mask, afterId) => {
+      if (++slices === 2) throw new Error("server stopped");
+      return db.remaskDocuments(sources, mask, afterId, 0);
+    };
+    await expect(remaskCapturedOutput(dying)).rejects.toThrow("server stopped");
+    expect(db.metaGet("captured_mask_upto")).toBe(`1:${docs[0]}`);
+    expect(db.chunksOfDocument(docs[1] as number)[0]?.body).toBe(`GH_TOKEN=${secret}`);
+    const from: number[] = [];
+    const next = Object.create(db) as SqliteAdapter;
+    next.remaskDocuments = (sources, mask, afterId, budget) => {
+      from.push(afterId);
+      return db.remaskDocuments(sources, mask, afterId, budget);
+    };
+    expect(await remaskCapturedOutput(next)).toBeGreaterThan(0);
+    expect(from[0]).toBe(docs[0]);
+    for (const id of docs) expect(db.chunksOfDocument(id)[0]?.body).toBe("GH_TOKEN=***");
+    expect(db.metaGet("captured_mask_upto")).toBe(`1:${docs[2]}`);
+  });
+
+  it("goes over every document again when the pointer is from older rules", async () => {
+    const docs = [legacy("exec", "v1"), legacy("url", "v2")];
+    db.metaSet("captured_mask_upto", `0:${docs[1]}`);
+    expect(await remaskCapturedOutput(db)).toBeGreaterThan(0);
+    for (const id of docs) expect(db.chunksOfDocument(id)[0]?.body).toBe("GH_TOKEN=***");
+    expect(db.metaGet("captured_mask_upto")).toBe(`1:${docs[1]}`);
+  });
+});
+
+describe("re-masking a document cut into chunks before it was masked", () => {
+  const TOKEN = "ghp_Zq7Xk2VwRt9Lm4Np8Bs3Hd6Jc1Fy5Gu0Ea2W";
+  const pem = generateKeyPairSync("rsa", { modulusLength: 4096 })
+    .privateKey.export({ type: "pkcs8", format: "pem" })
+    .toString();
+  const keyLines = pem.split("\n").filter((l) => /^[A-Za-z0-9+/=]{40,}$/.test(l));
+  const logs = (from: number, n: number) =>
+    Array.from({ length: n }, (_, i) => `2026-11-09T10:00:${from + i} deploy step ${from + i} ok`);
+
+  /** Store `content` the way an older version did: chunked raw, as one captured document. */
+  function storeRaw(adapter: SqliteAdapter, content: string, kind?: "code"): number {
+    const cut = chunk(content, "shell: deploy", kind, undefined);
+    return adapter.upsertDocument(
+      {
+        source: "exec",
+        title: "shell: deploy",
+        contentType: cut.chunks[0]?.contentType ?? "prose",
+        contentHash: hashText(content),
+      },
+      cut.chunks,
+    ).id;
+  }
+
+  const bodies = (adapter: SqliteAdapter, id: number) =>
+    adapter.chunksOfDocument(id).map((c) => c.body);
+
+  it.each([
+    ["prose", undefined],
+    ["code (overlapping windows)", "code" as const],
+  ])("masks a private key that spans chunks (%s)", async (_, kind) => {
+    const content = [
+      ...logs(0, 30),
+      "$ cat deploy/id_rsa",
+      pem.trimEnd(),
+      `export GH=${TOKEN}`,
+      ...logs(30, 30),
+    ].join("\n");
+    const id = storeRaw(db, content, kind);
+    expect(db.chunksOfDocument(id).length).toBeGreaterThan(2);
+    // masking each chunk on its own leaves the base64 lines of the chunks after the BEGIN line
+    const alone = bodies(db, id).map(redactSecrets).join("\n");
+    expect(keyLines.filter((l) => alone.includes(l)).length).toBeGreaterThan(10);
+    db.metaSet("captured_mask_upto", `1:${id - 1}`);
+    expect(await remaskCapturedOutput(db)).toBeGreaterThan(0);
+    const text = bodies(db, id).join("\n");
+    expect(keyLines.filter((l) => text.includes(l))).toEqual([]);
+    expect(text).not.toContain("-----END PRIVATE KEY-----");
+    expect(text).not.toContain(TOKEN);
+    expect(text).toContain("[private key]");
+    expect(text).toContain("export GH=");
+    // the log lines around the key stay, each once, in order
+    const kept = text.split("\n").filter((l) => l.includes("deploy step"));
+    const all = [...logs(0, 30), ...logs(30, 30)];
+    expect(kind === "code" ? [...new Set(kept)] : kept).toEqual(all);
+    expect(bodies(db, id).every((b) => b.trim() !== "")).toBe(true);
+  });
+
+  it("masks a YAML secret block that spans chunks", async () => {
+    const block = Array.from({ length: 80 }, (_, i) => `    line-${i}-${"s3cr3tV4lue".repeat(3)}`);
+    const content = [...logs(0, 30), "db:", "  password: |", ...block, "  host: db.local"].join(
+      "\n",
+    );
+    const id = storeRaw(db, content);
+    expect(db.chunksOfDocument(id).length).toBeGreaterThan(2);
+    db.metaSet("captured_mask_upto", `1:${id - 1}`);
+    await remaskCapturedOutput(db);
+    const text = bodies(db, id).join("\n");
+    expect(text).not.toContain("s3cr3tV4lue");
+    expect(text).toContain("  password: |\n    ***");
+    expect(text).toContain("host: db.local");
+  });
+
+  it("leaves no fragment of a re-masked token in the FTS index", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "em-remask-"));
+    const path = join(dir, "t.db");
+    const trigrams = (s: string) =>
+      Array.from({ length: s.length - 2 }, (_, i) => s.slice(i, i + 3).toLowerCase());
+    const fresh = new SqliteAdapter(path, { vectors: false });
+    fresh.close();
+    const baseline = readFileSync(path).toString("latin1");
+    const adapter = new SqliteAdapter(path, { vectors: false });
+    storeRaw(adapter, `$ cat .env\nGH=${TOKEN}\n`);
+    expect(await remaskCapturedOutput(adapter)).toBeGreaterThan(0);
+    expect(adapter.metaGet("remask_fts_optimize")).toBeUndefined();
+    adapter.db.exec("VACUUM");
+    adapter.db.pragma("wal_checkpoint(TRUNCATE)");
+    adapter.close();
+    const raw = readFileSync(path).toString("latin1");
+    rmSync(dir, { recursive: true, force: true });
+    const probes = trigrams(TOKEN.slice(4)).filter((t) => !baseline.includes(t));
+    expect(probes.length).toBeGreaterThan(20);
+    expect(probes.filter((t) => raw.includes(t))).toEqual([]);
   });
 });

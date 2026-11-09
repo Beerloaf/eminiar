@@ -66,7 +66,10 @@ export interface StorageAdapter {
   /**
    * Rewrite the title, string meta and chunk text of these sources' documents through `mask`, in
    * place (FTS follows; changed chunks are re-embedded), in id order from after `afterId` until
-   * `budgetMs` has passed. `lastId` is the last document done; `done` when none are left.
+   * `budgetMs` has passed. A document's chunks are masked as the one text they were cut from, so
+   * a secret that spans chunks is masked whole; a chunk left with nothing is deleted. The FTS
+   * segments are merged once no document is left, so the old text's tokens leave the index.
+   * `lastId` is the last document done; `done` when none are left.
    */
   remaskDocuments(
     sources: string[],
