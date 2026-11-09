@@ -1,5 +1,13 @@
 import { createHash } from "node:crypto";
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import {
+  copyFileSync,
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+} from "node:fs";
 import { join } from "node:path";
 import {
   claudeJsonPath,
@@ -136,7 +144,12 @@ export function isOurs(cmd: unknown, stable: string): cmd is string {
 function isOurHook(cmd: unknown, stable: string): boolean {
   if (typeof cmd !== "string") return false;
   const bin = cmd.trim().replace(/^"(.*)"$/, "$1");
-  return bin === join(stable, "bin", "em-hook") || bin.endsWith("/.eminiar/plugin/bin/em-hook");
+  // The stable copy, the legacy plugin path, and the npm-installed layout of any install root.
+  return (
+    bin === join(stable, "bin", "em-hook") ||
+    bin.endsWith("/.eminiar/plugin/bin/em-hook") ||
+    /\/\.eminiar\/plugin\/node_modules\/eminiar\/bin\/em-hook$/.test(bin)
+  );
 }
 
 /**
@@ -191,19 +204,54 @@ function settingsHooks(stable: string): Record<string, Json[]> {
   return out;
 }
 
-/** Fallback: write hooks + MCP server directly, context-mode style. */
-export function registerSettings(stable: string): InstallRecord["wrote"] {
-  const settings = readJson(settingsPath());
-  const hooks = (settings.hooks as Record<string, unknown> | undefined) ?? {};
-  const ours = settingsHooks(stable);
+/**
+ * Merge our hook table into settings.hooks and write settings.json. Returns the events written,
+ * or none when settings.hooks is not an object (an array would silently drop what we add): that
+ * value is the user's, so it is left alone with a warning and the install record claims no hooks.
+ */
+function registerSettingsHooks(
+  settings: Json,
+  ours: Record<string, Json[]>,
+  stable: string,
+): string[] {
+  const current = settings.hooks;
+  if (
+    current !== undefined &&
+    current !== null &&
+    (typeof current !== "object" || Array.isArray(current))
+  ) {
+    log.warn(
+      "settings.json `hooks` is not an object; leaving it alone, so eminiar's hooks are not registered (fix it and re-run install)",
+    );
+    return [];
+  }
+  const hooks = (current as Record<string, unknown> | undefined | null) ?? {};
   // A re-install or upgrade replaces the previous registration whole.
   removeOurHooks(hooks, stable);
+  const odd: string[] = [];
   for (const [ev, entries] of Object.entries(ours)) {
     const list = hooks[ev];
+    if (list !== undefined && list !== null && !Array.isArray(list)) odd.push(ev);
     hooks[ev] = [...(Array.isArray(list) ? list : []), ...entries];
+  }
+  if (odd.length) {
+    // Not the shared .eminiar.bak: a later write (statusline) would overwrite that one.
+    const file = settingsPath();
+    if (existsSync(file)) copyFileSync(file, `${file}.eminiar.malformed.bak`);
+    log.warn(
+      `settings.json hooks for ${odd.join(", ")} were not lists and were replaced; the original is kept in ${file}.eminiar.malformed.bak`,
+    );
   }
   settings.hooks = hooks;
   writeJsonWithBackup(settingsPath(), settings);
+  return Object.keys(ours);
+}
+
+/** Fallback: write hooks + MCP server directly, context-mode style. */
+export function registerSettings(stable: string): InstallRecord["wrote"] {
+  const settings = readJson(settingsPath());
+  const ours = settingsHooks(stable);
+  const hookEvents = registerSettingsHooks(settings, ours, stable);
 
   const cj = readJson(claudeJsonPath());
   const servers = (cj.mcpServers as Json | undefined) ?? {};
@@ -223,7 +271,7 @@ export function registerSettings(stable: string): InstallRecord["wrote"] {
     cpSync(join(stable, "skills", name), join(skillsDir, name), { recursive: true });
     skills.push(name);
   }
-  return { hookEvents: Object.keys(ours), mcpServer: true, skills };
+  return { hookEvents, mcpServer: true, skills };
 }
 
 export function unregisterSettings(stable: string, wrote: InstallRecord["wrote"]): void {

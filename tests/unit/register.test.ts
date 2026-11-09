@@ -240,4 +240,59 @@ describe("registerSettings", () => {
     rmSync(join(stable, "hooks", "hooks.json"));
     expect(() => registerSettings(stable)).toThrow(/hooks\.json is missing/);
   });
+
+  it("removes a hook written at the legacy or npm plugin path, and leaves no empty hooks object", () => {
+    const stable = stableCopy();
+    const gate = hook('"/x/.eminiar/plugin/bin/em-hook" --gate');
+    writeSettings({
+      Notification: [
+        { hooks: [hook('"/Users/u/.eminiar/plugin/bin/em-hook"')] },
+        { hooks: [hook("/Users/u/.eminiar/plugin/node_modules/eminiar/bin/em-hook")] },
+        { hooks: [hook('"/Users/u/.eminiar/plugin/node_modules/eminiar/bin/em-hook" --gate')] },
+      ],
+    });
+    const wrote = registerSettings(stable);
+    expect(readHooks().Notification).toEqual([
+      { hooks: [hook('"/Users/u/.eminiar/plugin/node_modules/eminiar/bin/em-hook" --gate')] },
+    ]);
+    unregisterSettings(stable, wrote);
+    writeSettings({ Stop: [{ hooks: [gate] }] });
+    expect(readHooks().Stop).toEqual([{ hooks: [gate] }]);
+
+    // Nothing of the user's left: the `hooks` key itself goes.
+    writeFileSync(settingsFile(), JSON.stringify({ theme: "dark" }));
+    const w2 = registerSettings(stable);
+    unregisterSettings(stable, w2);
+    expect(JSON.parse(readFileSync(settingsFile(), "utf8"))).toEqual({ theme: "dark" });
+  });
+
+  it("claims no hook events and leaves settings.hooks alone when it is not an object", () => {
+    const stable = stableCopy();
+    for (const bad of [[], "oops", 3]) {
+      writeFileSync(settingsFile(), JSON.stringify({ hooks: bad }));
+      const wrote = registerSettings(stable);
+      expect(wrote.hookEvents).toEqual([]);
+      expect(JSON.parse(readFileSync(settingsFile(), "utf8")).hooks).toEqual(bad);
+      expect(() => unregisterSettings(stable, wrote)).not.toThrow();
+    }
+  });
+
+  it("keeps a copy of a non-list event value it has to replace", () => {
+    const stable = stableCopy();
+    const original = JSON.stringify({ hooks: { Stop: "oops" } });
+    writeFileSync(settingsFile(), original);
+    registerSettings(stable);
+    expect(readFileSync(`${settingsFile()}.eminiar.malformed.bak`, "utf8")).toBe(original);
+    expect(readHooks().Stop).toEqual(pluginTable(stable).Stop);
+  });
+
+  it("refuses an unfilled CLAUDE_PLUGIN_ variable other than the root, in any event", () => {
+    for (const v of ["CLAUDE_PLUGIN_DATA", "CLAUDE_PLUGIN_OTHER"]) {
+      const table = {
+        hooks: { Stop: [{ hooks: [hook(`"\${${v}}/x" "\${CLAUDE_PLUGIN_ROOT}/bin/em-hook"`)] }] },
+      };
+      const stable = stableCopy("em-stable-", JSON.stringify(table));
+      expect(() => registerSettings(stable)).toThrow(/cannot fill the variable/);
+    }
+  });
 });
