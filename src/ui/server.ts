@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { extname, join, normalize } from "node:path";
+import { extname, join, normalize, resolve } from "node:path";
 import { URL } from "node:url";
 import { pluginRoot } from "../version.js";
 import { adjudicatorRoute } from "./adjudicator-api.js";
@@ -177,6 +177,22 @@ function serveStatic(res: ServerResponse, p: string): boolean {
 }
 
 /**
+ * The project root a request may act on: the dashboard's own root or a project it
+ * lists. Any other `?root=` is ignored, so a request can never open a database,
+ * load config or run git in an arbitrary folder.
+ */
+export function requestRoot(asked: string | null, defaultRoot?: string): string | undefined {
+  if (!asked || (defaultRoot && resolve(asked) === resolve(defaultRoot))) return defaultRoot;
+  const want = resolve(asked);
+  try {
+    for (const p of listProjects()) if (p.root && resolve(p.root) === want) return p.root;
+  } catch {
+    // unreadable project list: fall through to the default
+  }
+  return defaultRoot;
+}
+
+/**
  * Local dashboard: binds 127.0.0.1 only. Reads are GET; memory writes and system
  * actions use other methods with a JSON content type and a loopback Origin, and no API
  * call is served to another site, so neither a stray link, an <img> nor a cross-site form
@@ -191,7 +207,7 @@ export async function serve(opts: { port: number; open: boolean; root?: string }
       if (!originAllowed(req, opts.port, p.startsWith("/api/")))
         return json(res, 403, { error: "forbidden origin" });
       const q = url.searchParams;
-      const root = q.get("root") ?? defaultRoot ?? undefined;
+      const root = requestRoot(q.get("root"), defaultRoot);
       const ctx = () => ctxFor(root);
       const num = (k: string, d: number) => Number(q.get(k) ?? d) || d;
       const str = (k: string) => q.get(k)?.trim() || undefined;
