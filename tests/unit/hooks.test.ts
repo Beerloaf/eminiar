@@ -170,7 +170,10 @@ describe("routing suggestions", () => {
     writeFileSync(
       join(guarded, ".claude", "settings.local.json"),
       JSON.stringify({
-        permissions: { deny: ["Read(**/secret.log)"], ask: ["Read(**/audit.log)"] },
+        permissions: {
+          deny: ["Read(**/secret.log)"],
+          ask: ["Read(**/audit.log)"],
+        },
       }),
     );
     for (const f of ["secret.log", "audit.log", "big.log"])
@@ -311,7 +314,7 @@ describe("routing suggestions", () => {
       "ls | grep x | sort",
       "git branch -a | grep feat",
       "git config --get user.name; git diff",
-      "node -e 'a => a'; git diff",
+      "echo 'a => a'; git diff",
       "gh pr view 12 --comments | grep LGTM",
       "gh run view 1 --log | grep error",
       "gh api repos/o/r/pulls | jq .",
@@ -365,6 +368,49 @@ describe("routing suggestions", () => {
       expect((await pre(command))?.hookSpecificOutput?.permissionDecision, command).toBeUndefined();
   });
 
+  it("routes a line of several commands only when every one of them only reads", () => {
+    const bash = (command: string) => suggest("Bash", { command }, root);
+    for (const command of [
+      "find . -name '*.ts'; cargo publish",
+      "find . -name '*.ts' && go install x",
+      "find . -name '*.ts'; git gc --prune=now",
+      "find . -name '*.ts'; git branch -df main",
+      "find . -name '*.ts'; ./deploy.sh",
+      "find . -name '*.ts'; \\rm x",
+      "find . -name '*.ts'; npm exec -- rm",
+      "find . -name '*.ts' & rm -rf node_modules",
+      "cat big.log & npm publish",
+      "find . -name '*.ts'; npm --prefix api install",
+      "find . -name '*.ts'; npm -g install foo",
+      "find . -name '*.ts'; npm -s run deploy",
+      "find . -name '*.ts'; yarn -s deploy",
+      "find . -name '*.ts'; make -s clean test",
+      "find . -name '*.ts'; sudo --user root rm -rf x",
+      "find . -name '*.ts'; timeout --signal KILL 30 rm -rf x",
+      "find . -name '*.ts'; nice --adjustment=5 rm -rf x",
+      "find . -name '*.ts'; mvn deploy",
+      "find . -name '*.ts'; mvn release:perform",
+      "find . -name '*.ts'; gradle publish",
+      "find . -name '*.ts'; gh workflow run x",
+      "find . -name '*.ts'; git diff --output=f",
+      'ssh host "echo x > /etc/motd"; git diff',
+      "cat big.log | awk '{print > \"out.txt\"}'",
+      "git log | awk '{print > \"log.txt\"}'",
+    ]) {
+      expect(bash(command), command).toBeUndefined();
+    }
+    for (const command of [
+      "find . -name '*.ts'; git diff",
+      "find . -name '*.ts' && git status",
+      "cat big.log & git diff",
+      "find . -name '*.ts'; npm -s test",
+      "find . -name '*.ts'; make -s test",
+      "find . -name '*.ts'; sudo --user root cat x",
+    ]) {
+      expect(bash(command)?.tool, command).toBe("em_execute");
+    }
+  });
+
   it("sends a git history read to em_history only when it reads the root's own repository", () => {
     const bash = (command: string, at = root) => suggest("Bash", { command }, at);
     mkdirSync(join(root, "src"), { recursive: true });
@@ -379,8 +425,9 @@ describe("routing suggestions", () => {
     // another repository, or one only the shell can name: judged like any other command
     expect(bash("git -C /tmp/other log -5")).toBeUndefined();
     expect(bash("git --git-dir=/tmp/other/.git log -5")).toBeUndefined();
-    expect(bash(`cd ${tmpdir()} && git log -5`)?.tool).toBe("em_execute");
-    expect(bash("cd vendor/lib && git log -5")?.tool).toBe("em_execute");
+    // another repository's working directory stays native: em_execute runs in the root
+    expect(bash(`cd ${tmpdir()} && git log -5`)).toBeUndefined();
+    expect(bash("cd vendor/lib && git log -5")).toBeUndefined();
     expect(bash("cd $REPO && git log -5")?.tool).toBe("em_execute");
     // a root that is not a git repository: nothing for em_history to classify
     const plain = mkdtempSync(join(tmpdir(), "em-root-nogit-"));
@@ -448,7 +495,11 @@ describe("hook handlers end to end", () => {
     );
     expect(deny?.hookSpecificOutput?.permissionDecision).toBe("deny");
     const agent = await handlers.PreToolUse!(
-      base({ hook_event_name: "PreToolUse", tool_name: "Agent", tool_input: { prompt: "do x" } }),
+      base({
+        hook_event_name: "PreToolUse",
+        tool_name: "Agent",
+        tool_input: { prompt: "do x" },
+      }),
     );
     expect(agent?.hookSpecificOutput?.updatedInput?.prompt).toMatch(/^Use the eminiar tools/);
 
@@ -464,11 +515,20 @@ describe("hook handlers end to end", () => {
     await handlers.PreCompact!(base({ hook_event_name: "PreCompact", trigger: "auto" }));
     const db = getStorage(getContext(root), { vectors: false });
     // every routed native call leaves one routing event: the denial and the allowed one
-    const routing = db
-      .eventsBySession("s1", { categories: ["routing"] })
-      .map((e) => JSON.parse(e.payload) as { tool: string; decision: string; target?: string });
+    const routing = db.eventsBySession("s1", { categories: ["routing"] }).map(
+      (e) =>
+        JSON.parse(e.payload) as {
+          tool: string;
+          decision: string;
+          target?: string;
+        },
+    );
     expect(routing).toContainEqual(
-      expect.objectContaining({ tool: "Bash", decision: "deny", target: "em_history" }),
+      expect.objectContaining({
+        tool: "Bash",
+        decision: "deny",
+        target: "em_history",
+      }),
     );
     expect(routing).toContainEqual(expect.objectContaining({ tool: "Bash", decision: "allow" }));
     expect(formatRoutingStats("routing", routingStats(db.eventsBySession("s1")))).toContain(
@@ -589,7 +649,11 @@ describe("graph context in hooks", () => {
     expect(readOk).toBeUndefined();
 
     const agent = await handlers.PreToolUse!(
-      base({ hook_event_name: "PreToolUse", tool_name: "Agent", tool_input: { prompt: "do y" } }),
+      base({
+        hook_event_name: "PreToolUse",
+        tool_name: "Agent",
+        tool_input: { prompt: "do y" },
+      }),
     );
     const prompt = String(agent?.hookSpecificOutput?.updatedInput?.prompt);
     expect(prompt).toMatch(/^Use the eminiar tools/);
@@ -615,7 +679,10 @@ describe("subagent findings", () => {
       }),
     );
     const db = getStorage(getContext(root), { vectors: false });
-    const r = await search(db, "pool leak", { mode: "lexical", filters: { source: ["session"] } });
+    const r = await search(db, "pool leak", {
+      mode: "lexical",
+      filters: { source: ["session"] },
+    });
     expect(r.hits.some((h) => h.chunk.body.includes("pool.ts"))).toBe(true);
     expect(r.hits[0]?.chunk.document.title).toBe("agent_findings");
   });
@@ -636,7 +703,9 @@ describe("server liveness", () => {
     writeFileSync(join(other, "package.json"), "{}");
     writeFileSync(
       join(other, "eminiar.config.json"),
-      JSON.stringify({ routing: { mode: "enforce", deferToContextMode: false } }),
+      JSON.stringify({
+        routing: { mode: "enforce", deferToContextMode: false },
+      }),
     );
     gitRepo(other);
     const out = await handlers.PreToolUse!(
@@ -666,10 +735,25 @@ describe("routing stats", () => {
       document_id: null,
     });
     const s = routingStats([
-      ev({ tool: "Bash", decision: "deny", target: "em_execute", rule: "heavy" }),
+      ev({
+        tool: "Bash",
+        decision: "deny",
+        target: "em_execute",
+        rule: "heavy",
+      }),
       ev({ tool: "Bash", decision: "allow" }),
-      ev({ tool: "Read", decision: "deny", target: "em_execute_file", rule: "big-read" }),
-      ev({ tool: "Grep", decision: "annotate", target: "em_symbols", rule: "symbol" }),
+      ev({
+        tool: "Read",
+        decision: "deny",
+        target: "em_execute_file",
+        rule: "big-read",
+      }),
+      ev({
+        tool: "Grep",
+        decision: "annotate",
+        target: "em_symbols",
+        rule: "symbol",
+      }),
       { ...ev({}), category: "recall" },
     ]);
     expect(s.decisions).toBe(4);

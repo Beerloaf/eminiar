@@ -50,7 +50,11 @@ export function literalOf(pattern: string): string | undefined {
 export function symbolHints(db: StorageAdapter, pattern: string): string | undefined {
   const lit = literalOf(pattern);
   if (!lit) return undefined;
-  const nodes = db.graphFindNodes({ query: lit, kinds: SYMBOL_KINDS, limit: 5 });
+  const nodes = db.graphFindNodes({
+    query: lit,
+    kinds: SYMBOL_KINDS,
+    limit: 5,
+  });
   if (!nodes.length) return undefined;
   const list = nodes
     .map((n) => `${n.kind} ${n.name} (${n.path}:${n.start_line ?? "?"})`)
@@ -165,6 +169,23 @@ function inRootRepo(root: string, dir: string): boolean {
   } catch {
     return false; // a directory that does not exist: git fails there too
   }
+}
+
+/** The repository (its `.git` folder's parent) a directory belongs to, or undefined for none. */
+function repoOf(dir: string): string | undefined {
+  try {
+    for (let d = realpathSync(dir); ; d = dirname(d)) {
+      if (existsSync(join(d, ".git"))) return d;
+      if (dirname(d) === d) return undefined;
+    }
+  } catch {
+    return undefined;
+  }
+}
+
+/** Would a git command run from the root (where em_execute runs) read the repository `dir` is in? */
+function sameRepo(root: string, dir: string): boolean {
+  return repoOf(root) === repoOf(dir);
 }
 
 export interface Suggestion {
@@ -283,12 +304,14 @@ function splitUnquoted(s: string, sep: (s: string, i: number) => number): string
   return out.map((p) => p.trim()).filter(Boolean);
 }
 
-/** The simple commands a shell line runs in sequence: split at `;`, `&&`, `||` and newlines. */
+/** The simple commands a shell line runs in sequence: split at `;`, `&`, `&&`, `||` and newlines. */
 export function commandSegments(cmd: string): string[] {
   return splitUnquoted(cmd, (s, i) => {
     const ch = s[i];
     if (ch === ";" || ch === "\n") return 1;
     if ((ch === "&" || ch === "|") && s[i + 1] === ch) return 2;
+    // A lone `&` backgrounds the command before it; not `2>&1`, `&>f`, `<&3`, `|&`.
+    if (ch === "&" && !/[&<>|]/.test(s[i - 1] ?? "") && !/[&>]/.test(s[i + 1] ?? "")) return 1;
     return 0;
   });
 }
@@ -321,18 +344,20 @@ function bounds(stage: string): boolean {
  * command containing one is never redirected to the sandbox.
  */
 const MUTATING =
-  /^(git\s+(?:(?:-[Cc]\s*[^-\s]\S*|--(?:git-dir|work-tree)[= ]\S+|--no-pager)\s+)*(add|commit|checkout|switch|push|pull|fetch|merge|rebase|stash|reset|restore|cherry-pick|revert|tag|init|clone|worktree|mv|rm|am|apply|submodule|clean|branch\s(?:.*\s)?(-[dDmM]|--delete|--move)|config(?:\s+--(?:global|local|system|worktree))*\s+(?:set|unset|--(?:unset|unset-all|add|replace-all|rename-section|remove-section|edit)|-e|\w[\w.-]*\s+\S+))|npm\s+(install|i|ci|uninstall|un|link|publish|version|update|up|dedupe|audit\s+fix)|pnpm\s+(install|i|add|remove|rm|update|up|link|audit\s.*--fix)|yarn\s+(add|remove|install|upgrade)|pip3?\s+(install|uninstall)|cargo\s+(add|install)|brew\s+(install|uninstall|upgrade)|gh\s+(pr|issue|release|repo)\s+(create|edit|merge|close|comment|delete|ready)|terraform\s+(?:-\S+\s+)*(apply|destroy|import|taint|untaint|state\s+(rm|mv|push))|helm\s+(?:-\S+\s+(?:[^-\s]\S*\s+)?)*(install|upgrade|uninstall|rollback|delete)|mvnw?\s.*\s(deploy|install|release:\S*)|gradlew?\s.*[\s:](publish|upload)\w*|rm|mv|cp|mkdir|rmdir|touch|chmod|chown|ln|sed\s+(?:-\S+\s+)*-i|tee|eval|sh|bash|zsh|find\s.*\s-(delete|exec|execdir|ok|okdir))(?![\w-])/;
+  /^(git\s+(?:(?:-[Cc]\s*[^-\s]\S*|--(?:git-dir|work-tree)[= ]\S+|--no-pager)\s+)*(add|commit|checkout|switch|push|pull|fetch|merge|rebase|stash|reset|restore|cherry-pick|revert|tag|init|clone|worktree|mv|rm|am|apply|submodule|clean|branch\s(?:.*\s)?(-[a-zA-Z]*[dDmM][a-zA-Z]*|--delete|--move)|config(?:\s+--(?:global|local|system|worktree))*\s+(?:set|unset|--(?:unset|unset-all|add|replace-all|rename-section|remove-section|edit)|-e|\w[\w.-]*\s+\S+))|npm\s+(install|i|ci|uninstall|un|link|publish|version|update|up|dedupe|audit\s+fix)|pnpm\s+(install|i|add|remove|rm|update|up|link|audit\s.*--fix)|yarn\s+(add|remove|install|upgrade)|pip3?\s+(install|uninstall)|cargo\s+(add|install)|brew\s+(install|uninstall|upgrade)|gh\s+(pr|issue|release|repo)\s+(create|edit|merge|close|comment|delete|ready)|terraform\s+(?:-\S+\s+)*(apply|destroy|import|taint|untaint|state\s+(rm|mv|push))|helm\s+(?:-\S+\s+(?:[^-\s]\S*\s+)?)*(install|upgrade|uninstall|rollback|delete)|mvnw?(?:\s.*)?\s(deploy|install|release:\S*)|gradlew?(?:\s.*)?[\s:](publish|upload)\w*|rm|mv|cp|mkdir|rmdir|touch|chmod|chown|ln|sed\s+(?:-\S+\s+)*-i|tee|eval|sh|bash|zsh|find\s.*\s-(delete|exec|execdir|ok|okdir))(?![\w-])/;
 /**
  * Commands that run the one after them, with the options they take (`sudo -u root`, `timeout 30`).
  * Each option is either one that takes a value or one that does not, never both: an ambiguous
  * split backtracks exponentially on a line of many flags.
  */
+const longOpts = (valued: string) =>
+  String.raw`--(?:${valued})\s+[^-\s]\S*|--(?!(?:${valued})(?:\s|$))\S*`;
 const RUNNERS = [
-  String.raw`sudo(?:\s+(?:-[ugCDhpRrtTU]\s*[^-\s]\S*|-(?![ugCDhpRrtTU])\S+))*`,
-  String.raw`env(?:\s+(?:-[uC]\s*[^-\s]\S*|-(?![uC])\S+))*`,
-  String.raw`(?:xargs|parallel)(?:\s+(?:-[nILPsdEaj]\s*[^-\s]\S*|-(?![nILPsdEaj])\S+))*`,
-  String.raw`timeout(?:\s+(?:-[sk]\s*[^-\s]\S*|-(?![sk])\S+))*\s+\d\S*`,
-  String.raw`nice(?:\s+-n\s*\S+|\s+-\d+)?`,
+  String.raw`sudo(?:\s+(?:-[ugCDhpRrtTU]\s*[^-\s]\S*|-(?![ugCDhpRrtTU-])\S+|${longOpts("user|group|chdir|host|prompt|close-from|role|type|other-user|chroot|command-timeout")}))*`,
+  String.raw`env(?:\s+(?:-[uC]\s*[^-\s]\S*|-(?![uC-])\S+|${longOpts("unset|chdir|split-string")}))*`,
+  String.raw`(?:xargs|parallel)(?:\s+(?:-[nILPsdEaj]\s*[^-\s]\S*|-(?![nILPsdEaj-])\S+|${longOpts("max-args|max-procs|max-lines|max-chars|delimiter|arg-file|eof|jobs")}))*`,
+  String.raw`timeout(?:\s+(?:-[sk]\s*[^-\s]\S*|-(?![sk-])\S+|${longOpts("signal|kill-after")}))*\s+\d\S*`,
+  String.raw`nice(?:\s+-n\s*\S+|\s+-\d+|\s+--adjustment(?:=|\s+)\S+)?`,
   String.raw`stdbuf(?:\s+-[ioe]\s*\S+)*`,
   String.raw`(?:time|command)(?:\s+-p)?`,
   "nohup",
@@ -346,7 +371,9 @@ const RUNNER = new RegExp(String.raw`^\s*(?:(?:${RUNNERS.join("|")})\s+)*`);
  * A redirection into a file (`> f`, `>> f`, `&> f`, `cmd>f`; not /dev/null, not `2>&1`) writes
  * something. `=>` and `->` are not redirections.
  */
-const WRITES_FILE = /(?<![-=>])>{1,2}\s*(?!&)(?!\/dev\/null)\S/;
+const WRITES_FILE = /(?:^|[\s\d&])>{1,2}\s*(?!&)(?!\/dev\/null)\S/;
+/** The same for a `>` glued to the word before it (`cmd>f`), once quoted text is taken out. */
+const GLUED_WRITE = /(?<![-=>])>{1,2}\s*(?!&)(?!\/dev\/null)\S/;
 /** A program read from a pipe (`curl … | python3`): whatever it does, it does like `| sh`. */
 const RUNS_STDIN = /^(python3?|node|perl|ruby|deno|bun)(\s+-\S*)*$/;
 /** Commands that never finish (follow, `--watch`): em_execute would only time out on them. */
@@ -376,46 +403,40 @@ const NPX_CHECKS = /^(vitest|jest|tsc|eslint|biome|prettier)\b/;
 /** pnpm / yarn words that are their own read-only commands, not scripts (`pnpm ls`, `yarn why`). */
 const PM_READS = /^(ls|list|outdated|why|info|view|audit|licenses|bin|root|help)$/;
 /**
- * Options that take the next word, before a subcommand: one set for kubectl and docker globals
- * (`-n prod`, `--context x`, `-H host`) and package-manager ones (`--prefix a`, `--filter web`).
+ * Options that take the next word, before a subcommand, per tool: `-n prod` for kubectl,
+ * `--prefix a` for npm. `-s` and `-w` are flags for most tools, so each tool has its own set.
  */
-const VALUE_OPTS = new Set([
-  "-n",
-  "--namespace",
-  "--context",
-  "--cluster",
-  "--kubeconfig",
-  "--user",
-  "-s",
-  "--server",
-  "--token",
-  "--as",
-  "-H",
-  "--host",
-  "-c",
-  "--config",
-  "-l",
-  "--log-level",
-  "-j",
-  "--prefix",
-  "-C",
-  "--dir",
-  "--cwd",
-  "-w",
-  "--workspace",
-  "-F",
-  "--filter",
-]);
+const VALUE_OPTS: Record<string, ReadonlySet<string>> = {
+  kubectl: new Set([
+    "-n",
+    "--namespace",
+    "--context",
+    "--cluster",
+    "--kubeconfig",
+    "--user",
+    "-s",
+    "--server",
+    "--token",
+    "--as",
+  ]),
+  docker: new Set(["-H", "--host", "-c", "--context", "--config", "-l", "--log-level"]),
+  npm: new Set(["--prefix", "-w", "--workspace", "--userconfig", "--registry", "--cache"]),
+  pnpm: new Set(["-C", "--dir", "--filter", "-F", "--workspace-dir"]),
+  yarn: new Set(["--cwd", "--cache-folder", "--registry"]),
+  make: new Set(["-C", "--directory", "-f", "--file", "-j", "--jobs"]),
+  npx: new Set(["-p", "--package"]),
+};
 
 /** The words after the options before them: ` -n prod get pods` → [get, pods]. */
-function afterOptions(args: string): string[] {
+function afterOptions(tool: string, args: string): string[] {
   const words = args.trim().split(/\s+/);
+  const valued = VALUE_OPTS[tool];
   let i = 0;
-  while (words[i]?.startsWith("-")) i += VALUE_OPTS.has(words[i]!) ? 2 : 1;
+  while (words[i]?.startsWith("-")) i += valued?.has(words[i]!) ? 2 : 1;
   return words.slice(i);
 }
 
-const subcommand = (args: string) => afterOptions(args).join(" ");
+const subcommand = (tool: string, args: string) => afterOptions(tool, args).join(" ");
 
 /**
  * `npm run <script>`, `yarn <script>`, `pnpm --filter x <script>`: anything but a test or check
@@ -423,7 +444,7 @@ const subcommand = (args: string) => afterOptions(args).join(" ");
  * change something.
  */
 function runsScript(tool: string, args: string): boolean {
-  const words = afterOptions(args);
+  const words = afterOptions(tool, args);
   let script = words.shift();
   if (script === "run" || script === "run-script") script = words.shift();
   else if (script === undefined || PM_READS.test(script) || (tool === "npm" && script !== "test"))
@@ -434,7 +455,7 @@ function runsScript(tool: string, args: string): boolean {
 
 /** `make`: recipes run anything; only test / check / lint targets, not told to fix, read. */
 function makeChanges(args: string): boolean {
-  const targets = afterOptions(args).filter((w) => w && !w.includes("="));
+  const targets = afterOptions("make", args).filter((w) => w && !w.includes("="));
   return !targets.length || !targets.every((t) => CHECK_SCRIPT.test(t)) || FIX_ARGS.test(args);
 }
 
@@ -454,11 +475,11 @@ function ghApiSends(args: string): boolean {
 const CHANGES = new Map<string, (args: string) => boolean>([
   ["curl", (a) => CURL_SENDS.test(a)],
   ["wget", (a) => !WGET_PRINTS.test(a) || WGET_SENDS.test(a)],
-  ["kubectl", (a) => !KUBECTL_READS.test(subcommand(a))],
-  ["docker", (a) => !DOCKER_READS.test(subcommand(a))],
+  ["kubectl", (a) => !KUBECTL_READS.test(subcommand("kubectl", a))],
+  ["docker", (a) => !DOCKER_READS.test(subcommand("docker", a))],
   ["gh", ghApiSends],
   ["make", makeChanges],
-  ["npx", (a) => !NPX_CHECKS.test(subcommand(a)) || FIX_ARGS.test(a)],
+  ["npx", (a) => !NPX_CHECKS.test(subcommand("npx", a)) || FIX_ARGS.test(a)],
   ["npm", (a) => runsScript("npm", a)],
   ["pnpm", (a) => runsScript("pnpm", a)],
   ["yarn", (a) => runsScript("yarn", a)],
@@ -484,20 +505,59 @@ function substitutions(segment: string): string[] {
  * starts, by its name without a path (`sudo /usr/bin/kubectl delete …` is `kubectl delete …`).
  */
 function staysNative(segment: string): boolean {
-  // Quoted text is data (`rg 'Promise<string>'`, `jq 'select(.n>3)'`), not a redirection.
-  if (WRITES_FILE.test(segment.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, "''"))) return true;
+  // A `>` inside quotes counts when it stands apart (`awk '{print > "out"}'`, `ssh h "echo x > f"`);
+  // glued to a word it is data there (`rg 'Promise<string>'`, `jq 'select(.n>3)'`) and a
+  // redirection outside quotes (`npm test>out.log`).
+  if (WRITES_FILE.test(segment)) return true;
+  if (GLUED_WRITE.test(segment.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, "''"))) return true;
   return pipeStages(segment).some((stage, i) => {
     const cmd = stage
       .replace(SHELL_WORDS, "")
       .replace(RUNNER, "")
       .replace(/^\S*\//, "");
     const [, tool = "", args = ""] = /^(\S+)([\s\S]*)$/.exec(cmd) ?? [];
+    // `npm --prefix api install`, `npm -g install`: judge the subcommand, not the options.
+    const bare = /^(npm|pnpm|yarn)$/.test(tool)
+      ? `${tool} ${afterOptions(tool, args).join(" ")}`
+      : cmd;
     return (
       MUTATING.test(cmd) ||
+      MUTATING.test(bare) ||
       FOLLOWS.test(cmd) ||
       (i > 0 && RUNS_STDIN.test(cmd)) ||
       CHANGES.get(tool)?.(args) === true
     );
+  });
+}
+
+/** Commands that only read (or navigate), by name; the other tools are judged by `readsOnly`. */
+const READ_ONLY =
+  /^(?:(?:cd|pushd|popd|pwd|true|false|:|test|\[|sleep|echo|printf|ls|tree|cat|head|tail|wc|grep|egrep|fgrep|rg|sort|uniq|cut|tr|nl|column|awk|sed|jq|yq|diff|cmp|du|df|stat|file|which|type|date|basename|dirname|realpath|readlink|ps|lsof|strings|xxd|od|find)|git\s+(?:(?:-[Cc]\s*[^-\s]\S*|--no-pager)\s+)*(?:diff|log|show|status|ls-files|ls-tree|grep|blame|branch(?=\s*$|\s+(?:-[avr]+|--(?:list|show-current|merged|no-merged|contains))(?:\s|$))|rev-list|rev-parse|for-each-ref|cat-file|describe|shortlog|reflog|merge-base|name-rev|config\s+(?:--(?:global|local|system|worktree)\s+)*(?:--get\S*|--list|-l)))(?![\w-])/;
+/** Read-only forms of the tools judged by CHANGES (which only rules out the known writes). */
+const TOOL_READS: Record<string, (args: string) => boolean> = {
+  gh: (a) =>
+    /^\s+(?:api|(?:pr|issue|run|search|repo|release)\s+(?:list|view|diff|checks|status))\b/.test(a),
+  npm: (a) =>
+    /^(?:test|t|run|run-script|ls|ll|list|outdated|view|show|info|why|explain|audit|root|bin|prefix|help)$/.test(
+      afterOptions("npm", a)[0] ?? "",
+    ),
+  pnpm: (a) => afterOptions("pnpm", a).length > 0,
+  yarn: (a) => afterOptions("yarn", a).length > 0, // bare `yarn` installs
+};
+
+/** Is this simple command (every pipe stage of it) known to only read? Unknown means no. */
+function readsOnly(segment: string): boolean {
+  return pipeStages(segment).every((stage) => {
+    const cmd = stage
+      .replace(SHELL_WORDS, "")
+      .replace(RUNNER, "")
+      .replace(/^\S*\//, "");
+    const [, tool = "", args = ""] = /^(\S+)([\s\S]*)$/.exec(cmd) ?? [];
+    // Flags that make a reader write: `git diff --output=f`, `sort -o f`.
+    if (/(?:^|\s)--output(?=[\s=]|$)/.test(args) || (tool === "sort" && /\s-\w*o\b/.test(args)))
+      return false;
+    if (CHANGES.has(tool)) return TOOL_READS[tool]?.(args) ?? !CHANGES.get(tool)!(args);
+    return READ_ONLY.test(cmd);
   });
 }
 
@@ -622,7 +682,10 @@ function firstStageBound(first: string, cwd: string): true | Heavy | undefined {
     const bytes = stageBytes(first, cwd);
     if (bytes === undefined) return undefined;
     if (bytes <= READ_LIMIT) return true; // what Read would show anyway
-    return { rule: "big-read", text: `reads about ${Math.round(bytes / 1024)} KB` };
+    return {
+      rule: "big-read",
+      text: `reads about ${Math.round(bytes / 1024)} KB`,
+    };
   }
   return undefined;
 }
@@ -656,7 +719,10 @@ function heavySegment(segment: string, cwd: string): Heavy | undefined {
   if (HEAVY_BASH.test(first)) return { rule: "heavy", text: "usually prints a lot" };
   // Only a source known to just read: an unknown one (`ssh`, `psql`, `aws`) may change something.
   if (READ_SOURCE.test(first) && rest.some((s) => UNBOUNDED_FILTERS.test(s)))
-    return { rule: "pipe", text: "streams an unbounded output through a filter" };
+    return {
+      rule: "pipe",
+      text: "streams an unbounded output through a filter",
+    };
   return undefined;
 }
 
@@ -679,11 +745,16 @@ function bashSuggestion(raw: string, root: string, cwd: string): Suggestion | un
   // `$(…)` and backticks run too: their commands are judged like the line's own.
   if ([...segments, ...substitutions(cmd).flatMap(commandSegments)].some(staysNative))
     return undefined;
+  // A line of several commands is routed only when every one of them is known to just read:
+  // anything else in it would run in the sandbox without Claude Code's Bash permission prompt.
+  if (segments.length > 1 && !segments.every(readsOnly)) return undefined;
   // git history reads have a classified answer: fixes traced to their origin, risk per
   // file, branches vs base — em_history, not a raw log through em_execute. em_history reads
   // the root's repository only, so a read of another one (or of none) is judged like any command.
   const history = historyCall(cmd);
   const dir = history && historyDir(segments, cwd);
+  // A git read in another repository is not em_history's (nor em_execute's, which runs in the root).
+  if (history && dir && !sameRepo(root, dir)) return undefined;
   if (history && dir && inRootRepo(root, dir)) {
     return {
       tool: "em_history",
@@ -857,7 +928,11 @@ function fileKnowledge(ctx: ProjectContext, input: HookInput): string | undefine
     const repeatAfter = ctx.config.recall.repeatAfter;
     const edit = EDIT_TOOLS.has(input.tool_name ?? "");
     const results = [
-      memoriesForFile(db, rel, { sessionId, symbols: fileSymbols(db, rel), repeatAfter }),
+      memoriesForFile(db, rel, {
+        sessionId,
+        symbols: fileSymbols(db, rel),
+        repeatAfter,
+      }),
       fileContext(db, rel, { sessionId, edit, repeatAfter }),
     ];
     const shown = results.filter((r) => r.text);
@@ -924,7 +999,11 @@ async function webKnowledge(ctx: ProjectContext, input: HookInput): Promise<stri
   if (!text.trim()) return undefined;
   try {
     const db = getStorage(ctx, { vectors: false });
-    const r = await recallForText(db, text, { maxMemories: 0, maxDocs: 3, path: "web" });
+    const r = await recallForText(db, text, {
+      maxMemories: 0,
+      maxDocs: 3,
+      path: "web",
+    });
     if (!r.text) return undefined;
     const pages = r.text.split("\n").filter((l) => l.startsWith("- docs:"));
     return [
@@ -947,7 +1026,12 @@ function withContext(
 ): HookOutput | undefined {
   if (!extra) return out;
   if (!out)
-    return { hookSpecificOutput: { hookEventName: "PreToolUse", additionalContext: extra } };
+    return {
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        additionalContext: extra,
+      },
+    };
   const cur = out.hookSpecificOutput?.additionalContext;
   return {
     ...out,
@@ -984,7 +1068,10 @@ export const preToolUse: HookHandler = async (
   }
 };
 
-type RoutedInput = HookInput & { tool_name: string; tool_input: Record<string, unknown> };
+type RoutedInput = HookInput & {
+  tool_name: string;
+  tool_input: Record<string, unknown>;
+};
 
 /** Routing proper: knowledge hints, then the routing mode's decision for this call. */
 async function route(
@@ -1014,7 +1101,10 @@ async function route(
     input.tool_name === "Grep" && graph
       ? literalOf(String(input.tool_input.pattern ?? ""))
       : undefined;
-  const s = suggest(input.tool_name, input.tool_input, ctx.root, { symbol, cwd: input.cwd });
+  const s = suggest(input.tool_name, input.tool_input, ctx.root, {
+    symbol,
+    cwd: input.cwd,
+  });
   const record = routingRecorder(ctx, input, s);
   if (!s) {
     record("allow");
