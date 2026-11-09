@@ -85,6 +85,34 @@ describe("processOutput with stderr", () => {
   });
 });
 
+describe("processOutput threshold", () => {
+  it("returns a short stdout whole when only stderr is noisy, with stderr tailed", async () => {
+    const stdout = "x".repeat(4500);
+    const stderr = `${"a".repeat(3000)}END`;
+    const r = await processOutput(db, ctx, { stdout, stderr, title: "t", source: "exec" });
+    expect(r.text).toContain(stdout);
+    expect(r.text).toContain("--- stderr ---");
+    expect(r.text).toContain("chars omitted");
+    expect(r.text.endsWith("]")).toBe(true);
+    expect(r.text).toContain("END");
+    expect(r.text.length).toBeLessThan(stdout.length + 2600);
+  });
+
+  it("previews a long stdout by its own head and tail, then stderr", async () => {
+    const stdout = `HEAD${"y".repeat(9000)}TAIL`;
+    const r = await processOutput(db, ctx, {
+      stdout,
+      stderr: "warned",
+      title: "t",
+      source: "exec",
+    });
+    expect(r.text).toContain("HEAD");
+    expect(r.text).toContain("TAIL");
+    expect(r.text).toContain("chars omitted");
+    expect(r.text).toContain("--- stderr ---\nwarned");
+  });
+});
+
 describe("exec tools and stderr", () => {
   const textOf = (r: { content: Array<{ type: string; text?: string }> }) =>
     r.content.map((c) => c.text ?? "").join("\n");

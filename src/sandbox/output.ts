@@ -36,6 +36,7 @@ export interface Processed {
 
 const HEAD = 3 * 1024;
 const TAIL = 1 * 1024;
+const STDERR_BUDGET = 2 * 1024;
 const STDERR_MARK = "--- stderr ---";
 
 /**
@@ -58,6 +59,13 @@ export function joinOutput(stdout: string, stderr = ""): string {
   return `${stdout}${gap}${STDERR_MARK}\n${stderr}\n`;
 }
 
+/** stdout whole, then at most the last STDERR_BUDGET chars of stderr under the mark. */
+function stderrTail(stdout: string, stderr: string): string {
+  if (stderr.length <= STDERR_BUDGET) return joinOutput(stdout, stderr);
+  const cut = stderr.length - STDERR_BUDGET;
+  return joinOutput(stdout, `… ${cut} chars omitted …\n${stderr.slice(-STDERR_BUDGET)}`);
+}
+
 /**
  * Decide what the model gets to see. Small outputs are returned verbatim. Large
  * ones are indexed; with an intent/queries only matching sections come back
@@ -70,8 +78,12 @@ export async function processOutput(
   input: ProcessInput,
 ): Promise<Processed> {
   const threshold = ctx.config.sandbox.indexThreshold;
-  const out = joinOutput(input.stdout, input.stderr);
-  if (!input.forceIndex && out.length <= threshold) {
+  const stderr = input.stderr ?? "";
+  const out = joinOutput(input.stdout, stderr);
+  // The threshold is about stdout alone: noisy stderr must not push a short stdout into a preview.
+  const stdoutFits = input.stdout.length <= threshold;
+  const stderrFits = stderr.length <= STDERR_BUDGET;
+  if (!input.forceIndex && stdoutFits && stderrFits) {
     return { text: out, returnedChars: out.length };
   }
   if (!out.trim()) return { text: "", returnedChars: 0 };
@@ -98,10 +110,12 @@ export async function processOutput(
   const queries = [...(input.queries ?? [])];
   if (input.intent && !queries.includes(input.intent)) queries.unshift(input.intent);
 
-  if (out.length <= threshold) return { text: out, ...indexed, returnedChars: out.length };
+  if (stdoutFits && stderrFits) return { text: out, ...indexed, returnedChars: out.length };
 
   const lines: string[] = [];
-  if (queries.length) {
+  if (stdoutFits && !queries.length) {
+    lines.push(stderrTail(input.stdout, stderr));
+  } else if (queries.length) {
     const responses: SearchResponse[] = [];
     for (const q of queries) {
       responses.push(
@@ -118,9 +132,11 @@ export async function processOutput(
     const terms = topTermsOf(bodies, 40).map((t) => t.term);
     if (terms.length) lines.push(`\nsearchable terms: ${terms.join(", ")}`);
   } else {
-    lines.push(out.slice(0, HEAD));
-    if (out.length > HEAD + TAIL) lines.push(`\n… ${out.length - HEAD - TAIL} chars omitted …\n`);
-    lines.push(out.slice(-TAIL));
+    const o = input.stdout;
+    lines.push(o.slice(0, HEAD));
+    if (o.length > HEAD + TAIL) lines.push(`\n… ${o.length - HEAD - TAIL} chars omitted …\n`);
+    lines.push(o.slice(-TAIL));
+    if (stderr.trim()) lines.push(stderrTail("", stderr));
   }
   const docList = ids.join(", ");
   lines.push(
