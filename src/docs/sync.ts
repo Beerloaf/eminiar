@@ -1,9 +1,10 @@
+import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import type { ProjectContext } from "../context.js";
 import { kickEmbedding } from "../embeddings/queue.js";
 import { type Fetched, fetchMarkdown } from "../fetch/fetcher.js";
 import { indexContent, indexPath, refuseOutside } from "../index/indexer.js";
-import { checkReadPath, loadPermissionRules } from "../permissions/settings.js";
+import { checkRead, loadPermissionRules, type ReadCheck } from "../permissions/settings.js";
 import { readRefusal } from "../sandbox/file.js";
 import type { StorageAdapter } from "../storage/adapter.js";
 import { syncDocsGraphQuietly } from "./graph.js";
@@ -14,6 +15,7 @@ import {
   manifestPath,
   probeManifestAt,
   setSyncState,
+  within,
 } from "./manifest.js";
 import { looksLikeSpec, specToMarkdown } from "./specs.js";
 
@@ -203,13 +205,27 @@ async function syncUrlSource(
  * they do for em_index, so a denied `.env` is never indexed.
  */
 export function refuseUnreadable(ctx: ProjectContext): (file: string) => string | undefined {
-  const outside = refuseOutside(ctx.root);
   const rules = loadPermissionRules(ctx.root);
+  const realRoot = realpathSync.native(ctx.root);
+  const denied = (c: ReadCheck) => `refused by permission rule ${c.rule} (${c.kind})`;
   return (file) => {
-    const refused = outside(file);
-    if (refused) return refused;
-    const c = checkReadPath(rules, file);
-    return c.allowed ? undefined : `refused by permission rule ${c.rule} (${c.kind})`;
+    // The path as written first: a pure regex test, no syscalls, and the common refusal.
+    const asWritten = checkRead(rules, [file]);
+    if (!asWritten.allowed) return denied(asWritten);
+    let real: string;
+    let native: string;
+    try {
+      real = realpathSync(file);
+      native = realpathSync.native(file);
+    } catch {
+      return undefined; // gone since the walk: the reader reports it
+    }
+    if (!within(native, realRoot)) return "refused, it resolves outside the project";
+    // Then its symlink target and on-disk letter case, when they differ (see checkReadPath).
+    const more = [real, native].filter((p, i, a) => p !== file && a.indexOf(p) === i);
+    if (!more.length) return undefined;
+    const c = checkRead(rules, more);
+    return c.allowed ? undefined : denied(c);
   };
 }
 

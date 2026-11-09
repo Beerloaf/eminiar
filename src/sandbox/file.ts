@@ -1,7 +1,7 @@
 import { existsSync, realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import type { PermissionRules } from "../permissions/rules.js";
-import { matchRead } from "../permissions/rules.js";
+import { readMatcher } from "../permissions/rules.js";
 import { checkRead, checkReadPath, type ReadCheck } from "../permissions/settings.js";
 
 /**
@@ -12,8 +12,10 @@ import { checkRead, checkReadPath, type ReadCheck } from "../permissions/setting
  * This guards the `path` argument only: the code the tool runs is checked against Bash
  * rules, like `em_execute`, and can still open other files.
  */
-export function confinePath(root: string, target: string, rules: PermissionRules): string {
+export function confinePath(root: string, target: string, given: PermissionRules): string {
   const abs = resolve(root, target);
+  // Relative Read patterns (`./.env`, `.env`, `/secrets/**`) resolve against this root.
+  const rules = given.root ? given : { ...given, root };
   // The path as written, before any stat, so that spelling of a denied name is refused
   // whether or not the file exists.
   refuse(checkRead(rules, [abs]), target);
@@ -28,9 +30,10 @@ export function confinePath(root: string, target: string, rules: PermissionRules
   const rel = relative(root, real);
   const inside = rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
   if (inside) return real;
-  if (rules.allow.some((r) => matchRead(r, real))) return real;
+  if (readMatcher(rules.allow, rules.root).test(real)) return real;
+  // `//` marks an absolute path in a Claude Code Read rule; a single `/` is project-relative.
   throw new Error(
-    `${target} is outside the project root; add a Read(${real}) rule to permissions.allow to opt it in`,
+    `${target} is outside the project root; add a Read(/${real}) rule to permissions.allow to opt it in`,
   );
 }
 

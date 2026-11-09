@@ -1429,4 +1429,62 @@ describe("path sources stay inside the project", () => {
     for (const rel of ["docs/home/private.md", "elsewhere/private.md"])
       expect(pdb.findDocumentByUri(`file://${join(pctx.root, rel)}`), rel).toBeUndefined();
   });
+
+  it("a project-relative Read(./.env) deny keeps .env out of a `**/.env` docs source (review repro)", async () => {
+    const settings = join(pctx.root, ".claude", "settings.json");
+    mkdirSync(join(pctx.root, ".claude"), { recursive: true });
+    writeFileSync(join(pctx.root, ".env"), "API_TOKEN=zq9xv7secretvalue\n");
+    writeFileSync(settings, JSON.stringify({ permissions: { deny: ["Read(./.env)"] } }));
+    const tag = docsTag("envs");
+    try {
+      const r = await syncSource(pctx, pdb, { ...src("envs", "."), glob: ["**/.env"] });
+      expect(r.indexed).toBe(0);
+      expect(r.errors.join("\n")).toContain(".env: refused by permission rule Read(./.env) (deny)");
+      expect(pdb.countDocuments(tag)).toBe(0);
+      expect(pdb.findDocumentByUri(`file://${join(pctx.root, ".env")}`)).toBeUndefined();
+      expect(pdb.termExists("zq9xv7secretvalue")).toBe(false);
+      expect(pdb.ftsSearch("trigram", '"zq9xv7secret"', 5)).toEqual([]);
+    } finally {
+      rmSync(settings, { force: true });
+      rmSync(join(pctx.root, ".env"), { force: true });
+      pdb.deleteDocumentsBySource(tag);
+    }
+  });
+
+  it("a file indexed before a Read rule denied it, or before it was deleted, leaves the index", async () => {
+    const settings = join(pctx.root, ".claude", "settings.json");
+    mkdirSync(join(pctx.root, ".claude"), { recursive: true });
+    mkdirSync(join(pctx.root, "notes"), { recursive: true });
+    const keep = join(pctx.root, "notes", "keep.md");
+    const later = join(pctx.root, "notes", "later.md");
+    const gone = join(pctx.root, "notes", "gone.md");
+    writeFileSync(keep, "# Keep\n\nStays.\n");
+    writeFileSync(later, "# Later\n\nDenied later.\n");
+    writeFileSync(gone, "# Gone\n\nDeleted later.\n");
+    const tag = docsTag("notes");
+    const uris = () =>
+      pdb
+        .documentsBySource(tag)
+        .map((d) => d.uri)
+        .sort();
+    try {
+      await syncSource(pctx, pdb, src("notes", "notes"));
+      expect(uris()).toEqual([`file://${gone}`, `file://${keep}`, `file://${later}`]);
+      // Denied by a form that resolves against the project root, and deleted from disk.
+      writeFileSync(settings, JSON.stringify({ permissions: { deny: ["Read(notes/later.md)"] } }));
+      rmSync(gone);
+      const r = await syncSource(pctx, pdb, src("notes", "notes"));
+      expect(r.skipped).toBe(1);
+      expect(uris()).toEqual([`file://${keep}`]);
+      // The same for em_reindex docs (source `file`): the denied file goes, the open one stays.
+      await emReindex.handler({ scope: "docs" }, pctx);
+      expect(pdb.findDocumentByUri(`file://${later}`)).toBeUndefined();
+      expect(pdb.findDocumentByUri(`file://${keep}`)).toBeDefined();
+    } finally {
+      rmSync(settings, { force: true });
+      rmSync(join(pctx.root, "notes"), { recursive: true, force: true });
+      pdb.deleteDocumentsBySource(tag);
+      pdb.deleteDocumentsBySource("file");
+    }
+  });
 });

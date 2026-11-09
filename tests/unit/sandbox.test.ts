@@ -22,6 +22,7 @@ import { runProcess } from "../../src/sandbox/run.js";
 import { closeAllStorage, getStorage } from "../../src/storage/index.js";
 import { SqliteAdapter } from "../../src/storage/sqlite/adapter.js";
 import { chooseInline, emBatchExecute } from "../../src/tools/em_batch_execute.js";
+import { emExecuteFile } from "../../src/tools/em_execute_file.js";
 import { emIndex } from "../../src/tools/em_index.js";
 
 let ctx: ProjectContext;
@@ -296,6 +297,37 @@ describe("confinePath", () => {
     expect(() => confinePath(root, "linked/.env", r)).toThrow(/\(deny\)/);
   });
 
+  it("resolves project-relative Read patterns against the root it confines to", () => {
+    for (const rule of ["Read(./.env)", "Read(.env)", "Read(/.env)"]) {
+      expect(() => confinePath(root, ".env", rules({ deny: [rule] })), rule).toThrow(/\(deny\)/);
+      // A symlink whose target the rule names.
+      expect(() => confinePath(root, "notes.txt", rules({ deny: [rule] })), rule).toThrow(
+        /\(deny\)/,
+      );
+    }
+    // A missing file is refused by its spelling before any stat.
+    expect(() => confinePath(root, "missing/.env", rules({ deny: ["Read(.env)"] }))).toThrow(
+      /\(deny\)/,
+    );
+    expect(() => confinePath(root, "secrets/key.pem", rules({ deny: ["Read(*.pem)"] }))).toThrow(
+      /Read\(\*\.pem\) \(deny\)/,
+    );
+    expect(() => confinePath(root, "app.ts", rules({ ask: ["Read(./app.ts)"] }))).toThrow(
+      /\(ask\)/,
+    );
+    // A relative rule does not reach a file of the same name elsewhere in the tree.
+    expect(confinePath(root, "linked/.env", rules({ deny: ["Read(./.env)"] }))).toBe(
+      join(root, "config.txt"),
+    );
+    // `//` opts an absolute path in, and the refusal names that form.
+    expect(() => confinePath(root, join(outside, "data.log"), rules({}))).toThrow(
+      `add a Read(/${join(outside, "data.log")}) rule`,
+    );
+    expect(
+      confinePath(root, join(outside, "data.log"), rules({ allow: [`Read(/${outside}/**)`] })),
+    ).toBe(join(outside, "data.log"));
+  });
+
   const probe = mkdtempSync(join(tmpdir(), "em-case-"));
   writeFileSync(join(probe, "a"), "");
   it.runIf(existsSync(join(probe, "A")))(
@@ -364,5 +396,40 @@ describe("em_index Read rules", () => {
       .documentsBySource("file")
       .map((d) => d.title);
     expect(docs).toEqual(["notes/guide.md"]);
+  });
+
+  it("project-relative rules from settings refuse em_execute_file and em_index alike, and drop an indexed file", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "em-rel-rules-")));
+    made.push(root);
+    mkdirSync(join(root, "keys"));
+    writeFileSync(join(root, ".env"), "TOKEN=1\n");
+    writeFileSync(join(root, "keys", "a.pem"), "k\n");
+    writeFileSync(join(root, "keys", "notes.md"), "# Notes\n\nfine\n");
+    const rctx: ProjectContext = { ...ictx, root, id: "em-rel-rules" };
+    // Indexed while nothing denied it.
+    await emIndex.handler({ path: "keys/notes.md" }, rctx);
+    const uri = `file://${join(root, "keys", "notes.md")}`;
+    expect(getStorage(rctx).findDocumentByUri(uri)).toBeDefined();
+    mkdirSync(join(root, ".claude"));
+    writeFileSync(
+      join(root, ".claude", "settings.json"),
+      JSON.stringify({
+        permissions: { deny: ["Read(./.env)", "Read(*.pem)"], ask: ["Read(keys/notes.md)"] },
+      }),
+    );
+    for (const [path, rule] of [
+      [".env", "Read(./.env) (deny)"],
+      ["keys/a.pem", "Read(*.pem) (deny)"],
+      ["keys/notes.md", "Read(keys/notes.md) (ask)"],
+    ] as const) {
+      const ef = await emExecuteFile.handler({ path }, rctx);
+      expect(ef.isError, path).toBe(true);
+      expect(textOf(ef)).toContain(rule);
+      const ix = await emIndex.handler({ path }, rctx);
+      expect(ix.isError, path).toBe(true);
+      expect(textOf(ix)).toContain(rule);
+    }
+    // The refused file left the index.
+    expect(getStorage(rctx).findDocumentByUri(uri)).toBeUndefined();
   });
 });

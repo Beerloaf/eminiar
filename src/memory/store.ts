@@ -526,28 +526,38 @@ export function reconcile(ctx: ProjectContext, db: StorageAdapter): ReconcileSum
   const memo = new Map<string, string>();
   out.migrated = migrateLegacy(ctx, db, out.skipped, memo);
   const dir = memoriesDir(ctx);
-  let files: string[] = [];
-  if (existsSync(dir)) {
-    if (!insideMemories(ctx, dir, memo)) out.skipped.push(memoriesRel(ctx));
-    else {
-      // fast-glob follows symlinks: a top-level topic or file link that leads out of the memories
-      // folder is listed once and never walked (a `x -> ~` would read every .md file in ~).
-      const ignore: string[] = [];
-      for (const e of readdirSync(dir, { withFileTypes: true })) {
-        const abs = join(dir, e.name);
-        if (!e.isSymbolicLink() || insideMemories(ctx, abs, memo)) continue;
-        out.skipped.push(relative(ctx.root, abs));
-        ignore.push(fg.escapePath(e.name), `${fg.escapePath(e.name)}/**`);
-      }
-      // Names nest one topic deep; depth 3 still finds one level more, reported as skipped.
-      files = fg.sync("**/*.md", {
-        cwd: dir,
-        absolute: true,
-        onlyFiles: true,
-        dot: true,
-        deep: 3,
-        ignore,
-      });
+  const files: string[] = [];
+  if (lstatSync(dir, { throwIfNoEntry: false })) {
+    if (!existsSync(dir) || !insideMemories(ctx, dir, memo)) {
+      // The folder itself is a dangling link or leads out of the project (often for a moment: a
+      // checkout, a link being replaced). Nothing under it is read, and the rows are kept:
+      // forgetting them here would drop every memory from search until the next reconcile.
+      out.skipped.push(memoriesRel(ctx));
+      return out;
+    }
+    // fast-glob follows symlinks: a top-level topic or file link that leads out of the memories
+    // folder is listed once and never walked (a `x -> ~` would read every .md file in ~).
+    const ignore: string[] = [];
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const abs = join(dir, e.name);
+      if (!e.isSymbolicLink() || insideMemories(ctx, abs, memo)) continue;
+      out.skipped.push(relative(ctx.root, abs));
+      ignore.push(fg.escapePath(e.name), `${fg.escapePath(e.name)}/**`);
+    }
+    // Names nest one topic deep; depth 3 still finds one level more, reported as skipped.
+    // Entries rather than files only, so a dangling link (a symlink whose target is gone, which
+    // fast-glob reports as a link instead of following it) is reported instead of vanishing.
+    for (const e of fg.sync("**/*.md", {
+      cwd: dir,
+      absolute: true,
+      onlyFiles: false,
+      objectMode: true,
+      dot: true,
+      deep: 3,
+      ignore,
+    })) {
+      if (e.dirent.isFile()) files.push(e.path);
+      else if (e.dirent.isSymbolicLink()) out.skipped.push(relative(ctx.root, e.path));
     }
   }
   const seen = new Set<string>();
@@ -760,10 +770,23 @@ export function rename(
   return { refsUpdated };
 }
 
+/** `abs` is a symlink whose target does not exist. */
+function danglingLink(abs: string): boolean {
+  return !!lstatSync(abs, { throwIfNoEntry: false })?.isSymbolicLink() && !existsSync(abs);
+}
+
 /** Delete the file and everything mirrored from it. */
 export function remove(ctx: ProjectContext, db: StorageAdapter, name: string): boolean {
-  assertMemoryPath(ctx, name);
+  assertValidName(name);
   const abs = absOf(ctx, name);
+  // A dangling link (its target is gone) may go: unlink removes the link, never a target, as long
+  // as the folder holding it is inside the memories folder. reconcile lists such links in skipped.
+  if (danglingLink(abs) && insideMemories(ctx, dirname(abs))) {
+    unlinkSync(abs);
+    forgetInDb(db, name, relOf(ctx, name));
+    return true;
+  }
+  assertMemoryPath(ctx, name);
   const existed = existsSync(abs) || !!db.memoryGetByName(name);
   if (existsSync(abs)) unlinkSync(abs);
   forgetInDb(db, name, relOf(ctx, name));

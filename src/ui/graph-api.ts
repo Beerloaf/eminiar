@@ -1,7 +1,8 @@
 import { readFileSync, realpathSync, statSync } from "node:fs";
-import { relative, resolve } from "node:path";
+import { resolve } from "node:path";
 import { overview as fileSymbols, isExported } from "../code/symbols.js";
 import type { ProjectContext } from "../context.js";
+import { within } from "../docs/manifest.js";
 import { ASPECTS, type Aspect, architecture } from "../graph/architecture.js";
 import { detectChanges } from "../graph/changes.js";
 import { nodeLabel } from "../graph/format.js";
@@ -123,7 +124,9 @@ export function treePayload(ctx: ProjectContext) {
 export function filePayload(ctx: ProjectContext, rel: string) {
   const clean = rel.replace(/^\.\//, "");
   const abs = resolve(ctx.root, clean);
-  if (relative(ctx.root, abs).startsWith("..")) throw new Error("path outside the project");
+  // within(): `..` as a whole segment and an absolute relative path (another drive), not a
+  // name that merely starts with `..` such as `..notes.md`.
+  if (!within(abs, ctx.root)) throw new Error("path outside the project");
   const refused = readRefusal(loadPermissionRules(ctx.root), abs, clean);
   if (refused) throw new Error(refused);
   let real = abs;
@@ -132,8 +135,7 @@ export function filePayload(ctx: ProjectContext, rel: string) {
   } catch {
     return { error: "not found", path: clean };
   }
-  if (relative(realpathSync(ctx.root), real).startsWith(".."))
-    throw new Error("path outside the project");
+  if (!within(real, realpathSync(ctx.root))) throw new Error("path outside the project");
   const st = statSync(real);
   if (!st.isFile()) return { error: "not a file", path: clean };
   const db = getStorage(ctx);

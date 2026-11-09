@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
 import { z } from "zod";
 import { kickEmbedding } from "../embeddings/queue.js";
-import { indexContent, indexPath } from "../index/indexer.js";
+import { forgetFile, indexContent, indexPath } from "../index/indexer.js";
 import { checkReadPath, loadPermissionRules } from "../permissions/settings.js";
 import { readRefusal } from "../sandbox/file.js";
 import { getStorage } from "../storage/index.js";
@@ -43,8 +43,12 @@ export const emIndex = defineTool({
     // Claude Code's Read rules, as em_execute_file applies them: the path as written, then its
     // resolved forms. A denied target is refused; a denied file under a directory is skipped.
     const rules = loadPermissionRules(ctx.root);
-    const refused = readRefusal(rules, resolve(ctx.root, args.path), args.path);
-    if (refused) return errorResult(refused);
+    const abs = resolve(ctx.root, args.path);
+    const refused = readRefusal(rules, abs, args.path);
+    if (refused) {
+      forgetFile(db, abs); // indexed before the rule existed: it leaves the index too
+      return errorResult(refused);
+    }
     const s = indexPath(db, ctx.root, args.path, {
       source: args.source ?? "file",
       globs: args.glob ?? ctx.config.index.docs,

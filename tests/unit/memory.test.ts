@@ -1,8 +1,10 @@
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   unlinkSync,
@@ -688,5 +690,53 @@ describe("memory files outside the project", () => {
     expect(existsSync(join(project, "team", "memories", "topic", "shared.md"))).toBe(true);
     expect(reconcile(c, cdb).removed).toBe(0);
     expect(read(c, cdb, "topic/shared")?.body).toBe("Kept in the team folder.");
+  });
+
+  it("a memories folder that leads out for a moment keeps its rows instead of forgetting them", () => {
+    const project = projectAt();
+    resetContextCache();
+    const c = getContext(project);
+    const cdb = getStorage(c);
+    write(c, cdb, { name: "topic/keep", kind: "decision", content: "Important decision." });
+    const dir = join(project, ".eminiar", "memories");
+    const moved = `${dir}.bak`;
+    renameSync(dir, moved);
+    // Out of the project, then a dangling link: refused, nothing read, nothing forgotten.
+    for (const target of [tmp("em-mem-away-"), join(project, "nowhere")]) {
+      symlinkSync(target, dir);
+      const r = reconcile(c, cdb);
+      expect([r.removed, r.skipped], target).toEqual([0, [".eminiar/memories"]]);
+      expect(cdb.memoryGetByName("topic/keep"), target).toBeDefined();
+      unlinkSync(dir);
+    }
+    renameSync(moved, dir);
+    expect(reconcile(c, cdb).removed).toBe(0);
+    // A folder that is really gone still forgets its memories.
+    rmSync(dir, { recursive: true });
+    expect(reconcile(c, cdb).removed).toBe(1);
+    expect(cdb.memoryGetByName("topic/keep")).toBeUndefined();
+  });
+
+  it("reconcile reports a dangling memory link, and remove unlinks it without touching a target", () => {
+    const project = projectAt();
+    const dir = join(project, ".eminiar", "memories");
+    mkdirSync(join(dir, "t"), { recursive: true });
+    symlinkSync(join(project, "missing.md"), join(dir, "t", "dang.md"));
+    resetContextCache();
+    const c = getContext(project);
+    const cdb = getStorage(c);
+    expect(reconcile(c, cdb).skipped).toEqual([".eminiar/memories/t/dang.md"]);
+    expect(remove(c, cdb, "t/dang")).toBe(true);
+    expect(lstatSync(join(dir, "t", "dang.md"), { throwIfNoEntry: false })).toBeUndefined();
+    expect(reconcile(c, cdb).skipped).toEqual([]);
+    // A link that resolves outside, or one in a topic folder linked out, is still refused.
+    const notes = outsideNotes();
+    symlinkSync(join(notes, "topic", "page.md"), join(dir, "t", "out.md"));
+    expect(() => remove(c, cdb, "t/out")).toThrow(/outside the memories folder/);
+    expect(readFileSync(join(notes, "topic", "page.md"), "utf8")).toBe("personal notes\n");
+    symlinkSync(notes, join(dir, "away"));
+    symlinkSync(join(notes, "gone.md"), join(notes, "dead.md"));
+    expect(() => remove(c, cdb, "away/dead")).toThrow(/outside the memories folder/);
+    expect(lstatSync(join(notes, "dead.md")).isSymbolicLink()).toBe(true);
   });
 });

@@ -1,4 +1,4 @@
-import { readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { relative, resolve } from "node:path";
 import fg from "fast-glob";
 import { chunk, hashText, type Kind, kindToContentType } from "../chunker/index.js";
@@ -144,6 +144,37 @@ export function refuseOutside(root: string): (file: string) => string | undefine
   };
 }
 
+/**
+ * Drop every document indexed from `file` (any source), so a file a Read rule now denies, or
+ * one that resolves outside the project, leaves the index instead of staying searchable.
+ * Returns how many documents went.
+ */
+export function forgetFile(db: StorageAdapter, file: string): number {
+  const uri = `file://${file}`;
+  let n = 0;
+  // One row per (uri, content hash); bounded so a corrupt table cannot spin.
+  for (let doc = db.findDocumentByUri(uri); doc && n < 1000; doc = db.findDocumentByUri(uri)) {
+    db.deleteDocument(doc.id);
+    n++;
+  }
+  return n;
+}
+
+/**
+ * Drop the documents of `source` indexed from files under `dir` that no longer exist, so a
+ * deleted or renamed file stops answering searches. `seen` (files the walk just found) skips
+ * the stat for the common case.
+ */
+function pruneMissing(db: StorageAdapter, source: Source, dir: string, seen: Set<string>): void {
+  const prefix = `file://${dir.endsWith("/") ? dir : `${dir}/`}`;
+  for (const doc of db.documentsBySource(source, 1_000_000)) {
+    if (!doc.uri?.startsWith(prefix)) continue;
+    const file = doc.uri.slice("file://".length);
+    if (seen.has(file) || existsSync(file)) continue;
+    db.deleteDocument(doc.id);
+  }
+}
+
 export function indexPath(
   db: StorageAdapter,
   root: string,
@@ -176,6 +207,8 @@ export function indexPath(
     try {
       const refused = opts.refuse?.(file);
       if (refused) {
+        // Indexed before the rule existed (or by an older version): it leaves the index too.
+        forgetFile(db, file);
         summary.skipped.push({ path: rel, reason: refused });
         continue;
       }
@@ -205,5 +238,6 @@ export function indexPath(
       summary.skipped.push({ path: rel, reason: (err as Error).message });
     }
   }
+  if (st.isDirectory()) pruneMissing(db, opts.source ?? "file", abs, new Set(files));
   return summary;
 }
