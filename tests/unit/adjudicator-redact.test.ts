@@ -3,6 +3,7 @@ import {
   forRemote,
   head,
   isSecretName,
+  normalize,
   redact,
   redactSecrets,
 } from "../../src/adjudicator/redact.js";
@@ -564,6 +565,128 @@ describe("redactSecrets: stored command output", () => {
     // a name that is not a key stays
     expect(redactSecrets("AGE-SECRET-KEY-1SHORT")).toBe("AGE-SECRET-KEY-1SHORT");
   });
+
+  it("looks for a key block's END line within 64 KB only", () => {
+    // An END 70 KB on would make the key block swallow every line of output in between.
+    const log = "2026-11-09 INFO a line of ordinary log output\n".repeat(1_600);
+    const text = `-----BEGIN PRIVATE KEY-----\n${log}-----END PRIVATE KEY-----\ntail`;
+    expect(log.length).toBeGreaterThan(65_536);
+    const out = redactSecrets(text);
+    expect(out.startsWith("[private key]\n2026-11-09 INFO a line")).toBe(true);
+    expect(out).toContain("tail");
+    expect(out.length).toBeGreaterThan(65_536);
+    // within 64 KB the whole block goes
+    const near = `-----BEGIN PRIVATE KEY-----\n${log.slice(0, 60_000)}\n-----END PRIVATE KEY-----\ntail`;
+    expect(redactSecrets(near)).toBe("[private key]\ntail");
+  });
+});
+
+describe("redactSecrets: shapes the PR #54 review found", () => {
+  const T = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+  const b64 = (s: string) => Buffer.from(s).toString("base64");
+  const cases: Array<[string, string, string]> = [
+    // [label, input, masked]
+    [
+      "escaped JSON (kubectl last-applied-configuration)",
+      '{"last-applied":"{\\"password\\":\\"Hunter2Secret!\\",\\"user\\":\\"x\\"}"}',
+      '{"last-applied":"{\\"password\\":\\"***\\",\\"user\\":\\"x\\"}"}',
+    ],
+    [
+      "doubly escaped JSON",
+      '"{\\\\\\"api_key\\\\\\":\\\\\\"k_9f8e7d6c5b4a\\\\\\"}"',
+      '"{\\\\\\"api_key\\\\\\":\\\\\\"***\\\\\\"}"',
+    ],
+    [
+      "a URL password with a /",
+      "postgres://app:Pa55/word9@db.internal:5432/prod",
+      "postgres://***@db.internal:5432/prod",
+    ],
+    [
+      "a URL password with an @",
+      "postgres://app:Pa55@word9@db.internal:5432/prod",
+      "postgres://***@db.internal:5432/prod",
+    ],
+    [
+      "a quoted value over 512 chars",
+      `"client_secret": "${"x9".repeat(300)}"`,
+      '"client_secret": "***"',
+    ],
+    [
+      "a quoted value over several lines",
+      'DB_PASSWORD="first-line-secret-9f\nsecond-line"\nnext',
+      'DB_PASSWORD="***"\nnext',
+    ],
+    [
+      "a quoted value cut off at the end of the text",
+      'x {"password": "Hunter2-cut',
+      'x {"password": "***',
+    ],
+    [
+      "a quoted value never closed within 4 KB",
+      `token="${"a".repeat(5_000)}\nnext`,
+      'token="***\nnext',
+    ],
+    [
+      ".dockerconfigjson (Kubernetes Secret data)",
+      `data:\n  .dockerconfigjson: ${b64(`{"auths":{"ghcr.io":{"auth":"${b64(`me:${T}`)}"}}}`)}\n  ok: eWVz`,
+      "data:\n  .dockerconfigjson: ***\n  ok: eWVz",
+    ],
+    [
+      "a base64 DATABASE_URL",
+      `data:\n  DATABASE_URL: ${b64("postgres://u:S3cretPw@h/db")}`,
+      "data:\n  DATABASE_URL: ***",
+    ],
+    [
+      "a base64 value in JSON",
+      `{"data": {"url": "${b64("redis://:S3cretPw@cache:6379")}"}}`,
+      '{"data": {"url": "***"}}',
+    ],
+    [
+      "an Azure SAS signature",
+      "https://acct.blob.core.windows.net/c/f?sv=2022-11-02&sig=AbCdEf123456%2BGhIjKl%3D&se=2026",
+      "https://acct.blob.core.windows.net/c/f?sv=2022-11-02&sig=***&se=2026",
+    ],
+    [
+      "Twilio API key and account SIDs",
+      // built at run time: a literal one trips GitHub's push protection
+      `SK${"0123456789abcdef".repeat(2)} AC${"0123456789abcdef".repeat(2)}`,
+      "SK*** AC***",
+    ],
+  ];
+  for (const [label, input, masked] of cases) {
+    it(`masks ${label}`, () => {
+      const out = redactSecrets(input);
+      expect(out).toBe(masked);
+      expect(redactSecrets(out)).toBe(out);
+    });
+  }
+
+  it("keeps the look-alikes", () => {
+    for (const text of [
+      // ports before a path with an @ in it
+      "https://registry.example.com:8443/@scope/pkg",
+      "http://localhost:3000/api?x=1",
+      // base64 that decodes to nothing secret, hex digests
+      "data:\n  username: YWRtaW4=\n  config: eyJsb2dMZXZlbCI6ImluZm8ifQ==",
+      "sha: 3f2a9c0e1b7d4a6f8e2c5b1a9d0f3e7c6b4a2d1e",
+      // code with a quote after a secret-looking label
+      'print("password: ")\nfoo()\nprint("done")',
+      'log("token: ", x)',
+      // sig= outside a query, a short SK id, an account id that is not hex
+      "sig=short",
+      "SK123 ACCOUNT_ID",
+    ]) {
+      expect(redactSecrets(text), text).toBe(text);
+    }
+    // only the credentials go: the host, and an email in the query, stay
+    expect(redactSecrets("https://u:p@host.example/path?email=a@b.example")).toBe(
+      "https://***@host.example/path?email=a@b.example",
+    );
+  });
+
+  it("removes trailing spaces in normalize() from the start of each run", () => {
+    expect(normalize("a  \nb\t \n  c   ")).toBe("a\nb\n c");
+  });
 });
 
 describe("isSecretName", () => {
@@ -697,6 +820,27 @@ describe("redact: performance", () => {
       "key: a1\n".repeat(n / 8),
       "ya29.".repeat(n / 5),
       "eyJwYXlsb2FkIjoi".repeat(n / 16),
+      // runs of spaces where two space quantifiers meet (prose, curl -u, the separator)
+      "password is".concat(" ".repeat(n), "x"),
+      "password is :".concat(" ".repeat(n), "x"),
+      "-u".concat(" ".repeat(n), "x"),
+      "--user".concat(" ".repeat(n), "=", " ".repeat(n), "x"),
+      // quoted values: unclosed, escaped, over several lines, cut off
+      'token="'.concat("a".repeat(n)),
+      'token="a\n'.repeat(n / 9),
+      'token="'.concat("a\n".repeat(n / 2)),
+      "token=\" token=' token=`".repeat(n / 22),
+      '\\"password\\":\\"'.repeat(n / 17),
+      '\\"password\\":\\"'.concat("a".repeat(n)),
+      "password=\\".repeat(n / 10),
+      // URL credentials with / and @ in the password, base64 values, SAS signatures
+      "x://a:".concat("b/".repeat(n / 2)),
+      "x://a:b@".concat("c@".repeat(n / 2)),
+      "x://a:b".concat("@c/".repeat(n / 3)),
+      "a: ".concat("QUFB".repeat(n / 4)),
+      "a: QUFBQUFBQUFBQUFB ".repeat(n / 20),
+      "?sig=".repeat(n / 5),
+      "SK".concat("0".repeat(n)),
     ];
     // A quadratic rule on 100 KB is ~5e9 steps (seconds); a linear pass is a few ms. Under
     // parallel load (vitest workers, CI neighbours) an absolute 100 ms flakes, so the bound scales
@@ -716,5 +860,63 @@ describe("redact: performance", () => {
         ).toBeLessThan(bound);
       }
     }
+  });
+
+  // The inputs that took 1-18 s each before the space runs were made unambiguous (review of
+  // PR #54): each must take well under 50 ms, or a small multiple of a linear pass over the same
+  // length on this machine when it is under load.
+  it("stays linear on long runs of spaces, in every entry point", () => {
+    const remote = (s: string) => forRemote(s, 4000);
+    const headOf = (s: string) => head(s);
+    const fns: Array<[string, (s: string) => string]> = [
+      ["redact", redact],
+      ["redactSecrets", redactSecrets],
+      ["normalize", normalize],
+      ["forRemote", remote],
+      ["head", headOf],
+    ];
+    const inputs = [
+      "password is".concat(" ".repeat(98_000), "x"),
+      "-u".concat(" ".repeat(195_000), "x"),
+      " ".repeat(98_000).concat("x"),
+      "x".concat(" ".repeat(98_000), "\nx"),
+      "password: |\n  a\n  b\n".repeat(98_000 / 20),
+    ];
+    for (const [name, f] of fns) {
+      for (const s of inputs) {
+        const plain = "the quick brown fox jumps over the lazy dog 0123456789\n"
+          .repeat(Math.ceil(s.length / 55))
+          .slice(0, s.length);
+        const baseline = Math.min(time(plain, f), time(plain, f), time(plain, f));
+        const bound = Math.max(50, 10 * baseline);
+        let t = time(s, f);
+        for (let retry = 0; retry < 2 && t >= bound; retry++) t = Math.min(t, time(s, f));
+        expect(
+          t,
+          `${name} ${JSON.stringify(s.slice(0, 16))} (bound ${bound.toFixed(0)} ms)`,
+        ).toBeLessThan(bound);
+      }
+    }
+  });
+
+  it("masks many YAML blocks in time linear in their number", () => {
+    const block = "db_password: |\n  line-one\n  line-two\nplain: value\n";
+    const small = block.repeat(4_000);
+    const large = block.repeat(64_000);
+    const best = (s: string) =>
+      Math.min(time(s, redactSecrets), time(s, redactSecrets), time(s, redactSecrets));
+    // 16x the blocks: ~16x the time when linear, ~256x when each block shifts the rest (half
+    // a second at 16k blocks, seconds at 64k). Under parallel load one pair of timings can be
+    // skewed, so a slow ratio is re-measured.
+    const bound = (t: number) => Math.max(200, 48 * t);
+    let t1 = best(small);
+    let t16 = best(large);
+    for (let retry = 0; retry < 2 && t16 >= bound(t1); retry++) {
+      t1 = best(small);
+      t16 = best(large);
+    }
+    expect(t16, `t1 ${t1.toFixed(1)} ms`).toBeLessThan(bound(t1));
+    const out = redactSecrets(block.repeat(3));
+    expect(out).toBe("db_password: |\n  ***\nplain: value\n".repeat(3));
   });
 });

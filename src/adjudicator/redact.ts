@@ -9,13 +9,16 @@ import { createHash } from "node:crypto";
 
 /** Unicode NFKC, CRLF → LF, trailing spaces and runs of blank lines collapsed, trimmed. */
 export function normalize(text: string): string {
-  return text
-    .normalize("NFKC")
-    .replace(/\r\n?/g, "\n")
-    .replace(/[ \t]+$/gm, "")
-    .replace(/[ \t]{2,}/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  return (
+    text
+      .normalize("NFKC")
+      .replace(/\r\n?/g, "\n")
+      // (only from the start of a run: tried at every space of a long run, the match is quadratic)
+      .replace(/(?<![ \t])[ \t]+$/gm, "")
+      .replace(/[ \t]{2,}/g, " ")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim()
+  );
 }
 
 /** sha256 hex of the normalised text: the same request always hashes the same. */
@@ -92,24 +95,68 @@ const NOT_A_SECRET_VALUE =
 // Two steps keep it linear: ASSIGN_NAME finds `name<sep>` (a name starts only at an identifier
 // boundary, and whether it is secret is decided in code: an alternation of secret words inside
 // the regex backtracks badly on long identifier runs), and only for a secret name does the
-// sticky ASSIGN_VALUE read the value. A non-secret name never consumes the text after it, so
+// sticky ASSIGN_VALUES (readValue()) read the value. A non-secret name never consumes the text after it, so
 // `.env: FOO_KEY=x` and `https://…?token=x` are still found.
-const ASSIGN_NAME = /(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+)(["'`]?[ \t]*(?::=|=>|[:=])[ \t]*)/g;
-// A quoted value may contain spaces and escapes and is capped, so an unclosed quote stays cheap.
-// A bare value runs to whitespace or a quote, or to a `&` / `;` / `,` that ends the value (the
-// end of the text, or the next `name=` pair); it never starts with `=`, `<`, a bracket or a YAML
-// block indicator.
-const ASSIGN_VALUE = new RegExp(
-  [
-    "(?!(?:Basic|Bearer|Token|Digest|Negotiate|NTLM)[ \\t]+\\*\\*\\*)",
-    "(?:",
-    "([\"'`])((?:(?!\\1)[^\\\\\\n]|\\\\.){0,512})\\1", // 1 quote, 2 quoted value
-    "|",
-    "([^\\s\"'`&;,=<\\[{(|>](?:[^\\s\"'`&;,]|[&;,](?=[^\\s\"'`&;,])(?![A-Za-z0-9_.\\- ]*=))*)", // 3 bare
-    ")",
-  ].join(""),
-  "y",
-);
+// The separator may follow an escaped quote: JSON inside a JSON string (`{\"password\":\"x\"}`,
+// kubectl's last-applied-configuration) escapes its quotes once or more.
+const ASSIGN_NAME =
+  /(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+)(\\{0,8}["'`]?[ \t]*(?::=|=>|[:=])[ \t]*)/g;
+// The value is read by the first of these sticky patterns that matches at its start; each one
+// stops at a quote or whitespace it cannot cross, so a failed attempt stays cheap. (Each names
+// the opening quote, with any backslashes before it, `open`, and the value `value`.)
+// - a value in escaped quotes (`\"x\"`), up to the same escaped quote;
+// - a quoted value on one line, with spaces and escapes, up to 4096 chars;
+// - a quoted value over several lines with no whitespace in them (an .env value, a key), whose
+//   closing quote ends the line or the item;
+// - a quote that is not closed within 4096 chars, or not before the end of the text (a value
+//   cut off by a clip): masked to the end of its line, so no part of it is left;
+// - a bare value: it runs to whitespace or a quote, or to a `&` / `;` / `,` that ends the value
+//   (the end of the text, or the next `name=` pair); it never starts with `=`, `<`, a bracket, a
+//   YAML block indicator or an escaped quote.
+const NOT_A_SCHEME_STUB = /(?!(?:Basic|Bearer|Token|Digest|Negotiate|NTLM)[ \t]+\*\*\*)/.source;
+const ASSIGN_VALUES: Array<{ re: RegExp; closed: boolean }> = [
+  {
+    re: /(?<open>\\{1,8}(?<q>["']))(?<value>(?:(?!\k<q>)[^\\\n]|\\+(?![\\"'])){0,4096})\k<open>/y,
+    closed: true,
+  },
+  {
+    re: /(?<open>["'`])(?<value>(?:(?!\k<open>)[^\\\n]|\\.){0,4096})\k<open>/y,
+    closed: true,
+  },
+  {
+    re: /(?<open>["'`])(?<value>[^\s"'`\\]{0,512}(?:\r?\n[^\s"'`\\]{0,512}){1,64})\k<open>(?=[ \t]*(?:[,;)}\]#\r\n]|$))/y,
+    closed: true,
+  },
+  {
+    re: /(?<open>["'`])(?<value>(?:(?!\k<open>)[^\\\n]|\\.){4096}[^\n]*|(?![\s)\]};,])(?:(?!\k<open>)[^\\\n]|\\.)+$)/y,
+    closed: false,
+  },
+  {
+    re: new RegExp(
+      `${NOT_A_SCHEME_STUB}(?<open>)(?<value>(?!\\\\+["'\`])[^\\s"'\`&;,=<\\[{(|>](?:[^\\s"'\`&;,]|[&;,](?=[^\\s"'\`&;,])(?![A-Za-z0-9_.\\- ]*=))*)`,
+      "y",
+    ),
+    closed: false,
+  },
+];
+
+/** The value at `start` of a secret name: its length, its raw text and the masked form. */
+function readValue(
+  text: string,
+  start: number,
+): { length: number; raw: string; masked: string } | undefined {
+  for (const { re, closed } of ASSIGN_VALUES) {
+    re.lastIndex = start;
+    const v = re.exec(text);
+    if (!v?.groups) continue;
+    const open = v.groups.open ?? "";
+    const raw = v.groups.value ?? "";
+    // an escaped opening quote closes with the same backslashes: `\"` … `\"`
+    const close = closed ? open : "";
+    return { length: v[0].length, raw, masked: `${open}***${close}` };
+  }
+  return undefined;
+}
 
 /** A secret name's value that a caller wants left as it is (see keepInOutput). */
 type KeepValue = (name: string, value: string) => boolean;
@@ -121,14 +168,12 @@ function maskAssignments(text: string, keep?: KeepValue): string {
   for (let m = ASSIGN_NAME.exec(text); m; m = ASSIGN_NAME.exec(text)) {
     if (!isSecretName(m[1] as string)) continue;
     const start = m.index + m[0].length;
-    ASSIGN_VALUE.lastIndex = start;
-    const v = ASSIGN_VALUE.exec(text);
+    const v = readValue(text, start);
     if (!v) continue;
-    const [value, q, quoted, bare] = v;
-    const raw = q ? (quoted ?? "") : (bare ?? "");
+    const { raw } = v;
     if (!raw || NOT_A_SECRET_VALUE.test(raw) || keep?.(m[1] as string, raw)) continue;
-    out += text.slice(last, start) + (q ? `${q}***${q}` : "***");
-    last = start + value.length;
+    out += text.slice(last, start) + v.masked;
+    last = start + v.length;
     ASSIGN_NAME.lastIndex = last;
   }
   return out + text.slice(last);
@@ -143,7 +188,11 @@ function maskYamlBlocks(text: string): string {
   const lines = text.split("\n");
   const header =
     /^([ \t]*)(?:-[ \t]+)?["']?([A-Za-z0-9_.-]+)["']?[ \t]*:[ \t]*[|>][+-]?[1-9]?[ \t\r]*$/;
+  // Built as a new array: splicing each block out of `lines` shifts the rest every time, which
+  // is quadratic in the number of blocks.
+  const out: string[] = [];
   for (let i = 0; i < lines.length; i++) {
+    out.push(lines[i] as string);
     const h = header.exec(lines[i] as string);
     if (!h || !isSecretName(h[2] as string)) continue;
     const indent = (h[1] as string).length;
@@ -158,10 +207,10 @@ function maskYamlBlocks(text: string): string {
       last = j;
     }
     if (last === i) continue;
-    lines.splice(i + 1, last - i, `${pad}***`);
-    i++;
+    out.push(`${pad}***`);
+    i = last;
   }
-  return lines.join("\n");
+  return out.join("\n");
 }
 
 /** Set-Cookie attributes: their values are not secrets and stay readable. */
@@ -223,16 +272,25 @@ const PRIVATE_KEY_TO_END = new RegExp(
 const RULES: Rule[] = [
   // PEM / OpenSSH / PGP private key blocks, whole (to the END line, or the end of the text).
   [PRIVATE_KEY_TO_END, "[private key]"],
-  // Credentials inside URLs: scheme://user:pass@host, scheme://:pass@host
-  [/\b([a-z][a-z0-9+.-]{0,30}:\/\/)[^\s/:@]*:[^\s/@]+@/gi, "$1***@"],
+  // Credentials inside URLs: scheme://user:pass@host, scheme://:pass@host. The password may hold
+  // a `/` (not a port's `:8080/`) or an `@` (masked to the last `@` before the host, but not past
+  // a `/` `?` `#` after the first: `?email=a@b` in the path is not the host).
+  [
+    /\b([a-z][a-z0-9+.-]{0,30}:\/\/)[^\s/:@]*:(?!\d{1,5}(?:[/?#\s]|$))[^\s@]{1,256}@(?:[^\s@/?#]{1,256}@){0,3}/gi,
+    "$1***@",
+  ],
   // Authorization / Proxy-Authorization headers: the scheme stays, the credentials go.
   [
     /\b((?:Proxy-)?Authorization["']?[ \t]*[:=][ \t]*["']?)(?!(?:(?:Basic|Bearer|Token|Digest|Negotiate|NTLM|ApiKey|Key)[ \t]+)?\*\*\*)(?:(Basic|Bearer|Token|Digest|Negotiate|NTLM|ApiKey|Key)[ \t]+)?[^\s"'`]+/gi,
     (_m: string, pre = "", scheme = "") => `${pre}${scheme ? `${scheme} ` : ""}***`,
   ],
   [/\bBearer[ \t]+(?!\*\*\*)[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer ***"],
-  // curl -u / --user user:pass (the user stays)
-  [/(?<!\S)(-u|--user)([ \t]*=?[ \t]*)(["']?)([^\s:"'@]+):(?!\*\*\*)[^\s"']+\3/g, "$1$2$3$4:***$3"],
+  // curl -u / --user user:pass (the user stays). The `=` and the spaces around it are one group
+  // (`[ \t]*=?[ \t]*` splits a run of spaces every way it can: quadratic).
+  [
+    /(?<!\S)(-u|--user)([ \t]*(?:=[ \t]*)?)(["']?)([^\s:"'@]+):(?!\*\*\*)[^\s"']+\3/g,
+    "$1$2$3$4:***$3",
+  ],
   // --password x, --token x, --api-key x, --client-secret x … (the `=` form is an assignment)
   [
     /(?<!\S)(--(?:[a-z0-9]+-){0,4}(?:password|passwd|pass|passphrase|token|secret|api-?key|access-key|secret-key|auth-token|credentials?))([ \t]+)(?!-|\*\*\*)(?:(["'])[^\n]{0,256}?\3|[^\s"']+)/gi,
@@ -299,9 +357,10 @@ const RULES: Rule[] = [
     (_m: string, pre = "", pairs = "") => pre + maskCookiePairs(pairs),
   ],
   // Prose: "the password is Wint3rIsComing", "the signing secret was x9-y" (only when the word
-  // looks like a secret: it has a digit or a symbol).
+  // looks like a secret: it has a digit or a symbol). `(?:[ \t]*:)?[ \t]+`, not `[ \t]*:?[ \t]+`,
+  // which tries every split of a long run of spaces.
   [
-    /\b((?:pass(?:word|phrase|wd)|secret|token|api[ -]?key|access[ -]key)[ \t]+(?:is|was)[ \t]*:?[ \t]+)(["']?)(?=[^\s"']{0,128}[\d!@#$%^&*])(?!\*\*\*)[^\s"']{4,128}\2/gi,
+    /\b((?:pass(?:word|phrase|wd)|secret|token|api[ -]?key|access[ -]key)[ \t]+(?:is|was)(?:[ \t]*:)?[ \t]+)(["']?)(?=[^\s"']{0,128}[\d!@#$%^&*])(?!\*\*\*)[^\s"']{4,128}\2/gi,
     "$1$2***$2",
   ],
   [/\b(sk|rk|pk)_(live|test)_[A-Za-z0-9]{10,}/g, "$1_$2_***"],
@@ -313,6 +372,10 @@ const RULES: Rule[] = [
   [/\bhf_[A-Za-z0-9]{30,}/g, "hf_***"],
   [/\bxox[a-z]-[A-Za-z0-9-]{10,}/g, "xox*-***"],
   [/\b(hooks\.slack\.com\/services\/)[A-Za-z0-9/]{10,}/g, "$1***"],
+  // Azure shared access signatures: the `sig=` of a SAS URL or connection string
+  [/([?&;]sig=)(?!\*\*\*)[A-Za-z0-9%+/=_-]{16,}/gi, "$1***"],
+  // Twilio API key and account SIDs (the account SID is half of the basic-auth pair)
+  [/\b(SK|AC)[0-9a-f]{32}\b/g, "$1***"],
   [/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, "AKIA***"],
   [/\bAIza[0-9A-Za-z_-]{35}/g, "AIza***"],
   [/\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}/g, "SG.***"],
@@ -352,7 +415,25 @@ const TOKEN_SHAPES: Rule[] = [
   [/\bpypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{50,}/g, "pypi-***"],
   // base64 of `{"payload":"`, the ECR login password
   [/\beyJwYXlsb2FkIjoi[A-Za-z0-9+/=]{64,}/g, "[ecr password]"],
+  // A base64 value under any name (a Kubernetes Secret's `data:`, `.dockerconfigjson: eyJ…`,
+  // `DATABASE_URL: cG9zdGdyZXM6Ly8…`) whose decoded text holds a credential. (Found from the `:`,
+  // not from every identifier that might be a name: a third of the cost on ordinary output.)
+  [
+    /(:[ \t]*["']?)([A-Za-z0-9+/]{12,}={0,2})(?![A-Za-z0-9+/=])/g,
+    (m: string, pre = "", b64 = "") => (encodesSecret(b64) ? `${pre}***` : m),
+  ],
 ];
+
+/** Decoded text that is, or holds, a credential: URL credentials, docker auths, a private key. */
+const DECODED_SECRET =
+  /[a-z][a-z0-9+.-]{0,30}:\/\/[^\s/:@]*:[^\s@]+@|"auths?"[ \t]*:|PRIVATE KEY-----|(?:password|passwd|secret|token|api_?key)["']?[ \t]*[:=]/i;
+
+function encodesSecret(b64: string): boolean {
+  // a hex digest (a git SHA, a checksum) decodes to bytes that hold no text
+  if (/^[0-9a-f]+$/i.test(b64)) return false;
+  const text = Buffer.from(b64, "base64").toString("latin1");
+  return DECODED_SECRET.test(text);
+}
 
 /**
  * redactSecrets' rules: RULES up to the assignments (the generic runs after them are for remote

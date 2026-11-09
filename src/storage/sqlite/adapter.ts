@@ -1815,10 +1815,7 @@ export class SqliteAdapter implements StorageAdapter {
         this.db.exec("DELETE FROM swarm_runs;");
         // The memorable events were also indexed (source "session"), and that copy is what
         // em_recall and the prompt hook recall. The index scope clears it with everything else.
-        if (scope === "sessions") this.deleteDocumentsBySource("session");
-        // Drop the deleted rows' tokens from the FTS segments too, before the VACUUM.
-        this.db.exec("INSERT INTO chunks_fts_porter(chunks_fts_porter) VALUES ('optimize')");
-        this.db.exec("INSERT INTO chunks_fts_trigram(chunks_fts_trigram) VALUES ('optimize')");
+        if (scope === "sessions") this.purgeDocumentsBySource("session");
       }
       if (scope === "graph" || scope === "all") {
         this.db.exec(
@@ -1836,7 +1833,7 @@ export class SqliteAdapter implements StorageAdapter {
         // The index and graph scopes clear their own tables; a memories-only purge must
         // still drop the mirrored documents and memory nodes. The files stay on disk.
         if (scope === "memories") {
-          this.deleteDocumentsBySource("memory");
+          this.purgeDocumentsBySource("memory");
           this.db.exec(
             "DELETE FROM graph_edges WHERE src LIKE 'memory:%' OR dst LIKE 'memory:%'; DELETE FROM graph_nodes WHERE id LIKE 'memory:%';",
           );
@@ -1852,6 +1849,33 @@ export class SqliteAdapter implements StorageAdapter {
     } catch {
       // fail open
     }
+  }
+
+  /**
+   * Delete every document of one source for a purge, in set statements (deleteDocument() per
+   * document scans chunk_vec once each: minutes on a large index), with FTS5 secure-delete on
+   * while the chunks go. A plain FTS5 delete only records a tombstone and leaves the row's tokens
+   * in the index segments it shares with other rows, where they survive the VACUUM; secure-delete
+   * removes them from those segments, at a cost in proportion to the rows deleted rather than an
+   * 'optimize' rewrite of the whole index. Runs inside purge()'s transaction.
+   */
+  private purgeDocumentsBySource(source: string): void {
+    const chunkIds =
+      "SELECT c.id FROM chunks c JOIN documents d ON d.id = c.document_id WHERE d.source = ?";
+    if (this.vectors)
+      this.db.prepare(`DELETE FROM chunk_vec WHERE chunk_id IN (${chunkIds})`).run(source);
+    const fts = ["chunks_fts_porter", "chunks_fts_trigram"];
+    for (const t of fts) this.db.exec(`INSERT INTO ${t}(${t}, rank) VALUES ('secure-delete', 1)`);
+    try {
+      this.db
+        .prepare(
+          "DELETE FROM chunks WHERE document_id IN (SELECT id FROM documents WHERE source = ?)",
+        )
+        .run(source);
+    } finally {
+      for (const t of fts) this.db.exec(`INSERT INTO ${t}(${t}, rank) VALUES ('secure-delete', 0)`);
+    }
+    this.db.prepare("DELETE FROM documents WHERE source = ?").run(source);
   }
 
   transaction<T>(fn: () => T): T {
