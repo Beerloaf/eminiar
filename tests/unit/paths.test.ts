@@ -9,13 +9,13 @@ import { SqliteAdapter } from "../../src/storage/sqlite/adapter.js";
 const mode = (path: string) => statSync(path).mode & 0o777;
 const posix = process.platform !== "win32";
 
-const realHome = process.env.HOME;
-afterEach(() => {
-  delete process.env.EMINIAR_HOME;
-  process.env.HOME = realHome;
-});
-
 describe.runIf(posix)("data file modes", () => {
+  const realHome = process.env.HOME;
+  afterEach(() => {
+    delete process.env.EMINIAR_HOME;
+    process.env.HOME = realHome;
+  });
+
   const dir = (name: string, entries: string[] = []) => {
     const d = join(mkdtempSync(join(tmpdir(), "em-modes-")), name);
     mkdirSync(d);
