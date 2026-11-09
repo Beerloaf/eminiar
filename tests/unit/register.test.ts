@@ -111,6 +111,24 @@ describe("registerSettings", () => {
     });
   });
 
+  it("keeps a user's `em-hook --gate` entry and tolerates malformed entries", () => {
+    const stable = stableCopy();
+    const gate = hook(`"${join(stable, "bin", "em-hook")}" --gate`);
+    const ours = hook(`"${join(stable, "bin", "em-hook")}"`);
+    writeSettings({
+      PreToolUse: [{ matcher: "Bash", hooks: [gate, ours] }],
+      Stop: [null, { matcher: "x", hooks: "nope" }, { hooks: [null, ours] }] as never,
+    });
+
+    const wrote = registerSettings(stable);
+    expect(readHooks().PreToolUse?.[0]).toEqual({ matcher: "Bash", hooks: [gate] });
+
+    unregisterSettings(stable, wrote);
+    const left = readHooks();
+    expect(left.PreToolUse).toEqual([{ matcher: "Bash", hooks: [gate] }]);
+    expect(left.Stop).toEqual([null, { matcher: "x", hooks: "nope" }, { hooks: [null] }]);
+  });
+
   it("fills a stable root holding `$&` or `$$` literally", () => {
     const stable = stableCopy("em-st$&$$-");
     registerSettings(stable);

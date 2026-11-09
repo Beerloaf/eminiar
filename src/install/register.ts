@@ -128,9 +128,15 @@ export function isOurs(cmd: unknown, stable: string): cmd is string {
   return typeof cmd === "string" && (cmd.includes("/.eminiar/plugin/") || cmd.includes(stable));
 }
 
-/** Is this hook command eminiar's own hook binary? Other eminiar commands a user hooks up stay. */
+/**
+ * Is this hook command exactly what install writes: the hook binary alone, quoted or not, with no
+ * arguments? A user's own `em-hook --gate` entry (the fail-closed swarm gate) and other eminiar
+ * commands they hook up stay.
+ */
 function isOurHook(cmd: unknown, stable: string): boolean {
-  return isOurs(cmd, stable) && cmd.includes("/bin/em-hook");
+  if (typeof cmd !== "string") return false;
+  const bin = cmd.trim().replace(/^"(.*)"$/, "$1");
+  return bin === join(stable, "bin", "em-hook") || bin.endsWith("/.eminiar/plugin/bin/em-hook");
 }
 
 /**
@@ -142,8 +148,10 @@ function removeOurHooks(hooks: Record<string, unknown>, stable: string): void {
   for (const [ev, list] of Object.entries(hooks)) {
     if (!Array.isArray(list)) continue;
     const kept = (list as Json[]).flatMap((entry) => {
-      const all = (entry.hooks as Json[] | undefined) ?? [];
-      const rest = all.filter((h) => !isOurHook(h.command, stable));
+      // A malformed entry or hooks list is the user's; leave it alone rather than throw.
+      if (!entry || typeof entry !== "object" || !Array.isArray(entry.hooks)) return [entry];
+      const all = entry.hooks as Json[];
+      const rest = all.filter((h) => !(h && isOurHook(h.command, stable)));
       if (rest.length === all.length) return [entry];
       return rest.length ? [{ ...entry, hooks: rest }] : [];
     });
