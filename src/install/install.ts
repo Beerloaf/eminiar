@@ -7,10 +7,13 @@ import { resolveProjectRoot } from "../project.js";
 import { globalDb } from "../stats/global.js";
 import { version } from "../version.js";
 import {
+  claudeDir,
+  claudeJsonPath,
   clearNeedsAuthEntry,
   type Json,
   needsAuthEntry,
   readJson,
+  settingsPath,
   writeInstallRecord,
   writeJsonWithBackup,
 } from "./claude-config.js";
@@ -126,7 +129,7 @@ export async function install(opts: InstallOptions): Promise<number> {
   if (usedMethod === "settings") {
     wrote = registerSettings(stable);
     log.ok(
-      "hooks written to ~/.claude/settings.json, MCP server to ~/.claude.json, skills to ~/.claude/skills",
+      `hooks written to ${settingsPath()}, MCP server to ${claudeJsonPath()}, skills to ${join(claudeDir(), "skills")}`,
     );
   }
   if (wantClaude) {
