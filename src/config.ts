@@ -112,9 +112,9 @@ const buildAdjudicatorObject = () =>
       .prefault({}),
     minPromptChars: z.number().int().min(0).default(12),
     /**
-     * Ordered ladder, smallest first; "fable" may be inserted by the user. Every provider request
-     * carries the whole ladder and a committed project file may set it, so it is bounded: each
-     * tier at most once (task #56).
+     * Ordered ladder, smallest first; "fable" may be inserted by the user. Personal config only
+     * (a committed project file cannot set it). Every provider request carries the whole ladder,
+     * so it is bounded: each tier at most once (task #56).
      */
     tiers: z
       .array(z.enum(TIERS))
@@ -620,29 +620,36 @@ function envOverrides(): Record<string, unknown> {
  * and EMINIAR_* env (which can withdraw remote consent but never grant it). What is
  * left only turns the adjudicator on and tunes how verdicts are scored and used locally.
  * privacy also holds captureExchanges (storing Jev requests with prompt text), one more reason
- * it stays out.
+ * it stays out. mode, apply and tiers decide which model every subagent runs on (apply mode
+ * could put each dispatch on haiku, or floor them at fable), so they are personal too: a project
+ * file may only keep the adjudicator advise-only (projectKeeps).
  */
 export const PROJECT_ADJUDICATOR_KEYS: readonly string[] = [
   "enabled",
-  "mode",
   "surfaces",
   "promptMode",
   "minPromptChars",
-  "tiers",
   "weights",
-  "apply",
   "advice",
   "embedding",
   "learning",
   "cache",
 ];
 
+/**
+ * Whether projectLayer keeps adjudicator.<k> of a project section: a PROJECT_ADJUDICATOR_KEYS
+ * key, or `mode: "advise"`, which can only make the adjudicator more conservative.
+ */
+function projectKeeps(adj: Record<string, unknown>, k: string): boolean {
+  return PROJECT_ADJUDICATOR_KEYS.includes(k) || (k === "mode" && adj.mode === "advise");
+}
+
 /** The adjudicator keys of a raw project file that projectLayer drops, sorted. */
 export function droppedProjectAdjudicatorKeys(raw: Record<string, unknown>): string[] {
   const adj = raw.adjudicator;
   if (!isPlainObject(adj)) return [];
   return Object.keys(adj)
-    .filter((k) => !PROJECT_ADJUDICATOR_KEYS.includes(k))
+    .filter((k) => !projectKeeps(adj, k))
     .sort();
 }
 
@@ -864,7 +871,7 @@ export function personalConfigProblem(
 }
 
 /**
- * The project layer with its adjudicator section cut down to PROJECT_ADJUDICATOR_KEYS. A section
+ * The project layer with its adjudicator section cut down to what projectKeeps allows. A section
  * holding a key-like field stays whole instead, so the schema's secret check still refuses it
  * (the whole config falls back to defaults, the adjudicator off) rather than dropping it quietly.
  */
@@ -873,7 +880,7 @@ function projectLayer(raw: Record<string, unknown>): Record<string, unknown> {
   if (!isPlainObject(adj)) return raw;
   if (findSecretFields(adj).length) return raw;
   const kept: Record<string, unknown> = {};
-  for (const k of PROJECT_ADJUDICATOR_KEYS) if (Object.hasOwn(adj, k)) kept[k] = adj[k];
+  for (const k of Object.keys(adj)) if (projectKeeps(adj, k)) kept[k] = adj[k];
   return { ...(ownJson(raw) as Record<string, unknown>), adjudicator: kept };
 }
 
@@ -908,8 +915,8 @@ function withoutUnsafePaths(raw: Record<string, unknown>, source: string): Recor
 }
 
 /**
- * The personal layer: paths().configFile as it is, unless it sets adjudicator keys outside
- * PROJECT_ADJUDICATOR_KEYS from a location the project could have put there
+ * The personal layer: paths().configFile as it is, unless it sets adjudicator keys the project
+ * layer drops (droppedProjectAdjudicatorKeys) from a location the project could have put there
  * (personalConfigTrusted, task #54); then it gets the project layer's cut.
  */
 function personalLayer(projectRoot: string): Record<string, unknown> {
