@@ -529,6 +529,41 @@ describe("redactSecrets: stored command output", () => {
     // redact() still masks a cut-off key to the end of the (short, remote) text
     expect(redact(`${cut}\n\ncommit 826dd7c`)).toBe("[private key]");
   });
+
+  it("keeps a cut-off key's body to whole lines, never a prefix of the line after it", () => {
+    // grep -n output: the line after a BEGIN with no END starts with a 16+ character run of
+    // base64 characters (a path), which used to be taken as key body up to its first '.'
+    const grep =
+      'src/a.ts:10:  const k = "-----BEGIN PRIVATE KEY-----"\n' +
+      "src/storage/adapter.test.ts:11:  foo\n" +
+      "src/other/file.ts:12: bar";
+    expect(redactSecrets(grep)).toBe(
+      'src/a.ts:10:  const k = "[private key]\n' +
+        "src/storage/adapter.test.ts:11:  foo\n" +
+        "src/other/file.ts:12: bar",
+    );
+    // the same after a real body line
+    const b64 = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcw";
+    expect(
+      redactSecrets(`-----BEGIN PRIVATE KEY-----\n${b64}\nsrc/storage/adapter.test.ts:11:  foo`),
+    ).toBe("[private key]\nsrc/storage/adapter.test.ts:11:  foo");
+    // whole body lines still go: up to the end of the text, and with CRLF line ends
+    expect(redactSecrets(`-----BEGIN PRIVATE KEY-----\n${b64}\nMIIEvQIBADANBgkq`)).toBe(
+      "[private key]",
+    );
+    expect(
+      redactSecrets(`-----BEGIN PRIVATE KEY-----\r\n${b64}\r\nMIIEvQIBADANBgkq\r\nafter`),
+    ).toBe("[private key]\nafter");
+  });
+
+  it("masks an age secret key", () => {
+    const key = "AGE-SECRET-KEY-1QYQSZQGPQYQSZQGPQYQSZQGPQYQSZQGPQYQSZQGPQYQSZQGPQYQS3L9XZ";
+    const out = redactSecrets(`id: ${key}\nnext`);
+    expect(out).toBe("id: AGE-SECRET-KEY-***\nnext");
+    expect(redactSecrets(out)).toBe(out);
+    // a name that is not a key stays
+    expect(redactSecrets("AGE-SECRET-KEY-1SHORT")).toBe("AGE-SECRET-KEY-1SHORT");
+  });
 });
 
 describe("isSecretName", () => {

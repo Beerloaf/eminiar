@@ -34,6 +34,12 @@ describe.runIf(posix)("data file modes", () => {
     ensureDirs();
     expect(mode(old)).toBe(0o700);
 
+    // marked by install.json alone (no global.db yet), with eminiar's own sidecars beside it
+    const installed = dir("installed", ["install.json", "config.json", "swarm.key"]);
+    process.env.EMINIAR_HOME = installed;
+    ensureDirs();
+    expect(mode(installed)).toBe(0o700);
+
     // the default ~/.eminiar, whatever it holds
     delete process.env.EMINIAR_HOME;
     process.env.HOME = mkdtempSync(join(tmpdir(), "em-user-"));
