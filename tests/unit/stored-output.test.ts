@@ -1,7 +1,8 @@
-import { generateKeyPairSync } from "node:crypto";
+import { generateKeyPairSync, randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import Database from "better-sqlite3";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { redactSecrets } from "../../src/adjudicator/redact.js";
 import { chunk, hashText } from "../../src/chunker/index.js";
@@ -172,8 +173,10 @@ describe("captured output in the index", () => {
       return db.remaskDocuments(sources, mask, afterId, budget);
     };
     expect(await remaskCapturedOutput(spy)).toBeGreaterThan(0);
-    // the first run ended on the last captured document, `exec` (`file` is not captured)
-    expect(from).toEqual([exec]);
+    // the first run ended on the last captured document, `exec` (`file` is not captured); the
+    // slices after the first are the FTS merge
+    expect(from[0]).toBe(exec);
+    expect(from.slice(1).every((f) => f === later)).toBe(true);
     expect(db.chunksOfDocument(later)[0]?.body).toBe("GH_TOKEN=***");
     expect(db.metaGet("captured_mask_upto")).toBe(`1:${later}`);
     expect(await remaskCapturedOutput(db)).toBe(0);
@@ -305,6 +308,26 @@ describe("re-masking a document cut into chunks before it was masked", () => {
     expect(text).toContain("host: db.local");
   });
 
+  it("masks a key block whose END line is past the 64 KB the rule looks ahead", async () => {
+    const lines = Array.from({ length: 1200 }, () => randomBytes(48).toString("base64"));
+    const content = [
+      ...logs(0, 30),
+      "-----BEGIN RSA PRIVATE KEY-----",
+      ...lines,
+      "-----END RSA PRIVATE KEY-----",
+      ...logs(30, 30),
+    ].join("\n");
+    expect(content.length).toBeGreaterThan(70_000);
+    const id = storeRaw(db, content);
+    expect(db.chunksOfDocument(id).length).toBeGreaterThan(10);
+    db.metaSet("captured_mask_upto", `1:${id - 1}`);
+    await remaskCapturedOutput(db);
+    const text = bodies(db, id).join("\n");
+    expect(lines.filter((l) => text.includes(l))).toEqual([]);
+    expect(text).toContain("[private key]");
+    expect(text).toContain("deploy step 59 ok");
+  });
+
   it("leaves no fragment of a re-masked token in the FTS index", async () => {
     const dir = mkdtempSync(join(tmpdir(), "em-remask-"));
     const path = join(dir, "t.db");
@@ -315,15 +338,197 @@ describe("re-masking a document cut into chunks before it was masked", () => {
     const baseline = readFileSync(path).toString("latin1");
     const adapter = new SqliteAdapter(path, { vectors: false });
     storeRaw(adapter, `$ cat .env\nGH=${TOKEN}\n`);
+    adapter.db.pragma("wal_checkpoint(TRUNCATE)");
     expect(await remaskCapturedOutput(adapter)).toBeGreaterThan(0);
     expect(adapter.metaGet("remask_fts_optimize")).toBeUndefined();
-    adapter.db.exec("VACUUM");
-    adapter.db.pragma("wal_checkpoint(TRUNCATE)");
+    // no VACUUM: the merged segments and the zeroed pages are what the remask itself leaves
     adapter.close();
     const raw = readFileSync(path).toString("latin1");
     rmSync(dir, { recursive: true, force: true });
     const probes = trigrams(TOKEN.slice(4)).filter((t) => !baseline.includes(t));
     expect(probes.length).toBeGreaterThan(20);
     expect(probes.filter((t) => raw.includes(t))).toEqual([]);
+  });
+});
+
+describe("re-masking beside other processes", () => {
+  const TOKEN = "ghp_Zq7Xk2VwRt9Lm4Np8Bs3Hd6Jc1Fy5Gu0Ea2W";
+  const dirs: string[] = [];
+  afterAll(() => {
+    for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  });
+  const fresh = (vectors = false) => {
+    const dir = mkdtempSync(join(tmpdir(), "em-remask-"));
+    dirs.push(dir);
+    const path = join(dir, "t.db");
+    return { path, a: new SqliteAdapter(path, { vectors }) };
+  };
+  /** One raw captured document of one chunk per body. */
+  const raw = (a: SqliteAdapter, bodies: string[], title = "env", chunkTitle = "") =>
+    a.upsertDocument(
+      { source: "exec", title, contentType: "prose", contentHash: hashText(title + bodies.join()) },
+      bodies.map((body, ord) => ({
+        ord,
+        title: chunkTitle,
+        body,
+        contentType: "prose",
+        hash: `h${ord}`,
+      })),
+    ).id;
+  const trigrams = (s: string) =>
+    Array.from({ length: s.length - 2 }, (_, i) => s.slice(i, i + 3).toLowerCase());
+
+  it("finishes when another process commits while a document is being masked", async () => {
+    const { a, path } = fresh();
+    const hook = new SqliteAdapter(path, { vectors: false, busyTimeoutMs: 0 });
+    const id = raw(a, [`GH=${TOKEN}`]);
+    let wrote = false;
+    const racing = Object.create(a) as SqliteAdapter;
+    racing.remaskDocuments = (sources, _mask, afterId, budget) =>
+      a.remaskDocuments(
+        sources,
+        (t) => {
+          if (!wrote && t.includes(TOKEN)) {
+            wrote = true; // a hook commits between the remask's read and its write
+            hook.metaSet("hook_write", "1");
+          }
+          return redactSecrets(t);
+        },
+        afterId,
+        budget,
+      );
+    await remaskCapturedOutput(racing);
+    expect(wrote).toBe(true);
+    expect(a.chunksOfDocument(id)[0]?.body).toBe("GH=ghp_***");
+    hook.close();
+    a.close();
+  });
+
+  it("waits out a lock another process holds, without stalling the event loop on it", async () => {
+    const { a, path } = fresh();
+    const id = raw(a, [`GH=${TOKEN}`]);
+    const holder = new Database(path);
+    holder.exec("BEGIN IMMEDIATE");
+    holder.exec("INSERT INTO meta (key, value) VALUES ('held', '1')");
+    const started = performance.now();
+    setTimeout(() => holder.exec("COMMIT"), 300);
+    await remaskCapturedOutput(a);
+    expect(performance.now() - started).toBeGreaterThan(250);
+    expect(a.chunksOfDocument(id)[0]?.body).toBe("GH=ghp_***");
+    holder.close();
+    a.close();
+  });
+
+  it("two servers starting on one database together both finish", async () => {
+    const { a, path } = fresh();
+    const ids = Array.from({ length: 30 }, (_, i) =>
+      raw(a, [`GH=${TOKEN}`, `line ${i}`], `env ${i}`),
+    );
+    const b = new SqliteAdapter(path, { vectors: false });
+    const [x, y] = await Promise.all([remaskCapturedOutput(a), remaskCapturedOutput(b)]);
+    expect(x + y).toBeGreaterThanOrEqual(ids.length);
+    for (const id of ids) expect(a.chunksOfDocument(id)[0]?.body).toBe("GH=ghp_***");
+    expect(a.metaGet("remask_fts_optimize")).toBeUndefined();
+    b.close();
+    a.close();
+  });
+
+  it("masks chunk titles", async () => {
+    const { a } = fresh();
+    const id = raw(a, ["ok"], "t", `GH_TOKEN=${TOKEN}`);
+    await remaskCapturedOutput(a);
+    expect(a.chunksOfDocument(id)[0]?.title).toBe("GH_TOKEN=***");
+    a.close();
+  });
+
+  it("drops the vectors of rewritten chunks and keeps the others", async () => {
+    const { a } = fresh(true);
+    const id = raw(a, ["plain line", `GH=${TOKEN}`]);
+    const [keep, change] = a.chunksOfDocument(id);
+    if (!keep || !change) throw new Error("two chunks");
+    for (const c of [keep, change]) a.vecUpsert(c.id, new Float32Array(384).fill(0.1));
+    a.markEmbedded([keep.id, change.id]);
+    await remaskCapturedOutput(a);
+    const vecs = (
+      a.db.prepare("SELECT chunk_id FROM chunk_vec").all() as Array<{ chunk_id: number }>
+    ).map((r) => Number(r.chunk_id));
+    expect(vecs).toEqual([keep.id]);
+    expect(a.unembeddedChunkIds(10)).toEqual([change.id]);
+    a.close();
+  });
+
+  it("rewrites an older-rules pointer even when no document is left to mask", async () => {
+    const { a } = fresh();
+    a.metaSet("captured_mask_upto", "0:999");
+    expect(await remaskCapturedOutput(a)).toBe(0);
+    expect(a.metaGet("captured_mask_upto")).toBe("1:0");
+    a.close();
+  });
+
+  it("a run stopped before the FTS merge leaves its mark, and the next run merges", async () => {
+    const { a, path } = fresh();
+    a.db.pragma("wal_checkpoint(TRUNCATE)");
+    const baseline = readFileSync(path).toString("latin1");
+    raw(a, [`$ cat .env\nGH=${TOKEN}\n`]);
+    a.db.pragma("wal_checkpoint(TRUNCATE)");
+    let wrote = false;
+    const dying = Object.create(a) as SqliteAdapter;
+    dying.remaskDocuments = (sources, mask, afterId, budget) => {
+      if (wrote) throw new Error("server stopped");
+      const slice = a.remaskDocuments(sources, mask, afterId, budget);
+      wrote = slice.changed > 0;
+      return slice;
+    };
+    await expect(remaskCapturedOutput(dying)).rejects.toThrow("server stopped");
+    expect(a.metaGet("remask_fts_optimize")).toBe("1");
+    expect(await remaskCapturedOutput(a)).toBe(0);
+    expect(a.metaGet("remask_fts_optimize")).toBeUndefined();
+    a.close();
+    const after = readFileSync(path).toString("latin1");
+    const probes = trigrams(TOKEN.slice(4)).filter((t) => !baseline.includes(t));
+    expect(probes.length).toBeGreaterThan(20);
+    expect(probes.filter((t) => after.includes(t))).toEqual([]);
+  });
+
+  it("writes a large document in short transactions, last chunks first, and resumes one stopped part-way", async () => {
+    const { a, path } = fresh();
+    const n = 4000;
+    const id = raw(
+      a,
+      Array.from({ length: n }, (_, i) => `step ${i}\nAPI_TOKEN=tok-${i}abcdef0123456789`),
+      "big",
+    );
+    let slices = 0;
+    const dying = Object.create(a) as SqliteAdapter;
+    dying.remaskDocuments = (sources, mask, afterId, budget) => {
+      if (++slices === 2) throw new Error("server stopped");
+      return a.remaskDocuments(sources, mask, afterId, budget);
+    };
+    await expect(remaskCapturedOutput(dying)).rejects.toThrow("server stopped");
+    const masked = a.chunksOfDocument(id).map((c) => c.body.endsWith("API_TOKEN=***"));
+    const first = masked.indexOf(true);
+    // one transaction wrote part of it, from the end
+    expect(first).toBeGreaterThan(0);
+    expect(masked.slice(first).every(Boolean)).toBe(true);
+    // the document is not done, so the pointer stays before it
+    expect(a.metaGet("captured_mask_upto")).toBe(`1:${id - 1}`);
+    a.close();
+    // a new process picks it up again
+    const b = new SqliteAdapter(path, { vectors: false });
+    await remaskCapturedOutput(b);
+    expect(b.chunksOfDocument(id).every((c) => c.body.endsWith("API_TOKEN=***"))).toBe(true);
+    expect(b.metaGet("captured_mask_upto")).toBe(`1:${id}`);
+    b.close();
+  });
+
+  it("is run by the server's warm-up on every start, in its own try, before embedding", () => {
+    const src = readFileSync(new URL("../../src/server.ts", import.meta.url), "utf8");
+    const warm = src.slice(src.indexOf("const warm = setTimeout("));
+    expect(warm).toMatch(
+      /try \{\s*(?:\/\/[^\n]*\n\s*)*await remaskCapturedOutput\(db\);\s*\} catch \(err\) \{\s*process\.stderr\.write/,
+    );
+    const at = (s: string) => warm.indexOf(s);
+    expect(at("await remaskCapturedOutput(db)")).toBeGreaterThan(at("await reindexCode(ctx, db)"));
+    expect(at("await remaskCapturedOutput(db)")).toBeLessThan(at("kickEmbedding(ctx, db"));
   });
 });
