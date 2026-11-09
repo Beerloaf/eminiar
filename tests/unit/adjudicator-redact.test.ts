@@ -901,16 +901,21 @@ describe("redact: performance", () => {
 
   it("masks many YAML blocks in time linear in their number", () => {
     const block = "db_password: |\n  line-one\n  line-two\nplain: value\n";
-    const t1 = Math.min(
-      time(block.repeat(2_000), redactSecrets),
-      time(block.repeat(2_000), redactSecrets),
-    );
-    const t8 = Math.min(
-      time(block.repeat(16_000), redactSecrets),
-      time(block.repeat(16_000), redactSecrets),
-    );
-    // 8x the blocks: ~8x the time when linear, ~64x when each block shifts the rest
-    expect(t8).toBeLessThan(Math.max(50, 24 * t1));
+    const small = block.repeat(4_000);
+    const large = block.repeat(64_000);
+    const best = (s: string) =>
+      Math.min(time(s, redactSecrets), time(s, redactSecrets), time(s, redactSecrets));
+    // 16x the blocks: ~16x the time when linear, ~256x when each block shifts the rest (half
+    // a second at 16k blocks, seconds at 64k). Under parallel load one pair of timings can be
+    // skewed, so a slow ratio is re-measured.
+    const bound = (t: number) => Math.max(200, 48 * t);
+    let t1 = best(small);
+    let t16 = best(large);
+    for (let retry = 0; retry < 2 && t16 >= bound(t1); retry++) {
+      t1 = best(small);
+      t16 = best(large);
+    }
+    expect(t16, `t1 ${t1.toFixed(1)} ms`).toBeLessThan(bound(t1));
     const out = redactSecrets(block.repeat(3));
     expect(out).toBe("db_password: |\n  ***\nplain: value\n".repeat(3));
   });
