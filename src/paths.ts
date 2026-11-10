@@ -7,6 +7,28 @@ export function eminiarHome(): string {
   return process.env.EMINIAR_HOME || join(homedir(), ".eminiar");
 }
 
+/**
+ * Claude Code's configuration directory: CLAUDE_CONFIG_DIR, else ~/.claude. It holds the user
+ * settings, agents, skills, plugins and transcripts (code.claude.com/docs/en/claude-directory).
+ */
+export function claudeConfigDir(env: NodeJS.ProcessEnv = process.env, home = homedir()): string {
+  return env.CLAUDE_CONFIG_DIR?.trim() || join(home, ".claude");
+}
+
+/**
+ * Claude Code's global config (account, user- and local-scope MCP servers): ~/.claude.json
+ * beside ~/.claude, or inside CLAUDE_CONFIG_DIR when that is set.
+ */
+export function claudeJsonFile(env: NodeJS.ProcessEnv = process.env, home = homedir()): string {
+  const dir = env.CLAUDE_CONFIG_DIR?.trim();
+  return dir ? join(dir, ".claude.json") : join(home, ".claude.json");
+}
+
+/** Claude Code's plugins root: CLAUDE_CODE_PLUGIN_CACHE_DIR, else plugins/ in the config dir. */
+export function claudePluginsDir(env: NodeJS.ProcessEnv = process.env, home = homedir()): string {
+  return env.CLAUDE_CODE_PLUGIN_CACHE_DIR?.trim() || join(claudeConfigDir(env, home), "plugins");
+}
+
 export interface EminiarPaths {
   home: string;
   projects: string;
