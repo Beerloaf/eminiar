@@ -46,7 +46,7 @@ em_execute {language: "shell", code: "npm test", intent: "failing tests and thei
 |---|---|---|
 | `em_search` | `queries`, `source`, `content_type`, `sort`, `mode`, `since`, `limit` | Anything indexed: command output, files, pages, docs, memories, git messages, sessions |
 | `em_fetch_and_index` | `url` or `urls`, `queries`, `ttl_hours`, `force` | Fetch web pages, index them, return only the relevant sections. Cached for 24 hours |
-| `em_index` | `path` or `content`, `title`, `source`, `content_type`, `recursive`, `glob` | Add files, a directory or pasted text to the index |
+| `em_index` | `path` or `content`, `title`, `source`, `content_type`, `recursive`, `glob` | Add files, a directory or pasted text to the index. Files a `Read` deny or `ask` rule matches are refused or skipped |
 
 `em_search` options:
 
@@ -189,7 +189,7 @@ em_adjudicate {action: "feedback", id: 42, outcome: "too_small", note: "needed o
 | `em_usage` | Tokens, cache, cost and insights per model call from the local transcripts. `view`: `summary`, `daily`, `weekly`, `monthly`, `models`, `sessions`, `blocks`, `turns`, `tools`, `insights`, `savings`; `scope`: `project` or `session`; `since`: `30d` or an ISO date; `json`. See [Usage insights](usage.md) |
 | `em_doctor` | Installation health |
 | `em_reindex` | Rebuild part of the index: `code`, `git`, `metrics`, `docs`, `memories`, `embeddings` or `all`. Incremental unless `full: true` |
-| `em_purge` | Permanently delete project data: `index`, `sessions`, `graph`, `memories` (the database mirror only), `usage` (API calls, tool uses, context events, transcript offsets, statusline snapshots), `adjudicator` (decisions, verdict cache, provider breaker state, learned bias, captured Jev requests) or `all`. Needs `confirm: true` |
+| `em_purge` | Permanently delete project data: `index`, `sessions` (events and the session history `em_recall` searches, snapshots, stats), `graph`, `memories` (the database mirror only), `usage` (API calls, tool uses, context events, transcript offsets, statusline snapshots), `adjudicator` (decisions, verdict cache, provider breaker state, learned bias, captured Jev requests) or `all`. Needs `confirm: true` |
 
 ## Slash commands
 
