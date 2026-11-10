@@ -149,9 +149,9 @@ Routing decides what happens when Claude calls a native tool that an `em_*` tool
 
 | Native call | Suggested tool | Trigger |
 |---|---|---|
-| `Bash` | `em_history` | `git log`, `git blame`, `git show <sha>`, `git shortlog`, mapped to the matching action (`-- path` → `file`, `A..B` → `branch`, `--grep` → `search`, `-L :fn:file` → `symbol`). A one-commit `git log -1 --format=…` and `git show REF:path` are left alone |
-| `Bash` | `em_execute` | A simple command that usually prints a lot (`npm test`, `git diff`, `find`, `grep -r`, `curl` …) or streams an unknown output through `grep`, `sort`, `jq` … |
-| `Read` | `em_execute_file` | Files over 200 KB, or data files (`.log`, `.json`, `.csv`, `.xml`, `.sql`, `.har` …) over 20 KB |
+| `Bash` | `em_history` | `git log`, `git blame`, `git show <sha>`, `git shortlog`, mapped to the matching action (`-- path` → `file`, `A..B` → `branch`, `--grep` → `search`, `-L :fn:file` → `symbol`). A one-commit `git log -1 --format=…` and `git show REF:path` are left alone, and so is a read of another repository (`git -C`, `--git-dir`, a `cd` out of the project or into a nested repository) or in a project that is not a git repository (one with no commits yet reaches `em_history`, which says so) |
+| `Bash` | `em_execute` | A simple command that usually prints a lot (`npm test`, `git diff`, `find`, `grep -r`, `curl -s <url>`, `kubectl logs` …) or streams a read-only command's output (`ls`, `cat`, `ps`, `git ls-files`, `gh pr view` …) through filters (`grep`, `sort`, `jq` …) |
+| `Read` | `em_execute_file` | Files over 200 KB, or data files (`.log`, `.json`, `.csv`, `.xml`, `.sql`, `.har` …) over 20 KB, read whole (no `offset` / `limit`) from inside the project |
 | `Grep` | `em_symbols` / `em_search` | The pattern's identifier is a symbol the graph defines. Files-only grep: annotated with the matching symbols. Content-mode grep: denied |
 | `Grep` | `em_execute` | Content-mode grep without a `head_limit` for anything else |
 | `WebFetch` | `em_fetch_and_index` / `em_docs` | Always. Names the docs source if the site is already indexed |
@@ -176,9 +176,21 @@ is bounded by construction stays native:
 - `head` / `tail` of a file, a `sed -n 'A,Bp'` range, `du -s`, `grep -l` / `-c`, `git log -1`;
 - `cat` or `grep` over named files small enough for the native `Read` (200 KB in total, 20 KB
   for data files): the same read through Bash;
-- a command that changes something (`git commit`, `git checkout`, `npm install`, `rm`, `mv`,
-  `sed -i`, a `>` redirection into a file …): its output is secondary, and the native tool is
-  where Claude Code's permission prompts live.
+- a command it recognises as changing something (`git commit`, `npm install`, `rm`, `sed -i`,
+  a `>` redirection into a file, `kubectl delete`, `curl -X POST`, `gh api -f …`,
+  `terraform apply`, `npm run deploy`, `find … -delete`, `… | xargs rm`, `… | sh` …), in any
+  stage of a pipe or inside `$(…)`, after `sudo`, `env`, `time`, `timeout`, `{`, `!`, `then`,
+  `do` and similar: its output is secondary, and the native tool is where Claude Code's
+  permission prompts live. Tools with read-only forms are routed only in those: `kubectl get` /
+  `logs`, `docker ps` / `logs`, `curl` with no method other than `GET` / `HEAD`, body, upload or
+  output file, `wget -O -`, and test, lint or check scripts or `make` targets not asked to fix
+  or update;
+- a follow or a watch (`tail -f`, `kubectl logs -f`, `kubectl get -w`, `docker logs -f`,
+  `--watch`): it never finishes, so `em_execute` would only time out on it;
+- a pipe into anything but a known filter (`git diff | patch -p1`, `cat dump.sql | psql`,
+  `ls | xargs ./x.sh | sort`), or from a command it does not know (`ssh host … | grep`): either
+  may change something, so only known filters after the first stage, and a known read-only
+  source for a pipe that is routed for its filter, are sent to `em_execute`.
 
 Every routing decision is recorded as a `routing` session event: `em_stats` reports how many
 native calls were denied or annotated per tool, which `em_*` tool they were sent to and which
@@ -187,9 +199,10 @@ rule did it, and `~/.eminiar/hook.log` has one line per denial.
 **Safety rule:** `enforce` denies a call only while an eminiar MCP server runs for the project.
 The server writes a pid marker under `~/.eminiar/projects/<id>/servers/`. With no server, the
 hook annotates instead. Claude is never told to retry with a tool that it cannot reach. For
-the same reason, a big `Read` that a `Read` deny or `ask` rule matches is not redirected:
-`em_execute_file` would refuse it, so the native `Read` goes ahead under Claude Code's own
-permission check.
+the same reason, a big `Read` that `em_execute_file` would refuse is not redirected (a file
+outside the project, Claude Code's own saved tool outputs among them, or one a `Read` deny or
+`ask` rule matches): the native `Read` goes ahead under Claude Code's own permission check. A
+`git log` that `em_history` cannot answer is judged like any other command.
 
 **Project knowledge is not routing.** Memories, fix history, fan-in and doc notes are attached
 in every mode, including `off`. Every such decision is recorded, fired or quiet; `em_stats` and
@@ -229,6 +242,24 @@ root.
   `gcloud`, `kubectl` and `docker` pass through. Add more names with `sandbox.envAllow`.
 - **Speed:** these are the hot paths. They are designed to add about 1 ms over a raw process
   spawn. `npm run bench` measures them (see [Development](development.md#benchmarks)).
+
+### What the sandbox enforces
+
+The sandbox keeps output out of context. It is not an isolation boundary. Beyond the
+permission and file checks above:
+
+- Code in languages other than shell is not checked against any rule. `sandbox.disabledLanguages`
+  turns languages off.
+- Your own `PreToolUse` hooks on `Bash` do not see these calls, and Claude Code asks for
+  permission, if at all, for the tool call as a whole, not for each command in it.
+- There is no filesystem or network isolation: code runs as you, in the project root.
+
+To check these calls yourself, add a `PreToolUse` hook with the matcher
+`mcp__.*__em_(execute|batch_execute|execute_file)` (plugin installs name the tools
+`mcp__plugin_eminiar_eminiar__em_*`, settings installs `mcp__eminiar__em_*`). It receives the
+code in `tool_input.code` (`em_execute`, `em_execute_file`), each command in
+`tool_input.commands[].command` (`em_batch_execute`), and the file in `tool_input.path`
+(`em_execute_file`).
 
 ## Search
 

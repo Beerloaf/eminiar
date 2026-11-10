@@ -19,5 +19,5 @@ em_execute_file honours Claude Code's `Read` deny and ask rules for its `path`, 
   - hard links are not detected;
   - `matchRead` does not yet understand Claude Code's relative forms (`./.env`, `.env`, `/x` from the settings file, `//abs`), `?`, `[...]`, or a `/**/` that matches no folder;
   - em_index checks Read rules the same way (see mem:security/path-containment) but still takes a path outside the root;
-  - routing still redirects big Reads outside the root, which em_execute_file refuses;
+  - (fixed 2026-11-08, see decision/bash-routing-per-segment: routing now asks `confinePath` itself, so big Reads outside the root stay native);
   - only user, project and local settings are read (no managed settings). `CLAUDE_CONFIG_DIR` is honoured since 2026-11-08 (branch fix/claude-config-dir): the user file is `$CLAUDE_CONFIG_DIR/settings.json` when set, through `claudeConfigDir` in src/paths.ts, and the rules cache key includes it.
