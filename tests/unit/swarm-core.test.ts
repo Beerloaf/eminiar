@@ -474,6 +474,74 @@ swarms:
     expect(dis(1)).toBe("Agent");
   });
 
+  it("gives the em_execute tools only to a role that keeps Bash", () => {
+    const c = ok(`
+swarms:
+  s:
+    description: d
+    agents:
+      reader: { description: x, tools: [Read, Grep] }
+      shell: { description: x, tools: [Read, Bash] }
+      shell-off: { description: x, tools: [Read, Bash], disallowed_tools: [Bash] }
+      inherits: { description: x }
+      inherits-off: { description: x, disallowed_tools: [Bash] }
+`);
+    const s = c.swarms[0]!;
+    const fm = (role: string) => {
+      const text = renderAgentFile(c, s, s.roles.find((r) => r.role === role)!);
+      const m = /^---\n([\s\S]*?)\n---\n/.exec(text);
+      const f = parseYaml(m![1]!) as Record<string, string | undefined>;
+      const list = (v: string | undefined) => (v ? v.split(", ") : []);
+      return { tools: list(f.tools), disallowed: list(f.disallowedTools) };
+    };
+    const exec = [
+      "mcp__plugin_eminiar_eminiar__em_execute",
+      "mcp__plugin_eminiar_eminiar__em_execute_file",
+      "mcp__plugin_eminiar_eminiar__em_batch_execute",
+      "mcp__eminiar__em_execute",
+      "mcp__eminiar__em_execute_file",
+      "mcp__eminiar__em_batch_execute",
+    ];
+    const reader = fm("reader");
+    expect(reader.tools).toContain("mcp__eminiar__em_search");
+    for (const t of exec) expect(reader.tools).not.toContain(t);
+    expect(fm("shell").tools).toEqual(expect.arrayContaining(exec));
+    for (const t of exec) expect(fm("shell-off").tools).not.toContain(t);
+    // without a tools list the worker inherits every MCP tool: Bash off takes them off too
+    expect(fm("inherits").disallowed).toEqual(["Agent"]);
+    expect(fm("inherits-off").disallowed).toEqual(["Bash", "Agent", ...exec]);
+    expect(fm("shell-off").disallowed).toEqual(["Bash", "Agent", ...exec]);
+    expect(workerTools(["Read"]).some((t) => t.includes("em_execute"))).toBe(false);
+    expect(workerTools(["Bash"]).filter((t) => t.includes("em_execute"))).toHaveLength(4);
+  });
+
+  it("tells shared-tree workers with a shell to leave git state alone; others are not told", () => {
+    const c = ok(`
+swarms:
+  s:
+    description: d
+    agents:
+      shared: { description: x }
+      isolated: { description: x, isolation: worktree }
+      listed: { description: x, tools: [Read, Bash] }
+      no-shell: { description: x, tools: [Read, Edit] }
+      bash-off: { description: x, disallowed_tools: [Bash] }
+`);
+    const s = c.swarms[0]!;
+    const body = (i: number) => renderAgentFile(c, s, s.roles[i]!);
+    for (const i of [0, 2]) {
+      expect(body(i)).toMatch(/^3\. Other workers may be editing this working tree/m);
+      expect(body(i)).toContain("Never run `git stash`, `git checkout`");
+      expect(body(i)).toContain("`git add -A` or `git commit -a`");
+      expect(body(i)).toMatch(/^7\. Your final message goes back/m);
+    }
+    // a worktree has no other workers in it, and a role without a shell cannot run git
+    for (const i of [1, 3, 4]) {
+      expect(body(i)).not.toContain("git stash");
+      expect(body(i)).toMatch(/^6\. Your final message goes back/m);
+    }
+  });
+
   it("respects a role that lists Agent or Task in its own tools", () => {
     const c = ok(`
 version: 1

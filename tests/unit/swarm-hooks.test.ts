@@ -501,6 +501,76 @@ describe("swarm hooks for an opted-in project", () => {
   });
 });
 
+describe("routing for a swarm worker without Bash", () => {
+  it("lets its big Read through instead of denying toward em_execute_file, and never points it at the runners", async () => {
+    const root = project(
+      "noshell",
+      `swarms:
+  feat:
+    description: test swarm
+    agents:
+      reader: { description: reads, tools: [Read, Grep] }
+      coder: { description: codes, tools: [Read, Bash] }
+`,
+    );
+    sessionRoot(root);
+    resetSwarmConfigCache();
+    unmarks.push(markServerAlive(getContext(root)));
+    writeFileSync(join(root, "big.txt"), "x".repeat(300 * 1024));
+    const read = (over: Partial<HookInput>) =>
+      handlers.PreToolUse!(
+        input(root, {
+          hook_event_name: "PreToolUse",
+          tool_name: "Read",
+          tool_input: { file_path: join(root, "big.txt") },
+          ...over,
+        }),
+      );
+    const decision = async (over: Partial<HookInput>) =>
+      (await read(over))?.hookSpecificOutput?.permissionDecision;
+    expect(await decision({ agent_id: "a-r", agent_type: "swarm-feat-reader" })).toBeUndefined();
+    // a deny toward a tool it does have still stands
+    const fetched = await handlers.PreToolUse!(
+      input(root, {
+        hook_event_name: "PreToolUse",
+        tool_name: "WebFetch",
+        tool_input: { url: "https://example.com/x" },
+        agent_id: "a-r",
+        agent_type: "swarm-feat-reader",
+      }),
+    );
+    expect(fetched?.hookSpecificOutput?.permissionDecision).toBe("deny");
+    expect(fetched?.hookSpecificOutput?.permissionDecisionReason).toContain("em_fetch_and_index");
+    const coder = await read({ agent_id: "a-c", agent_type: "swarm-feat-coder" });
+    expect(coder?.hookSpecificOutput?.permissionDecision).toBe("deny");
+    expect(coder?.hookSpecificOutput?.permissionDecisionReason).toContain("em_execute_file");
+    // the main session (no agent_id, even with an agent type) and unknown types keep routing
+    expect(await decision({})).toBe("deny");
+    expect(await decision({ agent_type: "swarm-feat-reader" })).toBe("deny");
+    expect(await decision({ agent_id: "a-x", agent_type: "swarm-feat-gone" })).toBe("deny");
+
+    // and the routing prefix of its spawn does not point it at the runners
+    const spawned = async (type: string) => {
+      const r = await handlers.PreToolUse!(
+        input(root, {
+          hook_event_name: "PreToolUse",
+          tool_name: "Agent",
+          tool_input: { subagent_type: type, prompt: "go" },
+          tool_use_id: `toolu_ns_${type}`,
+        }),
+      );
+      return String(r?.hookSpecificOutput?.updatedInput?.prompt);
+    };
+    const reader = await spawned("swarm-feat-reader");
+    expect(reader).toMatch(/^Use the eminiar tools \(em_fetch_and_index, em_search/);
+    expect(reader).not.toContain("em_execute");
+    expect(reader).not.toContain("Bash/");
+    expect(await spawned("swarm-feat-coder")).toMatch(/^Use the eminiar tools \(em_execute, /);
+    expect(await spawned("Explore")).toMatch(/^Use the eminiar tools \(em_execute, /);
+    sessionRoot();
+  });
+});
+
 describe("swarm hooks with an invalid swarm file", () => {
   it("warns once at SessionStart and keeps every other path a no-op", async () => {
     const root = project(
@@ -711,6 +781,38 @@ describe("swarm hooks when the shell cwd drifts into a nested repository", () =>
       );
       expect(none?.hookSpecificOutput?.permissionDecision).not.toBe("deny");
       expect(db.swarm.spawnsPending(run.id, 0)).toBe(0);
+    } finally {
+      sessionRoot();
+      resetContextCache();
+    }
+  });
+
+  it("still tracks the nested repository's swarm when the session root has none", async () => {
+    // The other hooks key their database on the session root; tracking keeps the cwd fallback.
+    const ws = project("ws-plain");
+    const sub = join(ws, "backend");
+    mkdirSync(join(sub, ".git"), { recursive: true });
+    mkdirSync(join(sub, ".eminiar"), { recursive: true });
+    writeFileSync(join(sub, ".eminiar", "swarm.yaml"), BASIC);
+    sessionRoot(ws);
+    try {
+      resetContextCache();
+      resetSwarmConfigCache();
+      const db = dbOf(sub);
+      const run = startRun(db, activeSwarmConfig(sub)!, {
+        swarm: "feat",
+        goal: "nested",
+        sessionId: "s1",
+      });
+      await handlers.PreToolUse!(
+        input(sub, {
+          hook_event_name: "PreToolUse",
+          tool_name: "Agent",
+          tool_input: { subagent_type: "swarm-feat-coder", prompt: "go" },
+          tool_use_id: "toolu_nested1",
+        }),
+      );
+      expect(db.swarm.spawnsPending(run.id, 0)).toBe(1);
     } finally {
       sessionRoot();
       resetContextCache();

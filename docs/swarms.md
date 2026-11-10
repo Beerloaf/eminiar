@@ -104,7 +104,8 @@ swarms:
             - matcher: "Edit|Write"
               hooks:
                 - type: command
-                  command: "npx biome check --write --no-errors-on-unmatched ."
+                  # formats only the edited file; copy the script first, see Role hooks
+                  command: "node \"$CLAUDE_PROJECT_DIR/.eminiar/hooks/format-edited.mjs\""
         prompt: Implement the claimed task. Keep the diff minimal.
       reviewer:
         description: Adversarial reviewer that tries to break the change.
@@ -170,8 +171,8 @@ across all swarms.
 | `prompt` | `""` | The role's instructions, written into the agent file body |
 | `model` | `defaults.model` | `inherit`, `sonnet`, `opus`, `haiku`, `fable` or a full model id. When nothing sets a model, the agent file has no `model` line and Claude Code uses its default for subagents. With a `model_range`, this is the fallback |
 | `model_range` | `defaults.model_range` | `{ floor, ceiling }`: the tiers (`haiku`, `sonnet`, `opus`, `fable`) the adjudicator may move this worker's model between. See [Model ranges](#model-ranges) |
-| `tools` | unset | Tool allowlist. When set, eminiar adds its own `em_*` tools under both MCP name forms so routing never leaves the worker without them. Unset: the worker gets every tool |
-| `disallowed_tools` | unset | Tools the worker cannot use, such as `[Edit, Write, NotebookEdit]` for a read-only reviewer |
+| `tools` | unset | Tool allowlist. When set, eminiar adds its own `em_*` tools under both MCP name forms so routing never leaves the worker without them. `em_execute`, `em_execute_file` and `em_batch_execute` run code, so they are added only when the list has `Bash`. Unset: the worker gets every tool |
+| `disallowed_tools` | unset | Tools the worker cannot use, such as `[Edit, Write, NotebookEdit]` for a reviewer that must not edit files. `Bash` here also disallows `em_execute`, `em_execute_file` and `em_batch_execute` |
 | `skills` | `[]` | Skills preloaded into the worker, after `defaults.skills` |
 | `hooks` | unset | Hooks scoped to this worker. See [Role hooks](#role-hooks) |
 | `scope` | `[]` | Project-relative path globs the role works on (`src/**`, `docs/*.md`). Briefs focus history and hot files on them. No absolute paths or `..` |
@@ -248,6 +249,15 @@ hooks:
 They are copied into the role's agent file. Claude Code runs them only while that worker is
 active. Read [Security](#security) before you add one.
 
+Workers without `isolation: worktree` share one working tree, so a hook that rewrites files must
+touch only the file the tool just edited. A whole-tree formatter (`biome check --write .`,
+`prettier --write .`) rewrites the files other workers are editing: their next `Edit` fails, or
+lands on text they never read. The hook gets the tool call as JSON on stdin, and
+`tool_input.file_path` names the file. The example above runs
+[`.eminiar/hooks/format-edited.mjs`](../.eminiar/hooks/format-edited.mjs) from this repository:
+copy it to the same path in your project (it runs Biome on the one file; change the command for
+your formatter).
+
 ### Generated agent files
 
 Sync writes `.claude/agents/swarm-<swarm>-<role>.md` for every role. Each file starts with an
@@ -263,6 +273,22 @@ coordinator, the main session, starts workers. The ledger cannot see nested spaw
 not be tracked or capped. A role that lists `Agent` (or `Task`) in its own `tools` keeps it, and
 `Agent` is not added to its `disallowedTools`; with `enforce: true` such a nested call is still
 denied unless its type is in `allowed_agents`.
+
+**Shell tools follow Bash.** A role without `Bash` (left out of its `tools`, or listed in
+`disallowed_tools`) gets no `em_execute`, `em_execute_file` or `em_batch_execute` either, because
+each of them runs code. Only the exact name `Bash` counts: `Bash(rm:*)` in `disallowed_tools` leaves
+them in. Routing does not deny such a worker's native call toward one of them
+(a big `Read`, a content `Grep`); the call goes ahead instead, and its spawn prompt does not
+mention them. This covers eminiar's tools only: a role without a `tools` list inherits every
+MCP tool, including other servers' command runners, so a role that must have no shell needs a
+`tools` allowlist. `disallowed_tools: [Edit, Write, NotebookEdit]` keeps `Bash`, so a reviewer
+with it can still change files through the shell.
+
+**The shared working tree.** The protocol of every worker that has a shell and no
+`isolation: worktree` says that other workers may be editing the same tree with uncommitted
+changes. So it must never run `git stash`, `checkout`, `switch`, `reset`, `restore` or `clean`,
+even on one path, must not sweep their work into a commit with `git add -A` or `git commit -a`,
+and must make mutation checks in a copy outside the tree.
 
 Edit the YAML, not the generated files: the next sync overwrites them. Claude Code reads agent
 files when a session starts. If a new worker type is missing from the Agent tool, open
