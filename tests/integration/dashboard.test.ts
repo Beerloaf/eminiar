@@ -541,4 +541,27 @@ describe("dashboard", () => {
     });
     expect(sameOrigin.status).toBe(200);
   });
+
+  it("refuses API GETs another site sends, but still serves the page", async () => {
+    // node:http, because fetch decides the Sec-Fetch-* headers itself
+    const status = (path: string, headers: Record<string, string>) =>
+      new Promise<number>((resolve, reject) => {
+        const req = request({ host: "127.0.0.1", port, path, headers }, (res) => {
+          res.resume();
+          resolve(res.statusCode ?? 0);
+        });
+        req.on("error", reject);
+        req.end();
+      });
+    const crossSite = { "sec-fetch-site": "cross-site" };
+    for (const path of ["/api/stats", "/api/projects", "/api/changes?ref=HEAD"])
+      expect(await status(path, crossSite), path).toBe(403);
+    expect(await status("/api/stats", { "sec-fetch-site": "same-site" })).toBe(403);
+    expect(await status("/api/stats", { origin: "http://evil.example" })).toBe(403);
+    expect(await status("/api/stats", { "sec-fetch-site": "same-origin" })).toBe(200);
+    expect(await status("/api/stats", { "sec-fetch-site": "none" })).toBe(200);
+    expect(await status("/api/stats", {})).toBe(200);
+    // a link from elsewhere still opens the dashboard; only its API is closed to other sites
+    expect(await status("/", crossSite)).toBe(200);
+  });
 });
