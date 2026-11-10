@@ -2,7 +2,7 @@ import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, extname, join, relative, resolve } from "node:path";
 import type { ProjectContext } from "../context.js";
-import { getContext } from "../context.js";
+import { sessionContext } from "../context.js";
 import { type DocSource, readManifestAt } from "../docs/manifest.js";
 import { git } from "../history/log.js";
 import { loadPermissionRules } from "../permissions/settings.js";
@@ -1437,17 +1437,24 @@ function fileKnowledge(ctx: ProjectContext, input: HookInput): string | undefine
   }
 }
 
-/** Files a `git commit` command will include: the index, plus tracked changes with -a. */
-function commitFiles(root: string, cmd: string): string[] {
+/**
+ * Files a `git commit` command will include: the index, plus tracked changes with -a. git runs
+ * where the command does (the hook cwd, which follows a `cd` into a nested repository) and names
+ * files from that repository's top level; each is re-keyed onto the session root, which the
+ * database's paths are relative to, whether the root lies above the repository or inside it.
+ */
+function commitFiles(root: string, cwd: string, cmd: string): string[] {
+  const top = git(cwd, ["rev-parse", "--show-toplevel"], { allowFail: true }).trim();
+  if (!top) return [];
+  // -z: names unquoted, so non-ASCII paths match the database's.
   const list = (args: string[]) =>
-    git(root, args, { allowFail: true })
-      .split("\n")
-      .map((l) => l.trim())
+    git(cwd, [...args, "-z"], { allowFail: true })
+      .split("\0")
       .filter(Boolean);
   const files = new Set(list(["diff", "--cached", "--name-only"]));
   if (/\s(-[a-zA-Z]*a[a-zA-Z]*|--all)\b/.test(cmd))
     for (const f of list(["diff", "--name-only"])) files.add(f);
-  return [...files];
+  return [...files].map((f) => relative(root, join(top, f)));
 }
 
 /** Before `git commit`: the bug-prone and widely imported files it includes. */
@@ -1457,7 +1464,7 @@ function commitKnowledge(ctx: ProjectContext, input: HookInput): string | undefi
   if (!/(^|[;&|]\s*)git\s+commit\b/.test(cmd)) return undefined;
   try {
     const db = getStorage(ctx, { vectors: false });
-    return commitContext(db, commitFiles(ctx.root, cmd)) || undefined;
+    return commitContext(db, commitFiles(ctx.root, input.cwd || ctx.root, cmd)) || undefined;
   } catch {
     return undefined;
   }
@@ -1536,7 +1543,7 @@ export const preToolUse: HookHandler = async (
   if (!input.tool_name || !input.tool_input) return undefined;
   // em_swarm is eminiar's own tool: stamp (or strip) its caller, never route or annotate it.
   if (isSwarmTool(input.tool_name)) return swarmStampCaller(input);
-  const ctx = getContext(input.cwd);
+  const ctx = sessionContext(input.cwd);
   // A swarm worker starting a tool is alive: keep its capacity slot and its task.
   if (input.agent_id) swarmTouch(ctx, input);
   // Swarm capacity holds in every routing mode, and a denial wins over everything else.

@@ -784,6 +784,38 @@ describe("swarm hooks when the shell cwd drifts into a nested repository", () =>
       resetContextCache();
     }
   });
+
+  it("still tracks the nested repository's swarm when the session root has none", async () => {
+    // The other hooks key their database on the session root; tracking keeps the cwd fallback.
+    const ws = project("ws-plain");
+    const sub = join(ws, "backend");
+    mkdirSync(join(sub, ".git"), { recursive: true });
+    mkdirSync(join(sub, ".eminiar"), { recursive: true });
+    writeFileSync(join(sub, ".eminiar", "swarm.yaml"), BASIC);
+    sessionRoot(ws);
+    try {
+      resetContextCache();
+      resetSwarmConfigCache();
+      const db = dbOf(sub);
+      const run = startRun(db, activeSwarmConfig(sub)!, {
+        swarm: "feat",
+        goal: "nested",
+        sessionId: "s1",
+      });
+      await handlers.PreToolUse!(
+        input(sub, {
+          hook_event_name: "PreToolUse",
+          tool_name: "Agent",
+          tool_input: { subagent_type: "swarm-feat-coder", prompt: "go" },
+          tool_use_id: "toolu_nested1",
+        }),
+      );
+      expect(db.swarm.spawnsPending(run.id, 0)).toBe(1);
+    } finally {
+      sessionRoot();
+      resetContextCache();
+    }
+  });
 });
 
 describe("swarm enforcement in PreToolUse(Agent)", () => {
