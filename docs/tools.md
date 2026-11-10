@@ -23,6 +23,12 @@ Use these instead of `Bash` or `Read` when the output can be large.
 | `em_batch_execute` | `commands[{label, command, language}]`, `queries`, `intent`, `concurrency` | Several commands in parallel, with questions answered in one round trip |
 | `em_execute_file` | `path`, `code`, `intent` | Processing a large file. Your code gets the path in `$EM_FILE` and only what it prints returns |
 
+**What comes back.** stdout, then stderr after a `--- stderr ---` line, so test runners that report
+on stderr (Jest) are searched too. The two are indexed as separate documents, and the 5 KB rule
+below counts them together. Progress frames that a carriage return overwrote are dropped. The
+header (the first line, or each `## label` line of `em_batch_execute`) gives the exit code, the
+stdout size and, when there is any, the size of the stderr that comes back.
+
 **How `intent` works.** Output under 5 KB returns in full. Larger output is indexed and only the
 sections that match `intent` come back, with a list of searchable terms. Use `em_search` to dig
 further. `em_batch_execute` follows the same 5 KB rule per output when it has no `queries` or

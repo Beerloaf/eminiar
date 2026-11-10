@@ -64,7 +64,7 @@ default excludes:
 | Key | Default | Description |
 |---|---|---|
 | `timeoutMs` | `60000` | Time limit for one run |
-| `maxOutputBytes` | `2097152` (2 MB) | Output cap per run |
+| `maxOutputBytes` | `2097152` (2 MB) | Output cap per stream in one run: stdout stops at this many bytes, stderr keeps its last this many characters |
 | `indexThreshold` | `5120` (5 KB) | Output larger than this is indexed, and only matching sections return |
 | `envAllow` | `[]` | Extra environment variable names to pass to the sandbox |
 | `disabledLanguages` | `[]` | Languages to turn off, for example `["php"]` |
