@@ -226,12 +226,18 @@ root.
   with a `Read(<path>)` allow rule. A matching `Read` deny or `ask` rule refuses the path, inside
   the root or out, even when an allow rule matches. The path as written, its symlink target and
   (on macOS) its on-disk letter case are all checked. This guards the `path` only: the code you
-  pass is checked against Bash rules like any snippet, and can still open other files.
-- **Read rule forms:** a `Read` pattern is matched as a `*` / `**` glob against the absolute
-  path, after a leading `~` becomes your home folder, so `Read(**/.env)` and `Read(~/.ssh/**)`
-  match. These do not match yet: Claude Code's relative forms (`./.env`, `.env`, `/path` from the
-  settings file, `//path`), `?` and `[...]`, and a `/**/` that should match no folder
-  (`~/.aws/**/credentials` does not cover `~/.aws/credentials`).
+  pass is checked against Bash rules like any snippet, and can still open other files. `em_index`
+  applies the same check to its `path`, and skips (and lists) the files under a directory that
+  a rule matches.
+- **Read rule forms:** `Read` patterns resolve as Claude Code resolves them: `//path` is an
+  absolute path, `~/path` is under your home folder, `./path`, `path/with/slash` and `/path` are
+  under the project root (`/path` also matches the absolute `/path`, as earlier versions read
+  it), and a name without a slash (`.env`, `*.pem`) matches at any depth under the project root.
+  A pattern that starts with `**` matches anywhere. `*` stays within one folder, `**` crosses
+  folders, `/**/` also matches no folder (`~/.aws/**/credentials` covers `~/.aws/credentials`),
+  `?` is one character, and a matched folder covers the files below it. `[...]` is not supported.
+  A file a rule denies is skipped by the indexers and also removed from the index when an earlier
+  run had indexed it; files that no longer exist leave the index on the next sync too.
 - **Environment:** the process gets a stripped environment. Credentials for `gh`, `aws`,
   `gcloud`, `kubectl` and `docker` pass through. Add more names with `sandbox.envAllow`.
 - **Speed:** these are the hot paths. They are designed to add about 1 ms over a raw process
