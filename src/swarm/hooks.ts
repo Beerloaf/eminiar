@@ -893,9 +893,17 @@ function sessionStartAt(ctx: ProjectContext, sessionId?: string): string | undef
           ? `Agent files were regenerated (${sync.changed} changed); if Claude Code does not list them yet, run /agents or restart.`
           : `${sync.changed} agent file(s) are out of date (sync: manual); run \`eminiar swarm sync\`.`,
       );
-    if (sync.conflicts)
+    const held = sync.actions.filter((a) => a.held).length;
+    if (config.ignoredKeys.length)
       out.push(
-        `${sync.conflicts} agent file(s) in .claude/agents were left alone (hand-written, or generated and then edited); \`eminiar swarm sync --dry-run\` explains.`,
+        clip(
+          `${config.rel}: ${config.ignoredKeys.length} unknown key(s) ignored (first: ${issueWhere(config.ignoredKeys)}); generated agent files of the roles those keys belong to are not rewritten unless an update only tightens them (\`eminiar swarm sync --force\` does). \`eminiar swarm validate\` lists the keys.`,
+          400,
+        ),
+      );
+    if (sync.conflicts > held)
+      out.push(
+        `${sync.conflicts - held} agent file(s) in .claude/agents were left alone (hand-written, or generated and then edited); \`eminiar swarm sync --dry-run\` explains.`,
       );
     const mctx = main === local ? ctx : getContext(main);
     const db = getStorage(mctx, { vectors: false });
