@@ -11,9 +11,11 @@ export type RoutingMode = z.infer<typeof RoutingMode>;
 /**
  * A relative path that stays inside the folder it is joined to: not empty, no leading `/` or
  * `\`, no drive letter, no `..` segment (either separator), no control character (`\p{Cc}`: NUL, newline,
- * ...). Lexical only: symlinks are checked where the path is used (src/docs/manifest.ts). The
- * `..` lookahead reads `[\s\S]` so a line break could never hide a segment from it, and it also
- * refuses `.. ` / `...` segments, which Windows trims to `..` (trailing dots and spaces).
+ * ...). Lexical only: symlinks are checked where the path is used (the docs manifest in
+ * src/docs/manifest.ts, docs path sources by refuseOutside in src/index/indexer.ts, memory files
+ * in reconcile in src/memory/store.ts). The `..` lookahead reads `[\s\S]` so a line break could
+ * never hide a segment from it, and it also refuses `.. ` / `...` segments, which Windows trims
+ * to `..` (trailing dots and spaces).
  */
 export const PROJECT_RELATIVE_PATH_RE =
   /^(?![/\\])(?![A-Za-z]:)(?!(?:[\s\S]*[/\\])?\.\.[. ]*(?:[/\\]|$))[^\p{Cc}]+$/u;
@@ -110,9 +112,9 @@ const buildAdjudicatorObject = () =>
       .prefault({}),
     minPromptChars: z.number().int().min(0).default(12),
     /**
-     * Ordered ladder, smallest first; "fable" may be inserted by the user. Every provider request
-     * carries the whole ladder and a committed project file may set it, so it is bounded: each
-     * tier at most once (task #56).
+     * Ordered ladder, smallest first; "fable" may be inserted by the user. Personal config only
+     * (a committed project file cannot set it). Every provider request carries the whole ladder,
+     * so it is bounded: each tier at most once (task #56).
      */
     tiers: z
       .array(z.enum(TIERS))
@@ -268,6 +270,35 @@ export function adjudicatorDefaults(): AdjudicatorConfig {
 }
 
 /** Everything but the adjudicator section; loadConfig parses this alone while it is untouched. */
+/**
+ * Why a graph include/exclude glob is refused, or undefined when it is fine. The patterns reach
+ * micromatch, whose regexes backtrack exponentially in the number of `*` groups inside one path
+ * segment (`**\/*a*a*a*a*a*a*a*a*b.ts` froze a server for a minute on a 40 character file name),
+ * and a committed eminiar.config.json is untrusted. Bounds: 200 characters, 4 braces, 2 extglob
+ * groups, 3 wildcard groups per segment and 8 per pattern; the defaults use at most 2.
+ */
+export function graphGlobProblem(g: string): string | undefined {
+  if (g.length > 200) return "longer than 200 characters";
+  if ((g.match(/\{/g)?.length ?? 0) > 4) return "more than 4 braces";
+  if ((g.match(/\(/g)?.length ?? 0) > 2) return "more than 2 extglob groups";
+  let total = 0;
+  for (const seg of g.split(/[\\/]/)) {
+    const groups = seg.match(/\*+|\?/g)?.length ?? 0;
+    if (groups > 3) return "more than 3 wildcards in one path segment";
+    total += groups;
+  }
+  return total > 8 ? "more than 8 wildcards" : undefined;
+}
+
+const GraphGlob = z.string().superRefine((g, ctx) => {
+  const why = graphGlobProblem(g);
+  if (why)
+    ctx.addIssue({
+      code: "custom",
+      message: `graph glob ${JSON.stringify(g.slice(0, 40))} is ${why}`,
+    });
+});
+
 const BaseConfigSchema = z.object({
   routing: z
     .object({
@@ -312,7 +343,7 @@ const BaseConfigSchema = z.object({
   graph: z
     .object({
       include: z
-        .array(z.string())
+        .array(GraphGlob)
         .default([
           "**/*.ts",
           "**/*.tsx",
@@ -320,12 +351,15 @@ const BaseConfigSchema = z.object({
           "**/*.jsx",
           "**/*.mjs",
           "**/*.cjs",
+          "**/*.mts",
+          "**/*.cts",
           "**/*.py",
+          "**/*.pyi",
           "**/*.go",
           "**/*.php",
         ]),
       exclude: z
-        .array(z.string())
+        .array(GraphGlob)
         .default([
           "**/node_modules/**",
           "**/dist/**",
@@ -368,8 +402,14 @@ const BaseConfigSchema = z.object({
     .prefault({}),
   memories: z
     .object({
-      /** Project-relative directory of markdown memory files (`<topic>/<name>.md`); commit it. */
-      dir: z.string().default(".eminiar/memories"),
+      /**
+       * Project-relative directory of markdown memory files (`<topic>/<name>.md`); commit it.
+       * Absolute paths and `..` segments are refused: reconcile repairs the headers of files there.
+       */
+      dir: z
+        .string()
+        .regex(PROJECT_RELATIVE_PATH_RE, "must be a path inside the project (no leading / or ..)")
+        .default(".eminiar/memories"),
     })
     .prefault({}),
   recall: z
@@ -612,29 +652,36 @@ function envOverrides(): Record<string, unknown> {
  * and EMINIAR_* env (which can withdraw remote consent but never grant it). What is
  * left only turns the adjudicator on and tunes how verdicts are scored and used locally.
  * privacy also holds captureExchanges (storing Jev requests with prompt text), one more reason
- * it stays out.
+ * it stays out. mode, apply and tiers decide which model every subagent runs on (apply mode
+ * could put each dispatch on haiku, or floor them at fable), so they are personal too: a project
+ * file may only keep the adjudicator advise-only (projectKeeps).
  */
 export const PROJECT_ADJUDICATOR_KEYS: readonly string[] = [
   "enabled",
-  "mode",
   "surfaces",
   "promptMode",
   "minPromptChars",
-  "tiers",
   "weights",
-  "apply",
   "advice",
   "embedding",
   "learning",
   "cache",
 ];
 
+/**
+ * Whether projectLayer keeps adjudicator.<k> of a project section: a PROJECT_ADJUDICATOR_KEYS
+ * key, or `mode: "advise"`, which can only make the adjudicator more conservative.
+ */
+function projectKeeps(adj: Record<string, unknown>, k: string): boolean {
+  return PROJECT_ADJUDICATOR_KEYS.includes(k) || (k === "mode" && adj.mode === "advise");
+}
+
 /** The adjudicator keys of a raw project file that projectLayer drops, sorted. */
 export function droppedProjectAdjudicatorKeys(raw: Record<string, unknown>): string[] {
   const adj = raw.adjudicator;
   if (!isPlainObject(adj)) return [];
   return Object.keys(adj)
-    .filter((k) => !PROJECT_ADJUDICATOR_KEYS.includes(k))
+    .filter((k) => !projectKeeps(adj, k))
     .sort();
 }
 
@@ -856,7 +903,7 @@ export function personalConfigProblem(
 }
 
 /**
- * The project layer with its adjudicator section cut down to PROJECT_ADJUDICATOR_KEYS. A section
+ * The project layer with its adjudicator section cut down to what projectKeeps allows. A section
  * holding a key-like field stays whole instead, so the schema's secret check still refuses it
  * (the whole config falls back to defaults, the adjudicator off) rather than dropping it quietly.
  */
@@ -865,35 +912,43 @@ function projectLayer(raw: Record<string, unknown>): Record<string, unknown> {
   if (!isPlainObject(adj)) return raw;
   if (findSecretFields(adj).length) return raw;
   const kept: Record<string, unknown> = {};
-  for (const k of PROJECT_ADJUDICATOR_KEYS) if (Object.hasOwn(adj, k)) kept[k] = adj[k];
+  for (const k of Object.keys(adj)) if (projectKeeps(adj, k)) kept[k] = adj[k];
   return { ...(ownJson(raw) as Record<string, unknown>), adjudicator: kept };
 }
 
+/** Paths joined to the project root and written through, as [section, key]. */
+const PROJECT_PATH_KEYS = [
+  ["docs", "manifest"],
+  ["memories", "dir"],
+] as const;
+
 /**
- * A config layer without a docs.manifest that could leave the project (absolute, `..`, not a
- * string): em_docs rewrites that file, so a cloned repo must not aim it at ../settings.json, and a
- * bad personal value must not cost the rest of the personal config. Only that key is dropped, so
- * the next layer's or the default value applies and everything else stays. `source` names the
- * file in the stderr note. The real guard stays at write time (src/docs/manifest.ts).
+ * A config layer without a PROJECT_PATH_KEYS value that could leave the project (absolute, `..`,
+ * not a string): em_docs rewrites the docs manifest and reconcile repairs memory file headers,
+ * so a cloned repo must not aim them at ../settings.json or ~, and a bad personal value must not
+ * cost the rest of the personal config. Only that key is dropped, so the next layer's or the
+ * default value applies and everything else stays. `source` names the file in the stderr note.
+ * The real guard for the manifest stays at write time (src/docs/manifest.ts).
  */
-function withoutUnsafeDocsManifest(
-  raw: Record<string, unknown>,
-  source: string,
-): Record<string, unknown> {
-  const docs = raw.docs;
-  if (!isPlainObject(docs) || !Object.hasOwn(docs, "manifest")) return raw;
-  const m = docs.manifest;
-  if (typeof m === "string" && PROJECT_RELATIVE_PATH_RE.test(m)) return raw;
-  process.stderr.write(
-    `eminiar: ignoring docs.manifest ${JSON.stringify(m)} in ${source}: it must be a path inside the project\n`,
-  );
-  const { manifest: _dropped, ...rest } = ownJson(docs) as Record<string, unknown>;
-  return { ...(ownJson(raw) as Record<string, unknown>), docs: rest };
+function withoutUnsafePaths(raw: Record<string, unknown>, source: string): Record<string, unknown> {
+  let out = raw;
+  for (const [section, key] of PROJECT_PATH_KEYS) {
+    const sec = out[section];
+    if (!isPlainObject(sec) || !Object.hasOwn(sec, key)) continue;
+    const v = sec[key];
+    if (typeof v === "string" && PROJECT_RELATIVE_PATH_RE.test(v)) continue;
+    process.stderr.write(
+      `eminiar: ignoring ${section}.${key} ${JSON.stringify(v)} in ${source}: it must be a path inside the project\n`,
+    );
+    const { [key]: _dropped, ...rest } = ownJson(sec) as Record<string, unknown>;
+    out = { ...(ownJson(out) as Record<string, unknown>), [section]: rest };
+  }
+  return out;
 }
 
 /**
- * The personal layer: paths().configFile as it is, unless it sets adjudicator keys outside
- * PROJECT_ADJUDICATOR_KEYS from a location the project could have put there
+ * The personal layer: paths().configFile as it is, unless it sets adjudicator keys the project
+ * layer drops (droppedProjectAdjudicatorKeys) from a location the project could have put there
  * (personalConfigTrusted, task #54); then it gets the project layer's cut.
  */
 function personalLayer(projectRoot: string): Record<string, unknown> {
@@ -903,7 +958,7 @@ function personalLayer(projectRoot: string): Record<string, unknown> {
     !droppedProjectAdjudicatorKeys(raw).length || personalConfigTrusted(projectRoot, file)
       ? raw
       : projectLayer(raw);
-  return withoutUnsafeDocsManifest(layer, file);
+  return withoutUnsafePaths(layer, file);
 }
 
 /**
@@ -914,7 +969,7 @@ export function loadConfig(projectRoot: string): Config {
   const merged = deepMerge(
     deepMerge(
       personalLayer(projectRoot),
-      withoutUnsafeDocsManifest(
+      withoutUnsafePaths(
         projectLayer(readJson(join(projectRoot, "eminiar.config.json"))),
         "eminiar.config.json",
       ),

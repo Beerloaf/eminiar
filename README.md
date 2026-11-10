@@ -60,14 +60,17 @@ Everything runs locally in one SQLite database per project.
 
 `em_execute`, `em_batch_execute` and `em_execute_file` run shell, JavaScript and TypeScript, plus
 Python, Ruby, Go, PHP, Perl, R, Elixir, Rust and C# when they are installed. Output over 5 KB is
-indexed. Claude gets back only the sections that match its `intent`. Snippets obey your Claude
-Code `Bash` deny rules, and `em_execute_file` refuses a `path` that one of your `Read` deny rules
-matches ([which rule forms](docs/how-it-works.md#sandbox)).
+indexed. Claude gets back only the sections that match its `intent`. Shell snippets are checked
+against your Claude Code `Bash` deny and ask rules, and `em_execute_file` refuses a `path` that
+one of your `Read` deny rules matches. Snippets in other languages are not rule-checked, and
+the sandbox is not an isolation boundary
+([what is enforced](docs/how-it-works.md#what-the-sandbox-enforces)).
 
 Hooks route noisy commands for Claude. A Bash line is judged one command at a time: output that
-is already bounded (`| head`, `| wc`, `grep -l`, `cat` of a small file) and commands that change
-files stay native. `git log`, `git blame` and `git show` go to `em_history`, and a `Grep` for a
-symbol the graph knows goes to `em_symbols`. `em_stats` shows each routing decision and the rule
+is already bounded (`| head`, `| wc`, `grep -l`, `cat` of a small file) and commands it
+recognises as changing something (files, a cluster, a remote API) stay native. `git log`,
+`git blame` and `git show` go to `em_history`, and a `Grep` for a symbol the graph knows goes to
+`em_symbols`. `em_stats` shows each routing decision and the rule
 behind it, so you can see what was sent where.
 
 ### 🔎 Hybrid search — keyword and meaning together
