@@ -232,7 +232,10 @@ root.
   as ES modules; a snippet that calls `require(...)` gets one that resolves packages and
   relative paths from the project root, as a script of the project would.
 - **Output:** output over `sandbox.indexThreshold` (5 KB) is indexed. Claude gets back only the
-  sections that match its `intent`, plus a list of searchable terms.
+  sections that match its `intent`, plus a list of searchable terms. Secrets are masked in the
+  stored copy (see [Privacy and data](#privacy-and-data)). Output shown inline, and the head and
+  tail preview, are as printed; sections found for an `intent` or `queries` come from the masked
+  copy.
 - **Permissions:** shell snippets are checked against Claude Code's `permissions.deny` and `ask`
   Bash rules, one chained segment at a time. An `ask` rule counts as deny.
 - **Files:** the `path` given to `em_execute_file` must be inside the project root, or outside it
@@ -321,6 +324,34 @@ for a shared team knowledge base.
 | `~/.eminiar/plugin/` | The stable plugin copy |
 | `<project>/.eminiar/memories/` | Memory files (commit them) |
 | `<project>/.eminiar/docs.json` | Documentation sources manifest (commit it) |
+
+On macOS and Linux, `~/.eminiar` is readable by you alone (mode 0700), and each database with its
+`-wal` and `-shm` files is 0600. An existing `~/.eminiar` is tightened the next time eminiar opens
+it; a folder that `EMINIAR_HOME` points at is tightened only when it holds nothing but eminiar's
+own files, so a project or shared folder keeps its mode. Files in your project (memories,
+`eminiar.config.json`) keep the modes git gives them.
+
+Command and page output (`em_execute`, `em_batch_execute`, `em_execute_file`,
+`em_fetch_and_index`) is stored with its secrets masked, and so is the short error text of a
+failed tool call that session history keeps. Masked are tokens and keys with a known shape
+(`sk-…`, `ghp_…`, `ya29.…`, `hvs.…`, AWS, Slack, Stripe, JWTs, private key blocks), `Authorization`
+and cookie values, credentials in URLs, password flags on command lines, and `name=value` pairs
+whose name is a secret's (`AWS_SECRET_ACCESS_KEY`, `db_password`, `apiKey`). So `env` is stored as
+`GH_TOKEN=***`. Git SHAs, checksums, emails and base64 are kept, as is a lone `key` whose value
+reads as a name or a path (S3's `"Key": "photos/a.jpg"`, `key: string`), so the output stays
+searchable. The masking is best effort: a secret with no known shape and no secret name (an
+opaque token printed on its own line, a password in prose) is stored as printed.
+
+Stored as written: your prompts, Claude's replies, subagent reports and the command line that
+session events record for each tool call (session history indexes some of these for `em_recall`),
+pages indexed by `em_docs`, and the fetch cache in the global database. Output stored by an older
+version keeps its text: command and page output until `eminiar purge index --yes`, error
+text in session history until `em_purge {scope: "sessions"}`.
+Text that a delete replaces can stay in free database pages until SQLite reuses them;
+`eminiar purge <scope> --yes` runs a VACUUM.
+
+`em_purge {scope: "sessions"}` deletes the captured events with the session history `em_recall`
+searches; command output belongs to the `index` scope.
 
 eminiar uses the network only to download the embedding model, to fetch pages and documentation
 that you ask it to index, and to read package metadata from the npm, PyPI and Go registries. The
