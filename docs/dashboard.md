@@ -462,6 +462,7 @@ http://127.0.0.1:7331/#/explore?file=src/server.ts
   `Sec-Fetch-Site` (Safari before 16.4) are covered for writes only.
 - `doctor --fix` from the System tab is a POST.
 - Every request that writes needs a JSON content type and a loopback `Origin`.
-- File reads are checked to stay inside the project root.
+- File reads are checked to stay inside the project root, and the file viewer refuses a file that
+  a Claude Code `Read` deny or `ask` rule matches, checked as `em_execute_file` does.
 
 `eminiar serve` is an older name for the same command.

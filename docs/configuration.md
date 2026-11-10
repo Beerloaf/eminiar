@@ -121,6 +121,11 @@ default excludes:
 |---|---|---|
 | `dir` | `".eminiar/memories"` | Where memory files live, relative to the project root |
 
+`memories.dir` must be a path inside the project, by the same rule as `docs.manifest` below: an
+absolute path, a drive letter, a `..` segment or a control character is refused, and a config
+file that sets one is ignored for that key only, with a stderr note. Sessions repair missing or stale
+headers of the memory files there, so a cloned repo must not aim it at your other files.
+
 ### `recall`
 
 | Key | Default | Description |
@@ -162,7 +167,9 @@ note says so; the next layer's or the default value applies, and the rest of bot
   regular file; reads still follow a symlink that stays inside the project);
 - it is not a manifest this version can rewrite without losing data: `version` other than `1`,
   top-level keys other than `version` and `sources`, a `sources` that is not an array, or an
-  entry that is not valid (bad name, duplicate, unknown kind);
+  entry that is not valid (bad name, duplicate, unknown kind, a `path` outside the project; a
+  stderr note names a source dropped for its path, and `em_docs remove` of that name still
+  works because the write loses nothing else);
 - it could not be read (too large, not a regular file, not JSON, a merge conflict).
 
 The refusal names the file and the reason; fix or move the file, then retry. Hooks and other

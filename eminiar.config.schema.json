@@ -202,7 +202,8 @@
       "properties": {
         "dir": {
           "default": ".eminiar/memories",
-          "type": "string"
+          "type": "string",
+          "pattern": "^(?![/\\\\])(?![A-Za-z]:)(?!(?:[\\s\\S]*[/\\\\])?\\.\\.[. ]*(?:[/\\\\]|$))[^\\p{Cc}]+$"
         }
       }
     },
